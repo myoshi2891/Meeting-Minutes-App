@@ -96,7 +96,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * 認可：認証ミドルウェアが `/v1/meetings/{id}/...` と `/v1/jobs/{id}/...` の所有者を照合し、他人の会議は `404`（存在を漏らさない）。`GET /v1/meetings` は自分の会議のみ
 * ファイル階層：`recordings/{userId}/{meetingId}/{source}/{seq}.wav`。マイグレーション 011 が既存の `recordings/{meetingId}/` を `recordings/local/{meetingId}/` へ移動し `local_path` を更新する
 * ジョブの公平性：`lease_job` を「利用者ごとの実行中ジョブ数が少ない利用者を優先」に変更（`ORDER BY running_per_user, priority, created_at`）。GPU は依然 1 台なので、同時実行数の上限は Phase 2 と同じ
-* CSP：サーバーが `/` でアプリを配信する構成では `'self'` で吸収され変更不要。別オリジン配信は対象外
+* CSP と origin：**API origin はページ origin と同一とする**（前提契約）。サーバーが `/` でアプリ自身を配信するので `connect-src 'self'` で吸収され変更不要、同一 origin なので CORS 設定も不要。LAN モードとは「ページ自体を LAN の https origin から開く」ことであり、loopback から開いたページが別ホストの API を叩く構成ではない。**別オリジン配信は対象外**で、ブラウザ側 `validateConnection()` がページ origin 以外を `NOT_PAGE_ORIGIN` で拒否して実装レベルでも強制する（クライアント側 §7.3）。将来対象化する場合は CSP `connect-src` への対象 origin 追加と、`Authorization` ヘッダを伴う preflight に対応した CORS 設定の両方が必要になる
 * インターネット公開・リバースプロキシ・OS ログイン連携は対象外
 
 ---
@@ -664,8 +664,16 @@ def segments_of_chunk(conn: sqlite3.Connection, chunk_id: str) -> list[Segment]:
 
 
 def live_segments_since(conn: sqlite3.Connection, meeting_id: str, since_created_at: int) -> list[Segment]:
+    """since_created_at を**含む**境界で返す（クライアント側 §2.1・§3.2）。
+
+    created_at は epoch ms で一意でも単調増加でもない。handle_live_transcribe は 1 チャンク分の
+    セグメントを同じ now_ms() の値で書き込むため、同一ミリ秒に複数行が並ぶのは常態である。
+    排他境界（created_at > ?）にすると、cursor と同じミリ秒に後から挿入された行が次回以降の
+    検索条件から永久に外れる。境界ミリ秒の再送は受信側が id で重複排除する契約になっている。
+    並びは (created_at, id) で決める。start_ms は一意でなく、同点時の順序が安定しない。
+    """
     rows = conn.execute(
-        "SELECT * FROM transcript_segments WHERE meeting_id = ? AND created_at > ? ORDER BY created_at, start_ms",
+        "SELECT * FROM transcript_segments WHERE meeting_id = ? AND created_at >= ? ORDER BY created_at, id",
         (meeting_id, since_created_at),
     ).fetchall()
     return [_row(Segment, r) for r in rows]
@@ -2709,7 +2717,12 @@ async def put_speakers(meeting_id: str, req: SpeakersPutRequest, request: Reques
 
 @router.get("/meetings/{meeting_id}/live")
 async def get_live(meeting_id: str, request: Request, since: int = 0) -> Any:
-    """未マージの生セグメント（Live Transcript ペイン用）。since は created_at（epoch ms）。"""
+    """未マージの生セグメント（Live Transcript ペイン用）。
+
+    since は created_at（epoch ms）で、**境界を含む**（live_segments_since 参照）。
+    返す cursor は取得したセグメントの最大 created_at なので、次回の呼び出しでは
+    その 1 ミリ秒分が再送される。受信側は id で重複排除すること（クライアント側 §2.1）。
+    """
     ctx = get_ctx(request)
     with ctx.db.read() as conn:
         m = repo.get_meeting(conn, meeting_id)
@@ -3707,7 +3720,11 @@ async def test_live_job_created_on_put_and_reused_after_finalize(client3: httpx.
     assert len(received) == 6 and received[0]["segment"]["startMs"] == 0
     live_view = (await client3.get("/v1/meetings/m-1/live", params={"since": 0})).json()
     assert len(live_view["segments"]) == 6 and live_view["liveState"] == "RUNNING"
-    assert (await client3.get("/v1/meetings/m-1/live", params={"since": live_view["cursor"]})).json()["segments"] == []
+    # since は境界を含むので、cursor を渡すと境界ミリ秒の分だけが再送される（新規は増えない）。
+    # 排他境界にすると、この 1 ミリ秒に後から追記されたセグメントが永久に取り出せなくなる
+    replay = (await client3.get("/v1/meetings/m-1/live", params={"since": live_view["cursor"]})).json()
+    assert all(s["createdAt"] == live_view["cursor"] for s in replay["segments"])
+    assert {s["id"] for s in replay["segments"]} <= {s["id"] for s in live_view["segments"]}
     with ctx3.db.read() as conn:
         assert repo.get_chunk_by_key(conn, "m-1", "mic", 0).stt_status == "pending"    # 確定パイプラインには触らない
 

@@ -3,7 +3,7 @@
 **対象:** Phase 1・Phase 2 詳細設計のブラウザ側コードに対する Phase 3 の追加・変更。Live Transcript ペイン／話者名の割当／言語バッジ／欠損 Chunk の逆同期／LAN モード（許可ホストと HTTPS）／Live STT の負荷監視。
 **上位文書:** Phase 3 詳細設計書 ── サーバー側（`design-local-phase3-server.md`）§2 の設計判断と §20 の API。
 **制約:** Phase 1・2 と同じ（ブラウザ標準 API と TypeScript のみ、UI フレームワーク非依存の状態モデル）。
-**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Phase 1・2 の 34 テストと本書の 11 テスト（計 15 ファイル 45 件）が vitest で全件通過することを設計時点で確認している（§9）。
+**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Phase 1・2 の 41 テストと本書の 18 テスト（計 15 ファイル 59 件）が vitest で全件通過することを設計時点で確認している（§9）。
 
 ---
 
@@ -52,7 +52,14 @@ export interface LiveResponse {
   readonly meetingId: string;
   readonly liveState: LiveState;
   readonly segments: ReadonlyArray<LiveSegment>;
-  /** 次回の since に渡す created_at */
+  /**
+   * 次回の since に渡す created_at。サーバー側の検索は since を**含む**（`created_at >= ?`）ため、
+   * 境界ミリ秒のセグメントは毎回再送される。
+   *
+   * created_at は epoch ms であり一意性を保証できない（1 回の live_transcribe ジョブが複数セグメントを
+   * 同じ now_ms() で書き込む）。排他境界（`>`）にすると、cursor と同じミリ秒に後から挿入された
+   * セグメントを恒久的に取りこぼす。受信側は必ず id で重複排除すること（§3.2 LiveTranscriptStore）。
+   */
   readonly cursor: number;
 }
 
@@ -109,15 +116,13 @@ export interface LiveSegmentEvent {
 export type MeetingEventV3 = MeetingEvent | LiveSegmentEvent;
 
 /**
- * LiveSegment の全フィールドを検証する。SSE は外部入力であり、
+ * LiveSegment の全フィールドを検証する。SSE も GET /live も外部入力であり、
  * 未検証のフィールドは upsert のあと表示や並べ替え（startMs / source）で undefined として現れる。
  * language / confidence は null 可なので「期待する型か null」まで要求し、undefined を通さない。
  */
-export function isLiveSegmentEvent(value: unknown): value is LiveSegmentEvent {
+export function isLiveSegment(value: unknown): value is LiveSegment {
   if (typeof value !== "object" || value === null) return false;
-  const v = value as { type?: unknown; segment?: unknown };
-  if (v.type !== "live_segment" || typeof v.segment !== "object" || v.segment === null) return false;
-  const s = v.segment as Record<string, unknown>;
+  const s = value as Record<string, unknown>;
   return typeof s.id === "string"
     && (s.source === "mic" || s.source === "system")
     && typeof s.startMs === "number"
@@ -127,6 +132,73 @@ export function isLiveSegmentEvent(value: unknown): value is LiveSegmentEvent {
     && (typeof s.confidence === "number" || s.confidence === null)
     && typeof s.createdAt === "number";
 }
+
+export function isLiveSegmentEvent(value: unknown): value is LiveSegmentEvent {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as { type?: unknown; segment?: unknown };
+  return v.type === "live_segment" && isLiveSegment(v.segment);
+}
+
+/**
+ * エンドポイント別デコーダ。Phase3Client.request() は成功応答をそのまま `as T` で通さず、
+ * 必ずここを経由する（§2.2）。とくに segments / speakers は配列であることを確認しないと、
+ * 呼び出し側の .filter / .map が TypeError を投げ、結果型で表現したはずの失敗が例外として漏れる。
+ * 検証の粒度は「その後の処理が触るフィールド」に合わせ、失敗は null で返す。
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+export function decodeLiveResponse(value: unknown): LiveResponse | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.meetingId !== "string" || typeof value.cursor !== "number") return null;
+  if (!isLiveState(value.liveState)) return null;
+  if (!Array.isArray(value.segments) || !value.segments.every(isLiveSegment)) return null;
+  return value as unknown as LiveResponse;
+}
+
+export function decodeLivePutResponse(value: unknown): LivePutResponse | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.meetingId !== "string" || typeof value.liveSttEnabled !== "boolean" || typeof value.allowed !== "boolean") return null;
+  return value as unknown as LivePutResponse;
+}
+
+export function decodeSpeakersResponse(value: unknown): SpeakersResponse | null {
+  if (!isRecord(value) || typeof value.meetingId !== "string") return null;
+  if (!Array.isArray(value.speakers) || !value.speakers.every(isSpeakerEntry)) return null;
+  return value as unknown as SpeakersResponse;
+}
+
+export function decodeUserMeResponse(value: unknown): UserMeResponse | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.userId !== "string" || typeof value.name !== "string" || typeof value.multiUser !== "boolean") return null;
+  return value as unknown as UserMeResponse;
+}
+
+/**
+ * 会議詳細は Phase 2 の MeetingDetailResponse を継承する。Phase 2 側に型ガードは存在せず、
+ * §1 の通り contracts-phase2.ts は変更しないので、ここでは Phase 3 のクライアントコードが
+ * 実際に読むフィールド（継承部の meetingId / transcriptVersion と Phase 3 の追加分）を検証する。
+ * 継承部の残りは Phase 2 と同じ扱い（未検証）のままで、Phase 3 が新たに保証を弱める箇所はない。
+ */
+export function decodeMeetingDetailV3(value: unknown): MeetingDetailResponseV3 | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.meetingId !== "string" || typeof value.transcriptVersion !== "number") return null;
+  if (!isLiveState(value.liveState) || typeof value.liveSttEnabled !== "boolean" || typeof value.diarized !== "boolean") return null;
+  if (!isRecord(value.languageRatio) || !Object.values(value.languageRatio).every((n) => typeof n === "number")) return null;
+  if (!Array.isArray(value.speakers) || !value.speakers.every(isSpeakerEntry)) return null;
+  if (!Array.isArray(value.codecs) || !value.codecs.every((c) => c === "wav" || c === "flac" || c === "fake")) return null;
+  return value as unknown as MeetingDetailResponseV3;
+}
+
+function isLiveState(value: unknown): value is LiveState {
+  return value === "DISABLED" || value === "STARTING" || value === "RUNNING" || value === "DEGRADED" || value === "STOPPED";
+}
+
+function isSpeakerEntry(value: unknown): value is SpeakerEntry {
+  if (!isRecord(value)) return false;
+  return typeof value.label === "string" && (typeof value.name === "string" || value.name === null);
+}
 ```
 
 ## 2.2 `src/api/phase3-client.ts`
@@ -135,6 +207,7 @@ export function isLiveSegmentEvent(value: unknown): value is LiveSegmentEvent {
 // src/api/phase3-client.ts
 import { assertLocalHost } from "./local-saver";
 import type { ApiResult } from "./phase2-client";
+import { decodeLivePutResponse, decodeLiveResponse, decodeMeetingDetailV3, decodeSpeakersResponse, decodeUserMeResponse } from "./contracts-phase3";
 import type { LivePutResponse, LiveResponse, MeetingDetailResponseV3, SpeakerEntry, SpeakersResponse, UserMeResponse } from "./contracts-phase3";
 
 export interface Phase3ClientConfig {
@@ -152,30 +225,35 @@ export class Phase3Client {
   }
 
   getMeeting(meetingId: string): Promise<ApiResult<MeetingDetailResponseV3>> {
-    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}`);
+    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}`, decodeMeetingDetailV3);
   }
 
   getLive(meetingId: string, since: number): Promise<ApiResult<LiveResponse>> {
-    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}/live?since=${since}`);
+    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}/live?since=${since}`, decodeLiveResponse);
   }
 
   setLive(meetingId: string, enabled: boolean): Promise<ApiResult<LivePutResponse>> {
-    return this.request("PUT", `/v1/meetings/${encodeURIComponent(meetingId)}/live`, { enabled });
+    return this.request("PUT", `/v1/meetings/${encodeURIComponent(meetingId)}/live`, decodeLivePutResponse, { enabled });
   }
 
   getSpeakers(meetingId: string): Promise<ApiResult<SpeakersResponse>> {
-    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}/speakers`);
+    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}/speakers`, decodeSpeakersResponse);
   }
 
   putSpeakers(meetingId: string, speakers: ReadonlyArray<SpeakerEntry>): Promise<ApiResult<SpeakersResponse>> {
-    return this.request("PUT", `/v1/meetings/${encodeURIComponent(meetingId)}/speakers`, { speakers });
+    return this.request("PUT", `/v1/meetings/${encodeURIComponent(meetingId)}/speakers`, decodeSpeakersResponse, { speakers });
   }
 
   me(): Promise<ApiResult<UserMeResponse>> {
-    return this.request("GET", "/v1/users/me");
+    return this.request("GET", "/v1/users/me", decodeUserMeResponse);
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<ApiResult<T>> {
+  /**
+   * 成功応答を `json as T` で通すと、サーバーが壊れた本文を返したときに
+   * 型だけが通り、実際の失敗は呼び出し側の .filter / .map まで先送りされて TypeError になる。
+   * エンドポイントごとのデコーダを必須引数にして、形状不一致をその場で MALFORMED に落とす。
+   */
+  private async request<T>(method: string, path: string, decode: (value: unknown) => T | null, body?: unknown): Promise<ApiResult<T>> {
     const url = new URL(path, this.base);
     assertLocalHost(url);
     const controller = new AbortController();
@@ -185,7 +263,11 @@ export class Phase3Client {
       if (body !== undefined) headers["Content-Type"] = "application/json";
       const res = await this.fetchImpl(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal, credentials: "omit" });
       const json: unknown = res.status === 204 ? null : await res.json().catch(() => null);
-      if (res.ok) return { ok: true, value: json as T, status: res.status };
+      if (res.ok) {
+        const value = decode(json);
+        if (value === null) return { ok: false, status: res.status, code: "MALFORMED", message: `malformed body for ${method} ${path}` };
+        return { ok: true, value, status: res.status };
+      }
       const err = (typeof json === "object" && json !== null ? json : {}) as { code?: unknown; error?: unknown };
       return { ok: false, status: res.status, code: typeof err.code === "string" ? err.code : "UNKNOWN", message: typeof err.error === "string" ? err.error : `HTTP ${res.status}` };
     } catch (error) {
@@ -346,6 +428,10 @@ stateDiagram-v2
 どの遷移も録音経路（Phase 1 §15〜§17）には触れない。`STOPPED` は「Live のプレビューが止まった」状態であり、録音・保存・確定 STT はそのまま進む。
 
 `disable()` による遷移は `PUT /live` がサーバーに受け付けられたときだけ起きる。応答を待たずにローカルを落とすと、サーバーが Live ジョブを回したまま UI だけ停止表示になる。失敗時は状態を据え置き、`poll()` が返す `liveState` との突き合わせに委ねる。
+
+**`poll()` のカーソルは包括境界である。** サーバーは `since` を含む条件（`created_at >= ?`）でセグメントを返し、クライアントは受け取った最大 `created_at` を次の `since` にする。`created_at` は epoch ms であり、1 回の `live_transcribe_chunk` ジョブが複数セグメントを同じ `now_ms()` の値で書き込むため、一意でも単調増加でもない。ここを排他境界（`>`）にすると、`cursor` と同じミリ秒に後から挿入されたセグメントが次回以降の検索条件から永久に外れ、SSE も取りこぼしていた場合は復元不能になる。
+
+代償は「境界ミリ秒のセグメントが毎回再送される」ことだが、再送量は 1 ミリ秒分に限られ、`LiveTranscriptStore` は SSE との重複吸収のために既に `byId` の Map を持っている。複合カーソル `(createdAt, id)` でも同じ正しさは得られるものの、`LiveResponse.cursor` の型・サーバーの SQL・両側のテストにまたがる契約変更が必要になる一方、この構成では重複排除の実装が増えるわけではない。したがって包括境界 + id 重複排除を採る。
 
 ```typescript
 // src/live/live-transcript.ts
@@ -572,6 +658,7 @@ export function summaryLanguageOptions(view: LanguageView, setting: Language): {
 
 ```typescript
 // src/recording/resync.ts
+import { isChunkResponse } from "../api/contracts";
 import type { ChunkListResponse } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
 import type { ChunkStore } from "../storage/idb";
@@ -598,7 +685,19 @@ export interface ResyncReport {
 /** 失敗を例外にすると呼び出し側（設定画面のボタン）が握りつぶしやすいので、結果型で返す。 */
 export type ResyncResult =
   | { readonly ok: true; readonly report: ResyncReport }
-  | { readonly ok: false; readonly reason: "NETWORK" | "TIMEOUT" | "HTTP"; readonly detail: string };
+  | { readonly ok: false; readonly reason: "NETWORK" | "TIMEOUT" | "HTTP" | "MALFORMED"; readonly detail: string };
+
+/**
+ * 一覧応答を `as ChunkListResponse` で通すと chunks が配列でないときに
+ * 直後の .filter が TypeError を投げ、結果型で表現したはずの失敗が例外として漏れる。
+ * 要素の検証は Phase 1 §17 で export 済みの isChunkResponse を再利用する
+ * （§1 の通り contracts.ts 自体は変更しない）。
+ */
+function isChunkListResponse(value: unknown): value is ChunkListResponse {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as { meetingId?: unknown; chunks?: unknown };
+  return typeof v.meetingId === "string" && Array.isArray(v.chunks) && v.chunks.every(isChunkResponse);
+}
 
 export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): Promise<ResyncResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
@@ -620,8 +719,9 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
     clearTimeout(timer);
   }
   if (!res.ok) return { ok: false, reason: "HTTP", detail: `chunk list HTTP ${res.status}` };
-  const list = (await res.json()) as ChunkListResponse;
-  const missing = list.chunks.filter((c) => !c.registered);
+  const body: unknown = await res.json().catch(() => null);
+  if (!isChunkListResponse(body)) return { ok: false, reason: "MALFORMED", detail: "malformed ChunkListResponse" };
+  const missing = body.chunks.filter((c) => !c.registered);
   let requeued = 0;
   const unavailable: string[] = [];
   for (const c of missing) {
@@ -647,6 +747,8 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
 
 一覧取得に失敗した場合は `{ ok: false }` を返し、UI は「サーバーに接続できませんでした [再試行]」を出す。例外にしないのは、この関数が設定画面のボタンから呼ばれ、未捕捉の例外が「押しても何も起きない」という形で表面化しやすいためである。IndexedDB 側は何も変更しないので、そのまま再試行できる。
 
+この方針は本文のパースにも適用する。`NETWORK` / `TIMEOUT` / `HTTP` だけを結果型にして本文を `as ChunkListResponse` で通すと、`chunks` が配列でない応答で直後の `.filter` が `TypeError` を投げ、例外にしないという方針がその一点だけ破れる（`res.json()` 自体も本文が JSON でなければ reject する）。`MALFORMED` を失敗理由に加え、パースと形状検証の両方を同じ結果型に落とす。UI の文言は「サーバーの応答を解釈できませんでした [再試行]」とし、接続失敗と区別する。
+
 ---
 
 # 7. LAN モード：許可ホストと HTTPS
@@ -666,9 +768,25 @@ let allowedHosts: ReadonlySet<string> = new Set(LOOPBACK_HOSTS);
 /**
  * Phase 3：LAN モードでサーバーのホスト名を許可する。loopback は常に含まれる。
  * 非 loopback は https のみ（トークンを平文で流さない）。設定は起動時に 1 回だけ行う。
+ *
+ * 追加できるのは**ページ origin のホストだけ**である。LAN モードは「サーバーが自分自身の
+ * アプリを配信する」構成だけを対象とし（サーバー側 §2.5、本書 §7.3）、任意ホストは設定できない。
+ * ここを「https なら何でも可」にすると、`https://example.com` を設定された時点で
+ * トークンと WAV 本体が公開ホストへ送られる。ブラウザからは DNS 解決結果を検証できないため、
+ * プライベートアドレス判定ではなく origin 一致で担保する（§7.3）。
+ * pageOrigin は既定で location.origin。テストから注入できるよう引数にしている。
  */
-export function configureAllowedHosts(extraHosts: ReadonlyArray<string>): void {
-  allowedHosts = new Set([...LOOPBACK_HOSTS, ...extraHosts.map((h) => h.trim().toLowerCase()).filter((h) => h !== "")]);
+export function configureAllowedHosts(extraHosts: ReadonlyArray<string>, pageOrigin: string = location.origin): void {
+  let pageHost: string;
+  try {
+    pageHost = new URL(pageOrigin).hostname.toLowerCase();
+  } catch {
+    pageHost = "";
+  }
+  const allowed = extraHosts
+    .map((h) => h.trim().toLowerCase())
+    .filter((h) => h !== "" && h === pageHost);
+  allowedHosts = new Set([...LOOPBACK_HOSTS, ...allowed]);
 }
 
 export function resetAllowedHosts(): void {
@@ -784,8 +902,6 @@ function isApiErrorBody(value: unknown): value is ApiErrorBody {
 }
 ```
 
-CSP の `connect-src` は、サーバーがアプリを配信する構成では `'self'` が LAN ホストを含むため変更不要（サーバー側 §2.5）。
-
 ## 7.2 `src/api/lan-settings.ts`
 
 ```typescript
@@ -799,10 +915,17 @@ export interface ServerConnection {
 
 export type ConnectionValidation =
   | { readonly ok: true; readonly url: URL; readonly lan: boolean }
-  | { readonly ok: false; readonly reason: "INVALID_URL" | "BAD_PROTOCOL" | "LAN_REQUIRES_HTTPS" | "EMPTY_TOKEN" };
+  | { readonly ok: false; readonly reason: "INVALID_URL" | "BAD_PROTOCOL" | "LAN_REQUIRES_HTTPS" | "NOT_PAGE_ORIGIN" | "EMPTY_TOKEN" };
 
-/** 設定画面の検証。LAN（非 loopback）は https 必須。 */
-export function validateConnection(conn: ServerConnection): ConnectionValidation {
+/**
+ * 設定画面の検証。LAN（非 loopback）は https 必須、かつページ origin と一致すること（§7.3）。
+ *
+ * https を通過条件にするだけでは不十分で、`https://example.com` のような公開ホストを
+ * そのまま許可してしまう。そこにトークンと WAV 本体が送られる以上、TLS であることは
+ * 送信先が信頼できることを意味しない。Phase 3 の対象構成では API origin はページ origin と
+ * 同一なので、origin 一致を必須にしても正当な設定を弾くことはない。
+ */
+export function validateConnection(conn: ServerConnection, pageOrigin: string = location.origin): ConnectionValidation {
   let url: URL;
   try {
     url = new URL(conn.baseUrl);
@@ -812,17 +935,44 @@ export function validateConnection(conn: ServerConnection): ConnectionValidation
   if (url.protocol !== "http:" && url.protocol !== "https:") return { ok: false, reason: "BAD_PROTOCOL" };
   const lan = !isLoopback(url.hostname);
   if (lan && url.protocol !== "https:") return { ok: false, reason: "LAN_REQUIRES_HTTPS" };
+  if (lan && url.origin !== safeOrigin(pageOrigin)) return { ok: false, reason: "NOT_PAGE_ORIGIN" };
   if (conn.token.trim() === "") return { ok: false, reason: "EMPTY_TOKEN" };
   return { ok: true, url, lan };
 }
 
+/** pageOrigin が壊れている場合に「一致」へ倒れないよう、null 相当の値を返す。 */
+function safeOrigin(pageOrigin: string): string {
+  try {
+    return new URL(pageOrigin).origin;
+  } catch {
+    return "\u0000";
+  }
+}
+
 /** 検証を通った接続先だけを許可ホストに登録する。 */
-export function applyConnection(conn: ServerConnection): ConnectionValidation {
-  const v = validateConnection(conn);
-  if (v.ok) configureAllowedHosts(v.lan ? [v.url.hostname] : []);
+export function applyConnection(conn: ServerConnection, pageOrigin: string = location.origin): ConnectionValidation {
+  const v = validateConnection(conn, pageOrigin);
+  if (v.ok) configureAllowedHosts(v.lan ? [v.url.hostname] : [], pageOrigin);
   return v;
 }
 ```
+
+## 7.3 origin 契約
+
+**Phase 3 では API origin をページ origin と同一とする。** これは前提条件であって最適化ではない。サーバーが `/` でアプリ自身を配信し（サーバー側 §2.5）、ブラウザはその同じ origin にだけ API を呼ぶ。LAN モードとは「ページ自体を loopback ではなく LAN の https origin から開く」ことを意味し、「loopback から開いたページが別ホストの API を叩く」構成ではない。
+
+この契約から次が従う。
+
+| 項目 | 帰結 |
+| --- | --- |
+| CSP `connect-src` | `'self'` で足りる。LAN ホストはページ origin そのものなので追加不要（サーバー側 §2.5 の CSP をそのまま使う） |
+| CORS | 同一 origin なので API サーバー側の CORS 設定は不要 |
+| `validateConnection()` | ページ origin 以外（loopback を除く）を `NOT_PAGE_ORIGIN` で拒否し、契約を実装レベルで強制する（§7.2） |
+| `configureAllowedHosts()` | ページ origin のホストしか許可集合に入れない（§7.1） |
+
+**別 origin 構成は対象外**であり、設定画面から指定することもできない。仮に将来対象化する場合は、文書上の記述だけでは足りず、(1) アプリを配信する側の CSP `connect-src` に対象 origin を追加し、(2) API サーバーに当該 origin を許可する CORS 設定（`Authorization` ヘッダを使うので preflight 対応が必須）を入れ、(3) `validateConnection()` の origin 判定をその許可リストに差し替える、の 3 点を揃える必要がある。
+
+> **ブラウザの制約**：許可判定を「プライベートアドレスかどうか」で行うことはできない。ブラウザの JS から DNS 解決結果を参照する API は存在せず、`https://internal.example.com` が LAN の 192.168.x.x に解決されるのか公開 IP に解決されるのかをクライアントは知り得ない。origin 拘束はこの制約下で等価な保証を与える——ページ自体がローカル／LAN のサーバーから配信されている以上、その origin が公開ホストであることはこの構成では起こらない。
 
 ---
 
@@ -838,9 +988,11 @@ Phase 1・2 のハーネスを流用する。
 
 ```typescript
 // test/live-transcript.test.ts
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { LiveTranscriptStore, liveBanner, type LiveTranscriptState } from "../src/live/live-transcript";
 import type { LivePutResponse, LiveResponse, LiveSegment } from "../src/api/contracts-phase3";
+import { Phase3Client } from "../src/api/phase3-client";
+import { resetAllowedHosts } from "../src/api/local-saver";
 import type { ApiResult } from "../src/api/phase2-client";
 
 const seg = (id: string, startMs: number, createdAt: number): LiveSegment =>
@@ -855,7 +1007,9 @@ function build(opts: { serverState?: LiveResponse["liveState"]; offline?: boolea
     getLive: async (_m: string, since: number): Promise<ApiResult<LiveResponse>> =>
       opts.offline
         ? { ok: false, status: 0, code: "NETWORK", message: "down" }
-        : { ok: true, status: 200, value: { meetingId: "m", liveState: opts.serverState ?? "RUNNING", segments: served.filter((s) => s.createdAt > since), cursor: Math.max(since, ...served.map((s) => s.createdAt)) } },
+        // サーバーは since を含む境界で返す（§2.1・サーバー側 live_segments_since）。
+        // ここを > にするとダブルだけが取りこぼしのない世界になり、回帰テストが素通りする
+        : { ok: true, status: 200, value: { meetingId: "m", liveState: opts.serverState ?? "RUNNING", segments: served.filter((s) => s.createdAt >= since), cursor: Math.max(since, ...served.map((s) => s.createdAt)) } },
     setLive: async (_m: string, enabled: boolean): Promise<ApiResult<LivePutResponse>> => {
       setCalls.push(enabled);
       if (opts.setLiveFails === true) return { ok: false, status: 0, code: "NETWORK", message: "down" };
@@ -881,6 +1035,26 @@ describe("LiveTranscriptStore", () => {
     b.serve([seg("d", 15000, 40)]);
     await b.store.poll();
     expect(b.store.current.segments).toHaveLength(4);
+  });
+
+  it("同一 createdAt に後から挿入されたセグメントを取りこぼさない", async () => {
+    // created_at は epoch ms で一意性がなく、1 ジョブが複数セグメントを同じ値で書く。
+    // 排他境界（created_at > cursor）だと、cursor と同じミリ秒の後続挿入が恒久的に消える（§2.1）。
+    const b = build();
+    b.serve([seg("a", 0, 100), seg("b", 5000, 100)]);
+    await b.store.poll();
+    expect(b.store.current.cursor).toBe(100);
+    expect(b.store.current.segments.map((s) => s.id)).toEqual(["a", "b"]);
+
+    // 同じミリ秒 100 に c が追記される
+    b.serve([seg("a", 0, 100), seg("b", 5000, 100), seg("c", 10000, 100)]);
+    await b.store.poll();
+    expect(b.store.current.segments.map((s) => s.id)).toEqual(["a", "b", "c"]);
+    expect(b.store.current.cursor).toBe(100);
+
+    // 境界ミリ秒は毎回再送されるが、id 重複排除で増殖しない
+    await b.store.poll();
+    expect(b.store.current.segments.map((s) => s.id)).toEqual(["a", "b", "c"]);
   });
 
   it("サーバー不達で STOPPED（SERVER）、有効化に成功すると STARTING", async () => {
@@ -920,6 +1094,39 @@ describe("LiveTranscriptStore", () => {
     expect(liveBanner({ ...base, state: "DISABLED" })).toBeNull();
     expect(liveBanner({ ...base, state: "DEGRADED" })).toMatch(/遅延/);
     expect(liveBanner({ ...base, state: "STOPPED", stopReason: "SERVER" })).toMatch(/停止/);
+  });
+});
+
+describe("Phase3Client の応答検証", () => {
+  afterEach(() => resetAllowedHosts());
+
+  const client = (body: string) =>
+    new Phase3Client(
+      { baseUrl: "http://127.0.0.1:43117", token: "t", timeoutMs: 1000 },
+      async () => new Response(body, { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+
+  it("getLive は segments が配列でない応答を MALFORMED として返す", async () => {
+    // `json as T` で通すと型だけが通り、LiveTranscriptStore.upsert の for-of で
+    // TypeError になる。失敗は ApiResult の失敗分岐で表現する（§2.2）
+    const bad = ['{"meetingId":"m","liveState":"RUNNING","segments":{"0":{}},"cursor":1}',
+                 '{"meetingId":"m","liveState":"RUNNING","cursor":1}',
+                 '{"meetingId":"m","liveState":"BOGUS","segments":[],"cursor":1}',
+                 '{"meetingId":"m","liveState":"RUNNING","segments":[{"id":1}],"cursor":1}'];
+    for (const body of bad) {
+      const res = await client(body).getLive("m", 0);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.code).toBe("MALFORMED");
+    }
+    const good = await client('{"meetingId":"m","liveState":"RUNNING","segments":[],"cursor":7}').getLive("m", 0);
+    expect(good.ok).toBe(true);
+    if (good.ok) expect(good.value.cursor).toBe(7);
+  });
+
+  it("getSpeakers も speakers の配列性を要求する", async () => {
+    const res = await client('{"meetingId":"m","speakers":"none"}').getSpeakers("m");
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe("MALFORMED");
   });
 });
 ```
@@ -1084,30 +1291,64 @@ describe("欠損 Chunk の逆同期", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("TIMEOUT");
   });
+
+  it("壊れた一覧応答でも例外を投げず MALFORMED として返す", async () => {
+    const h = await createHarness();
+    // chunks が配列でない／本文が JSON ですらない場合、as ChunkListResponse では
+    // 直後の .filter や res.json() が throw し、結果型を返す約束が破れる（§6）
+    const bodies = ['{"meetingId":"m-x","chunks":{"0":{"registered":false}}}', "not json at all", "null"];
+    for (const body of bodies) {
+      const badFetch: typeof fetch = async () => new Response(body, { status: 200 });
+      const result = await resyncMissingChunks(
+        { chunkStore: h.chunkStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl: badFetch },
+        "m-x",
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("MALFORMED");
+    }
+  });
 });
 
 describe("LAN モードの許可ホスト", () => {
   afterEach(() => resetAllowedHosts());
 
+  const PAGE = "https://minutes.local:43117";
+
   it("既定は loopback のみ。LAN ホストは設定後、かつ https のみ", () => {
     expect(() => assertLocalHost(new URL("http://127.0.0.1:43117/v1/health"))).not.toThrow();
     expect(() => assertLocalHost(new URL("https://minutes.local:43117/v1/health"))).toThrow(/disallowed host/);
-    configureAllowedHosts(["minutes.local"]);
+    configureAllowedHosts(["minutes.local"], PAGE);
     expect(() => assertLocalHost(new URL("https://minutes.local:43117/v1/health"))).not.toThrow();
     expect(() => assertLocalHost(new URL("http://minutes.local:43117/v1/health"))).toThrow(/requires https/);
     expect(() => assertLocalHost(new URL("https://example.com/"))).toThrow(/disallowed host/);
     expect(() => assertLocalHost(new URL("http://127.0.0.1:43117/"))).not.toThrow();   // loopback は常に可
   });
 
-  it("接続設定の検証：非 loopback は https 必須、トークン必須", () => {
-    expect(validateConnection({ baseUrl: "http://127.0.0.1:43117", token: "t" })).toMatchObject({ ok: true, lan: false });
-    expect(validateConnection({ baseUrl: "http://192.168.1.10:43117", token: "t" })).toEqual({ ok: false, reason: "LAN_REQUIRES_HTTPS" });
-    expect(validateConnection({ baseUrl: "https://192.168.1.10:43117", token: "" })).toEqual({ ok: false, reason: "EMPTY_TOKEN" });
-    expect(validateConnection({ baseUrl: "ftp://x", token: "t" })).toEqual({ ok: false, reason: "BAD_PROTOCOL" });
-    expect(validateConnection({ baseUrl: "not a url", token: "t" })).toEqual({ ok: false, reason: "INVALID_URL" });
-    const applied = applyConnection({ baseUrl: "https://192.168.1.10:43117", token: "t" });
+  it("ページ origin 以外は許可集合に入らない（https でも公開ホストへは送らない）", () => {
+    // https だからという理由だけで公開ホストを許可すると、トークンと WAV がそこへ送られる（§7.3）
+    configureAllowedHosts(["example.com", "minutes.local"], PAGE);
+    expect(() => assertLocalHost(new URL("https://example.com/v1/health"))).toThrow(/disallowed host/);
+    expect(() => assertLocalHost(new URL("https://minutes.local:43117/v1/health"))).not.toThrow();
+    // pageOrigin が壊れていても loopback 以外は増やさない
+    configureAllowedHosts(["example.com"], "not a url");
+    expect(() => assertLocalHost(new URL("https://example.com/v1/health"))).toThrow(/disallowed host/);
+    expect(() => assertLocalHost(new URL("http://127.0.0.1:43117/"))).not.toThrow();
+  });
+
+  it("接続設定の検証：非 loopback は https 必須、ページ origin 必須、トークン必須", () => {
+    expect(validateConnection({ baseUrl: "http://127.0.0.1:43117", token: "t" }, PAGE)).toMatchObject({ ok: true, lan: false });
+    expect(validateConnection({ baseUrl: "http://192.168.1.10:43117", token: "t" }, PAGE)).toEqual({ ok: false, reason: "LAN_REQUIRES_HTTPS" });
+    expect(validateConnection({ baseUrl: "https://192.168.1.10:43117", token: "t" }, PAGE)).toEqual({ ok: false, reason: "NOT_PAGE_ORIGIN" });
+    expect(validateConnection({ baseUrl: "https://example.com", token: "t" }, PAGE)).toEqual({ ok: false, reason: "NOT_PAGE_ORIGIN" });
+    expect(validateConnection({ baseUrl: PAGE, token: "" }, PAGE)).toEqual({ ok: false, reason: "EMPTY_TOKEN" });
+    expect(validateConnection({ baseUrl: "ftp://x", token: "t" }, PAGE)).toEqual({ ok: false, reason: "BAD_PROTOCOL" });
+    expect(validateConnection({ baseUrl: "not a url", token: "t" }, PAGE)).toEqual({ ok: false, reason: "INVALID_URL" });
+    const applied = applyConnection({ baseUrl: PAGE, token: "t" }, PAGE);
     expect(applied.ok).toBe(true);
-    expect(() => assertLocalHost(new URL("https://192.168.1.10:43117/v1/live"))).not.toThrow();
+    expect(() => assertLocalHost(new URL(`${PAGE}/v1/live`))).not.toThrow();
+    // 弾かれた接続先は許可集合に残らない
+    expect(applyConnection({ baseUrl: "https://example.com", token: "t" }, PAGE).ok).toBe(false);
+    expect(() => assertLocalHost(new URL("https://example.com/v1/live"))).toThrow(/disallowed host/);
   });
 });
 ```
@@ -1120,9 +1361,13 @@ describe("LAN モードの許可ホスト", () => {
 | `NO_AUDIO_FRAMES` で Live を自動停止（Invariant 1・8） | `live-transcript.test.ts` |
 | 話者名は利用者が付け、AI 由来の名前が入る経路がない | `speakers-language.test.ts` |
 | 混在判定 0.6 と要約言語の選択規則 | `speakers-language.test.ts` |
+| `since` は境界を含み、同一 `createdAt` の後続挿入を取りこぼさない | `live-transcript.test.ts` |
+| 成功応答もエンドポイント別デコーダを通し、形状不一致は `MALFORMED` | `live-transcript.test.ts` |
 | `registered=false` の逆同期 | `resync-lan.test.ts` |
+| 一覧応答の破損を例外にせず結果型で返す | `resync-lan.test.ts` |
 | LAN は許可ホスト + https 必須、既定は loopback のみ | `resync-lan.test.ts` |
-| Phase 1・2 の回帰 | 同じツリーで 34 テストを実行 |
+| API origin はページ origin に限る（§7.3） | `resync-lan.test.ts` |
+| Phase 1・2 の回帰 | 同じツリーで 41 テストを実行 |
 
 ---
 
