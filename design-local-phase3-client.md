@@ -12,7 +12,7 @@
 | ファイル | 種別 | 内容 | 本書 |
 | --- | --- | --- | --- |
 | `src/api/contracts-phase3.ts` | 新規 | Live / 話者 / 言語 / 利用者の契約型 | §2 |
-| `src/api/events.ts` | 変更（全文） | SSE の `live_segment` イベントを受け取り、`onLiveSegment` に振り分ける | §3 |
+| `src/api/events.ts` | 変更（全文） | SSE の `live_segment` イベントを受け取り、`onLiveSegment` に振り分ける。認証・transport は Phase 2 §8 と同一（`fetch` + Bearer） | §3 |
 | `src/live/live-transcript.ts` | 新規 | Live Transcript ペインの状態、`GET /live` のカーソル補完、`NO_AUDIO_FRAMES` での自動停止 | §3 |
 | `src/ui/speakers.ts` | 新規 | 話者ラベル → 名前の割当状態と表示 | §4 |
 | `src/ui/language.ts` | 新規 | 言語バッジと要約言語設定 | §5 |
@@ -108,12 +108,24 @@ export interface LiveSegmentEvent {
 
 export type MeetingEventV3 = MeetingEvent | LiveSegmentEvent;
 
+/**
+ * LiveSegment の全フィールドを検証する。SSE は外部入力であり、
+ * 未検証のフィールドは upsert のあと表示や並べ替え（startMs / source）で undefined として現れる。
+ * language / confidence は null 可なので「期待する型か null」まで要求し、undefined を通さない。
+ */
 export function isLiveSegmentEvent(value: unknown): value is LiveSegmentEvent {
   if (typeof value !== "object" || value === null) return false;
   const v = value as { type?: unknown; segment?: unknown };
   if (v.type !== "live_segment" || typeof v.segment !== "object" || v.segment === null) return false;
   const s = v.segment as Record<string, unknown>;
-  return typeof s.id === "string" && typeof s.startMs === "number" && typeof s.text === "string" && typeof s.createdAt === "number";
+  return typeof s.id === "string"
+    && (s.source === "mic" || s.source === "system")
+    && typeof s.startMs === "number"
+    && typeof s.endMs === "number"
+    && typeof s.text === "string"
+    && (typeof s.language === "string" || s.language === null)
+    && (typeof s.confidence === "number" || s.confidence === null)
+    && typeof s.createdAt === "number";
 }
 ```
 
@@ -192,12 +204,12 @@ export class Phase3Client {
 
 ## 3.1 SSE クライアント `src/api/events.ts`（変更）
 
-`live_segment` を受け取り `onLiveSegment` に渡す。既存の 5 種は Phase 2 と同じ経路。
+`live_segment` を受け取り `onLiveSegment` に渡す。既存の 5 種は Phase 2 と同じ経路。認証と transport も Phase 2 §8 と同一で、`fetch` + `ReadableStream` に Bearer を載せる。Phase 3 のマルチユーザー（サーバー側 §19）は利用者ごとに別トークンを持つため、Cookie 1 本では表現できず、ヘッダを付けられる transport が前提になる。
 
 ```typescript
 // src/api/events.ts
 import { assertLocalHost } from "./local-saver";
-import { isMeetingEvent, jobFromServerRow, type JobListResponse, type MeetingEvent } from "./contracts-phase2";
+import { isMeetingEvent, jobFromServerRow, type JobListResponse, type MeetingDetailResponse, type MeetingEvent } from "./contracts-phase2";
 import { isLiveSegmentEvent, type LiveSegmentEvent } from "./contracts-phase3";
 
 export interface EventSourceLike {
@@ -208,8 +220,12 @@ export interface EventSourceLike {
 
 export interface EventsClientDeps {
   readonly baseUrl: string;
-  readonly createEventSource: (url: URL) => EventSourceLike;
+  /** IndexedDB のトークン。マルチユーザーでは利用者ごとに異なる（サーバー側 §19）。 */
+  readonly token: string;
+  readonly createEventSource: (url: URL, token: string) => EventSourceLike;
   readonly fetchJobs: () => Promise<JobListResponse>;
+  /** 再接続後の補完用。会議の status と各版を取り戻す（Phase 2 §8）。 */
+  readonly fetchMeeting: () => Promise<MeetingDetailResponse>;
   readonly onEvent: (event: MeetingEvent) => void;
   /** Phase 3：Live セグメント。未指定なら捨てる */
   readonly onLiveSegment?: (event: LiveSegmentEvent) => void;
@@ -229,7 +245,7 @@ export class MeetingEventsClient {
     if (this.source !== null) return;
     const url = new URL(`/v1/meetings/${encodeURIComponent(this.meetingId)}/events`, this.deps.baseUrl);
     assertLocalHost(url);
-    const es = this.deps.createEventSource(url);
+    const es = this.deps.createEventSource(url, this.deps.token);
     this.source = es;
     es.addEventListener("open", () => {
       const isReconnect = this.everConnected && this.disconnected;
@@ -267,8 +283,19 @@ export class MeetingEventsClient {
     this.deps.onEvent(normalized);
   }
 
+  /**
+   * 切断中に落ちたイベントを取り戻す。jobs だけでは meeting_status と各版が復元されない。
+   * transcript / summary の本文は取らず、版だけ流して Phase 2 §11 の stale 機構に委ねる。
+   * Live セグメントは LiveTranscriptStore.poll() が cursor 以降を取り直すので、ここでは扱わない。
+   */
   private async backfill(): Promise<void> {
     try {
+      const meeting = await this.deps.fetchMeeting();
+      this.deps.onEvent({ type: "meeting_status", status: meeting.status });
+      this.deps.onEvent({ type: "transcript_version", transcriptVersion: meeting.transcriptVersion });
+      if (meeting.latestSummaryVersion !== null) {
+        this.deps.onEvent({ type: "summary_version", version: meeting.latestSummaryVersion });
+      }
       const list = await this.deps.fetchJobs();
       for (const job of list.jobs) this.deps.onEvent({ type: "job", job });
     } catch (error) {
@@ -287,8 +314,10 @@ export function normalizeEvent(value: unknown): MeetingEvent | null {
   return isMeetingEvent(value) ? value : null;
 }
 
-export function defaultCreateEventSource(url: URL): EventSourceLike {
-  return new EventSource(url, { withCredentials: false });
+// FetchEventSource の本体は Phase 2 §8 のまま（同一ファイル内にあるので再掲しない）。
+// Phase 3 での events.ts の変更は EVENT_TYPES への live_segment 追加と、その振り分けだけ。
+export function defaultCreateEventSource(url: URL, token: string): EventSourceLike {
+  return new FetchEventSource(url, token);
 }
 ```
 
@@ -315,6 +344,8 @@ stateDiagram-v2
 ```
 
 どの遷移も録音経路（Phase 1 §15〜§17）には触れない。`STOPPED` は「Live のプレビューが止まった」状態であり、録音・保存・確定 STT はそのまま進む。
+
+`disable()` による遷移は `PUT /live` がサーバーに受け付けられたときだけ起きる。応答を待たずにローカルを落とすと、サーバーが Live ジョブを回したまま UI だけ停止表示になる。失敗時は状態を据え置き、`poll()` が返す `liveState` との突き合わせに委ねる。
 
 ```typescript
 // src/live/live-transcript.ts
@@ -381,9 +412,16 @@ export class LiveTranscriptStore {
     return true;
   }
 
-  async disable(reason: LiveStopReason): Promise<void> {
-    await this.deps.setLive(this.state.meetingId, false);
+  /**
+   * サーバーが受け付けて初めてローカル状態を落とす。応答を捨てると、
+   * サーバーは Live を回したままなのに UI だけ停止表示になり、両者が食い違う。
+   * 失敗時は状態を変えずに false を返し、呼び出し側の再試行か poll() の突き合わせに委ねる。
+   */
+  async disable(reason: LiveStopReason): Promise<boolean> {
+    const res = await this.deps.setLive(this.state.meetingId, false);
+    if (!res.ok) return false;
     this.set({ enabled: false, state: reason === "USER" ? "DISABLED" : "STOPPED", stopReason: reason });
+    return true;
   }
 
   /**
@@ -393,8 +431,7 @@ export class LiveTranscriptStore {
   async onRecordingHealth(reasons: ReadonlyArray<DegradedReason>): Promise<boolean> {
     if (!this.state.enabled) return false;
     if (!reasons.includes("NO_AUDIO_FRAMES")) return false;
-    await this.disable("AUDIO_FRAMES_DROPPED");
-    return true;
+    return await this.disable("AUDIO_FRAMES_DROPPED");
   }
 
   private upsert(segments: ReadonlyArray<LiveSegment>): void {
@@ -546,6 +583,8 @@ export interface ResyncDeps {
   readonly scheduler: LocalSaveScheduler;
   readonly baseUrl: string;
   readonly token: string;
+  /** 既定 10000。LAN 越しでは loopback より遅延が大きく、無期限に待つと UI が戻らない。 */
+  readonly timeoutMs?: number;
   readonly fetchImpl?: typeof fetch;
 }
 
@@ -556,12 +595,31 @@ export interface ResyncReport {
   readonly unavailable: ReadonlyArray<string>;
 }
 
-export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): Promise<ResyncReport> {
+/** 失敗を例外にすると呼び出し側（設定画面のボタン）が握りつぶしやすいので、結果型で返す。 */
+export type ResyncResult =
+  | { readonly ok: true; readonly report: ResyncReport }
+  | { readonly ok: false; readonly reason: "NETWORK" | "TIMEOUT" | "HTTP"; readonly detail: string };
+
+export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): Promise<ResyncResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const timeoutMs = deps.timeoutMs ?? 10_000;
   const url = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
   assertLocalHost(url);
-  const res = await fetchImpl(url, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit" });
-  if (!res.ok) throw new Error(`chunk list HTTP ${res.status}`);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetchImpl(url, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", signal: controller.signal });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return { ok: false, reason: "TIMEOUT", detail: `chunk list timeout after ${timeoutMs}ms` };
+    }
+    return { ok: false, reason: "NETWORK", detail: error instanceof Error ? error.message : String(error) };
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res.ok) return { ok: false, reason: "HTTP", detail: `chunk list HTTP ${res.status}` };
   const list = (await res.json()) as ChunkListResponse;
   const missing = list.chunks.filter((c) => !c.registered);
   let requeued = 0;
@@ -581,11 +639,13 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
     await deps.scheduler.enqueue(key);
     requeued++;
   }
-  return { missingOnServer: missing.length, requeued, unavailable };
+  return { ok: true, report: { missingOnServer: missing.length, requeued, unavailable } };
 }
 ```
 
 再送は Phase 1 の `LocalSaver` と同じ PUT であり、サーバーは同一 sha256 なら `200` で受け入れ `verified` に戻す（サーバー側 §20.2）。Blob がない Chunk は UI に「録音の一部が復元できません」と表示する。
+
+一覧取得に失敗した場合は `{ ok: false }` を返し、UI は「サーバーに接続できませんでした [再試行]」を出す。例外にしないのは、この関数が設定画面のボタンから呼ばれ、未捕捉の例外が「押しても何も起きない」という形で表面化しやすいためである。IndexedDB 側は何も変更しないので、そのまま再試行できる。
 
 ---
 
@@ -780,13 +840,13 @@ Phase 1・2 のハーネスを流用する。
 // test/live-transcript.test.ts
 import { describe, expect, it } from "vitest";
 import { LiveTranscriptStore, liveBanner, type LiveTranscriptState } from "../src/live/live-transcript";
-import type { LiveResponse, LiveSegment } from "../src/api/contracts-phase3";
+import type { LivePutResponse, LiveResponse, LiveSegment } from "../src/api/contracts-phase3";
 import type { ApiResult } from "../src/api/phase2-client";
 
 const seg = (id: string, startMs: number, createdAt: number): LiveSegment =>
   ({ id, source: "mic", startMs, endMs: startMs + 5000, text: id, language: "ja", confidence: 0.8, createdAt });
 
-function build(opts: { serverState?: LiveResponse["liveState"]; offline?: boolean } = {}) {
+function build(opts: { serverState?: LiveResponse["liveState"]; offline?: boolean; setLiveFails?: boolean } = {}) {
   let now = 1000;
   const states: LiveTranscriptState[] = [];
   const setCalls: boolean[] = [];
@@ -796,9 +856,10 @@ function build(opts: { serverState?: LiveResponse["liveState"]; offline?: boolea
       opts.offline
         ? { ok: false, status: 0, code: "NETWORK", message: "down" }
         : { ok: true, status: 200, value: { meetingId: "m", liveState: opts.serverState ?? "RUNNING", segments: served.filter((s) => s.createdAt > since), cursor: Math.max(since, ...served.map((s) => s.createdAt)) } },
-    setLive: async (_m: string, enabled: boolean) => {
+    setLive: async (_m: string, enabled: boolean): Promise<ApiResult<LivePutResponse>> => {
       setCalls.push(enabled);
-      return { ok: true as const, status: 200, value: { meetingId: "m", liveSttEnabled: enabled, allowed: true } };
+      if (opts.setLiveFails === true) return { ok: false, status: 0, code: "NETWORK", message: "down" };
+      return { ok: true, status: 200, value: { meetingId: "m", liveSttEnabled: enabled, allowed: true } };
     },
     now: () => now,
     onChange: (s: LiveTranscriptState) => states.push(s),
@@ -843,6 +904,17 @@ describe("LiveTranscriptStore", () => {
     expect(await b.store.onRecordingHealth(["NO_AUDIO_FRAMES"])).toBe(false);   // 既に無効なら何もしない
   });
 
+  it("setLive が失敗したらローカル状態を変えない", async () => {
+    const b = build({ setLiveFails: true });
+    expect(await b.store.disable("USER")).toBe(false);
+    expect(b.store.current.enabled).toBe(true);
+    expect(b.store.current.state).toBe("STARTING");
+    expect(b.store.current.stopReason).toBeNull();
+    // NO_AUDIO_FRAMES 経路も同様に、サーバーが受け付けるまで停止扱いにしない
+    expect(await b.store.onRecordingHealth(["NO_AUDIO_FRAMES"])).toBe(false);
+    expect(b.store.current.enabled).toBe(true);
+  });
+
   it("バナー文言", () => {
     const base: LiveTranscriptState = { meetingId: "m", enabled: true, state: "RUNNING", stopReason: null, segments: [], cursor: 0, lastUpdatedAt: null };
     expect(liveBanner({ ...base, state: "DISABLED" })).toBeNull();
@@ -857,7 +929,15 @@ describe("LiveTranscriptStore", () => {
 import { describe, expect, it } from "vitest";
 import { MeetingEventsClient, type EventSourceLike } from "../src/api/events";
 import type { LiveSegmentEvent } from "../src/api/contracts-phase3";
-import type { MeetingEvent } from "../src/api/contracts-phase2";
+import type { MeetingDetailResponse, MeetingEvent } from "../src/api/contracts-phase2";
+
+const meetingDetail: MeetingDetailResponse = {
+  meetingId: "m", title: "t", status: "recording",
+  chunkCounts: { mic: 1, system: 0 },
+  sttStatusCounts: { pending: 0, queued: 0, processing: 0, completed: 1, skipped: 0, failed: 0 },
+  transcriptVersion: 1, latestSummaryVersion: null,
+  sttModelUsed: null, llmModelUsed: null, syncDriftMs: null,
+};
 
 class FakeEventSource implements EventSourceLike {
   readonly listeners = new Map<string, Array<(e: MessageEvent<string>) => void>>();
@@ -879,8 +959,10 @@ describe("SSE live_segment の振り分け", () => {
     const live: LiveSegmentEvent[] = [];
     const client = new MeetingEventsClient({
       baseUrl: "http://127.0.0.1:43117",
+      token: "tok",
       createEventSource: () => (es = new FakeEventSource()),
       fetchJobs: async () => ({ meetingId: "m", jobs: [], counts: { pending: 0, leased: 0, processing: 0, retrying: 0, completed: 0, failed: 0, cancelled: 0 } }),
+      fetchMeeting: async () => meetingDetail,
       onEvent: (e) => events.push(e),
       onLiveSegment: (e) => live.push(e),
       onError: (e) => {
@@ -892,7 +974,15 @@ describe("SSE live_segment の振り分け", () => {
     source.emit("live_segment", JSON.stringify({ type: "live_segment", segment: { id: "s1", source: "mic", startMs: 0, endMs: 5000, text: "x", language: "ja", confidence: 0.9, createdAt: 10 } }));
     source.emit("meeting_status", JSON.stringify({ type: "meeting_status", status: "recording" }));
     source.emit("live_segment", JSON.stringify({ type: "live_segment", segment: { id: 1 } }));   // 型不正は捨てる
+    // 一部フィールドだけ欠けたものも捨てる（並べ替えや表示で undefined が現れないように）
+    const full = { id: "s2", source: "mic", startMs: 0, endMs: 1, text: "y", language: null, confidence: null, createdAt: 11 };
+    source.emit("live_segment", JSON.stringify({ type: "live_segment", segment: { ...full, source: "speaker" } }));
+    source.emit("live_segment", JSON.stringify({ type: "live_segment", segment: { ...full, endMs: undefined } }));
+    source.emit("live_segment", JSON.stringify({ type: "live_segment", segment: { ...full, language: undefined } }));
     expect(live.map((e) => e.segment.id)).toEqual(["s1"]);
+    // language / confidence は null なら通る
+    source.emit("live_segment", JSON.stringify({ type: "live_segment", segment: full }));
+    expect(live.map((e) => e.segment.id)).toEqual(["s1", "s2"]);
     expect(events).toEqual([{ type: "meeting_status", status: "recording" }]);
   });
 });
@@ -973,11 +1063,26 @@ describe("欠損 Chunk の逆同期", () => {
       return res;
     };
     const putsBefore = h.server.putCount;
-    const report = await resyncMissingChunks({ chunkStore: h.chunkStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchWithMissing }, meetingId);
-    expect(report).toEqual({ missingOnServer: 2, requeued: 1, unavailable: [r1.chunkKey] });
+    const result = await resyncMissingChunks({ chunkStore: h.chunkStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchWithMissing }, meetingId);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.report).toEqual({ missingOnServer: 2, requeued: 1, unavailable: [r1.chunkKey] });
     for (let i = 0; i < 10; i++) await h.advance(100);
     expect(h.server.putCount).toBe(putsBefore + 1);
     expect((await h.chunkStore.getChunk(r0.chunkKey))?.save.status).toBe("DB_REGISTERED");
+  });
+
+  it("一覧取得がタイムアウトしても例外を投げず、失敗として返す", async () => {
+    const h = await createHarness();
+    const hangingFetch: typeof fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      });
+    const result = await resyncMissingChunks(
+      { chunkStore: h.chunkStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, timeoutMs: 20, fetchImpl: hangingFetch },
+      "m-timeout",
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("TIMEOUT");
   });
 });
 
@@ -1048,4 +1153,4 @@ describe("LAN モードの許可ホスト", () => {
 
 ---
 
-*本書のコードは Node 上の vitest で検証済みだが、LAN 越しの `EventSource` 再接続、自己署名証明書のブラウザ受け入れ、Live 有効時の AudioWorklet 負荷は対象ブラウザと 2 台構成の実機でのみ確認できる。§10 の実機項目を通過したものだけを Phase 3 ブラウザ側の完了とする。*
+*本書のコードは Node 上の vitest で検証済みだが、LAN 越しの SSE 長時間接続とバックオフ再接続、自己署名証明書のブラウザ受け入れ、Live 有効時の AudioWorklet 負荷は対象ブラウザと 2 台構成の実機でのみ確認できる。§10 の実機項目を通過したものだけを Phase 3 ブラウザ側の完了とする。*
