@@ -95,7 +95,7 @@ flowchart LR
 
 ## 【やらないこと】
 
-- Phase 2（System Audio、VAD、ローカルQueue、Retry、DLQ）およびPhase 3（Live STT、Speaker分離、FLAC移行、高度な復旧処理）の実装設計には踏み込まない（v4.0内での位置づけへの言及のみ可）
+- Phase 2（System Audio、サーバー側の高精度VAD〈Silero等〉、ローカルQueue、Retry、DLQ）およびPhase 3（Live STT、Speaker分離、FLAC移行、高度な復旧処理）の実装設計には踏み込まない（v4.0内での位置づけへの言及のみ可）。ただしPhase 1では、AudioWorklet内でフレームごとのRMSエネルギーから`vadScore`を算出し、ハングオーバー付きのしきい値判定で`hasVoice`を決めるところまでを実装範囲に含める（完了条件は両値を`ChunkTimingMetadata`に記録してローカル保存先へ渡すことまで）。Silero VAD等の学習済みモデルによる高精度化と、VADスコアに基づくSTTスキップ判断はPhase 2の範囲であり、ブラウザ側VADは「STTスキップ候補のヒント」に留める
 - ローカルSTT／ローカル要約／ローカルDB／エディタといった外部（クラウド・ローカル問わず）サービスそのものの実装コードは書かない（採用ツールが何であってもPhase 1の対象外）
 - DBスキーマ（meetings / audio_chunks / processing_jobsテーブル）の全面的な再設計は行わない。ローカル保存方式への変更に伴う軽微な追随的変更（例：カラム名、ストレージURLをローカルパスに読み替える等）以外は、Phase 1に必要な範囲でのみ参照する
 - v4.0で定義された10個のInvariantを緩和・変更する提案は行わない
