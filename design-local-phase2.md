@@ -299,7 +299,7 @@ GPU OOM で STT ジョブが失敗した場合、次の候補に落として再�
 
 # 8. SQLite スキーマ DDL
 
-v4.0 §73〜§76 の Postgres DDL を SQLite に翻訳し、Phase 2 のテーブルを追加する。Phase 1 のサーバー実装（最小スタブ）が `meetings` / `audio_chunks` を既に持っている場合は、マイグレーション 002 以降で列を追加する。
+v4.0 §73〜§76 の Postgres DDL を SQLite に翻訳し、Phase 2 のテーブルを追加する。Phase 1 のサーバー実装（最小スタブ）が `meetings` / `audio_chunks` を既に持っている場合、`CREATE TABLE IF NOT EXISTS` は既存テーブルをそのまま残すため列は増えない。§8.2 の列補完ステップで不足列を追加し、既存データを保持したまま Phase 2 のスキーマへ上げる。
 
 ## 8.1 接続設定
 
@@ -324,6 +324,49 @@ CREATE TABLE IF NOT EXISTS schema_version (
 ```
 
 `db/migrations/NNN_*.sql` を番号順に適用し、`schema_version` に記録する。各ファイルは 1 トランザクションで適用する。ロールバック用 SQL は書かない（ローカルの単一利用者環境では、失敗時は起動前に `minutes.sqlite` のバックアップ（§23）から戻す方が単純）。
+
+### 8.2.1 既存 DB（Phase 1 スタブ）からのアップグレード
+
+`CREATE TABLE IF NOT EXISTS` は既存テーブルの列を検査しない。Phase 1 の `meetings` / `audio_chunks` を持つ DB に 002 / 003 を適用しても `transcript_version` や `stt_status` は増えず、Phase 2 のクエリが列不在で失敗する。そのため `migrate.py` は各マイグレーションの SQL を適用した後、同じトランザクション内で `PRAGMA table_info` を検査して不足列を追加する。
+
+```python
+# migrate.py（抜粋）
+# 各マイグレーションで「あるべき列」を宣言する。NOT NULL 列は必ず DEFAULT を持つ（ALTER TABLE ADD COLUMN の制約）。
+REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
+    "meetings": {
+        "local_user_id": "TEXT NOT NULL DEFAULT 'local'",
+        "native_sample_rate": "INTEGER NOT NULL DEFAULT 48000",
+        "total_audio_frames": "INTEGER",
+        "transcript_version": "INTEGER NOT NULL DEFAULT 0",
+        "stt_model_used": "TEXT",
+        "llm_model_used": "TEXT",
+    },
+    "audio_chunks": {
+        "vad_source": "TEXT NOT NULL DEFAULT 'browser_rms'",
+        "server_vad_score": "REAL",
+        "save_status": "TEXT NOT NULL DEFAULT 'registered'",
+        "stt_status": "TEXT NOT NULL DEFAULT 'pending'",
+    },
+}
+
+def ensure_columns(conn: sqlite3.Connection, table: str, required: dict[str, str]) -> list[str]:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    added: list[str] = []
+    for name, ddl in required.items():
+        if name in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        added.append(name)
+    return added
+```
+
+| 規則 | 内容 |
+| --- | --- |
+| 追加のみ | 不足列は `ALTER TABLE ADD COLUMN` で追加する。既存行には DEFAULT が入る。列名は上の宣言以外を動的に組み立てない（SQL 文字列連結の対象を定数に限定する） |
+| 再構築が必要な変更 | 既存列の CHECK 制約の変更（Phase 1 の `meetings.status` に `transcribing` 以降の状態を加える等）や NOT NULL 化は ADD COLUMN で表現できない。この場合は `CREATE TABLE meetings_new` → `INSERT INTO meetings_new (...) SELECT ... FROM meetings` → `DROP TABLE meetings` → `ALTER TABLE meetings_new RENAME TO meetings` → インデックス再作成の順（SQLite 公式の再構築手順）で行い、既存行を保持する。外部キーを持つ表の再構築は `PRAGMA foreign_keys = OFF` をトランザクションの外で先に実行し、終了後 `PRAGMA foreign_key_check` で検証する |
+| schema_version | SQL 適用と列補完（または再構築）を 1 トランザクションでコミットし、その後に `schema_version` を記録する。列補完だけが先に走って途中で落ちた状態を作らない |
+| 起動時の検査 | `schema_version` が最新でも `ensure_columns` は毎回実行する（差分なしなら no-op）。手動で触られた DB や中断されたアップグレードからの復帰を単純にする |
+| テスト | `transcript_version` / `stt_status` を持たない Phase 1 相当の `meetings` / `audio_chunks` を作り行を入れた DB に対し、マイグレーション後に (1) 両列が `PRAGMA table_info` に現れる、(2) 既存行が残り DEFAULT 値が入っている、(3) `schema_version` が最新である、(4) 同じ DB にもう一度適用しても何も変わらない、を検証する |
 
 ## 8.3 meetings
 
@@ -585,7 +628,8 @@ RETURNING id, meeting_id, chunk_id, job_type, attempts, model_name;
 | --- | --- |
 | heartbeat | `processing` 中のワーカーは 60 秒ごとに `UPDATE ... SET lease_until = now + 300000 WHERE id = ? AND lease_owner = ?` を発行する。STT 1 Chunk は通常 5 分未満だが、CPU-only の large モデルなど長時間の場合に備える |
 | Sweeper | 30 秒ごとに `status IN ('leased','processing') AND lease_until < now` を `pending` に戻し、`last_error = 'lease expired'` を記録する。起動時にも 1 回実行する（§5.3） |
-| 二重実行 | Sweeper で戻された後に旧ワーカーが完了報告を送ってきた場合、`UPDATE ... WHERE lease_owner = :owner` が 0 行になるため無視される。結果の書き込み（`transcript_segments`）は `UNIQUE (chunk_id, segment_index)` + `INSERT OR IGNORE` で冪等（Invariant 5） |
+| 二重実行 | Sweeper で戻された後に旧ワーカーが完了報告を送ってきた場合、`UPDATE ... WHERE id = :id AND lease_owner = :owner AND attempts = :attempts` が 0 行になるため無視される。§9.2 の `RETURNING` が返す `attempts` を fencing token としてワーカーが持ち回り、完了報告と結果の書き込みの両方に付ける |
+| 結果の書き込み | `transcript_segments` への INSERT は完了報告と同じトランザクションで行い、先に `SELECT 1 FROM processing_jobs WHERE id = :id AND lease_owner = :owner AND attempts = :attempts AND status = 'processing'` を検証して 0 行なら INSERT せずに結果を破棄する。lease 失効後の旧ワーカーが `INSERT OR IGNORE` で `UNIQUE (chunk_id, segment_index)` を先に埋め、正規の再試行（`attempts` が進んだ側）の結果が無視される事態を防ぐ。検証を通った同一 attempt の重複報告は `UNIQUE` + `INSERT OR IGNORE` で冪等のまま（Invariant 5） |
 
 ## 9.4 Retry 分類とバックオフ
 
@@ -746,7 +790,7 @@ flowchart TB
 | 判定 | 定義 | 既定値（設定値） |
 | --- | --- | --- |
 | 時間重なり率 | `overlap_ms / min(dur_a, dur_b)` | 0.5 |
-| 類似度 | `1 − levenshtein(norm_a, norm_b) / max(len_a, len_b)`。日本語は文字単位、英語は単語単位 | 0.8 |
+| 類似度 | `1 − levenshtein(norm_a, norm_b) / max(len_a, len_b)`。日本語は文字単位、英語は単語単位。正規化後に `norm_a` または `norm_b` が空（記号やフィラーだけの発話）なら類似度 0 として扱い、この式を評価しない（`max(len_a, len_b) = 0` での除算を起こさない） | 0.8 |
 | 包含 | `norm_a` が `norm_b` の部分文字列（またはその逆）で、長さ比が 0.3〜0.95 | — |
 
 「部分重複」は Chunk 境界で発話が切れ、N-1 側が前半だけ、N 側が全文を拾ったケースである。長い方を残すことで文が復元される。「表記ゆれ」は類似度しきい値 0.8 で吸収する範囲にとどめ、しきい値未満は別発話として両方残す（取りこぼしより二重残しを選ぶ。利用者が UI で削除できる）。
@@ -936,7 +980,7 @@ v4.0 §67〜§68 を継承する。再生成は新しい `version` 行を追加�
 | 判定 | 512 サンプル窓の確率列から、`threshold`（既定 0.5）以上が `min_speech_ms`（既定 250ms）以上続く区間を音声とし、Chunk 内の音声区間合計が `min_voiced_ms`（既定 500ms）以上なら `has_voice=1` |
 | 出力 | `audio_chunks.has_voice`、`server_vad_score`（音声区間の割合 0..1）、`vad_source='server_silero'` |
 | 優先度 | STT より先（`priority=50`）。VAD は軽いので全 Chunk の VAD を先に終わらせ、STT ジョブ数を確定させる |
-| モデル未配置 | `vad_chunk` を `skipped` 扱いにし、ブラウザ側の `has_voice` をそのまま使う（`vad_source='browser_rms'` のまま）。VAD 不在で処理を止めない |
+| モデル未配置 | VAD を実行せず、ブラウザ側の `has_voice` をそのまま採用して `vad_source='browser_rms'` のまま `processing_jobs.status = 'completed'` にし、§9.5 の `transcribe_chunk` 生成へ進む（VAD 不在で処理を止めない）。`skipped` は `audio_chunks.stt_status` にのみ使う値であり、`processing_jobs.status` に `skipped` は存在しない。モデル配置を待って再試行する設定（既定オフ）では §9.4 の `MODEL_MISSING` として `retrying` にし、`attempts` を増やさない |
 
 ## 13.2 false negative 率の実測
 
@@ -1067,7 +1111,9 @@ export type MeetingEvent =
   | { readonly type: "progress"; readonly jobType: JobType; readonly done: number; readonly total: number };
 ```
 
-SSE を選ぶ理由：進捗はサーバー → ブラウザの一方向で十分であり、WebSocket より CSP と実装が単純。`connect-src` に既に `127.0.0.1:43117` が含まれるため追加設定は不要。再接続は `EventSource` の標準動作に任せ、切断中の取りこぼしは再接続時に `GET /jobs` で埋める。
+SSE を選ぶ理由：進捗はサーバー → ブラウザの一方向で十分であり、WebSocket より CSP と実装が単純。`connect-src` に既に `127.0.0.1:43117` が含まれるため追加設定は不要。
+
+ただしブラウザ標準の `EventSource` は使わず、`fetch` + `ReadableStream` で読む。`EventSource` はリクエストヘッダを付けられず、トークンを IndexedDB に置く本設計（Phase 1 §4.3 の `Set-Cookie` は任意扱い）では `Authorization: Bearer` を送れないためである。Phase 3 のマルチユーザーは利用者ごとに別トークンを持つため、Cookie 1 本での代替も成立しない。`EventSource` の自動再接続が失われるぶんは指数バックオフ（1s → 最大 30s）を自前で持つ。切断中の取りこぼしは、再接続時に `GET /meetings/{id}`（`status` と `transcriptVersion` / `latestSummaryVersion`）と `GET /jobs` で埋める。transcript / summary の本文は取りに行かず版だけを反映し、UI が必要とした時点で取得する。
 
 ---
 
@@ -1089,7 +1135,7 @@ minutes_local/
   db/
     connection.py      # PRAGMA 適用、接続プール（プロセス内 1 書き込み接続 + 読み取り接続）
     migrate.py         # schema_version と migrations/*.sql の適用
-    migrations/        # 001_〜007_ の SQL（§8）
+    migrations/        # 001_〜008_ の SQL（§8、§16.3.1）
     repo_*.py          # テーブルごとのクエリ（meetings / chunks / jobs / segments / summaries / notes / metrics）
   jobs/
     runner.py          # lease 取得ループ（§9.2）、種別ごとの handler ディスパッチ、heartbeat
@@ -1173,7 +1219,7 @@ flowchart LR
 
 | 拡張点（Phase 1 §17 参照） | 内容 |
 | --- | --- |
-| `RecordingController` | `source` をコンストラクタ引数に追加（Phase 1 は `"mic"` 固定で `persistChunk` 内にリテラルがある）。2 インスタンスは同じ `SessionClock` を共有せず、それぞれ `createSessionClock` を呼ぶ。`sessionStartEpochMs` は会議開始時刻として Mic 側の値を `meetings` に記録する |
+| `RecordingController` | `source` をコンストラクタ引数に追加（Phase 1 は `"mic"` 固定で `persistChunk` 内にリテラルがある）。2 インスタンスは `audioFrameCount` が source ごとに独立するため同じ `SessionClock` オブジェクトを共有せず、それぞれ `createSessionClock` を呼ぶ。ただし `startOffsetMs` / `endOffsetMs` は会議タイムライン（Mic の `sessionStartEpochMs`）基準に正規化する：System 側は `start()` の `StartOptions.timelineOriginEpochMs` に Mic の `sessionStartEpochMs` を受け取り、`persistChunk` は `frameToOffsetMs(startFrame) + (clock.sessionStartEpochMs − timelineOriginEpochMs)` を `startOffsetMs` とする（Mic は差 0 で Phase 1 と同じ値）。これにより `audio_chunks.start_offset_ms` が両 source で同じ原点を持ち、§11.4 の `start_ms` 順マージが成立する。`meetings.session_start_epoch_ms` には Mic 側の値を記録する |
 | `sequenceNo` | source ごとに 0 から採番。`chunkKey` が source を含むため IndexedDB 上で衝突しない |
 | `finalizeMeeting` | `expectedChunkCounts.system` に実数を入れる。System が途中で止まった会議は、その時点までの Chunk 数 |
 | `LocalSaveScheduler` | 共有。`insertSorted` は `chunkKey` の文字列順なので `mic:*` が `system:*` より先に並ぶが、順序保証は source 内で十分（サーバーは source 別に `sequence_no` を見る） |
@@ -1190,6 +1236,31 @@ Phase 1 §8.3 の `frameClockDriftMs` を両 source で記録し、その差を�
 | 受入基準 | v4.0 §123：60 分で P95 < 100ms、P99 < 250ms |
 | 超過時 | Merger は補正しない（§11.4）。`MeetingDetailResponse.syncDriftMs` を UI に表示し「同期誤差が大きい会議」と注記する。補正アルゴリズム（片側の `start_ms` をドリフト分ずらす）は実測データが集まってから Phase 3 で検討する |
 | 断定しない | 共通 AudioContext は同期基準であってドリフトゼロの保証ではない（v4.0 §5.1）。`getDisplayMedia` の音声トラックは別のクロックドメインから来るため、Mic より大きなドリフトが観測されうる |
+
+### 16.3.1 `sync_samples` の永続化と集計
+
+```sql
+-- 008_sync_samples.sql
+CREATE TABLE IF NOT EXISTS sync_samples (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  meeting_id           TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  source               TEXT NOT NULL CHECK (source IN ('mic','system')),
+  sequence_no          INTEGER NOT NULL,
+  sampled_at_epoch_ms  INTEGER NOT NULL,       -- wallClockStartEpochMs + durationMs（Chunk 生成時刻）
+  frame_clock_drift_ms REAL NOT NULL,          -- ChunkTimingMetadata.frameClockDriftMs
+  created_at           INTEGER NOT NULL,
+  UNIQUE (meeting_id, source, sequence_no)
+);
+CREATE INDEX IF NOT EXISTS idx_sync_samples_meeting ON sync_samples(meeting_id, sampled_at_epoch_ms);
+```
+
+| 項目 | 内容 |
+| --- | --- |
+| 保存 | `PUT /chunks/{source}/{seq}` の登録処理で、`X-Chunk-Meta` の `frameClockDriftMs` が有限の数値である場合のみ `INSERT OR IGNORE`（冪等再送で重複しない）。フィールドがない Phase 1 クライアントは行を作らず、数値でない値は 422 にせず無視する（`ChunkTimingMetadata` の optional 互換を維持） |
+| 対の作り方 | 集計時に system の各サンプルに対し、`sampled_at_epoch_ms` が最も近い mic のサンプルを組にする（source ごとに開始時刻が異なるため `sequence_no` では揃わない）。相手が 30 秒より離れている（片側が停止した後）サンプルは対にしない。対の差 `drift_mic − drift_system` の絶対値を同期誤差とする |
+| 集計期間 | 会議全体のうち両 source のサンプルが存在する区間。受入基準（60 分で P95 < 100ms、P99 < 250ms）の判定は録音 60 分以上の会議についてのみ行い、短い会議は参考値として表示する |
+| 応答 | `MeetingDetailResponse.syncDriftMs` は `GET /meetings/{id}` のたびに `sync_samples` から対を作り p95 / p99 を計算して返す（`percentile` の定義はクライアント §6 と同じ nearest-rank）。system のサンプルがない会議は `null`。メモリ上のキャッシュは持たず、サーバー再起動後も SQLite の行から同じ値を返す |
+| 保持 | 会議削除時に CASCADE。エクスポート対象外。§23 のバックアップには含まれる |
 
 ---
 

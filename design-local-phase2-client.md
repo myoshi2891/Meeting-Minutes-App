@@ -28,7 +28,7 @@ Phase 2 のブラウザ側の責務は次の 3 つである。
 | `src/api/contracts-summary.ts` | 新規 | 基本設計 §12.4 の型 | §3 |
 | `src/recording/system-audio.ts` | 新規 | `getDisplayMedia` と track 監視 | §5 |
 | `src/recording/multi-source-recorder.ts` | 新規 | 2 Controller の束ねとドリフト差の計測 | §6 |
-| `src/api/events.ts` | 新規 | SSE クライアント | §8 |
+| `src/api/events.ts` | 新規 | SSE クライアント（`fetch` + `ReadableStream` で Bearer 認証。`EventSource` は使わない） | §8 |
 | `src/api/phase2-client.ts` | 新規 | 型付き fetch | §9 |
 | `src/notes/notes-store.ts` | 新規 | ノートの Autosave | §10 |
 | `src/ui/state.ts` | 新規 | UI 状態 reducer | §11 |
@@ -460,10 +460,35 @@ export type MeetingEvent =
   | { readonly type: "summary_version"; readonly version: number }
   | { readonly type: "progress"; readonly jobType: JobType; readonly done: number; readonly total: number };
 
+const JOB_TYPES: ReadonlyArray<string> = ["vad_chunk", "transcribe_chunk", "merge_transcript", "synthesize_minutes"];
+const MEETING_STATUSES: ReadonlyArray<string> = [
+  "created", "recording", "finalizing", "finalized",
+  "transcribing", "transcribed", "summarizing", "completed", "failed",
+];
+
+/**
+ * 判別子だけでなく、その種別が必要とするフィールドまで検証する。
+ * SSE は外部入力であり、type だけ見て通すと `{ type: "job" }` が reducer に届いて
+ * applyEvent が `event.job.jobId` で落ちる。型述語は「検証済み」の宣言なので中身まで見る。
+ */
 export function isMeetingEvent(value: unknown): value is MeetingEvent {
   if (typeof value !== "object" || value === null) return false;
-  const t = (value as { type?: unknown }).type;
-  return t === "job" || t === "meeting_status" || t === "transcript_version" || t === "summary_version" || t === "progress";
+  const v = value as Record<string, unknown>;
+  switch (v.type) {
+    case "job":
+      return typeof v.job === "object" && v.job !== null && typeof (v.job as { jobId?: unknown }).jobId === "string";
+    case "meeting_status":
+      return typeof v.status === "string" && MEETING_STATUSES.includes(v.status);
+    case "transcript_version":
+      return typeof v.transcriptVersion === "number";
+    case "summary_version":
+      return typeof v.version === "number";
+    case "progress":
+      return typeof v.jobType === "string" && JOB_TYPES.includes(v.jobType)
+        && typeof v.done === "number" && typeof v.total === "number";
+    default:
+      return false;
+  }
 }
 
 /** サーバー側 §13.2：JobRunner が publish する job は snake_case の DB 行なので、ここで camelCase に変換する。 */
@@ -493,7 +518,7 @@ export function jobFromServerRow(row: Record<string, unknown>): JobSummary | nul
 
 # 4. `src/recording/recording-controller.ts` の変更
 
-変更点は 3 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一。
+変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一。
 
 ```typescript
 // src/recording/recording-controller.ts
@@ -529,6 +554,12 @@ export interface RecordingControllerDeps {
 export interface StartOptions {
   /** Phase 2: System 側は false。会議レコードは Mic 側が 1 回だけ作る。 */
   readonly registerMeeting?: boolean;
+  /**
+   * 会議タイムラインの原点（= Mic の sessionStartEpochMs）。基本設計 §16.2。
+   * System 側は Mic の値を受け取り、start/end オフセットを Mic 基準へ揃える。
+   * 未指定なら自身の sessionStartEpochMs を原点とする（Mic 側。Phase 1 と同じ値になる）。
+   */
+  readonly timelineOriginEpochMs?: number;
 }
 
 export function makeChunkKey(meetingId: string, source: AudioSource, sequenceNo: number): string {
@@ -545,6 +576,7 @@ export class RecordingController {
   private sourceNode: MediaStreamAudioSourceNode | null = null;
   private clock: SessionClock | null = null;
   private meetingId: string | null = null;
+  private timelineOriginEpochMs = 0;
   private nextSequenceNo = 0;
   private readonly memoryBacklog: AudioChunkRecord[] = [];
   private chunkQueue: Promise<void> = Promise.resolve();
@@ -565,6 +597,9 @@ export class RecordingController {
     await audioContext.audioWorklet.addModule(workletModuleUrl);
     this.clock = createSessionClock(audioContext);
     this.meetingId = meetingId;
+    // Mic は自身が原点。System は Mic の原点を受け取り、両 source の start_offset_ms を
+    // 同じ基準に揃える（§11.4 の start_ms 順マージが成立する前提、基本設計 §16.2）。
+    this.timelineOriginEpochMs = options.timelineOriginEpochMs ?? this.clock.sessionStartEpochMs;
 
     if (options.registerMeeting !== false) {
       const meeting: MeetingRecord = {
@@ -700,8 +735,11 @@ export class RecordingController {
     const wavBuffer = buildStandaloneWav(pcm);
     const sha256 = await sha256Hex(wavBuffer);
 
-    const startOffsetMs = frameToOffsetMs(event.startFrame);
-    const endOffsetMs = frameToOffsetMs(event.endFrame);
+    // source ごとに SessionClock が別なので、原点差を足して会議タイムラインへ揃える。
+    // Mic は originShiftMs === 0 となり Phase 1 と同じ値になる。durationMs は差分なので影響を受けない。
+    const originShiftMs = this.clock.sessionStartEpochMs - this.timelineOriginEpochMs;
+    const startOffsetMs = frameToOffsetMs(event.startFrame) + originShiftMs;
+    const endOffsetMs = frameToOffsetMs(event.endFrame) + originShiftMs;
     const meta: ChunkTimingMetadata = {
       meetingId: this.meetingId,
       source: this.source,
@@ -710,7 +748,7 @@ export class RecordingController {
       endFrame: event.endFrame,
       startOffsetMs,
       endOffsetMs,
-      wallClockStartEpochMs: this.clock.sessionStartEpochMs + startOffsetMs,
+      wallClockStartEpochMs: this.timelineOriginEpochMs + startOffsetMs,
       sampleRate: AUDIO_PIPELINE_CONFIG.targetSampleRate,
       channels: AUDIO_PIPELINE_CONFIG.channels,
       durationMs: endOffsetMs - startOffsetMs,
@@ -847,7 +885,7 @@ export interface SourceController {
   readonly source: AudioSource;
   readonly sessionClock: SessionClock | null;
   readonly chunkCount: number;
-  start(meetingId: string, title: string, consentConfirmedAt: number, options: { registerMeeting: boolean }): Promise<void>;
+  start(meetingId: string, title: string, consentConfirmedAt: number, options: { registerMeeting: boolean; timelineOriginEpochMs?: number }): Promise<void>;
   stop(): Promise<void>;
   flush(): Promise<void>;
 }
@@ -906,17 +944,21 @@ export class MultiSourceRecorder {
   async start(meetingId: string, title: string, consentConfirmedAt: number): Promise<{ readonly systemEnabled: boolean }> {
     const micStream = await this.deps.acquireMic();
     this.mic = this.deps.createController("mic", micStream);
+    // getDisplayMedia は transient user activation を要求する。mic.start() は addModule と
+    // IndexedDB 書き込みを待つため、その後で呼ぶと activation が切れて取得に失敗しうる。
+    // 呼び出しだけ先に出し、await は mic の初期化後に行う。
+    // 生成直後に catch を付けるのは、await するまでの間に reject しても unhandled にしないため。
+    const systemPromise = this.deps.acquireSystem().catch(() => null);
     await this.mic.start(meetingId, title, consentConfirmedAt, { registerMeeting: true });
 
-    let systemStream: MediaStream | null = null;
-    try {
-      systemStream = await this.deps.acquireSystem();
-    } catch {
-      systemStream = null;
-    }
+    const systemStream = await systemPromise;
     if (systemStream !== null) {
       this.system = this.deps.createController("system", systemStream);
-      await this.system.start(meetingId, title, consentConfirmedAt, { registerMeeting: false });
+      await this.system.start(meetingId, title, consentConfirmedAt, {
+        registerMeeting: false,
+        // System のオフセットを Mic の原点へ揃える（基本設計 §16.2）。
+        timelineOriginEpochMs: this.mic.sessionClock?.sessionStartEpochMs,
+      });
     }
     return { systemEnabled: this.system !== null };
   }
@@ -981,7 +1023,25 @@ export interface FinalizerDeps {
   readonly scheduler: LocalSaveScheduler;
   readonly baseUrl: string;
   readonly token: string;
+  /** 既定 10000。ローカルサーバー相手でも無期限には待たない（Phase 1 §17.1 と同じ方針）。 */
+  readonly timeoutMs?: number;
   readonly fetchImpl?: typeof fetch;
+}
+
+/** AbortController でタイムアウトさせる。fetch 自身にタイムアウトはない。 */
+async function fetchWithTimeout(fetchImpl: typeof fetch, url: URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchImpl(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function describeFetchError(error: unknown, timeoutMs: number): string {
+  if (error instanceof DOMException && error.name === "AbortError") return `TIMEOUT after ${timeoutMs}ms`;
+  return error instanceof Error ? error.message : String(error);
 }
 
 export type FinalizeResult =
@@ -992,6 +1052,7 @@ const SOURCES: ReadonlyArray<AudioSource> = ["mic", "system"];
 
 export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const timeoutMs = deps.timeoutMs ?? 10_000;
   const meeting = await deps.meetingStore.get(meetingId);
   if (meeting === undefined) return { ok: false, stage: "verify", detail: "meeting not found" };
 
@@ -1012,7 +1073,12 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
 
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
   assertLocalHost(listUrl);
-  const listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit" });
+  let listRes: Response;
+  try {
+    listRes = await fetchWithTimeout(fetchImpl, listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit" }, timeoutMs);
+  } catch (error) {
+    return { ok: false, stage: "verify", detail: `list failed: ${describeFetchError(error, timeoutMs)}` };
+  }
   if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
   const list = (await listRes.json()) as ChunkListResponse;
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
@@ -1030,6 +1096,17 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   }
 
   const counts: Record<AudioSource, number> = { mic: bySource.mic.length, system: bySource.system.length };
+
+  // finalizing へ進める前の値を控える。POST が失敗・タイムアウトしたらここへ戻す。
+  // 戻さないと、IndexedDB に finalizing のまま取り残された会議ができ、再開経路がなくなる。
+  const before = { status: meeting.status, endedAt: meeting.endedAt, finalChunkCount: meeting.finalChunkCount };
+  const restore = async (): Promise<void> => {
+    meeting.status = before.status;
+    meeting.endedAt = before.endedAt;
+    meeting.finalChunkCount = before.finalChunkCount;
+    await deps.meetingStore.put(meeting);
+  };
+
   meeting.status = "finalizing";
   meeting.finalChunkCount = counts.mic + counts.system;
   meeting.endedAt = Date.now();
@@ -1042,15 +1119,20 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   };
   const finUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/finalize`, deps.baseUrl);
   assertLocalHost(finUrl);
-  const finRes = await fetchImpl(finUrl, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    credentials: "omit",
-  });
+  let finRes: Response;
+  try {
+    finRes = await fetchWithTimeout(fetchImpl, finUrl, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      credentials: "omit",
+    }, timeoutMs);
+  } catch (error) {
+    await restore();
+    return { ok: false, stage: "finalize", detail: `finalize failed: ${describeFetchError(error, timeoutMs)}` };
+  }
   if (!finRes.ok) {
-    meeting.status = "stop_requested";
-    await deps.meetingStore.put(meeting);
+    await restore();
     return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}` };
   }
   meeting.status = "finalized";
@@ -1063,12 +1145,12 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
 
 # 8. SSE クライアント `src/api/events.ts`
 
-`EventSource` の再接続は標準動作に任せ、切断中に取りこぼしたイベントは再接続時の `GET /jobs` で補完する（基本設計 §14）。
+SSE は `fetch` + `ReadableStream` で読む。`EventSource` はリクエストヘッダを付けられず、トークンが IndexedDB にある本設計（Phase 1 §4.3）では認証できないためである。自動再接続は失われるので指数バックオフで自前に持ち、切断中に取りこぼしたイベントは再接続時の `GET /meetings/{id}` と `GET /jobs` で補完する（基本設計 §14）。
 
 ```typescript
 // src/api/events.ts
 import { assertLocalHost } from "./local-saver";
-import { isMeetingEvent, jobFromServerRow, type JobListResponse, type MeetingEvent } from "./contracts-phase2";
+import { isMeetingEvent, jobFromServerRow, type JobListResponse, type MeetingDetailResponse, type MeetingEvent } from "./contracts-phase2";
 
 /** EventSource のうち使う面だけ。テストで Fake に差し替える。 */
 export interface EventSourceLike {
@@ -1079,9 +1161,13 @@ export interface EventSourceLike {
 
 export interface EventsClientDeps {
   readonly baseUrl: string;
-  readonly createEventSource: (url: URL) => EventSourceLike;
+  /** IndexedDB の settings ストアに入っているトークン（Phase 1 §4.3）。 */
+  readonly token: string;
+  readonly createEventSource: (url: URL, token: string) => EventSourceLike;
   /** 再接続後の補完用。失敗は無視せず onError に渡す。 */
   readonly fetchJobs: () => Promise<JobListResponse>;
+  /** 再接続後の補完用。会議の status と各版を取り戻す。 */
+  readonly fetchMeeting: () => Promise<MeetingDetailResponse>;
   readonly onEvent: (event: MeetingEvent) => void;
   readonly onError: (error: Error) => void;
 }
@@ -1099,7 +1185,7 @@ export class MeetingEventsClient {
     if (this.source !== null) return;
     const url = new URL(`/v1/meetings/${encodeURIComponent(this.meetingId)}/events`, this.deps.baseUrl);
     assertLocalHost(url);
-    const es = this.deps.createEventSource(url);
+    const es = this.deps.createEventSource(url, this.deps.token);
     this.source = es;
 
     es.addEventListener("open", () => {
@@ -1109,7 +1195,7 @@ export class MeetingEventsClient {
       if (isReconnect) void this.backfill();
     });
     es.addEventListener("error", () => {
-      // EventSource は自動再接続する。ここでは切断状態を記録するだけ。
+      // 再接続は transport 側に任せる。ここでは切断状態を記録するだけ。
       this.disconnected = true;
     });
     for (const type of EVENT_TYPES) {
@@ -1136,8 +1222,20 @@ export class MeetingEventsClient {
     this.deps.onEvent(normalized);
   }
 
+  /**
+   * 切断中に落ちたイベントを取り戻す。jobs だけでは meeting_status と各版が復元されず、
+   * UI が古い status を表示し続ける。MeetingDetailResponse が 3 つとも持っているので 1 リクエストで足りる。
+   * transcript / summary の本文は取りに行かない。版だけ流せば §11 の staleTranscriptVersion /
+   * staleSummaryVersion が立ち、UI が必要になった時点で本文を取得する（再接続のたびに全文を引かない）。
+   */
   private async backfill(): Promise<void> {
     try {
+      const meeting = await this.deps.fetchMeeting();
+      this.deps.onEvent({ type: "meeting_status", status: meeting.status });
+      this.deps.onEvent({ type: "transcript_version", transcriptVersion: meeting.transcriptVersion });
+      if (meeting.latestSummaryVersion !== null) {
+        this.deps.onEvent({ type: "summary_version", version: meeting.latestSummaryVersion });
+      }
       const list = await this.deps.fetchJobs();
       for (const job of list.jobs) this.deps.onEvent({ type: "job", job });
     } catch (error) {
@@ -1157,8 +1255,116 @@ export function normalizeEvent(value: unknown): MeetingEvent | null {
   return isMeetingEvent(value) ? value : null;
 }
 
-export function defaultCreateEventSource(url: URL): EventSourceLike {
-  return new EventSource(url, { withCredentials: false });
+const INITIAL_RETRY_MS = 1_000;
+const MAX_RETRY_MS = 30_000;
+
+/**
+ * SSE を fetch + ReadableStream で読む。`EventSource` を使わない理由は 2 つある。
+ * (1) `EventSource` は Authorization ヘッダを付けられない。トークンは IndexedDB にあり、
+ *     Phase 1 §4.3 の `Set-Cookie` は「してもよい」という任意扱いなので Cookie は当てにできない。
+ * (2) Phase 3 のマルチユーザーは利用者ごとに別トークンで、Cookie 1 本では表現できない。
+ * 代償として `EventSource` の自動再接続が失われるため、指数バックオフの再接続を自前で持つ。
+ * `open` / `error` の発火タイミングは `EventSource` と揃えてあり、MeetingEventsClient 側は変わらない。
+ */
+export class FetchEventSource implements EventSourceLike {
+  private readonly listeners = new Map<string, Array<(event: MessageEvent<string>) => void>>();
+  private controller: AbortController | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryMs = INITIAL_RETRY_MS;
+  private closed = false;
+
+  constructor(private readonly url: URL, private readonly token: string, private readonly fetchImpl: typeof fetch = fetch) {
+    void this.run();
+  }
+
+  addEventListener(type: string, listener: (event: MessageEvent<string>) => void): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  close(): void {
+    this.closed = true;
+    this.controller?.abort();
+    this.controller = null;
+    if (this.retryTimer !== null) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
+  private emit(type: string, data: string): void {
+    for (const listener of this.listeners.get(type) ?? []) listener({ data } as MessageEvent<string>);
+  }
+
+  private async run(): Promise<void> {
+    while (!this.closed) {
+      const controller = new AbortController();
+      this.controller = controller;
+      try {
+        const res = await this.fetchImpl(this.url, {
+          headers: { Authorization: `Bearer ${this.token}`, Accept: "text/event-stream" },
+          credentials: "omit",
+          signal: controller.signal,
+        });
+        if (!res.ok || res.body === null) throw new Error(`SSE HTTP ${res.status}`);
+        this.retryMs = INITIAL_RETRY_MS;            // 接続できたらバックオフを初期値へ戻す
+        this.emit("open", "");
+        await this.pump(res.body);
+      } catch {
+        // 中断も切断も同じ扱い。close() 済みならこの下で抜ける。
+      }
+      this.controller = null;
+      if (this.closed) return;
+      this.emit("error", "");
+      await this.waitBeforeRetry();
+    }
+  }
+
+  private async pump(body: ReadableStream<Uint8Array>): Promise<void> {
+    const reader = body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      buffer += value;
+      // イベントは空行区切り。LF / CRLF の両方を受ける。
+      for (;;) {
+        const match = /\r?\n\r?\n/.exec(buffer);
+        if (match === null) break;
+        const block = buffer.slice(0, match.index);
+        buffer = buffer.slice(match.index + match[0].length);
+        this.dispatchBlock(block);
+      }
+    }
+  }
+
+  /** 1 イベントぶんのブロックを解釈する。`event:` の省略時は SSE 既定の "message"。 */
+  private dispatchBlock(block: string): void {
+    let type = "message";
+    const dataLines: string[] = [];
+    for (const line of block.split(/\r?\n/)) {
+      if (line === "" || line.startsWith(":")) continue;      // コメント行（keep-alive）は捨てる
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      const raw = colon === -1 ? "" : line.slice(colon + 1);
+      const value = raw.startsWith(" ") ? raw.slice(1) : raw;
+      if (field === "event") type = value;
+      else if (field === "data") dataLines.push(value);
+    }
+    if (dataLines.length > 0) this.emit(type, dataLines.join("\n"));
+  }
+
+  private waitBeforeRetry(): Promise<void> {
+    const delay = this.retryMs;
+    this.retryMs = Math.min(this.retryMs * 2, MAX_RETRY_MS);
+    return new Promise((resolve) => {
+      this.retryTimer = setTimeout(() => {
+        this.retryTimer = null;
+        resolve();
+      }, delay);
+    });
+  }
+}
+
+export function defaultCreateEventSource(url: URL, token: string): EventSourceLike {
+  return new FetchEventSource(url, token);
 }
 ```
 
@@ -1330,6 +1536,12 @@ interface Draft {
   readonly revision: number;
   readonly lastAppliedSummaryVersion: number | null;
   readonly savedAt: number;
+  /**
+   * この revision の内容をサーバーへ送信済みか。true は「保存済みの控え」、
+   * false と未設定は「未送信の編集」。optional なのは、このフィールドを持たない
+   * 旧ビルドの下書きを isDraft で弾いて未送信の編集を失わないため（未設定は未送信として扱う）。
+   */
+  readonly saved?: boolean;
 }
 
 function isDraft(v: unknown): v is Draft {
@@ -1369,6 +1581,12 @@ export class NotesStore {
     }
     const server = res.value;
     if (draft !== null && draft.revision === server.revision) {
+      // 保存済みの控え（doSave / acceptServer が書いたもの）は未送信ではない。
+      // ここで saved を見ないと、リロードのたびに同じ内容を PUT し続けることになる。
+      if (draft.saved === true) {
+        this.set({ json: draft.json, revision: server.revision, lastAppliedSummaryVersion: draft.lastAppliedSummaryVersion, sync: "saved" });
+        return;
+      }
       // 同じ版から編集した未送信の下書き → 下書きを優先し dirty として送る
       this.set({ json: draft.json, revision: server.revision, lastAppliedSummaryVersion: draft.lastAppliedSummaryVersion, sync: "dirty" });
       this.schedule();
@@ -1385,7 +1603,7 @@ export class NotesStore {
   /** エディタの変更ごとに呼ぶ。debounce して保存する。 */
   setDraft(json: unknown, lastAppliedSummaryVersion: number | null = this.state.lastAppliedSummaryVersion): void {
     this.set({ json, lastAppliedSummaryVersion, sync: this.state.sync === "conflict" ? "conflict" : "dirty" });
-    void this.deps.drafts.set(this.draftKey(), { json, revision: this.state.revision, lastAppliedSummaryVersion, savedAt: Date.now() } satisfies Draft);
+    void this.deps.drafts.set(this.draftKey(), { json, revision: this.state.revision, lastAppliedSummaryVersion, savedAt: Date.now(), saved: false } satisfies Draft);
     if (this.state.sync !== "conflict") this.schedule();
   }
 
@@ -1394,7 +1612,7 @@ export class NotesStore {
     const s = this.state.serverNotes;
     if (s === null) return;
     this.set({ json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, sync: "saved", serverNotes: null });
-    void this.deps.drafts.set(this.draftKey(), { json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, savedAt: Date.now() } satisfies Draft);
+    void this.deps.drafts.set(this.draftKey(), { json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, savedAt: Date.now(), saved: true } satisfies Draft);
   }
 
   /** 差分 UI で「自分の版で上書き」を選んだとき：サーバーの revision を採用して再送。 */
@@ -1450,7 +1668,8 @@ export class NotesStore {
     if (res.ok) {
       const stillSame = this.state.json === snapshot.json;
       this.set({ revision: res.value.revision, sync: stillSame ? "saved" : "dirty" });
-      void this.deps.drafts.set(this.draftKey(), { json: this.state.json, revision: res.value.revision, lastAppliedSummaryVersion: this.state.lastAppliedSummaryVersion, savedAt: Date.now() } satisfies Draft);
+      // stillSame が false なら保存中に編集が入っている＝控えの内容はまだ未送信。
+      void this.deps.drafts.set(this.draftKey(), { json: this.state.json, revision: res.value.revision, lastAppliedSummaryVersion: this.state.lastAppliedSummaryVersion, savedAt: Date.now(), saved: stillSame } satisfies Draft);
       if (!stillSame) this.schedule();
       return;
     }
@@ -1530,8 +1749,14 @@ export function reduce(state: UiState, action: UiAction): UiState {
         staleSummaryVersion: state.staleSummaryVersion !== null && state.staleSummaryVersion <= action.summary.version ? null : state.staleSummaryVersion,
       };
     case "jobs_loaded": {
+      // applyEvent の job と同じ updatedAt 比較をかける。無条件に上書きすると、
+      // SSE で先に届いた新しい状態を、後から解決した一覧取得の古い行が巻き戻す。
       const jobs = new Map(state.jobs);
-      for (const j of action.jobs) jobs.set(j.jobId, j);
+      for (const j of action.jobs) {
+        const current = jobs.get(j.jobId);
+        if (current !== undefined && current.updatedAt > j.updatedAt) continue;
+        jobs.set(j.jobId, j);
+      }
       return { ...state, jobs };
     }
     case "backend":
@@ -1879,6 +2104,45 @@ describe("finalize（mic + system）", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.stage).toBe("waiting_local_save");
   });
+
+  it("finalize がタイムアウトしても会議を finalizing のまま残さない", async () => {
+    const h = await createHarness();
+    const meetingId = "m-fin-timeout";
+    await h.meetingStore.put({
+      meetingId, title: "t", status: "stop_requested",
+      sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 960000 },
+      consentConfirmedAt: 1, createdAt: 1, updatedAt: 1, endedAt: null, finalChunkCount: null,
+    });
+    const mic = await makeChunkRecord(meetingId, 0);
+    await h.chunkStore.putChunk(mic);
+    await h.scheduler.enqueue(mic.chunkKey);
+    for (let i = 0; i < 10; i++) await h.advance(100);
+
+    // finalize だけ応答しない fetch。abort シグナルを受けて初めて reject する。
+    const hangingFetch: typeof fetch = (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!url.endsWith("/finalize")) return h.server.fetch(input, init);
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      });
+    };
+
+    const result = await finalizeMeeting(
+      { chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, timeoutMs: 20, fetchImpl: hangingFetch },
+      meetingId,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.stage).toBe("finalize");
+      expect(result.detail).toMatch(/TIMEOUT/);
+    }
+
+    // finalizing 前の値へ戻っており、復帰後に再度 finalize を呼べる
+    const after = await h.meetingStore.get(meetingId);
+    expect(after?.status).toBe("stop_requested");
+    expect(after?.endedAt).toBeNull();
+    expect(after?.finalChunkCount).toBeNull();
+  });
 });
 ```
 
@@ -1888,7 +2152,7 @@ describe("finalize（mic + system）", () => {
 // test/events.test.ts
 import { describe, expect, it } from "vitest";
 import { MeetingEventsClient, normalizeEvent, type EventSourceLike } from "../src/api/events";
-import type { JobListResponse, MeetingEvent } from "../src/api/contracts-phase2";
+import type { JobListResponse, MeetingDetailResponse, MeetingEvent } from "../src/api/contracts-phase2";
 
 class FakeEventSource implements EventSourceLike {
   readonly listeners = new Map<string, Array<(e: MessageEvent<string>) => void>>();
@@ -1906,6 +2170,16 @@ class FakeEventSource implements EventSourceLike {
 
 const serverJobRow = { id: "j1", meeting_id: "m", chunk_id: null, job_type: "merge_transcript", status: "completed", priority: 200, attempts: 1, max_attempts: 5, updated_at: 10, created_at: 1 };
 
+const emptyJobs: JobListResponse = { meetingId: "m", jobs: [], counts: { pending: 0, leased: 0, processing: 0, retrying: 0, completed: 0, failed: 0, cancelled: 0 } };
+
+const meetingDetail: MeetingDetailResponse = {
+  meetingId: "m", title: "t", status: "transcribing",
+  chunkCounts: { mic: 2, system: 0 },
+  sttStatusCounts: { pending: 0, queued: 0, processing: 0, completed: 2, skipped: 0, failed: 0 },
+  transcriptVersion: 3, latestSummaryVersion: 2,
+  sttModelUsed: "small", llmModelUsed: null, syncDriftMs: null,
+};
+
 describe("MeetingEventsClient", () => {
   it("snake_case の job 行を camelCase に変換して通知する", () => {
     const ev = normalizeEvent({ type: "job", job: serverJobRow });
@@ -1914,21 +2188,43 @@ describe("MeetingEventsClient", () => {
     expect(normalizeEvent({ type: "transcript_version", transcriptVersion: 2 })).toEqual({ type: "transcript_version", transcriptVersion: 2 });
   });
 
-  it("再接続後に GET /jobs で補完し、初回接続では補完しない", async () => {
+  it("種別ごとの必須フィールドが欠けたペイロードは捨てる", () => {
+    // job が無い job イベントを通すと applyEvent が event.job.jobId で落ちる
+    expect(normalizeEvent({ type: "job" })).toBeNull();
+    expect(normalizeEvent({ type: "job", job: { id: 1 } })).toBeNull();
+    expect(normalizeEvent({ type: "transcript_version" })).toBeNull();
+    expect(normalizeEvent({ type: "summary_version", version: "2" })).toBeNull();
+    expect(normalizeEvent({ type: "meeting_status", status: "bogus" })).toBeNull();
+    expect(normalizeEvent({ type: "progress", jobType: "nope", done: 1, total: 2 })).toBeNull();
+    expect(normalizeEvent({ type: "progress", jobType: "vad_chunk", done: 1 })).toBeNull();
+    // 正しいものは通る
+    expect(normalizeEvent({ type: "meeting_status", status: "transcribing" })).toEqual({ type: "meeting_status", status: "transcribing" });
+    expect(normalizeEvent({ type: "progress", jobType: "vad_chunk", done: 1, total: 2 })).toEqual({ type: "progress", jobType: "vad_chunk", done: 1, total: 2 });
+  });
+
+  it("再接続後に会議状態と jobs を補完し、初回接続では補完しない", async () => {
     let es: FakeEventSource | null = null;
     const received: MeetingEvent[] = [];
-    let fetchCount = 0;
+    let jobsCount = 0;
+    let meetingCount = 0;
+    let passedToken: string | null = null;
     const jobs: JobListResponse = { meetingId: "m", jobs: [{ jobId: "j9", jobType: "vad_chunk", status: "completed", chunkId: "c", attempts: 1, errorClass: null, lastError: null, modelName: null, durationMs: 5, updatedAt: 99 }], counts: { pending: 0, leased: 0, processing: 0, retrying: 0, completed: 1, failed: 0, cancelled: 0 } };
     const client = new MeetingEventsClient({
       baseUrl: "http://127.0.0.1:43117",
-      createEventSource: (url) => {
+      token: "tok",
+      createEventSource: (url, token) => {
         expect(url.pathname).toBe("/v1/meetings/m/events");
+        passedToken = token;                      // transport が Bearer に載せる（EventSource ではヘッダを付けられない）
         es = new FakeEventSource();
         return es;
       },
       fetchJobs: async () => {
-        fetchCount++;
+        jobsCount++;
         return jobs;
+      },
+      fetchMeeting: async () => {
+        meetingCount++;
+        return meetingDetail;
       },
       onEvent: (e) => received.push(e),
       onError: (e) => {
@@ -1938,29 +2234,86 @@ describe("MeetingEventsClient", () => {
     client.connect();
     if (es === null) throw new Error("no es");
     const source: FakeEventSource = es;
+    expect(passedToken).toBe("tok");
     source.emit("open");
-    expect(fetchCount).toBe(0);
+    expect(jobsCount).toBe(0);
+    expect(meetingCount).toBe(0);
     source.emit("job", JSON.stringify({ type: "job", job: serverJobRow }));
     source.emit("summary_version", JSON.stringify({ type: "summary_version", version: 1 }));
     expect(received.map((e) => e.type)).toEqual(["job", "summary_version"]);
+
+    received.length = 0;
     source.emit("error");
     source.emit("open");
     await new Promise((r) => setTimeout(r, 0));
-    expect(fetchCount).toBe(1);
-    expect(received[received.length - 1]).toEqual({ type: "job", job: jobs.jobs[0] });
+    expect(meetingCount).toBe(1);
+    expect(jobsCount).toBe(1);
+    // 切断中に落ちた status と各版が戻る。jobs だけでは status が古いままになる。
+    expect(received).toEqual([
+      { type: "meeting_status", status: "transcribing" },
+      { type: "transcript_version", transcriptVersion: 3 },
+      { type: "summary_version", version: 2 },
+      { type: "job", job: jobs.jobs[0] },
+    ]);
     client.close();
     expect(source.closed).toBe(true);
   });
 
+  it("要約がまだ無い会議では summary_version を流さない", async () => {
+    let es: FakeEventSource | null = null;
+    const received: MeetingEvent[] = [];
+    const client = new MeetingEventsClient({
+      baseUrl: "http://127.0.0.1:43117",
+      token: "tok",
+      createEventSource: () => (es = new FakeEventSource()),
+      fetchJobs: async () => emptyJobs,
+      fetchMeeting: async () => ({ ...meetingDetail, latestSummaryVersion: null }),
+      onEvent: (e) => received.push(e),
+      onError: (e) => {
+        throw e;
+      },
+    }, "m");
+    client.connect();
+    const source = es as unknown as FakeEventSource;
+    source.emit("open");
+    source.emit("error");
+    source.emit("open");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(received.map((e) => e.type)).toEqual(["meeting_status", "transcript_version"]);
+  });
+
+  it("補完の失敗は onError に渡し、例外を漏らさない", async () => {
+    let es: FakeEventSource | null = null;
+    const errors: Error[] = [];
+    const client = new MeetingEventsClient({
+      baseUrl: "http://127.0.0.1:43117",
+      token: "tok",
+      createEventSource: () => (es = new FakeEventSource()),
+      fetchJobs: async () => emptyJobs,
+      fetchMeeting: async () => {
+        throw new Error("server down");
+      },
+      onEvent: () => undefined,
+      onError: (e) => errors.push(e),
+    }, "m");
+    client.connect();
+    const source = es as unknown as FakeEventSource;
+    source.emit("open");
+    source.emit("error");
+    source.emit("open");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(errors.map((e) => e.message)).toEqual(["server down"]);
+  });
+
   it("壊れた JSON は onError に渡し、例外にしない", () => {
     const errors: Error[] = [];
-    const client = new MeetingEventsClient({ baseUrl: "http://127.0.0.1:43117", createEventSource: () => new FakeEventSource(), fetchJobs: async () => ({ meetingId: "m", jobs: [], counts: { pending: 0, leased: 0, processing: 0, retrying: 0, completed: 0, failed: 0, cancelled: 0 } }), onEvent: () => undefined, onError: (e) => errors.push(e) }, "m");
+    const client = new MeetingEventsClient({ baseUrl: "http://127.0.0.1:43117", token: "tok", createEventSource: () => new FakeEventSource(), fetchJobs: async () => emptyJobs, fetchMeeting: async () => meetingDetail, onEvent: () => undefined, onError: (e) => errors.push(e) }, "m");
     client.handle("{broken");
     expect(errors).toHaveLength(1);
   });
 
   it("外部ホストの baseUrl は拒否する", () => {
-    const client = new MeetingEventsClient({ baseUrl: "https://example.com", createEventSource: () => new FakeEventSource(), fetchJobs: async () => { throw new Error("x"); }, onEvent: () => undefined, onError: () => undefined }, "m");
+    const client = new MeetingEventsClient({ baseUrl: "https://example.com", token: "tok", createEventSource: () => new FakeEventSource(), fetchJobs: async () => { throw new Error("x"); }, fetchMeeting: async () => { throw new Error("x"); }, onEvent: () => undefined, onError: () => undefined }, "m");
     expect(() => client.connect()).toThrow(/disallowed host/);
   });
 });
@@ -2077,6 +2430,26 @@ describe("NotesStore", () => {
     expect(c.store.current.json).toEqual(["server"]);
     expect(c.store.current.revision).toBe(3);
   });
+
+  it("保存に成功した下書きは saved: true で控えられる", async () => {
+    const b = build();
+    await b.store.load();
+    b.store.setDraft(["a"]);
+    expect(b.drafts.get("notes:m")).toMatchObject({ json: ["a"], saved: false });
+    await b.fire();
+    expect(b.store.current.sync).toBe("saved");
+    expect(b.drafts.get("notes:m")).toMatchObject({ json: ["a"], revision: 1, saved: true });
+  });
+
+  it("保存済みの控えはリロードで再送しない", async () => {
+    const b = build({ serverRevision: 2 });
+    await b.drafts.set("notes:m", { json: ["server"], revision: 2, lastAppliedSummaryVersion: null, savedAt: 1, saved: true });
+    await b.store.load();
+    expect(b.store.current.sync).toBe("saved");
+    expect(b.timers).toHaveLength(0);      // 再送が予約されていない
+    await b.fire();
+    expect(b.puts).toHaveLength(0);
+  });
 });
 ```
 
@@ -2099,6 +2472,17 @@ describe("UI reducer", () => {
     s = reduce(s, { type: "event", event: { type: "job", job: job("j1", "completed", 6) } });
     expect(s.jobs.get("j1")?.status).toBe("completed");
     expect(jobCounts(s).transcribe_chunk).toEqual({ done: 1, failed: 0, active: 0, total: 1 });
+  });
+
+  it("jobs_loaded も updatedAt が古い行では上書きしない", () => {
+    // SSE の completed が先に届き、遅れて解決した一覧取得が古い processing を運んでくる状況
+    let s = reduce(INITIAL_UI_STATE, { type: "event", event: { type: "job", job: job("j1", "completed", 9) } });
+    s = reduce(s, { type: "jobs_loaded", jobs: [job("j1", "processing", 4), job("j2", "pending", 1)] });
+    expect(s.jobs.get("j1")?.status).toBe("completed");
+    expect(s.jobs.get("j2")?.status).toBe("pending");
+    // 新しい行なら採用する
+    s = reduce(s, { type: "jobs_loaded", jobs: [job("j1", "failed", 12)] });
+    expect(s.jobs.get("j1")?.status).toBe("failed");
   });
 
   it("新しい版の通知は stale に記録し、取得で解消する", () => {
@@ -2170,8 +2554,8 @@ describe("UI reducer", () => {
 | 1 Live STT failure ≠ Recording failure | Phase 3。Phase 2 のブラウザ側は STT 結果を表示するだけで、録音経路（§4・§6）は SSE / fetch の失敗を参照しない |
 | 2 AI failure ≠ Transcript loss | §11 `summary_loaded` は `transcript` を触らない。`staleSummaryVersion` は通知のみ |
 | 3 STT failure ≠ Recording loss | §11 `TranscriptResponse.gaps` を失敗区間として表示するだけ。IndexedDB の Chunk は Phase 1 §26 の保持期間まで残る |
-| 4 Queue failure ≠ Job metadata loss | §8 再接続補完は `GET /jobs`（SQLite）から復元。ブラウザは進捗を SSE だけに依存しない |
-| 5 Duplicate delivery ≠ Duplicate transcript | §11 `applyEvent` は `updatedAt` で古い job 行を捨て、`jobs` は `jobId` キーの Map |
+| 4 Queue failure ≠ Job metadata loss | §8 再接続補完は `GET /meetings/{id}`（status と各版）と `GET /jobs`（SQLite）から復元。ブラウザは進捗を SSE だけに依存しない |
+| 5 Duplicate delivery ≠ Duplicate transcript | §11 `applyEvent` と `jobs_loaded` の両方が `updatedAt` で古い job 行を捨て、`jobs` は `jobId` キーの Map。SSE と一覧取得のどちらが先に解決しても巻き戻らない |
 | 6 AI regeneration ≠ Manual note overwrite | §10 `NotesStore` は AI 出力を書かない。`409` は `conflict` にして自動上書きしない |
 | 7 VAD false negative ≠ Original audio loss | §9 `transcribeSilentChunk` で無音判定 Chunk を手動 STT できる。Chunk は削除されない |
 | 8 Browser tab hidden ≠ timer-based recording failure | §4 は Phase 1 と同じくフレーム基準。§6 `sampleDrift` はタイマーではなく Chunk 生成イベントで呼ぶ。§10 の debounce タイマーは保存の遅延にしか影響しない |
@@ -2188,7 +2572,7 @@ describe("UI reducer", () => {
 | 共有停止（`track.ended`）で System のみ停止 | 設計済・テスト済 | §5（`SYSTEM_TRACK_ENDED`）、§6 `dropSystem` |
 | 同意文言に System Audio を追加 | 設計済（UI 文言） | 基本設計 §16.1。`consentConfirmedAt` は Phase 1 と同じ |
 | Mic/System ドリフトの 30 秒ごとの記録と P95/P99 表示 | 設計済・テスト済（集計）・実機（実測） | §6、`frameClockDriftMs` を `X-Chunk-Meta` に載せる（§4） |
-| SSE で進捗を反映し、再接続後に欠落を補完 | 設計済・テスト済 | §8、§11 |
+| SSE で進捗を反映し、再接続後に欠落を補完 | 設計済・テスト済 | §8（`fetchMeeting` で status と各版、`fetchJobs` で job）、§11 |
 | transcript の薄字表示・失敗区間の表示・根拠リンク | 設計済（状態）・手動（描画） | §11 `dimmedSegmentIds`、`TranscriptResponse.gaps`、`sourceSegmentIds` |
 | `rejected` の折りたたみ表示とモデル注記 | 設計済・テスト済 | §11 `visibleRejected`、`MeetingSummary.modelCaveats` |
 | AI 再生成が手動ノートを上書きしない | 設計済・テスト済（サーバー側 §23.5）・本書 §10（クライアントは AI 出力をノートに書かない） | Invariant 6 |
@@ -2198,4 +2582,4 @@ describe("UI reducer", () => {
 
 ---
 
-*本書のコードは Node 上の vitest で検証済みだが、`getDisplayMedia` の実際の可否、`EventSource` の再接続挙動、2 系統同時録音時の AudioWorklet 負荷は対象ブラウザの実機でのみ確認できる。基本設計 §26.4 の実機項目を通過したものだけを Phase 2 ブラウザ側の完了とする。*
+*本書のコードは Node 上の vitest で検証済みだが、`getDisplayMedia` の実際の可否、`FetchEventSource` の長時間接続とバックオフ再接続の挙動、2 系統同時録音時の AudioWorklet 負荷は対象ブラウザの実機でのみ確認できる。基本設計 §26.4 の実機項目を通過したものだけを Phase 2 ブラウザ側の完了とする。*

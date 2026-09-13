@@ -307,6 +307,8 @@ class SyncWrite:
 
 基本設計 §8 の DDL を番号付きの文字列定数として保持する。基本設計では `migrations/*.sql` としていたが、パッケージ配布時のファイル同梱を単純にするため Python 定数に変更する（**基本設計 §8.2 からの変更**。DDL の内容は同一）。
 
+`CREATE TABLE IF NOT EXISTS` は既存テーブルの列を検査しないため、Phase 1 のスタブが作った `meetings` / `audio_chunks` を持つ DB では列が増えない。`ensure_all_columns` で不足列を補う（基本設計 §8.2.1）。既存列の CHECK 制約変更（Phase 1 の `meetings.status` に `transcribing` 以降を加える等）は `ADD COLUMN` で表現できないため、その場合だけ基本設計 §8.2.1 の再構築手順（`CREATE TABLE ... _new` → `INSERT ... SELECT` → `DROP` → `RENAME` → インデックス再作成）を踏む。
+
 ```python
 # minutes_local/db/migrate.py
 """schema_version テーブルと番号付き DDL。基本設計 §8 の DDL をそのまま保持する。"""
@@ -471,7 +473,59 @@ CREATE TABLE IF NOT EXISTS usage_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_metric_time ON usage_metrics(metric, recorded_at);
 """),
+    (8, """
+CREATE TABLE IF NOT EXISTS sync_samples (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  meeting_id           TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  source               TEXT NOT NULL CHECK (source IN ('mic','system')),
+  sequence_no          INTEGER NOT NULL,
+  sampled_at_epoch_ms  INTEGER NOT NULL,
+  frame_clock_drift_ms REAL NOT NULL,
+  created_at           INTEGER NOT NULL,
+  UNIQUE (meeting_id, source, sequence_no)
+);
+CREATE INDEX IF NOT EXISTS idx_sync_samples_meeting ON sync_samples(meeting_id, sampled_at_epoch_ms);
+"""),
 ]
+
+# CREATE TABLE IF NOT EXISTS は既存テーブルの列を検査しない。Phase 1 のスタブが作った
+# meetings / audio_chunks に対して 2 / 3 を適用しても列は増えないため、明示的に補う（基本設計 §8.2.1）。
+# NOT NULL 列は ALTER TABLE ADD COLUMN の制約上、必ず DEFAULT を持つ。
+REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
+    "meetings": {
+        "local_user_id": "TEXT NOT NULL DEFAULT 'local'",
+        "native_sample_rate": "INTEGER NOT NULL DEFAULT 48000",
+        "total_audio_frames": "INTEGER",
+        "transcript_version": "INTEGER NOT NULL DEFAULT 0",
+        "stt_model_used": "TEXT",
+        "llm_model_used": "TEXT",
+    },
+    "audio_chunks": {
+        "vad_source": "TEXT NOT NULL DEFAULT 'browser_rms'",
+        "server_vad_score": "REAL",
+        "save_status": "TEXT NOT NULL DEFAULT 'registered'",
+        "stt_status": "TEXT NOT NULL DEFAULT 'pending'",
+    },
+}
+
+
+def ensure_all_columns(conn: sqlite3.Connection) -> list[str]:
+    """不足列を ALTER TABLE ADD COLUMN で補う。既存行には DEFAULT が入る。差分がなければ no-op。"""
+    added: list[str] = []
+    for table, required in REQUIRED_COLUMNS.items():
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if exists is None:
+            continue
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in required.items():
+            if name in present:
+                continue
+            # 列名と DDL は上の定数だけを出所とする（外部入力を SQL に連結しない）。
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+            added.append(f"{table}.{name}")
+    return added
 
 
 def current_version(conn: sqlite3.Connection) -> int:
@@ -492,8 +546,14 @@ def migrate(db: Database) -> int:
             if current_version(conn) >= version:
                 continue
             _exec_multi(conn, ddl)
+            # DDL 適用と列補完を同じトランザクションでコミットしてから schema_version を記録する。
+            # 列補完だけが先に確定した中途半端な状態を作らない。
+            ensure_all_columns(conn)
             conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)", (version, now_ms()))
             applied += 1
+    # schema_version が最新でも毎回実行する（手動で触られた DB や中断されたアップグレードからの復帰）。
+    with db.write_sync() as conn:
+        ensure_all_columns(conn)
     return applied
 
 
@@ -645,6 +705,7 @@ class Notes(BaseModel):
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from typing import Any
@@ -838,16 +899,29 @@ def mark_processing(conn: sqlite3.Connection, job_id: str, owner: str, model_nam
     return cur.rowcount == 1
 
 
-def finish_job(conn: sqlite3.Connection, job_id: str, owner: str, status: JobStatus, *,
+def lease_is_current(conn: sqlite3.Connection, job_id: str, owner: str, attempts: int) -> bool:
+    """lease_owner と attempts（fencing token）が一致するか。基本設計 §9.3。
+
+    lease_owner だけでは不十分で、Sweeper が pending に戻し別ワーカーが lease し直すと
+    attempts が進む。attempts まで見ることで、失効した旧ワーカーを確実に識別できる。
+    """
+    row = conn.execute(
+        "SELECT 1 FROM processing_jobs WHERE id = ? AND lease_owner = ? AND attempts = ? AND status IN ('leased','processing')",
+        (job_id, owner, attempts),
+    ).fetchone()
+    return row is not None
+
+
+def finish_job(conn: sqlite3.Connection, job_id: str, owner: str, attempts: int, status: JobStatus, *,
                error_class: str | None = None, last_error: str | None = None,
                next_run_at: int | None = None, duration_ms: int | None = None) -> bool:
-    """lease_owner が一致する場合だけ更新する（Sweeper で回収済みの旧ワーカー報告を無視、基本設計 §9.3）。"""
+    """lease_owner と attempts が一致する場合だけ更新する（Sweeper で回収済みの旧ワーカー報告を無視、基本設計 §9.3）。"""
     cur = conn.execute(
         """UPDATE processing_jobs
            SET status = ?, error_class = ?, last_error = ?, next_run_at = COALESCE(?, next_run_at),
                duration_ms = COALESCE(?, duration_ms), lease_until = NULL, lease_owner = NULL, updated_at = ?
-           WHERE id = ? AND lease_owner = ?""",
-        (status, error_class, last_error, next_run_at, duration_ms, now_ms(), job_id, owner),
+           WHERE id = ? AND lease_owner = ? AND attempts = ?""",
+        (status, error_class, last_error, next_run_at, duration_ms, now_ms(), job_id, owner, attempts),
     )
     return cur.rowcount == 1
 
@@ -894,8 +968,16 @@ def reset_job_for_rerun(conn: sqlite3.Connection, meeting_id: str, job_type: Job
 
 # ---- transcript_segments ----
 
-def insert_segments(conn: sqlite3.Connection, segments: list[Segment]) -> int:
-    """UNIQUE (chunk_id, segment_index) + INSERT OR IGNORE（Invariant 5）。"""
+def insert_segments(conn: sqlite3.Connection, segments: list[Segment], *,
+                    job_id: str, owner: str, attempts: int) -> int:
+    """UNIQUE (chunk_id, segment_index) + INSERT OR IGNORE（Invariant 5）。
+
+    書き込み前に lease を検証する。完了報告を弾くだけでは不十分で、リースが切れた旧ワーカーの
+    結果が先に UNIQUE 行を埋めると、正規の再試行の結果が INSERT OR IGNORE で黙って捨てられる。
+    検証と INSERT は同じトランザクションで行う（呼び出し側が write() で開いている）。
+    """
+    if not lease_is_current(conn, job_id, owner, attempts):
+        return 0        # 失効したワーカーの結果は破棄する
     n = 0
     for s in segments:
         cur = conn.execute(
@@ -909,6 +991,53 @@ def insert_segments(conn: sqlite3.Connection, segments: list[Segment]) -> int:
         )
         n += cur.rowcount
     return n
+
+
+def insert_sync_sample(conn: sqlite3.Connection, meeting_id: str, source: str, sequence_no: int,
+                       sampled_at: int, drift_ms: float) -> None:
+    """基本設計 §16.3.1。冪等再送で重複しないよう INSERT OR IGNORE。"""
+    conn.execute(
+        """INSERT OR IGNORE INTO sync_samples
+           (meeting_id, source, sequence_no, sampled_at_epoch_ms, frame_clock_drift_ms, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (meeting_id, source, sequence_no, sampled_at, drift_ms, now_ms()),
+    )
+
+
+# mic と system は開始時刻が違うので sequence_no では揃わない。時刻が最も近いものを組にする。
+# 片側が停止した後の孤立サンプルを拾わないよう、30 秒（Chunk 1 個ぶん）より離れた組は捨てる。
+SYNC_PAIR_MAX_GAP_MS = 30_000
+
+
+def sync_drift_percentiles(conn: sqlite3.Connection, meeting_id: str) -> dict[str, float] | None:
+    """基本設計 §16.3.1。保存済みサンプルから p95 / p99 を返す。system が無ければ None。
+
+    毎回 SQLite から計算するので、サーバーを再起動しても同じ値になる（メモリ上のキャッシュを持たない）。
+    """
+    rows = conn.execute(
+        "SELECT source, sampled_at_epoch_ms AS t, frame_clock_drift_ms AS d FROM sync_samples WHERE meeting_id = ? ORDER BY t",
+        (meeting_id,),
+    ).fetchall()
+    mic = [(r["t"], r["d"]) for r in rows if r["source"] == "mic"]
+    system = [(r["t"], r["d"]) for r in rows if r["source"] == "system"]
+    if not mic or not system:
+        return None
+    deltas: list[float] = []
+    for t_sys, d_sys in system:
+        t_mic, d_mic = min(mic, key=lambda m: abs(m[0] - t_sys))
+        if abs(t_mic - t_sys) > SYNC_PAIR_MAX_GAP_MS:
+            continue
+        deltas.append(abs(d_mic - d_sys))
+    if not deltas:
+        return None
+    deltas.sort()
+    return {"p95": _percentile(deltas, 95), "p99": _percentile(deltas, 99)}
+
+
+def _percentile(sorted_values: list[float], p: int) -> float:
+    """nearest-rank。クライアント §6 の percentile と同じ定義にする。"""
+    idx = min(len(sorted_values) - 1, max(0, math.ceil(p / 100 * len(sorted_values)) - 1))
+    return sorted_values[idx]
 
 
 def list_segments(conn: sqlite3.Connection, meeting_id: str, merged_version: int | None = None) -> list[Segment]:
@@ -1824,7 +1953,7 @@ class JobRunner:
         handler = self.handlers.get(job.job_type)
         if handler is None:
             async with self.ctx.db.write() as conn:
-                repo.finish_job(conn, job.id, self.owner, "failed", error_class="INTERNAL",
+                repo.finish_job(conn, job.id, self.owner, job.attempts, "failed", error_class="INTERNAL",
                                 last_error=f"no handler for {job.job_type}")
             return
 
@@ -1848,7 +1977,7 @@ class JobRunner:
         hb.cancel()
         duration = int((time.monotonic() - started) * 1000)
         async with self.ctx.db.write() as conn:
-            ok = repo.finish_job(conn, job.id, self.owner, "completed", duration_ms=duration)
+            ok = repo.finish_job(conn, job.id, self.owner, job.attempts, "completed", duration_ms=duration)
             if ok and model_used is not None:
                 conn.execute("UPDATE processing_jobs SET model_name = ? WHERE id = ?", (model_used, job.id))
             if ok and job.job_type in ("vad_chunk", "transcribe_chunk"):
@@ -1860,7 +1989,7 @@ class JobRunner:
         now = now_ms()
         d = decide(err, job.attempts, job.max_attempts, now)
         async with self.ctx.db.write() as conn:
-            ok = repo.finish_job(conn, job.id, self.owner, d.next_status, error_class=err.error_class,
+            ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
                                  last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
             if not ok:
                 return  # 旧ワーカーの報告は無視（基本設計 §9.3）
@@ -1982,7 +2111,8 @@ stateDiagram-v2
 | `retrying → pending` | 明示的な UPDATE はない。`lease_job` が `status IN ('pending','retrying') AND next_run_at <= now` で直接 `leased` にする | 基本設計 §9.1 の `retrying → pending` は論理遷移。DB 上は `retrying → leased` |
 | `OOM` 時のダウングレード | `JobRunner._downgrade_stt` | `meetings.stt_model_used` と、未実行 `transcribe_chunk` の `model_name` を一括更新 |
 | `MODEL_MISSING` / `PROVIDER_UNREACHABLE` | `retry.decide` が `consume_attempt=False`。Runner が `attempts` を戻す | 無期限 retry。5 分間隔 |
-| 旧ワーカーの完了報告 | `repo.finish_job` の `lease_owner` 条件が 0 行 | Sweeper で回収後の二重完了を防ぐ |
+| 旧ワーカーの完了報告 | `repo.finish_job` の `lease_owner` + `attempts` 条件が 0 行 | Sweeper で回収後の二重完了を防ぐ |
+| 旧ワーカーの結果書き込み | `repo.insert_segments` が `lease_is_current` で弾く | 失効した結果が UNIQUE 行を先取りし、正規の再試行の結果が捨てられるのを防ぐ |
 
 ---
 
@@ -2480,14 +2610,22 @@ def levenshtein(a: list[str] | str, b: list[str] | str) -> int:
 
 
 def similarity(norm_a: str, norm_b: str) -> float:
-    if not norm_a and not norm_b:
-        return 1.0
+    """基本設計 §11.3。正規化後が空なら 0.0（＝別発話扱い）を返す。
+
+    空同士を 1.0（完全一致）にすると、記号やフィラーだけの発話が必ず重複判定され、
+    片方が削除される。取りこぼしより二重残しを選ぶ方針（§11.3）にも反する。
+    ここで 0.0 を返すことで max(len_a, len_b) == 0 での除算も起きない。
+    """
+    if not norm_a or not norm_b:
+        return 0.0
     if is_mostly_latin(norm_a) and is_mostly_latin(norm_b):
         ua, ub = norm_a.split(), norm_b.split()
     else:
         ua, ub = list(norm_a), list(norm_b)
     denom = max(len(ua), len(ub))
-    return 1.0 - levenshtein(ua, ub) / denom if denom else 1.0
+    if denom == 0:
+        return 0.0
+    return 1.0 - levenshtein(ua, ub) / denom
 
 
 def time_overlap_ratio(a: Candidate, b: Candidate) -> float:
@@ -3188,7 +3326,11 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
     with ctx.db.read() as conn:
         chunk = pipeline.job_of_chunk(conn, job)
     if ctx.vad is None:
-        # モデル未配置：ブラウザ側判定をそのまま使う（基本設計 §13.1）
+        # モデル未配置：ブラウザ側の has_voice をそのまま採用し、vad_source は browser_rms のまま。
+        # 例外を投げずに戻るので runner は processing_jobs.status を completed にし、§9.5 の
+        # transcribe_chunk 生成へ進む。skipped は audio_chunks.stt_status 専用の値であり、
+        # processing_jobs.status には存在しない（基本設計 §13.1）。
+        # モデル配置を待って再試行する設定では、ここで ModelMissingError を投げて retrying にする。
         async with ctx.db.write() as conn:
             pipeline.on_vad_completed(conn, chunk, chunk.has_voice, _stt_model_for(ctx, job.meeting_id, conn))
         return None
@@ -3255,7 +3397,10 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         for i, a in enumerate(absolute)
     ]
     async with ctx.db.write() as conn:
-        repo.insert_segments(conn, segments)
+        # lease が失効していれば 0 件で戻り、以降の集計も行わない（基本設計 §9.3）。
+        written = repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
+        if written == 0 and segments:
+            return model_name
         if meeting.stt_model_used is None:
             repo.update_meeting(conn, chunk.meeting_id, stt_model_used=model_name)
         repo.record_metric(conn, "stt_seconds", chunk.duration_ms / 1000, model_name=model_name, meeting_id=chunk.meeting_id)
@@ -3425,6 +3570,7 @@ from __future__ import annotations
 import base64
 import errno
 import json
+import math
 from typing import Any
 
 from fastapi import APIRouter, Header, Request, Response
@@ -3548,8 +3694,17 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
         duration_ms=duration_ms, sample_count=header.sample_count, local_path=rel, size_bytes=len(data), sha256=sha,
         vad_score=float(meta.get("vadScore", 0.0)), has_voice=bool(meta.get("hasVoice", True)), created_at=now_ms(),
     )
+    # 同期誤差サンプル（基本設計 §16.3.1）。frameClockDriftMs は Phase 1 の ChunkTimingMetadata に
+    # 後から足した optional フィールドなので、欠落や非数値は 422 にせず無視する
+    # （Phase 1 クライアントがそのまま Phase 2 サーバーに繋がる、§2 の後方互換）。
+    drift = meta.get("frameClockDriftMs")
+    sampled_at = int(meta.get("wallClockStartEpochMs", now_ms())) + duration_ms
+
     async with ctx.db.write() as conn:
         stored = repo.upsert_chunk(conn, chunk)
+        if isinstance(drift, (int, float)) and not isinstance(drift, bool) and math.isfinite(drift):
+            # 冪等再送で重複しないよう INSERT OR IGNORE（UNIQUE (meeting_id, source, sequence_no)）
+            repo.insert_sync_sample(conn, meeting_id, source, sequence_no, sampled_at, float(drift))
     return JSONResponse(_chunk_response(stored), status_code=201 if stored.id == chunk.id else 200)
 
 
@@ -3660,12 +3815,13 @@ async def meeting_detail(meeting_id: str, request: Request) -> Any:
         chunks = repo.list_chunks(conn, meeting_id)
         stt_counts = repo.count_chunks_by_stt(conn, meeting_id)
         latest = repo.latest_summary(conn, meeting_id)
+        drift = repo.sync_drift_percentiles(conn, meeting_id)      # 基本設計 §16.3.1
     return {
         "meetingId": m.id, "title": m.title, "status": m.status,
         "chunkCounts": {"mic": sum(1 for c in chunks if c.source == "mic"), "system": sum(1 for c in chunks if c.source == "system")},
         "sttStatusCounts": stt_counts, "transcriptVersion": m.transcript_version,
         "latestSummaryVersion": latest.version if latest else None,
-        "sttModelUsed": m.stt_model_used, "llmModelUsed": m.llm_model_used, "syncDriftMs": None,
+        "sttModelUsed": m.stt_model_used, "llmModelUsed": m.llm_model_used, "syncDriftMs": drift,
     }
 
 
@@ -4256,14 +4412,17 @@ async def create_meeting(client: httpx.AsyncClient, meeting_id: str = "m-1") -> 
     assert r.status_code in (200, 201)
 
 
-async def put_chunk(client: httpx.AsyncClient, meeting_id: str, seq: int, pcm: bytes, source: str = "mic") -> httpx.Response:
+async def put_chunk(client: httpx.AsyncClient, meeting_id: str, seq: int, pcm: bytes, source: str = "mic",
+                    meta: str | None = None) -> httpx.Response:
+    """meta は X-Chunk-Meta の中身（Base64URL 済み）。未指定なら既定のメタデータを組み立てる。"""
     wav = build_wav(pcm)
     duration = len(pcm) // 32
-    meta = {"startOffsetMs": seq * 30000, "endOffsetMs": seq * 30000 + duration, "vadScore": 0.5, "hasVoice": True}
     import base64
-    meta_b64 = base64.urlsafe_b64encode(json.dumps(meta).encode()).decode().rstrip("=")
+    if meta is None:
+        body = {"startOffsetMs": seq * 30000, "endOffsetMs": seq * 30000 + duration, "vadScore": 0.5, "hasVoice": True}
+        meta = base64.urlsafe_b64encode(json.dumps(body).encode()).decode().rstrip("=")
     return await client.put(f"/v1/meetings/{meeting_id}/chunks/{source}/{seq}", content=wav,
-                            headers={"Content-Type": "audio/wav", "X-Chunk-SHA256": sha256_hex(wav), "X-Chunk-Meta": meta_b64})
+                            headers={"Content-Type": "audio/wav", "X-Chunk-SHA256": sha256_hex(wav), "X-Chunk-Meta": meta})
 
 
 async def finalize(client: httpx.AsyncClient, meeting_id: str, mic: int, system: int = 0) -> httpx.Response:
@@ -4446,7 +4605,7 @@ async def test_sweeper_recovers_expired_lease_and_ignores_stale_owner(client: ht
     async with ctx.db.write() as conn:
         assert repo.get_job(conn, job.id).status == "pending"
         # 旧ワーカーの完了報告は無視される（基本設計 §9.3）
-        assert repo.finish_job(conn, job.id, "dead-worker", "completed") is False
+        assert repo.finish_job(conn, job.id, "dead-worker", job.attempts, "completed") is False
         assert repo.get_job(conn, job.id).status == "pending"
 
 
@@ -4494,6 +4653,102 @@ async def test_allowed_types_excludes_summary_while_stt_running(ctx: AppContext)
         conn.execute("INSERT INTO meetings (id,title,status,session_start_epoch_ms,native_sample_rate,consent_confirmed_at,created_at,updated_at) VALUES ('m','t','transcribing',0,16000,1,?,?)", (t, t))
         conn.execute("INSERT INTO processing_jobs (id,meeting_id,job_type,status,priority,created_at,updated_at) VALUES ('j','m','transcribe_chunk','processing',100,?,?)", (t, t))
     assert "synthesize_minutes" not in runner.allowed_types()
+```
+
+### 23.4.1 既存 DB のアップグレードと fencing token
+
+```python
+# tests/test_migrate_and_fencing.py
+from __future__ import annotations
+
+import sqlite3
+
+from minutes_local.db import repo
+from minutes_local.db.connection import Database, now_ms
+from minutes_local.db.migrate import current_version, ensure_all_columns, migrate, MIGRATIONS
+from minutes_local.db.models import Segment
+
+
+def test_phase1_db_gains_missing_columns_and_keeps_rows(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """CREATE TABLE IF NOT EXISTS は既存テーブルを変えない。列補完が効くことを確かめる。"""
+    path = tmp_path / "minutes.sqlite"
+    raw = sqlite3.connect(path)
+    # Phase 1 スタブ相当：transcript_version も stt_status も無い
+    raw.execute("""CREATE TABLE meetings (
+        id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
+        session_start_epoch_ms INTEGER NOT NULL, consent_confirmed_at INTEGER NOT NULL,
+        ended_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)""")
+    raw.execute("""CREATE TABLE audio_chunks (
+        id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, source TEXT NOT NULL, sequence_no INTEGER NOT NULL,
+        start_offset_ms INTEGER NOT NULL, end_offset_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+        sample_count INTEGER NOT NULL, local_path TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+        sha256 TEXT NOT NULL, vad_score REAL NOT NULL DEFAULT 0, has_voice INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL)""")
+    raw.execute("INSERT INTO meetings VALUES ('m-old','旧会議','finalized',0,1,2,3,4)")
+    raw.execute("INSERT INTO audio_chunks VALUES ('c-old','m-old','mic',0,0,30000,30000,480000,'p',10,'sha',0.5,1,5)")
+    raw.commit()
+    raw.close()
+
+    db = Database(path)
+    migrate(db)
+
+    with db.read() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(meetings)")}
+        assert {"transcript_version", "native_sample_rate", "stt_model_used", "local_user_id"} <= cols
+        chunk_cols = {r[1] for r in conn.execute("PRAGMA table_info(audio_chunks)")}
+        assert {"stt_status", "vad_source", "save_status", "server_vad_score"} <= chunk_cols
+        # 既存行は残り、新しい列には DEFAULT が入る
+        m = conn.execute("SELECT * FROM meetings WHERE id='m-old'").fetchone()
+        assert m["title"] == "旧会議" and m["transcript_version"] == 0
+        c = conn.execute("SELECT * FROM audio_chunks WHERE id='c-old'").fetchone()
+        assert c["stt_status"] == "pending" and c["vad_source"] == "browser_rms"
+        assert current_version(conn) == MIGRATIONS[-1][0]
+
+
+def test_migrate_is_idempotent(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    db = Database(tmp_path / "minutes.sqlite")
+    assert migrate(db) == len(MIGRATIONS)
+    assert migrate(db) == 0                      # 2 回目は何も適用しない
+    with db.write_sync() as conn:
+        assert ensure_all_columns(conn) == []    # 差分なしなら no-op
+
+
+async def test_expired_worker_cannot_write_segments(ctx: AppContext) -> None:
+    """lease 失効後の旧ワーカーの結果が UNIQUE 行を先取りしないこと（基本設計 §9.3、Invariant 5）。"""
+    async with ctx.db.write() as conn:
+        t = now_ms()
+        conn.execute("INSERT INTO meetings (id,title,status,session_start_epoch_ms,native_sample_rate,consent_confirmed_at,created_at,updated_at) VALUES ('m','t','transcribing',0,16000,1,?,?)", (t, t))
+        conn.execute("INSERT INTO audio_chunks (id,meeting_id,source,sequence_no,start_offset_ms,end_offset_ms,duration_ms,sample_count,local_path,size_bytes,sha256,created_at) VALUES ('c','m','mic',0,0,30000,30000,480000,'p',10,'sha',?)", (t,))
+        repo.insert_job(conn, "m", "transcribe_chunk", chunk_id="c")
+
+    with ctx.db.read() as conn:
+        job_id = conn.execute("SELECT id FROM processing_jobs").fetchone()["id"]
+
+    async with ctx.db.write() as conn:
+        old = repo.lease_job(conn, "worker-old", ["transcribe_chunk"], now_ms())
+    assert old is not None and old.attempts == 1
+
+    # Sweeper が回収し、別ワーカーが lease し直す → attempts が進む
+    async with ctx.db.write() as conn:
+        repo.sweep_expired(conn, now_ms() + 10**7)
+        new = repo.lease_job(conn, "worker-new", ["transcribe_chunk"], now_ms())
+    assert new is not None and new.attempts == 2
+
+    seg = Segment(id=repo.new_id(), meeting_id="m", chunk_id="c", source="mic", segment_index=0,
+                  start_ms=0, end_ms=1000, text="旧ワーカーの結果", normalized_text="旧ワーカーの結果",
+                  language="ja", confidence=0.9, no_speech_prob=0.0, created_at=now_ms())
+    async with ctx.db.write() as conn:
+        # 旧ワーカーは書けない。書けてしまうと UNIQUE (chunk_id, segment_index) を占有し、
+        # 正規の再試行の結果が INSERT OR IGNORE で黙って捨てられる。
+        assert repo.insert_segments(conn, [seg], job_id=job_id, owner="worker-old", attempts=1) == 0
+        assert repo.finish_job(conn, job_id, "worker-old", 1, "completed") is False
+        # 現行ワーカーは書ける
+        assert repo.insert_segments(conn, [seg], job_id=job_id, owner="worker-new", attempts=2) == 1
+        assert repo.finish_job(conn, job_id, "worker-new", 2, "completed") is True
+
+    with ctx.db.read() as conn:
+        rows = conn.execute("SELECT text FROM transcript_segments WHERE chunk_id='c'").fetchall()
+    assert len(rows) == 1
 ```
 
 ## 23.5 パイプライン全体
@@ -4649,6 +4904,25 @@ def test_normalize_and_similarity() -> None:
     assert similarity("仕様について確認します", "仕様について確認しました") > 0.8
     assert similarity("the quick brown fox", "the quick brown dog") == 0.75
     assert similarity("全く別の話", "予算の見直し") < 0.5
+
+
+def test_similarity_treats_empty_normalized_text_as_different() -> None:
+    """正規化で全部落ちた発話同士を「完全一致」にしない（基本設計 §11.3）。
+
+    記号やフィラーだけの発話は normalize 後に空になる。これを 1.0 にすると必ず重複判定され、
+    片方が削除される。除算（max(len_a, len_b) == 0）も起きない。
+    """
+    assert normalize("……") == ""
+    assert similarity("", "") == 0.0
+    assert similarity("", "予算の見直し") == 0.0
+    assert similarity("予算の見直し", "") == 0.0
+
+
+def test_empty_candidates_are_kept_both() -> None:
+    a = _cand("a", "c1", 0, 2000, "……")
+    b = _cand("b", "c2", 1000, 3000, "〜〜")
+    assert decide_pair(a, b, overlap_ratio=0.5, text_similarity=0.8,
+                       containment_min=0.3, containment_max=0.95) == "keep_both"
 
 
 def _cand(i: str, chunk: str, s: int, e: int, text: str, conf: float = 0.5) -> Candidate:
@@ -4875,6 +5149,76 @@ async def test_ollama_outage_leaves_transcribed_then_completes(client: httpx.Asy
         assert repo.get_meeting(conn, "m-1").status == "completed"
 ```
 
+### 23.8.1 同期誤差サンプルの保存と集計
+
+```python
+# tests/test_sync_samples.py
+from __future__ import annotations
+
+import base64
+import json
+
+import httpx
+
+from minutes_local.db import repo
+from minutes_local.jobs.context import AppContext
+from tests.conftest import create_meeting, put_chunk, sine_pcm
+
+
+def _meta(seq: int, source: str, drift: float | None) -> str:
+    m: dict[str, object] = {
+        "meetingId": "m-1", "source": source, "sequenceNo": seq,
+        "startOffsetMs": seq * 30000, "endOffsetMs": (seq + 1) * 30000, "durationMs": 30000,
+        "wallClockStartEpochMs": 1_700_000_000_000 + seq * 30000,
+    }
+    if drift is not None:
+        m["frameClockDriftMs"] = drift
+    return base64.urlsafe_b64encode(json.dumps(m).encode()).decode().rstrip("=")
+
+
+async def test_drift_samples_are_stored_and_aggregated(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    await create_meeting(client)
+    for seq in range(4):
+        await put_chunk(client, "m-1", seq, sine_pcm(30), source="mic", meta=_meta(seq, "mic", 0.0))
+        await put_chunk(client, "m-1", seq, sine_pcm(30), source="system", meta=_meta(seq, "system", -float(seq)))
+
+    detail = (await client.get("/v1/meetings/m-1")).json()
+    assert detail["syncDriftMs"] is not None
+    assert detail["syncDriftMs"]["p99"] >= detail["syncDriftMs"]["p95"] >= 0
+
+    # サーバー再起動後も SQLite から同じ値が出る（メモリ上のキャッシュを持たない）
+    with ctx.db.read() as conn:
+        again = repo.sync_drift_percentiles(conn, "m-1")
+    assert again == detail["syncDriftMs"]
+
+
+async def test_missing_drift_field_is_ignored_not_rejected(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    """Phase 1 クライアントは frameClockDriftMs を送らない。422 にせず行も作らない（§2 の後方互換）。"""
+    await create_meeting(client)
+    r = await put_chunk(client, "m-1", 0, sine_pcm(30), source="mic", meta=_meta(0, "mic", None))
+    assert r.status_code == 201
+    r = await put_chunk(client, "m-1", 1, sine_pcm(30), source="mic", meta=_meta(1, "mic", float("nan")))
+    assert r.status_code == 201
+    with ctx.db.read() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM sync_samples WHERE meeting_id='m-1'").fetchone()["n"] == 0
+        assert repo.sync_drift_percentiles(conn, "m-1") is None
+
+
+async def test_mic_only_meeting_has_no_drift(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    await create_meeting(client)
+    await put_chunk(client, "m-1", 0, sine_pcm(30), source="mic", meta=_meta(0, "mic", 1.5))
+    detail = (await client.get("/v1/meetings/m-1")).json()
+    assert detail["syncDriftMs"] is None      # system のサンプルがなければ組を作れない
+
+
+async def test_resend_does_not_duplicate_samples(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    await create_meeting(client)
+    for _ in range(2):        # 冪等再送
+        await put_chunk(client, "m-1", 0, sine_pcm(30), source="mic", meta=_meta(0, "mic", 1.0))
+    with ctx.db.read() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM sync_samples WHERE meeting_id='m-1'").fetchone()["n"] == 1
+```
+
 ## 23.9 テストと基本設計 §26 の対応
 
 | 基本設計 §26 の項目 | テスト |
@@ -4890,6 +5234,11 @@ async def test_ollama_outage_leaves_transcribed_then_completes(client: httpx.Asy
 | Ollama 停止中に transcript まで完了 | `test_ollama_outage_leaves_transcribed_then_completes` |
 | STT 実行中は要約を lease しない | `test_allowed_types_excludes_summary_while_stt_running` |
 | 外部通信ゼロ（モジュール規則） | `test_httpx_only_in_allowed_modules` |
+| 既存 DB のアップグレード（列補完） | `test_phase1_db_gains_missing_columns_and_keeps_rows`、`test_migrate_is_idempotent` |
+| lease 失効ワーカーの結果を書かせない | `test_expired_worker_cannot_write_segments` |
+| 空の正規化テキストを重複扱いしない | `test_similarity_treats_empty_normalized_text_as_different`、`test_empty_candidates_are_kept_both` |
+| Mic/System 同期誤差の保存と P95/P99 | `test_drift_samples_are_stored_and_aggregated`、`test_mic_only_meeting_has_no_drift`、`test_resend_does_not_duplicate_samples` |
+| `frameClockDriftMs` 欠落時の後方互換 | `test_missing_drift_field_is_ignored_not_rejected` |
 
 ---
 
@@ -4901,7 +5250,7 @@ async def test_ollama_outage_leaves_transcribed_then_completes(client: httpx.Asy
 | 2 AI failure ≠ Transcript loss | `handlers.handle_summary` は `transcript_segments` に書かない。`runner._on_failure` → `pipeline.on_summary_deferred / on_summary_failed` は `meetings.status` のみ変更 |
 | 3 STT failure ≠ Recording loss | `handle_transcribe` は `read_pcm` のみ。`InvalidAudioError` 時は `save_status='missing'` を記録するだけ |
 | 4 Queue failure ≠ Job metadata loss | `processing_jobs` が唯一の Job Store。`sweeper.sweep_once` で再起動後に回収 |
-| 5 Duplicate delivery ≠ Duplicate transcript | `repo.finish_job` の `lease_owner` 条件、`repo.insert_segments` の `INSERT OR IGNORE`、部分一意インデックス |
+| 5 Duplicate delivery ≠ Duplicate transcript | `repo.finish_job` と `repo.insert_segments` の `lease_owner` + `attempts`（fencing token）検証、`INSERT OR IGNORE`、部分一意インデックス |
 | 6 AI regeneration ≠ Manual note overwrite | `routes_meetings.put_notes` のみが `meeting_notes` を書く。`jobs/` に `put_notes` 呼び出しなし |
 | 7 VAD false negative ≠ Original audio loss | `pipeline.on_vad_completed` は `stt_status='skipped'` にするだけ。`transcribe_silent_chunk` で救済 |
 | 8 Browser tab hidden ≠ timer-based recording failure | サーバー側の該当なし。Sweeper / heartbeat のタイマーは処理進捗にのみ影響し、録音には関与しない |
