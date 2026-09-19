@@ -459,7 +459,9 @@ stateDiagram-v2
 
 `disable()` による遷移は `PUT /live` がサーバーに受け付けられたときだけ起きる。応答を待たずにローカルを落とすと、サーバーが Live ジョブを回したまま UI だけ停止表示になる。失敗時は状態を据え置き、`poll()` が返す `liveState` との突き合わせに委ねる。
 
-`enable()` も同じ規律に従う。通信失敗（`NETWORK` / `TIMEOUT`）は「サーバーが有効化を受け付けたかどうか不明」であって無効の確認ではないため、状態を据え置いて `poll()` に委ねる。`DISABLED` へ落とすのは、サーバーが応答を返したうえで `liveSttEnabled=false` と回答した場合だけである。不明な失敗で `enabled=false` にすると、`onRecordingHealth()` の `!enabled` 早期 return が停止要求まで抑止し、サーバーが Live を回したままの食い違いが自動では戻らなくなる。
+`enable()` も同じ規律に従う。失敗応答は `code` を問わず（`NETWORK` / `TIMEOUT` も 5xx も）「サーバーが有効化を受け付けたかどうか不明」であって無効の確認ではないため、状態を据え置いて `poll()` に委ねる。`DISABLED` へ落とすのは、サーバーが応答を返したうえで `liveSttEnabled=false` と回答した場合だけである。不明な失敗で `enabled=false` にすると、`onRecordingHealth()` の `!enabled` 早期 return が停止要求まで抑止し、サーバーが Live を回したままの食い違いが自動では戻らなくなる。
+
+**`poll()` は single-flight で、状態同期はサーバーの `liveState` を正とする。** SSE 再接続と定期タイマーが同時に呼びうるため、実行中の 1 本があればその Promise を共有し、`getLive` は常に 1 本だけ飛ばす。並走を許すと先に投げた古い応答が後着して `liveState` / `stopReason` / `cursor` / `lastUpdatedAt` を巻き戻す。応答が `DISABLED` を返したときは `state` だけでなく `enabled` も落とす（`enabled` は「サーバーで確認済みの有効状態」であり、片方だけ同期すると `onRecordingHealth()` が有効と誤認して無効な会議へ停止要求を投げる）。通信失敗で `STOPPED`（`stopReason=SERVER`）に倒すのは `RUNNING` / `DEGRADED` のときだけで、`DISABLED` / `STARTING` / `STOPPED` は据え置く。回っていなかった会議まで停止扱いにすると、偽の停止理由が UI に出る。
 
 **`poll()` のカーソルは包括境界である。** サーバーは `since` を含む条件（`created_at >= ?`）でセグメントを返し、クライアントは受け取った最大 `created_at` を次の `since` にする。`created_at` は epoch ms であり、1 回の `live_transcribe_chunk` ジョブが複数セグメントを同じ `now_ms()` の値で書き込むため、一意でも単調増加でもない。ここを排他境界（`>`）にすると、`cursor` と同じミリ秒に後から挿入されたセグメントが次回以降の検索条件から永久に外れ、SSE も取りこぼしていた場合は復元不能になる。
 
@@ -493,6 +495,7 @@ export interface LiveTranscriptDeps {
 export class LiveTranscriptStore {
   private state: LiveTranscriptState;
   private readonly byId = new Map<string, LiveSegment>();
+  private inFlightPoll: Promise<void> | null = null;
 
   constructor(private readonly deps: LiveTranscriptDeps, meetingId: string, initial: { enabled: boolean; state: LiveState }) {
     this.state = { meetingId, enabled: initial.enabled, state: initial.state, stopReason: null, segments: [], cursor: 0, lastUpdatedAt: null };
@@ -508,33 +511,46 @@ export class LiveTranscriptStore {
     this.set({ lastUpdatedAt: this.deps.now() });
   }
 
-  /** 再接続後や定期的な補完。cursor 以降だけ取る。 */
+  /**
+   * 再接続後や定期的な補完。cursor 以降だけ取る。
+   * SSE 再接続とタイマーから同時に呼ばれうるため single-flight にする。並走を許すと、
+   * 先に投げた古い応答が後着して liveState / stopReason / lastUpdatedAt を巻き戻す。
+   */
   async poll(): Promise<void> {
+    if (this.inFlightPoll !== null) return this.inFlightPoll;   // 実行中の 1 本に相乗りする
+    this.inFlightPoll = this.pollOnce().finally(() => { this.inFlightPoll = null; });
+    return this.inFlightPoll;
+  }
+
+  private async pollOnce(): Promise<void> {
     const res = await this.deps.getLive(this.state.meetingId, this.state.cursor);
     if (!res.ok) {
-      if (res.code === "NETWORK" || res.code === "TIMEOUT") this.set({ state: "STOPPED", stopReason: "SERVER" });
+      // NETWORK / TIMEOUT は「回っていたはずの Live が切れた」ときだけ STOPPED に倒す。
+      // DISABLED / STARTING / STOPPED まで巻き込むと、無効な会議を停止扱いにして stopReason を汚す。
+      const running = this.state.state === "RUNNING" || this.state.state === "DEGRADED";
+      if ((res.code === "NETWORK" || res.code === "TIMEOUT") && running) this.set({ state: "STOPPED", stopReason: "SERVER" });
       return;
     }
     this.upsert(res.value.segments);
+    // サーバーが DISABLED を返したら enabled も落とす。state だけ同期すると onRecordingHealth() が
+    // 有効と誤認し、既に無効な会議へ停止要求を投げ続ける（enabled は「サーバーで確認済みの有効状態」）。
     this.set({ state: res.value.liveState, cursor: Math.max(this.state.cursor, res.value.cursor), lastUpdatedAt: this.deps.now(),
+               enabled: res.value.liveState === "DISABLED" ? false : this.state.enabled,
                stopReason: res.value.liveState === "STOPPED" && this.state.stopReason === null ? "SERVER" : this.state.stopReason });
   }
 
   /**
    * disable() と対称に、サーバーの応答で確認できたことだけをローカル状態に反映する。
-   * NETWORK / TIMEOUT は「サーバーが有効化を受け付けたかどうか不明」であって、無効の確認ではない。
+   * 失敗応答は code を問わず「サーバーが有効化を受け付けたかどうか不明」であって、無効の確認ではない
+   * （5xx や AUTH も同じ。サーバーは既に Live を回しているかもしれない）。
    * ここで DISABLED に落とすと、サーバーが Live を回しているのに UI だけ無効を確信し、
    * さらに onRecordingHealth() の `!enabled` 早期 return が停止要求まで抑止するため、
    * 食い違いが自動では戻らなくなる。状態を据え置けば poll() が実際の liveState に再同期する。
    */
   async enable(): Promise<boolean> {
     const res = await this.deps.setLive(this.state.meetingId, true);
-    if (!res.ok) {
-      if (res.code === "NETWORK" || res.code === "TIMEOUT") return false;   // 状態は変えず poll() に委ねる
-      this.set({ enabled: false, state: "DISABLED" });                      // サーバーが明示的に拒否した
-      return false;
-    }
-    if (!res.value.liveSttEnabled) {                                        // サーバーが無効と回答した
+    if (!res.ok) return false;                                              // 状態は変えず poll() に委ねる
+    if (!res.value.liveSttEnabled) {                                        // サーバーが明示的に無効と回答した
       this.set({ enabled: false, state: "DISABLED" });
       return false;
     }
@@ -1109,21 +1125,25 @@ import type { ApiResult } from "../src/api/phase2-client";
 const seg = (id: string, startMs: number, createdAt: number): LiveSegment =>
   ({ id, source: "mic", startMs, endMs: startMs + 5000, text: id, language: "ja", confidence: 0.8, createdAt });
 
-function build(opts: { serverState?: LiveResponse["liveState"]; offline?: boolean; setLiveFails?: boolean; setLiveReturnsDisabled?: boolean } = {}) {
+function build(opts: { serverState?: LiveResponse["liveState"]; initialState?: LiveResponse["liveState"]; offline?: boolean; setLiveFails?: boolean; setLiveErrors?: boolean; setLiveReturnsDisabled?: boolean } = {}) {
   let now = 1000;
   const states: LiveTranscriptState[] = [];
   const setCalls: boolean[] = [];
   let served: LiveSegment[] = [];
+  let getCalls = 0;
   const deps = {
-    getLive: async (_m: string, since: number): Promise<ApiResult<LiveResponse>> =>
-      opts.offline
-        ? { ok: false, status: 0, code: "NETWORK", message: "down" }
-        // サーバーは since を含む境界で返す（§2.1・サーバー側 live_segments_since）。
-        // ここを > にするとダブルだけが取りこぼしのない世界になり、回帰テストが素通りする
-        : { ok: true, status: 200, value: { meetingId: "m", liveState: opts.serverState ?? "RUNNING", segments: served.filter((s) => s.createdAt >= since), cursor: Math.max(since, ...served.map((s) => s.createdAt)) } },
+    getLive: async (_m: string, since: number): Promise<ApiResult<LiveResponse>> => {
+      getCalls += 1;                                   // poll() の single-flight を検証するために数える
+      if (opts.offline === true) return { ok: false, status: 0, code: "NETWORK", message: "down" };
+      // サーバーは since を含む境界で返す（§2.1・サーバー側 live_segments_since）。
+      // ここを > にするとダブルだけが取りこぼしのない世界になり、回帰テストが素通りする
+      return { ok: true, status: 200, value: { meetingId: "m", liveState: opts.serverState ?? "RUNNING", segments: served.filter((s) => s.createdAt >= since), cursor: Math.max(since, ...served.map((s) => s.createdAt)) } };
+    },
     setLive: async (_m: string, enabled: boolean): Promise<ApiResult<LivePutResponse>> => {
       setCalls.push(enabled);
       if (opts.setLiveFails === true) return { ok: false, status: 0, code: "NETWORK", message: "down" };
+      // 通信は届いたがサーバー内部で失敗した経路（有効化の可否は不明のまま）
+      if (opts.setLiveErrors === true) return { ok: false, status: 500, code: "INTERNAL", message: "boom" };
       // サーバーが要求を受け取ったうえで無効と回答する経路（allowed=false など）
       if (opts.setLiveReturnsDisabled === true) return { ok: true, status: 200, value: { meetingId: "m", liveSttEnabled: false, allowed: false } };
       return { ok: true, status: 200, value: { meetingId: "m", liveSttEnabled: enabled, allowed: true } };
@@ -1131,8 +1151,8 @@ function build(opts: { serverState?: LiveResponse["liveState"]; offline?: boolea
     now: () => now,
     onChange: (s: LiveTranscriptState) => states.push(s),
   };
-  const store = new LiveTranscriptStore(deps, "m", { enabled: true, state: "STARTING" });
-  return { store, states, setCalls, serve: (s: LiveSegment[]) => (served = s), tick: (ms: number) => (now += ms) };
+  const store = new LiveTranscriptStore(deps, "m", { enabled: true, state: opts.initialState ?? "STARTING" });
+  return { store, states, setCalls, serve: (s: LiveSegment[]) => (served = s), tick: (ms: number) => (now += ms), getCalls: () => getCalls };
 }
 
 describe("LiveTranscriptStore", () => {
@@ -1170,14 +1190,40 @@ describe("LiveTranscriptStore", () => {
     expect(b.store.current.segments.map((s) => s.id)).toEqual(["a", "b", "c"]);
   });
 
-  it("サーバー不達で STOPPED（SERVER）、有効化に成功すると STARTING", async () => {
-    const b = build({ offline: true });
+  it("RUNNING 中のサーバー不達だけ STOPPED（SERVER）にし、無効な会議は巻き込まない", async () => {
+    const b = build({ offline: true, initialState: "RUNNING" });
     await b.store.poll();
     expect(b.store.current.state).toBe("STOPPED");
     expect(b.store.current.stopReason).toBe("SERVER");
     expect(await b.store.enable()).toBe(true);
     expect(b.store.current.state).toBe("STARTING");
     expect(b.setCalls).toEqual([true]);
+
+    // 回っていなかった会議を不達で停止扱いにすると、stopReason=SERVER の偽の停止理由が UI に出る
+    const idle = build({ offline: true, initialState: "DISABLED" });
+    await idle.store.poll();
+    expect(idle.store.current.state).toBe("DISABLED");
+    expect(idle.store.current.stopReason).toBeNull();
+  });
+
+  it("poll() は single-flight で、多重呼び出しでも getLive は 1 本だけ飛ぶ", async () => {
+    // SSE 再接続とタイマーが同時に叩くと、古い応答の後着が liveState や cursor を巻き戻す
+    const b = build();
+    b.serve([seg("a", 0, 10)]);
+    await Promise.all([b.store.poll(), b.store.poll(), b.store.poll()]);
+    expect(b.getCalls()).toBe(1);
+    await b.store.poll();                            // 完了後は次の 1 本が飛ぶ
+    expect(b.getCalls()).toBe(2);
+  });
+
+  it("poll() が DISABLED を返したら enabled も落とす", async () => {
+    // state だけ同期すると onRecordingHealth() が有効と誤認し、無効な会議へ停止要求を投げる
+    const b = build({ serverState: "DISABLED" });
+    await b.store.poll();
+    expect(b.store.current.state).toBe("DISABLED");
+    expect(b.store.current.enabled).toBe(false);
+    expect(await b.store.onRecordingHealth(["NO_AUDIO_FRAMES"])).toBe(false);
+    expect(b.setCalls).toEqual([]);
   });
 
   it("NO_AUDIO_FRAMES で Live を自動停止し、録音側の理由には触れない", async () => {
@@ -1202,8 +1248,8 @@ describe("LiveTranscriptStore", () => {
     expect(b.store.current.enabled).toBe(true);
   });
 
-  it("enable() は NETWORK 失敗で状態を落とさず、サーバーの明示的な無効応答だけで DISABLED にする", async () => {
-    // 通信失敗で DISABLED に落とすと、サーバーが Live を回したままでも
+  it("enable() は失敗応答で状態を落とさず、サーバーの明示的な無効応答だけで DISABLED にする", async () => {
+    // 通信失敗でも 5xx でも DISABLED に落とすと、サーバーが Live を回したままでも
     // onRecordingHealth() の !enabled 早期 return が停止要求を抑止してしまう
     const b = build({ setLiveFails: true });
     expect(await b.store.enable()).toBe(false);
@@ -1211,6 +1257,11 @@ describe("LiveTranscriptStore", () => {
     expect(b.store.current.state).toBe("STARTING");
     expect(await b.store.onRecordingHealth(["NO_AUDIO_FRAMES"])).toBe(false);   // setLive はまだ落ちている
     expect(b.store.current.enabled).toBe(true);      // 停止扱いにはしない（poll() が再同期する）
+
+    const errored = build({ setLiveErrors: true });
+    expect(await errored.store.enable()).toBe(false);
+    expect(errored.store.current.enabled).toBe(true);   // 5xx も「無効の確認」ではない
+    expect(errored.store.current.state).toBe("STARTING");
 
     const denied = build({ setLiveReturnsDisabled: true });
     expect(await denied.store.enable()).toBe(false);
