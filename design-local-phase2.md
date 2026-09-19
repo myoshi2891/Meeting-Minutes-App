@@ -2,7 +2,7 @@
 
 **対象フェーズ:** Phase 2 ── finalize 済み会議を、利用者のマシン上だけで「確定 transcript → AI 議事録 → 手動編集」まで処理する。System Audio の追加を含む。
 **Phase 3:** Live STT / 話者分離 / FLAC / 高度な復旧 / LAN 共有 ── 方針と接続点のみ（概要レベル）。
-**設計方針:** Local-First / Zero External Call / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation
+**設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation
 **上位文書:** システム設計書 v4.0、Phase 1 詳細設計書（`design-local-phase1.md`）。本書は両者の「Recording is Source of Truth」原則と Invariant 1〜10 を変更せずに継承する。
 **粒度:** 基本設計。アーキテクチャ・API 契約・SQLite スキーマ・状態遷移・アルゴリズム方針までを確定し、実装コードは TypeScript 型定義と SQL DDL に限る。Python 側はモジュール構成と責務の記述にとどめる。
 **技術選定（確定）:** 常駐サーバーは Python（FastAPI + SQLite + faster-whisper + Ollama HTTP API）。
@@ -44,7 +44,7 @@ Phase 2 で「壊れても録音と transcript を失わない」ことを保証
 | 継承（追記可） | SQLite `audio_chunks` の列。Phase 2 は `stt_status` / `vad_source` / `server_vad_score` を追加する | v4.0 §74 |
 | 継承 | ハードウェア区分とモデルフォールバック表（Phase 1 §3.7）。本書 §7 で確定 | — |
 | 継承 | Hallucination 対応方針「除外 + `rejected` 保持 + 警告」（Phase 1 §3.8）。本書 §12 で確定 | — |
-| 継承 | Zero External Call の唯一の例外候補「モデルファイルの明示操作によるダウンロード」（Phase 1 §25）。本書 §7.4 で確定 | — |
+| 継承 | Zero External Data Egress の唯一の例外候補「モデルファイルの明示操作によるダウンロード」（Phase 1 §25）。本書 §7.4 で確定 | — |
 
 ---
 
@@ -279,7 +279,7 @@ Apple Silicon は統合メモリのため `tier` は物理メモリで判定す�
 
 GPU OOM で STT ジョブが失敗した場合、次の候補に落として再試行する（§9.4）。ダウングレードは**ジョブ単位ではなく会議単位**で記録し（`meetings.stt_model_used`）、同一会議内で Chunk ごとにモデルが混在する事態を避ける。一度落としたら、その会議の残りジョブは落とした後のモデルで処理する。
 
-## 7.4 モデルファイルの配置と取得 ── Zero External Call の唯一の例外
+## 7.4 モデルファイルの配置と取得 ── Zero External Data Egress の唯一の例外
 
 | 方式 | 内容 | 採否 |
 | --- | --- | --- |
@@ -1341,7 +1341,7 @@ v4.0 §69〜§72 をそのまま継承する。ローカル版で変わるのは
 | 接続点 | Phase 1 の PUT 経路をそのまま使う。`meetings.status='recording'` 中でも `vad_chunk` / `transcribe_chunk` を生成する設定（`live_stt_enabled`）を持つ。Merger は走らせず、`GET /segments` の生セグメントを Live Transcript ペインに出す |
 | State Machine | v4.0 §82 の `DISABLED → STARTING → RUNNING → DEGRADED → RECONNECTING → STOPPED` を、サーバー到達性（`LocalBackendHealth`）とジョブ遅延で駆動 |
 | ハードウェア制約 | `gpu_small` / `cpu_only` では既定オフ。録音中の STT がマシンを圧迫して AudioWorklet のドロップ（`NO_AUDIO_FRAMES`）を誘発しないことを実測で確認してから有効化する |
-| Web Speech API | ローカル版では採用しない。ブラウザ実装がクラウド STT に音声を送る場合があり、Zero External Call に反する |
+| Web Speech API | ローカル版では採用しない。ブラウザ実装がクラウド STT に音声を送る場合があり、Zero External Data Egress に反する |
 
 ---
 

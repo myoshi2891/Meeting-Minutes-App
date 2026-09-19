@@ -3,7 +3,7 @@
 **対象:** 常駐サーバー `minutes-local`（FastAPI + SQLite + faster-whisper + Silero VAD + Ollama HTTP）の実装コードとテストコード。
 **上位文書:** Phase 2 基本設計書（`design-local-phase2.md`）。本書は基本設計の §7〜§15 を実装粒度に展開する。基本設計の DDL（§8）・API 契約（§14）・状態遷移（§9）は変更せず再掲する。
 **対となる文書:** Phase 2 詳細設計書 ── ブラウザ側（`design-local-phase2-client.md`）。
-**設計方針:** Local-First / Zero External Call / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。
+**設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。
 **検証状態:** 本書の全 `python` コードブロック（54 ファイル）はパッケージとして抽出でき、Fake Provider による pytest 9 ファイル 34 テストが Python 3.12 + FastAPI + pydantic v2 で全件通過することを設計時点で確認している（§23）。実モデル（faster-whisper / Silero / Ollama）は設計時点では実行していない。
 
 ---
@@ -1484,7 +1484,7 @@ def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = N
 
 ```python
 # minutes_local/storage/models_dir.py
-"""モデルファイルの配置確認と、明示操作によるダウンロード（Zero External Call の唯一の例外）。"""
+"""モデルファイルの配置確認と、明示操作によるダウンロード（Zero External Data Egress の唯一の例外）。"""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -4135,7 +4135,7 @@ async def models(request: Request) -> Any:
 
 @router.post("/models/download", status_code=202)
 async def download(req: DownloadRequest, request: Request) -> Any:
-    """Zero External Call の唯一の例外。明示操作でのみ呼ばれる（基本設計 §7.4）。会議データは送信しない。"""
+    """Zero External Data Egress の唯一の例外。明示操作でのみ呼ばれる（基本設計 §7.4）。会議データは送信しない。"""
     ctx = get_ctx(request)
     if req.kind != "stt" or req.name not in WHISPER_MODELS:
         return JSONResponse(error_body("VALIDATION", "unknown model"), status_code=422)

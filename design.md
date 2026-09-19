@@ -61,6 +61,8 @@ flowchart LR
 1. 次の7種類の成果物がすべて揃っている
    - ① TypeScriptインターフェース定義一式（`AudioPipelineConfig` / `SessionClock` / `ChunkTimingMetadata` / `VADConfig` / `VADResult` / `RecordingHealth` / Upload Stateの型）
    - ② Upload State Machineの状態遷移図（Mermaid形式。`GENERATED → IDB_STORED → UPLOAD_PENDING → UPLOADING → UPLOADED → DB_REGISTERED`、およびエラー分岐 `UPLOAD_FAILED / RETRYING` を含む全状態を網羅）。ここでの`RETRYING`は**Phase 1の保存先（オブジェクトストレージ）へのアップロード再送**を指し、Phase 2のQueueジョブのretry／DLQとは別の機構である
+     - **再送時のPresigned URLは使い回さない**こと。`UPLOAD_FAILED` / `RETRYING` からの再送では、必ず発行エンドポイントを呼び直して新しいURLを取得する。v4.0はPresigned URLの有効期限を5〜15分と定めており、指数バックオフ付きのRetry（およびネットワーク断からの復旧）は容易にこの期限を超えるため、保持したURLでの再送は期限切れエラーを繰り返し、Retry回数だけを消費して`DEAD_LETTER`に落ちる
+     - URL再取得時は初回発行と同じ認可フローを通すこと（所有権検証、サーバー側でのObject Key決定、期待ハッシュの再確認）。「Presigned URLはBearer Tokenである」以上、再発行も同じ認可判断であり、初回だけ検証して再発行を素通りさせると、その経路が認可の抜け穴になる
    - ③ IndexedDBスキーマ定義（object store名、keyPath、index、バージョン管理方法を含む）
    - ④ AudioWorkletProcessor実装コード（ネイティブsample rate取得 → 16kHzリサンプリング → モノラルミックス → Int16変換 → VADスコア算出 → 480,000サンプル蓄積 → WAV Builder呼び出しまでの一連の処理）
    - ⑤ WAVエンコーダ実装（44バイトWAVヘッダ生成を含む、PCM16 / Mono / 16kHz固定仕様に準拠）

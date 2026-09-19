@@ -3,7 +3,7 @@
 **対象:** Phase 2 詳細設計（`design-local-phase2-server.md`）の `minutes_local` パッケージに対する Phase 3 の追加・変更。Live STT（準リアルタイム）／話者分離／日英言語認識／FLAC 事後圧縮と高度な復旧／LAN 共有。
 **上位文書:** Phase 2 基本設計書 §20〜§24（Phase 3 概要）。Phase 3 には基本設計が存在しないため、本書 §2 で基本設計相当の判断を先に確定する。
 **対となる文書:** Phase 3 詳細設計書 ── ブラウザ側（`design-local-phase3-client.md`）。
-**設計方針:** Local-First / Zero External Call / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。LAN 共有は「利用者自身が管理する LAN 内」に限定し、インターネット公開は対象外。
+**設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。LAN 共有は「利用者自身が管理する LAN 内」に限定し、インターネット公開は対象外。
 **検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 34 テストと本書の 20 テスト（計 12 ファイル 54 件）が Fake Provider による pytest で全件通過することを設計時点で確認している（§23）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
 
 ---
@@ -25,8 +25,8 @@
 | 候補 | 内容 | 採否 |
 | --- | --- | --- |
 | A. 準リアルタイム | 録音中に PUT された Chunk を finalize を待たず STT し、未マージの生セグメントを Live Transcript ペインに出す。遅延 = 30 秒（Chunk 長）+ STT 時間 | **採用** |
-| B. 真のストリーミング | 数百 ms 単位で音声を送りサーバーで逐次 STT | 不採用。録音中の AudioWorklet と GPU/CPU を奪い合い、`NO_AUDIO_FRAMES` を誘発しうる（Invariant 8 の観点）。ブラウザ側の Zero External Call を保ったまま実装するには WebSocket が必要で CSP が広がる |
-| C. Web Speech API | ブラウザ組み込み | 不採用。実装がクラウド STT に音声を送る場合があり Zero External Call に反する |
+| B. 真のストリーミング | 数百 ms 単位で音声を送りサーバーで逐次 STT | 不採用。録音中の AudioWorklet と GPU/CPU を奪い合い、`NO_AUDIO_FRAMES` を誘発しうる（Invariant 8 の観点）。ブラウザ側の Zero External Data Egress を保ったまま実装するには WebSocket が必要で CSP が広がる |
+| C. Web Speech API | ブラウザ組み込み | 不採用。実装がクラウド STT に音声を送る場合があり Zero External Data Egress に反する |
 
 確定事項：
 
@@ -1275,7 +1275,7 @@ class FakeDiarizationProvider(DiarizationProvider):
 
 ```python
 # minutes_local/diarization/pyannote_provider.py
-"""pyannote.audio の実 Provider。遅延 import。モデルは {models_dir}/diarization/ に利用者が配置する（Zero External Call）。"""
+"""pyannote.audio の実 Provider。遅延 import。モデルは {models_dir}/diarization/ に利用者が配置する（Zero External Data Egress）。"""
 from __future__ import annotations
 
 import tempfile

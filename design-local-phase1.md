@@ -1,7 +1,7 @@
 # 議事録Webアプリケーション Phase 1 詳細設計書（完全ローカル処理版）
 
 **対象フェーズ:** Phase 1 ── Mic → AudioWorklet → 30秒Standalone WAV → IndexedDB → ローカル常駐サーバーへのPUT（File System Access APIによる手動エクスポートをフォールバック）
-**設計方針:** Local-First / Zero External Call / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation
+**設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation
 **上位文書:** 議事録Webアプリケーション システム設計書 v4.0（設計レビュー版）。本書は v4.0 の「Recording is Source of Truth」原則と Invariant 1〜10 を変更せずに継承する。
 **位置づけ:** 本書だけを見て Phase 1 のコーディングと結合テストに着手できることを目的とする。
 
@@ -19,7 +19,7 @@
 
 | 方針 | 意味 | v4.0 からの差分 |
 | --- | --- | --- |
-| Local-First / Zero External Call | 音声・文字起こし・要約は、いかなる処理段階でも利用者のマシン（または利用者が管理するLAN内サーバー）の外へ出ない | Free-Tier-First を置き換える |
+| Local-First / Zero External Data Egress | 音声・文字起こし・要約は、いかなる処理段階でも利用者のマシン（または利用者が管理するLAN内サーバー）の外へ出ない | Free-Tier-First を置き換える |
 | No Cloud Quota / No Cloud Billing | クラウドの無料枠・レートリミット・課金という制約は存在しない前提に立つ | v4.0 §20〜§37, §99〜§105 のクォータ設計は本書では扱わない |
 | Hardware-Aware Degradation | GPU の有無・VRAM・CPUコア数に応じてモデルサイズと同時実行数を段階的に落とす | クラウドのRPD/RPS上限を、ローカルGPU/CPUスループット上限に読み替える |
 | Backend-Optional Recording | ローカル常駐サーバーが未起動・クラッシュ・ポート競合の状態でも、録音と IndexedDB 保存は継続する | Network断（v4.0 §91）を「ローカル常駐サーバーの起動断」に読み替える |
@@ -3287,7 +3287,7 @@ flowchart LR
 | Overlap | Chunk は Overlap しない | STT 入力を組む際に前 Chunk 末尾 3 秒を連結する。`start_offset_ms` はそのぶん補正する |
 | ハードウェア制約 | `/v1/health.capabilities` | `maxConcurrentStt` を超えるジョブは `pending` のまま待たせる。GPU OOM は retryable として `sttModel` を一段下げて再試行 |
 | DB スキーマ | `meetings.user_id` → `local_user_id`、`audio_chunks.r2_key` → `local_path` | それ以外の列は v4.0 §73〜§76 を維持 |
-| モデル取得 | 本書の範囲外 | モデルファイルは利用者が事前配置する。自動ダウンロードを実装する場合は明示的な利用者操作を必須にし、CSP と同等の allowlist をサーバー側にも設ける（Zero External Call の例外として設定画面に明記） |
+| モデル取得 | 本書の範囲外 | モデルファイルは利用者が事前配置する。自動ダウンロードを実装する場合は明示的な利用者操作を必須にし、CSP と同等の allowlist をサーバー側にも設ける（Zero External Data Egress の例外として設定画面に明記） |
 
 SQLite への読み替えで注意する点：`processing_jobs` の Job Lock（v4.0 §49）は `UPDATE ... RETURNING` を SQLite 3.35 以降でそのまま使える。`lease_until` によるスイーパー（v4.0 §55〜§56）は単一プロセス内のタイマーで代替できるが、ワーカープロセスが別の場合は同じ設計を維持する。
 
@@ -3404,7 +3404,7 @@ v4.0 §116（Audio）、§117（Network → ローカル起動断に読み替え
 | Hallucination 除外項目の UI（`rejected` 配列の表示） | Phase 2 | §3.8 |
 | モデル別「既知の弱点」注記テーブルの内容 | Phase 2 | §3.8。採用モデルの確定後 |
 | Transcript Merger のアルゴリズム | Phase 2 | §3.10 |
-| モデルファイルの自動ダウンロード（Zero External Call の唯一の例外候補） | Phase 2 | §25。利用者の明示操作を必須にする方針のみ確定 |
+| モデルファイルの自動ダウンロード（Zero External Data Egress の唯一の例外候補） | Phase 2 | §25。利用者の明示操作を必須にする方針のみ確定 |
 | `DB_REGISTERED` 後の IndexedDB Blob 保持期間（既定 24 時間）の妥当性 | Phase 1 実装後の運用で調整 | §26 |
 | System Audio 追加時の Mic/System ドリフト実測（P95 < 100ms） | Phase 2 | §8.3、v4.0 §123 |
 | Live STT（ローカル STT のストリーミング） | Phase 3 | v4.0 §81〜§83 の位置づけを変更しない |

@@ -10,7 +10,10 @@ Notion AIのようなリアルタイム音声文字起こし機能を持ち、�
 
 クラウド版（添付`design.md`）は、STT／要約／ストレージ／Queue／DBを無料枠クラウドサービス（Groq, Gemini, Supabase, Cloudflare R2/Queues等）に依存する設計だったが、本依頼はこれを次の方針に置き換える。
 
-- **Local-First / Zero External Call**：音声データ・文字起こし結果・要約結果は、いかなる処理段階でも利用者のマシン（または利用者が管理するLAN内サーバー）の外に出さない
+- **Local-First / Zero External Data Egress**：音声データ・文字起こし結果・要約結果は、いかなる処理段階でも利用者のマシン（または利用者が管理するLAN内サーバー）の外に出さない
+  - 要件名を「Zero External Call」ではなく「Zero External Data Egress」とするのは、**モデルファイルの取得**という外部通信を例外として認めるためである。ローカルSTT／ローカルLLMはモデル配布元（Hugging Face等）からの初回ダウンロードを避けられない場合があり、「外部通信を一切行わない」という名前のままでは、設計がその一点で自分の要件名に反することになる
+  - 例外として認めるのは**モデルファイルの取得のみ**であり、次を満たすこと：利用者の明示操作を必須とする（自動ダウンロードしない）、接続先を配布元ホストのallowlistに限定する、会議データ（音声・文字起こし・要約・メタデータ）を一切送信しない
+  - 守るべき不変条件は「外部への**データ送出**がないこと」であり、上記allowlist宛の取得通信はこれを破らない
 - **No Cloud Quota / No Cloud Billing**：無料枠クォータやAPI課金という制約そのものが存在しない前提に立つ
 - **Hardware-Aware Degradation**：GPUの有無・VRAM量・CPUコア数に応じて、モデルサイズや同時実行数を段階的に落とせる設計にする
 - **Recording is Source of Truth**：クラウド版のInvariant群のうち、この最重要原則および10個の設計不変条件（Invariant 1〜10）はローカル版でも維持する（変更不可）
@@ -62,7 +65,12 @@ flowchart LR
 
 1. 次の7種類の成果物がすべて揃っている
    - ① TypeScriptインターフェース定義一式（`AudioPipelineConfig` / `SessionClock` / `ChunkTimingMetadata` / `VADConfig` / `VADResult` / `RecordingHealth` / ローカル保存State（Upload Stateに相当）の型。加えて`LocalBackendHealth`（ローカル常駐サーバーの起動状態を表す型）を含む）
-   - ② ローカル保存State Machineの状態遷移図（Mermaid形式。`GENERATED → IDB_STORED → LOCAL_SAVE_PENDING → SAVING → SAVED → DB_REGISTERED`、およびエラー分岐 `LOCAL_SAVE_FAILED / RETRYING / BACKEND_UNAVAILABLE` を含む全状態を網羅）。ここでの`RETRYING`と`BACKEND_UNAVAILABLE`は**Phase 1のローカル保存先への再送**を指し、Phase 2のローカルQueueジョブのretry／DLQとは別の機構である
+   - ② ローカル保存State Machineの状態遷移図（Mermaid形式。`GENERATED → IDB_STORED → LOCAL_SAVE_PENDING → SAVING → SAVED → DB_REGISTERED`、およびエラー分岐 `LOCAL_SAVE_FAILED / RETRYING / BACKEND_UNAVAILABLE` を含む全状態を網羅）
+    - `DB_REGISTERED`はPhase 1の範囲に含める。ただし「ローカルDBは後続フェーズとの接続点にとどめる」という下記【制約・フォーマット】と衝突しないよう、**Phase 1で設計するのはメタデータ登録の責務境界までとし、ジョブテーブル・STT・要約のスキーマ設計には踏み込まない**。具体的に次を明記すること
+    - **責務の所在**：Chunkメタデータ（`meetingId` / `source` / `sequenceNo` / `sha256` / `sizeBytes` / 保存先パス / `ChunkTimingMetadata`）をローカルDBへ登録するのはローカルAPIサーバー側の責務であり、ブラウザは登録結果を受け取って状態を進めるだけとする
+    - **完了条件**：ブラウザが`DB_REGISTERED`へ遷移してよいのは、サーバーがファイル書き込みとメタデータ登録の**両方の完了**を応答で明示した場合に限る。ファイル書き込みだけが成功した場合は`SAVED`で止め、後から登録状況を照会して進める経路を用意する
+    - **冪等性**：同一Chunkの再送は`meetingId + source + sequenceNo`を論理キーとして冪等に扱う。既存ファイルと同一ハッシュなら成功として受理し二重登録しない、不一致なら既存ファイルを上書きせず衝突として返す（録音を失わないことを優先する）
+    - **再試行条件**：どの失敗で再送するか（ローカルサーバー未起動・書き込み失敗・登録失敗）と、再送しない失敗（ハッシュ衝突・認証失敗）を区別して定義する。ブラウザ側に保持したChunkを、`DB_REGISTERED`に到達するまで削除しないこと。ここでの`RETRYING`と`BACKEND_UNAVAILABLE`は**Phase 1のローカル保存先への再送**を指し、Phase 2のローカルQueueジョブのretry／DLQとは別の機構である
    - ③ IndexedDBスキーマ定義（object store名、keyPath、index、バージョン管理方法を含む）
    - ④ AudioWorkletProcessor実装コード（ネイティブsample rate取得 → 16kHzリサンプリング → モノラルミックス → Int16変換 → VADスコア算出 → 480,000サンプル蓄積 → WAV Builder呼び出しまでの一連の処理）
    - ⑤ WAVエンコーダ実装（44バイトWAVヘッダ生成を含む、PCM16 / Mono / 16kHz固定仕様に準拠）
@@ -109,7 +117,7 @@ flowchart LR
 ## 【参考資料・コンテキスト】
 
 - 添付：議事録Webアプリケーション システム設計書 v4.0（設計レビュー版）
-  - 設計方針：Free-Tier-First / Recording-First / Fault-Tolerant / At-Least-Once / Provider-Agnostic（本依頼ではFree-Tier-Firstの部分をLocal-First / Zero External Callに読み替える）
+  - 設計方針：Free-Tier-First / Recording-First / Fault-Tolerant / At-Least-Once / Provider-Agnostic（本依頼ではFree-Tier-Firstの部分をLocal-First / Zero External Data Egressに読み替える）
   - v3.0からの主要修正点（MediaRecorderを外す理由、16kHz固定の誤認修正、クロック設計の考え方）
   - DBスキーマ（meetings / audio_chunks / processing_jobs）
   - 10個の設計不変条件（Invariant 1〜10）
