@@ -429,6 +429,8 @@ stateDiagram-v2
 
 `disable()` による遷移は `PUT /live` がサーバーに受け付けられたときだけ起きる。応答を待たずにローカルを落とすと、サーバーが Live ジョブを回したまま UI だけ停止表示になる。失敗時は状態を据え置き、`poll()` が返す `liveState` との突き合わせに委ねる。
 
+`enable()` も同じ規律に従う。通信失敗（`NETWORK` / `TIMEOUT`）は「サーバーが有効化を受け付けたかどうか不明」であって無効の確認ではないため、状態を据え置いて `poll()` に委ねる。`DISABLED` へ落とすのは、サーバーが応答を返したうえで `liveSttEnabled=false` と回答した場合だけである。不明な失敗で `enabled=false` にすると、`onRecordingHealth()` の `!enabled` 早期 return が停止要求まで抑止し、サーバーが Live を回したままの食い違いが自動では戻らなくなる。
+
 **`poll()` のカーソルは包括境界である。** サーバーは `since` を含む条件（`created_at >= ?`）でセグメントを返し、クライアントは受け取った最大 `created_at` を次の `since` にする。`created_at` は epoch ms であり、1 回の `live_transcribe_chunk` ジョブが複数セグメントを同じ `now_ms()` の値で書き込むため、一意でも単調増加でもない。ここを排他境界（`>`）にすると、`cursor` と同じミリ秒に後から挿入されたセグメントが次回以降の検索条件から永久に外れ、SSE も取りこぼしていた場合は復元不能になる。
 
 代償は「境界ミリ秒のセグメントが毎回再送される」ことだが、再送量は 1 ミリ秒分に限られ、`LiveTranscriptStore` は SSE との重複吸収のために既に `byId` の Map を持っている。複合カーソル `(createdAt, id)` でも同じ正しさは得られるものの、`LiveResponse.cursor` の型・サーバーの SQL・両側のテストにまたがる契約変更が必要になる一方、この構成では重複排除の実装が増えるわけではない。したがって包括境界 + id 重複排除を採る。
@@ -488,9 +490,21 @@ export class LiveTranscriptStore {
                stopReason: res.value.liveState === "STOPPED" && this.state.stopReason === null ? "SERVER" : this.state.stopReason });
   }
 
+  /**
+   * disable() と対称に、サーバーの応答で確認できたことだけをローカル状態に反映する。
+   * NETWORK / TIMEOUT は「サーバーが有効化を受け付けたかどうか不明」であって、無効の確認ではない。
+   * ここで DISABLED に落とすと、サーバーが Live を回しているのに UI だけ無効を確信し、
+   * さらに onRecordingHealth() の `!enabled` 早期 return が停止要求まで抑止するため、
+   * 食い違いが自動では戻らなくなる。状態を据え置けば poll() が実際の liveState に再同期する。
+   */
   async enable(): Promise<boolean> {
     const res = await this.deps.setLive(this.state.meetingId, true);
-    if (!res.ok || !res.value.liveSttEnabled) {
+    if (!res.ok) {
+      if (res.code === "NETWORK" || res.code === "TIMEOUT") return false;   // 状態は変えず poll() に委ねる
+      this.set({ enabled: false, state: "DISABLED" });                      // サーバーが明示的に拒否した
+      return false;
+    }
+    if (!res.value.liveSttEnabled) {                                        // サーバーが無効と回答した
       this.set({ enabled: false, state: "DISABLED" });
       return false;
     }
@@ -515,7 +529,7 @@ export class LiveTranscriptStore {
    * 録音側の判定（Phase 1 §19）はフレーム基準であり、Live の停止は録音に影響しない。
    */
   async onRecordingHealth(reasons: ReadonlyArray<DegradedReason>): Promise<boolean> {
-    if (!this.state.enabled) return false;
+    if (!this.state.enabled) return false;   // enabled は「サーバーで確認済みの有効状態」だけを表す（enable()/disable() 参照）
     if (!reasons.includes("NO_AUDIO_FRAMES")) return false;
     return await this.disable("AUDIO_FRAMES_DROPPED");
   }
@@ -707,21 +721,32 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res: Response;
+  // 期限はヘッダ受信までではなく本文読み切りまで掛ける。ヘッダ到着直後に clearTimeout すると、
+  // 本文が止まったまま流れてこない応答（TCP は生きているが chunk が来ない）で res.json() が
+  // 無期限に待ち、設定画面のボタンが永久に返らない。timer の解除は全処理の完了後に行う。
+  let missing: ChunkListResponse["chunks"];
   try {
-    res = await fetchImpl(url, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", signal: controller.signal });
+    const res = await fetchImpl(url, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", signal: controller.signal });
+    if (!res.ok) return { ok: false, reason: "HTTP", detail: `chunk list HTTP ${res.status}` };
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch (parseError) {
+      // 期限切れによる abort をここで MALFORMED に丸めない。下の catch で TIMEOUT に落とす。
+      if (controller.signal.aborted) throw parseError;
+      return { ok: false, reason: "MALFORMED", detail: "malformed ChunkListResponse" };
+    }
+    if (!isChunkListResponse(body)) return { ok: false, reason: "MALFORMED", detail: "malformed ChunkListResponse" };
+    missing = body.chunks.filter((c) => !c.registered);
   } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
+    // 本文読み取り中の abort もここへ来る。signal 由来かどうかで TIMEOUT と NETWORK を分ける。
+    if (controller.signal.aborted) {
       return { ok: false, reason: "TIMEOUT", detail: `chunk list timeout after ${timeoutMs}ms` };
     }
     return { ok: false, reason: "NETWORK", detail: error instanceof Error ? error.message : String(error) };
   } finally {
     clearTimeout(timer);
   }
-  if (!res.ok) return { ok: false, reason: "HTTP", detail: `chunk list HTTP ${res.status}` };
-  const body: unknown = await res.json().catch(() => null);
-  if (!isChunkListResponse(body)) return { ok: false, reason: "MALFORMED", detail: "malformed ChunkListResponse" };
-  const missing = body.chunks.filter((c) => !c.registered);
   let requeued = 0;
   const unavailable: string[] = [];
   for (const c of missing) {
@@ -747,15 +772,15 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
 
 一覧取得に失敗した場合は `{ ok: false }` を返し、UI は「サーバーに接続できませんでした [再試行]」を出す。例外にしないのは、この関数が設定画面のボタンから呼ばれ、未捕捉の例外が「押しても何も起きない」という形で表面化しやすいためである。IndexedDB 側は何も変更しないので、そのまま再試行できる。
 
-この方針は本文のパースにも適用する。`NETWORK` / `TIMEOUT` / `HTTP` だけを結果型にして本文を `as ChunkListResponse` で通すと、`chunks` が配列でない応答で直後の `.filter` が `TypeError` を投げ、例外にしないという方針がその一点だけ破れる（`res.json()` 自体も本文が JSON でなければ reject する）。`MALFORMED` を失敗理由に加え、パースと形状検証の両方を同じ結果型に落とす。UI の文言は「サーバーの応答を解釈できませんでした [再試行]」とし、接続失敗と区別する。
+この方針は本文のパースにも適用する。`NETWORK` / `TIMEOUT` / `HTTP` だけを結果型にして本文を `as ChunkListResponse` で通すと、`chunks` が配列でない応答で直後の `.filter` が `TypeError` を投げ、例外にしないという方針がその一点だけ破れる（`res.json()` 自体も本文が JSON でなければ reject する）。`MALFORMED` を失敗理由に加え、パースと形状検証の両方を同じ結果型に落とす。UI の文言は「サーバーの応答を解釈できませんでした [再試行]」とし、接続失敗と区別する。\n\n期限（`timeoutMs`）はヘッダ受信までではなく**本文を読み切るまで**掛ける。`fetch()` の解決直後に `clearTimeout` すると、ヘッダだけ返して本文が流れてこない応答で `res.json()` が無期限に待ち、「無期限に待つと UI が戻らない」という `timeoutMs` の目的がその経路だけ達成されない。本文読み取り中の abort は `MALFORMED` ではなく `TIMEOUT` として返す——原因は応答の形ではなく期限切れであり、UI の文言と再試行の判断が変わるためである。
 
 ---
 
-# 7. LAN モード：許可ホストと HTTPS
+# 7. LAN モード：許可 origin と HTTPS
 
 ## 7.1 `src/api/local-saver.ts`（変更）
 
-Phase 1 §17.1 の全文に、許可ホストの設定関数を加える。既定は loopback のみで、Phase 1・2 の挙動は変わらない。
+Phase 1 §17.1 の全文に、許可 origin の設定関数を加える。既定は loopback のみで、Phase 1・2 の挙動は変わらない。
 
 ```typescript
 // src/api/local-saver.ts
@@ -763,51 +788,59 @@ import { encodeChunkMetaHeader, isChunkResponse, type ApiErrorBody } from "./con
 import type { AudioChunkRecord, LocalSaveError, LocalSaveErrorKind } from "../types/recording";
 
 const LOOPBACK_HOSTS: ReadonlyArray<string> = ["127.0.0.1", "localhost", "[::1]"];
-let allowedHosts: ReadonlySet<string> = new Set(LOOPBACK_HOSTS);
+let allowedOrigins: ReadonlySet<string> = new Set();
 
 /**
- * Phase 3：LAN モードでサーバーのホスト名を許可する。loopback は常に含まれる。
+ * Phase 3：LAN モードでサーバーの **origin**（scheme + hostname + port）を許可する。
+ * loopback は hostname 判定で常に許可されるため、この集合には入れない。
  * 非 loopback は https のみ（トークンを平文で流さない）。設定は起動時に 1 回だけ行う。
  *
- * 追加できるのは**ページ origin のホストだけ**である。LAN モードは「サーバーが自分自身の
- * アプリを配信する」構成だけを対象とし（サーバー側 §2.5、本書 §7.3）、任意ホストは設定できない。
- * ここを「https なら何でも可」にすると、`https://example.com` を設定された時点で
+ * 許可単位を hostname ではなく origin にしているのは、ホスト名だけを保持すると
+ * `https://minutes.local:43117` を許可した時点で、同じホスト上の**別ポートで動く別プロセス**
+ * （例：`https://minutes.local:8443`）にもトークンと WAV 本体を送れてしまうためである。
+ * LAN の同一ホストに第三者のサービスが同居する構成は珍しくなく、ポートまで固定して初めて
+ * 「アプリを配信したサーバーだけに送る」という契約が実装レベルで成立する。
+ *
+ * 追加できるのは**ページ origin と完全一致する origin だけ**である。LAN モードは「サーバーが
+ * 自分自身のアプリを配信する」構成だけを対象とし（サーバー側 §2.5、本書 §7.3）、任意 origin は
+ * 設定できない。ここを「https なら何でも可」にすると、`https://example.com` を設定された時点で
  * トークンと WAV 本体が公開ホストへ送られる。ブラウザからは DNS 解決結果を検証できないため、
  * プライベートアドレス判定ではなく origin 一致で担保する（§7.3）。
  * pageOrigin は既定で location.origin。テストから注入できるよう引数にしている。
  */
-export function configureAllowedHosts(extraHosts: ReadonlyArray<string>, pageOrigin: string = location.origin): void {
-  let pageHost: string;
-  try {
-    pageHost = new URL(pageOrigin).hostname.toLowerCase();
-  } catch {
-    pageHost = "";
-  }
-  const allowed = extraHosts
-    .map((h) => h.trim().toLowerCase())
-    .filter((h) => h !== "" && h === pageHost);
-  allowedHosts = new Set([...LOOPBACK_HOSTS, ...allowed]);
+export function configureAllowedHosts(extraOrigins: ReadonlyArray<string>, pageOrigin: string = location.origin): void {
+  const normalize = (value: string): string => {
+    try {
+      const origin = new URL(value.trim()).origin;
+      return origin === "null" ? "" : origin;   // file: など opaque origin は許可しない
+    } catch {
+      return "";
+    }
+  };
+  const page = normalize(pageOrigin);
+  const allowed = extraOrigins.map(normalize).filter((o) => o !== "" && o === page);
+  allowedOrigins = new Set(allowed);
 }
 
 export function resetAllowedHosts(): void {
-  allowedHosts = new Set(LOOPBACK_HOSTS);
+  allowedOrigins = new Set();
 }
 
 export function isLoopback(hostname: string): boolean {
   return LOOPBACK_HOSTS.includes(hostname.toLowerCase());
 }
 
-/** 外部ホストへの通信を実装レベルで遮断する（CSP の二重防御、Phase 1 §4.4）。 */
+/** 外部 origin への通信を実装レベルで遮断する（CSP の二重防御、Phase 1 §4.4）。 */
 export function assertLocalHost(url: URL): void {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error(`disallowed protocol: ${url.protocol}`);
   }
-  const host = url.hostname.toLowerCase();
-  if (!allowedHosts.has(host)) {
-    throw new Error(`disallowed host: ${url.hostname}`);
-  }
-  if (!isLoopback(host) && url.protocol !== "https:") {
+  if (isLoopback(url.hostname)) return;   // loopback は http でも可（従来どおり）
+  if (url.protocol !== "https:") {
     throw new Error(`non-loopback host requires https: ${url.hostname}`);
+  }
+  if (!allowedOrigins.has(url.origin)) {
+    throw new Error(`disallowed host: ${url.origin}`);   // scheme/host/port のいずれかが不一致
   }
 }
 
@@ -949,10 +982,10 @@ function safeOrigin(pageOrigin: string): string {
   }
 }
 
-/** 検証を通った接続先だけを許可ホストに登録する。 */
+/** 検証を通った接続先の origin だけを許可集合に登録する。 */
 export function applyConnection(conn: ServerConnection, pageOrigin: string = location.origin): ConnectionValidation {
   const v = validateConnection(conn, pageOrigin);
-  if (v.ok) configureAllowedHosts(v.lan ? [v.url.hostname] : [], pageOrigin);
+  if (v.ok) configureAllowedHosts(v.lan ? [v.url.origin] : [], pageOrigin);
   return v;
 }
 ```
@@ -968,7 +1001,7 @@ export function applyConnection(conn: ServerConnection, pageOrigin: string = loc
 | CSP `connect-src` | `'self'` で足りる。LAN ホストはページ origin そのものなので追加不要（サーバー側 §2.5 の CSP をそのまま使う） |
 | CORS | 同一 origin なので API サーバー側の CORS 設定は不要 |
 | `validateConnection()` | ページ origin 以外（loopback を除く）を `NOT_PAGE_ORIGIN` で拒否し、契約を実装レベルで強制する（§7.2） |
-| `configureAllowedHosts()` | ページ origin のホストしか許可集合に入れない（§7.1） |
+| `configureAllowedHosts()` | ページ origin と完全一致する origin（scheme + host + port）しか許可集合に入れない。同一ホストの別ポートも拒否する（§7.1） |
 
 **別 origin 構成は対象外**であり、設定画面から指定することもできない。仮に将来対象化する場合は、文書上の記述だけでは足りず、(1) アプリを配信する側の CSP `connect-src` に対象 origin を追加し、(2) API サーバーに当該 origin を許可する CORS 設定（`Authorization` ヘッダを使うので preflight 対応が必須）を入れ、(3) `validateConnection()` の origin 判定をその許可リストに差し替える、の 3 点を揃える必要がある。
 
@@ -998,7 +1031,7 @@ import type { ApiResult } from "../src/api/phase2-client";
 const seg = (id: string, startMs: number, createdAt: number): LiveSegment =>
   ({ id, source: "mic", startMs, endMs: startMs + 5000, text: id, language: "ja", confidence: 0.8, createdAt });
 
-function build(opts: { serverState?: LiveResponse["liveState"]; offline?: boolean; setLiveFails?: boolean } = {}) {
+function build(opts: { serverState?: LiveResponse["liveState"]; offline?: boolean; setLiveFails?: boolean; setLiveReturnsDisabled?: boolean } = {}) {
   let now = 1000;
   const states: LiveTranscriptState[] = [];
   const setCalls: boolean[] = [];
@@ -1013,6 +1046,8 @@ function build(opts: { serverState?: LiveResponse["liveState"]; offline?: boolea
     setLive: async (_m: string, enabled: boolean): Promise<ApiResult<LivePutResponse>> => {
       setCalls.push(enabled);
       if (opts.setLiveFails === true) return { ok: false, status: 0, code: "NETWORK", message: "down" };
+      // サーバーが要求を受け取ったうえで無効と回答する経路（allowed=false など）
+      if (opts.setLiveReturnsDisabled === true) return { ok: true, status: 200, value: { meetingId: "m", liveSttEnabled: false, allowed: false } };
       return { ok: true, status: 200, value: { meetingId: "m", liveSttEnabled: enabled, allowed: true } };
     },
     now: () => now,
@@ -1087,6 +1122,22 @@ describe("LiveTranscriptStore", () => {
     // NO_AUDIO_FRAMES 経路も同様に、サーバーが受け付けるまで停止扱いにしない
     expect(await b.store.onRecordingHealth(["NO_AUDIO_FRAMES"])).toBe(false);
     expect(b.store.current.enabled).toBe(true);
+  });
+
+  it("enable() は NETWORK 失敗で状態を落とさず、サーバーの明示的な無効応答だけで DISABLED にする", async () => {
+    // 通信失敗で DISABLED に落とすと、サーバーが Live を回したままでも
+    // onRecordingHealth() の !enabled 早期 return が停止要求を抑止してしまう
+    const b = build({ setLiveFails: true });
+    expect(await b.store.enable()).toBe(false);
+    expect(b.store.current.enabled).toBe(true);      // 直前の状態を保持
+    expect(b.store.current.state).toBe("STARTING");
+    expect(await b.store.onRecordingHealth(["NO_AUDIO_FRAMES"])).toBe(false);   // setLive はまだ落ちている
+    expect(b.store.current.enabled).toBe(true);      // 停止扱いにはしない（poll() が再同期する）
+
+    const denied = build({ setLiveReturnsDisabled: true });
+    expect(await denied.store.enable()).toBe(false);
+    expect(denied.store.current.enabled).toBe(false);
+    expect(denied.store.current.state).toBe("DISABLED");
   });
 
   it("バナー文言", () => {
@@ -1292,6 +1343,27 @@ describe("欠損 Chunk の逆同期", () => {
     if (!result.ok) expect(result.reason).toBe("TIMEOUT");
   });
 
+  it("ヘッダだけ返って本文が来ない応答も TIMEOUT として返す", async () => {
+    // 期限をヘッダ受信までで解除すると、この応答で res.json() が無期限に待ち続ける（§6）
+    const h = await createHarness();
+    const stalledBodyFetch: typeof fetch = async (_input, init) => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"meetingId":"m-stall","chunks":['));
+          init?.signal?.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")));
+          // 以降は何も流さない
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const result = await resyncMissingChunks(
+      { chunkStore: h.chunkStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, timeoutMs: 20, fetchImpl: stalledBodyFetch },
+      "m-stall",
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("TIMEOUT");   // MALFORMED でも NETWORK でもない
+  });
+
   it("壊れた一覧応答でも例外を投げず MALFORMED として返す", async () => {
     const h = await createHarness();
     // chunks が配列でない／本文が JSON ですらない場合、as ChunkListResponse では
@@ -1317,20 +1389,32 @@ describe("LAN モードの許可ホスト", () => {
   it("既定は loopback のみ。LAN ホストは設定後、かつ https のみ", () => {
     expect(() => assertLocalHost(new URL("http://127.0.0.1:43117/v1/health"))).not.toThrow();
     expect(() => assertLocalHost(new URL("https://minutes.local:43117/v1/health"))).toThrow(/disallowed host/);
-    configureAllowedHosts(["minutes.local"], PAGE);
+    configureAllowedHosts([PAGE], PAGE);
     expect(() => assertLocalHost(new URL("https://minutes.local:43117/v1/health"))).not.toThrow();
     expect(() => assertLocalHost(new URL("http://minutes.local:43117/v1/health"))).toThrow(/requires https/);
     expect(() => assertLocalHost(new URL("https://example.com/"))).toThrow(/disallowed host/);
     expect(() => assertLocalHost(new URL("http://127.0.0.1:43117/"))).not.toThrow();   // loopback は常に可
   });
 
+  it("許可は origin 単位。同じホストでもポートが違えば拒否する", () => {
+    // ホスト名だけで許可すると、同一ホストに同居する別プロセスへトークンと WAV を送れてしまう（§7.1）
+    configureAllowedHosts([PAGE], PAGE);
+    expect(() => assertLocalHost(new URL("https://minutes.local:43117/v1/chunks"))).not.toThrow();
+    expect(() => assertLocalHost(new URL("https://minutes.local:8443/v1/chunks"))).toThrow(/disallowed host/);
+    expect(() => assertLocalHost(new URL("https://minutes.local/v1/chunks"))).toThrow(/disallowed host/);   // 既定ポート 443
+    // ページ origin とポートが違う値は、そもそも許可集合に入らない
+    configureAllowedHosts(["https://minutes.local:8443"], PAGE);
+    expect(() => assertLocalHost(new URL("https://minutes.local:8443/v1/chunks"))).toThrow(/disallowed host/);
+    expect(() => assertLocalHost(new URL("https://minutes.local:43117/v1/chunks"))).toThrow(/disallowed host/);
+  });
+
   it("ページ origin 以外は許可集合に入らない（https でも公開ホストへは送らない）", () => {
     // https だからという理由だけで公開ホストを許可すると、トークンと WAV がそこへ送られる（§7.3）
-    configureAllowedHosts(["example.com", "minutes.local"], PAGE);
+    configureAllowedHosts(["https://example.com", PAGE], PAGE);
     expect(() => assertLocalHost(new URL("https://example.com/v1/health"))).toThrow(/disallowed host/);
     expect(() => assertLocalHost(new URL("https://minutes.local:43117/v1/health"))).not.toThrow();
     // pageOrigin が壊れていても loopback 以外は増やさない
-    configureAllowedHosts(["example.com"], "not a url");
+    configureAllowedHosts(["https://example.com"], "not a url");
     expect(() => assertLocalHost(new URL("https://example.com/v1/health"))).toThrow(/disallowed host/);
     expect(() => assertLocalHost(new URL("http://127.0.0.1:43117/"))).not.toThrow();
   });
