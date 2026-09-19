@@ -33,7 +33,7 @@
 
 ```typescript
 // src/api/contracts-phase3.ts
-import type { LocalBackendCapabilitiesV2, MeetingDetailResponse, MeetingEvent, TranscriptSegmentView } from "./contracts-phase2";
+import type { LocalBackendCapabilitiesV2, MeetingDetailResponse, MeetingEvent, MeetingStatusV2, TranscriptSegmentView } from "./contracts-phase2";
 
 export type LiveState = "DISABLED" | "STARTING" | "RUNNING" | "DEGRADED" | "STOPPED";
 
@@ -149,22 +149,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-export function decodeLiveResponse(value: unknown): LiveResponse | null {
+/**
+ * meetingId は「文字列であること」ではなく「**要求した会議のものであること**」を確認する。
+ * 型だけを見ると、別会議の応答（サーバー側のルーティング不具合、キャッシュの取り違え、
+ * 会議切り替え中に遅れて届いた前の会議の応答）がそのまま通り、LiveTranscriptStore が
+ * 別会議のセグメントを表示し、resync が別会議の Chunk 一覧をもとに再送を始める。
+ * 呼び出し側は必ず要求時の meetingId を渡す（Phase3Client.request() のクロージャ）。
+ */
+function isForMeeting(value: Record<string, unknown>, expectedMeetingId: string): boolean {
+  return typeof value.meetingId === "string" && value.meetingId === expectedMeetingId;
+}
+
+export function decodeLiveResponse(value: unknown, expectedMeetingId: string): LiveResponse | null {
   if (!isRecord(value)) return null;
-  if (typeof value.meetingId !== "string" || typeof value.cursor !== "number") return null;
+  if (!isForMeeting(value, expectedMeetingId) || typeof value.cursor !== "number") return null;
   if (!isLiveState(value.liveState)) return null;
   if (!Array.isArray(value.segments) || !value.segments.every(isLiveSegment)) return null;
   return value as unknown as LiveResponse;
 }
 
-export function decodeLivePutResponse(value: unknown): LivePutResponse | null {
+export function decodeLivePutResponse(value: unknown, expectedMeetingId: string): LivePutResponse | null {
   if (!isRecord(value)) return null;
-  if (typeof value.meetingId !== "string" || typeof value.liveSttEnabled !== "boolean" || typeof value.allowed !== "boolean") return null;
+  if (!isForMeeting(value, expectedMeetingId)) return null;
+  if (typeof value.liveSttEnabled !== "boolean" || typeof value.allowed !== "boolean") return null;
   return value as unknown as LivePutResponse;
 }
 
-export function decodeSpeakersResponse(value: unknown): SpeakersResponse | null {
-  if (!isRecord(value) || typeof value.meetingId !== "string") return null;
+export function decodeSpeakersResponse(value: unknown, expectedMeetingId: string): SpeakersResponse | null {
+  if (!isRecord(value) || !isForMeeting(value, expectedMeetingId)) return null;
   if (!Array.isArray(value.speakers) || !value.speakers.every(isSpeakerEntry)) return null;
   return value as unknown as SpeakersResponse;
 }
@@ -178,12 +190,17 @@ export function decodeUserMeResponse(value: unknown): UserMeResponse | null {
 /**
  * 会議詳細は Phase 2 の MeetingDetailResponse を継承する。Phase 2 側に型ガードは存在せず、
  * §1 の通り contracts-phase2.ts は変更しないので、ここでは Phase 3 のクライアントコードが
- * 実際に読むフィールド（継承部の meetingId / transcriptVersion と Phase 3 の追加分）を検証する。
- * 継承部の残りは Phase 2 と同じ扱い（未検証）のままで、Phase 3 が新たに保証を弱める箇所はない。
+ * 実際に読むフィールドを検証する。`status` と `latestSummaryVersion` は §4 の backfill() が
+ * そのまま MeetingEvent に載せて配信するため、未検証のまま通すと壊れた値が
+ * イベント経路に入り、失敗地点が受信側まで先送りされる。`chunkCounts` は会議詳細表示が
+ * 直接読むので同じ扱いにする。ここを通った値は、これら全フィールドについて形が保証される。
  */
-export function decodeMeetingDetailV3(value: unknown): MeetingDetailResponseV3 | null {
+export function decodeMeetingDetailV3(value: unknown, expectedMeetingId: string): MeetingDetailResponseV3 | null {
   if (!isRecord(value)) return null;
-  if (typeof value.meetingId !== "string" || typeof value.transcriptVersion !== "number") return null;
+  if (!isForMeeting(value, expectedMeetingId) || typeof value.transcriptVersion !== "number") return null;
+  if (!isMeetingStatusV2(value.status)) return null;
+  if (!(typeof value.latestSummaryVersion === "number" || value.latestSummaryVersion === null)) return null;
+  if (!isChunkCounts(value.chunkCounts)) return null;
   if (!isLiveState(value.liveState) || typeof value.liveSttEnabled !== "boolean" || typeof value.diarized !== "boolean") return null;
   if (!isRecord(value.languageRatio) || !Object.values(value.languageRatio).every((n) => typeof n === "number")) return null;
   if (!Array.isArray(value.speakers) || !value.speakers.every(isSpeakerEntry)) return null;
@@ -193,6 +210,17 @@ export function decodeMeetingDetailV3(value: unknown): MeetingDetailResponseV3 |
 
 function isLiveState(value: unknown): value is LiveState {
   return value === "DISABLED" || value === "STARTING" || value === "RUNNING" || value === "DEGRADED" || value === "STOPPED";
+}
+
+const MEETING_STATUSES: ReadonlyArray<MeetingStatusV2> =
+  ["created", "recording", "finalizing", "finalized", "transcribing", "transcribed", "summarizing", "completed", "failed"];
+
+function isMeetingStatusV2(value: unknown): value is MeetingStatusV2 {
+  return typeof value === "string" && (MEETING_STATUSES as ReadonlyArray<string>).includes(value);
+}
+
+function isChunkCounts(value: unknown): value is Readonly<Record<"mic" | "system", number>> {
+  return isRecord(value) && typeof value.mic === "number" && typeof value.system === "number";
 }
 
 function isSpeakerEntry(value: unknown): value is SpeakerEntry {
@@ -224,24 +252,26 @@ export class Phase3Client {
     assertLocalHost(this.base);
   }
 
+  // デコーダには要求した meetingId を束ねて渡す。応答の meetingId が要求と違う場合は
+  // 形が正しくても MALFORMED として落とす（contracts-phase3.ts の isForMeeting）
   getMeeting(meetingId: string): Promise<ApiResult<MeetingDetailResponseV3>> {
-    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}`, decodeMeetingDetailV3);
+    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}`, (v) => decodeMeetingDetailV3(v, meetingId));
   }
 
   getLive(meetingId: string, since: number): Promise<ApiResult<LiveResponse>> {
-    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}/live?since=${since}`, decodeLiveResponse);
+    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}/live?since=${since}`, (v) => decodeLiveResponse(v, meetingId));
   }
 
   setLive(meetingId: string, enabled: boolean): Promise<ApiResult<LivePutResponse>> {
-    return this.request("PUT", `/v1/meetings/${encodeURIComponent(meetingId)}/live`, decodeLivePutResponse, { enabled });
+    return this.request("PUT", `/v1/meetings/${encodeURIComponent(meetingId)}/live`, (v) => decodeLivePutResponse(v, meetingId), { enabled });
   }
 
   getSpeakers(meetingId: string): Promise<ApiResult<SpeakersResponse>> {
-    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}/speakers`, decodeSpeakersResponse);
+    return this.request("GET", `/v1/meetings/${encodeURIComponent(meetingId)}/speakers`, (v) => decodeSpeakersResponse(v, meetingId));
   }
 
   putSpeakers(meetingId: string, speakers: ReadonlyArray<SpeakerEntry>): Promise<ApiResult<SpeakersResponse>> {
-    return this.request("PUT", `/v1/meetings/${encodeURIComponent(meetingId)}/speakers`, decodeSpeakersResponse, { speakers });
+    return this.request("PUT", `/v1/meetings/${encodeURIComponent(meetingId)}/speakers`, (v) => decodeSpeakersResponse(v, meetingId), { speakers });
   }
 
   me(): Promise<ApiResult<UserMeResponse>> {
@@ -699,7 +729,14 @@ export interface ResyncReport {
 /** 失敗を例外にすると呼び出し側（設定画面のボタン）が握りつぶしやすいので、結果型で返す。 */
 export type ResyncResult =
   | { readonly ok: true; readonly report: ResyncReport }
-  | { readonly ok: false; readonly reason: "NETWORK" | "TIMEOUT" | "HTTP" | "MALFORMED"; readonly detail: string };
+  | { readonly ok: false; readonly reason: ResyncFailure; readonly detail: string };
+
+export type ResyncFailure =
+  | "NETWORK" | "TIMEOUT" | "HTTP" | "MALFORMED"
+  /** baseUrl が URL として不正、または許可 origin 外（§7.1 assertLocalHost） */
+  | "BAD_CONFIG"
+  /** IndexedDB / Scheduler 側の失敗。一覧取得は成功しているので再試行の意味が違う */
+  | "STORAGE";
 
 /**
  * 一覧応答を `as ChunkListResponse` で通すと chunks が配列でないときに
@@ -707,17 +744,30 @@ export type ResyncResult =
  * 要素の検証は Phase 1 §17 で export 済みの isChunkResponse を再利用する
  * （§1 の通り contracts.ts 自体は変更しない）。
  */
-function isChunkListResponse(value: unknown): value is ChunkListResponse {
+function isChunkListResponse(value: unknown, expectedMeetingId: string): value is ChunkListResponse {
   if (typeof value !== "object" || value === null) return false;
   const v = value as { meetingId?: unknown; chunks?: unknown };
-  return typeof v.meetingId === "string" && Array.isArray(v.chunks) && v.chunks.every(isChunkResponse);
+  // 別会議の一覧をそのまま使うと、この会議に存在しない Chunk を「未登録」と見なして
+  // 再送キューに積む。meetingId は型ではなく要求値との一致で確認する
+  if (typeof v.meetingId !== "string" || v.meetingId !== expectedMeetingId) return false;
+  return Array.isArray(v.chunks) && v.chunks.every(isChunkResponse);
 }
 
 export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): Promise<ResyncResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const timeoutMs = deps.timeoutMs ?? 10_000;
-  const url = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
-  assertLocalHost(url);
+
+  // new URL() は baseUrl が不正なら TypeError を、assertLocalHost() は許可 origin 外なら
+  // Error を投げる。どちらも「設定画面のボタンから呼ばれる関数は例外を投げない」という
+  // この関数の約束の外にあり、未捕捉の例外は「押しても何も起きない」形で表面化する。
+  // 設定値の誤りは通信失敗とは再試行の意味が違うので、BAD_CONFIG として区別する。
+  let url: URL;
+  try {
+    url = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
+    assertLocalHost(url);
+  } catch (error) {
+    return { ok: false, reason: "BAD_CONFIG", detail: error instanceof Error ? error.message : String(error) };
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -736,7 +786,7 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
       if (controller.signal.aborted) throw parseError;
       return { ok: false, reason: "MALFORMED", detail: "malformed ChunkListResponse" };
     }
-    if (!isChunkListResponse(body)) return { ok: false, reason: "MALFORMED", detail: "malformed ChunkListResponse" };
+    if (!isChunkListResponse(body, meetingId)) return { ok: false, reason: "MALFORMED", detail: "malformed ChunkListResponse" };
     missing = body.chunks.filter((c) => !c.registered);
   } catch (error) {
     // 本文読み取り中の abort もここへ来る。signal 由来かどうかで TIMEOUT と NETWORK を分ける。
@@ -747,22 +797,37 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
   } finally {
     clearTimeout(timer);
   }
+  // 一覧取得と同じ理由で、IndexedDB と Scheduler の失敗も結果型に落とす。
+  // getChunk / updateSaveState は QuotaExceededError や InvalidStateError（接続が閉じた
+  // 後の操作）で reject し、enqueue も内部で IndexedDB を触る。ここを try の外に置くと、
+  // 一覧取得だけを保護した意味がなくなり、同じボタンが同じ形で無反応になる。
   let requeued = 0;
   const unavailable: string[] = [];
-  for (const c of missing) {
-    const key = makeChunkKey(meetingId, c.source, c.sequenceNo);
-    const record = await deps.chunkStore.getChunk(key);
-    if (record === undefined || record.wav === null) {
-      unavailable.push(key);
-      continue;
+  try {
+    for (const c of missing) {
+      const key = makeChunkKey(meetingId, c.source, c.sequenceNo);
+      const record = await deps.chunkStore.getChunk(key);
+      if (record === undefined || record.wav === null) {
+        unavailable.push(key);
+        continue;
+      }
+      await deps.chunkStore.updateSaveState(key, (r) => {
+        r.save.status = "LOCAL_SAVE_PENDING";
+        r.save.savedVia = null;
+        r.save.serverPath = null;
+      });
+      await deps.scheduler.enqueue(key);
+      requeued++;
     }
-    await deps.chunkStore.updateSaveState(key, (r) => {
-      r.save.status = "LOCAL_SAVE_PENDING";
-      r.save.savedVia = null;
-      r.save.serverPath = null;
-    });
-    await deps.scheduler.enqueue(key);
-    requeued++;
+  } catch (error) {
+    // 途中まで積んだ分はそのまま残す。LOCAL_SAVE_PENDING は Phase 1 §16 の通常経路で
+    // 拾われるので、巻き戻すより進んだ状態を保つ方が Chunk を失わない。
+    // requeued 件数は detail に載せ、UI が「途中まで再送キューに積んだ」ことを言えるようにする。
+    return {
+      ok: false,
+      reason: "STORAGE",
+      detail: `local store failed after ${requeued} requeued: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
   return { ok: true, report: { missingOnServer: missing.length, requeued, unavailable } };
 }
@@ -772,7 +837,20 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
 
 一覧取得に失敗した場合は `{ ok: false }` を返し、UI は「サーバーに接続できませんでした [再試行]」を出す。例外にしないのは、この関数が設定画面のボタンから呼ばれ、未捕捉の例外が「押しても何も起きない」という形で表面化しやすいためである。IndexedDB 側は何も変更しないので、そのまま再試行できる。
 
-この方針は本文のパースにも適用する。`NETWORK` / `TIMEOUT` / `HTTP` だけを結果型にして本文を `as ChunkListResponse` で通すと、`chunks` が配列でない応答で直後の `.filter` が `TypeError` を投げ、例外にしないという方針がその一点だけ破れる（`res.json()` 自体も本文が JSON でなければ reject する）。`MALFORMED` を失敗理由に加え、パースと形状検証の両方を同じ結果型に落とす。UI の文言は「サーバーの応答を解釈できませんでした [再試行]」とし、接続失敗と区別する。\n\n期限（`timeoutMs`）はヘッダ受信までではなく**本文を読み切るまで**掛ける。`fetch()` の解決直後に `clearTimeout` すると、ヘッダだけ返して本文が流れてこない応答で `res.json()` が無期限に待ち、「無期限に待つと UI が戻らない」という `timeoutMs` の目的がその経路だけ達成されない。本文読み取り中の abort は `MALFORMED` ではなく `TIMEOUT` として返す——原因は応答の形ではなく期限切れであり、UI の文言と再試行の判断が変わるためである。
+この方針は本文のパースにも適用する。`NETWORK` / `TIMEOUT` / `HTTP` だけを結果型にして本文を `as ChunkListResponse` で通すと、`chunks` が配列でない応答で直後の `.filter` が `TypeError` を投げ、例外にしないという方針がその一点だけ破れる（`res.json()` 自体も本文が JSON でなければ reject する）。`MALFORMED` を失敗理由に加え、パースと形状検証の両方を同じ結果型に落とす。UI の文言は「サーバーの応答を解釈できませんでした [再試行]」とし、接続失敗と区別する。
+
+期限（`timeoutMs`）はヘッダ受信までではなく**本文を読み切るまで**掛ける。`fetch()` の解決直後に `clearTimeout` すると、ヘッダだけ返して本文が流れてこない応答で `res.json()` が無期限に待ち、「無期限に待つと UI が戻らない」という `timeoutMs` の目的がその経路だけ達成されない。本文読み取り中の abort は `MALFORMED` ではなく `TIMEOUT` として返す——原因は応答の形ではなく期限切れであり、UI の文言と再試行の判断が変わるためである。
+
+同じ理由で、**一覧取得の前後にある例外経路も結果型に含める**。`new URL()` は `baseUrl` が不正なら `TypeError` を、`assertLocalHost()` は許可 origin 外なら `Error` を投げ、`getChunk()` / `updateSaveState()` / `enqueue()` は IndexedDB の失敗（容量超過、接続が閉じた後の操作）で reject する。これらを捕捉しないと、保護したのは `fetch` 経路だけで、設定を間違えた場合とストレージが詰まった場合には同じボタンが同じように無反応になる。失敗理由は再試行の意味で分ける。
+
+| reason | 起点 | UI の文言と次の操作 |
+| --- | --- | --- |
+| `BAD_CONFIG` | `baseUrl` が不正、または許可 origin 外 | 「接続先の設定が正しくありません [設定を開く]」。再試行しても結果は変わらない |
+| `NETWORK` / `TIMEOUT` | 一覧取得の通信 | 「サーバーに接続できませんでした [再試行]」 |
+| `HTTP` / `MALFORMED` | 一覧取得の応答 | 「サーバーの応答を解釈できませんでした [再試行]」 |
+| `STORAGE` | IndexedDB / Scheduler | 「ローカル保存領域にアクセスできませんでした [再試行]」。一覧取得は成功しているので、再試行はサーバーではなくストレージ側の回復を待つ意味になる |
+
+`STORAGE` で返る場合、ループの途中まで積んだ分は巻き戻さない。`LOCAL_SAVE_PENDING` に落ちた Chunk は Phase 1 §16 の通常の保存経路が拾うので、進んだ状態を保つ方が Chunk を失わない。再実行しても、既に登録済みの Chunk は `registered=true` として一覧から外れるため二重に積まれることはない。
 
 ---
 
@@ -1179,6 +1257,38 @@ describe("Phase3Client の応答検証", () => {
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.code).toBe("MALFORMED");
   });
+
+  it("要求した meetingId と違う応答は、形が正しくても MALFORMED として返す", async () => {
+    // 会議を切り替えた直後に前の会議の応答が遅れて届くと、型検査だけでは通ってしまい、
+    // 別会議のセグメントや話者名が現在の会議として表示される
+    const live = await client('{"meetingId":"m-other","liveState":"RUNNING","segments":[],"cursor":1}').getLive("m-mine", 0);
+    expect(live.ok).toBe(false);
+    if (!live.ok) expect(live.code).toBe("MALFORMED");
+    const speakers = await client('{"meetingId":"m-other","speakers":[]}').getSpeakers("m-mine");
+    expect(speakers.ok).toBe(false);
+    const put = await client('{"meetingId":"m-other","liveSttEnabled":true,"allowed":true}').setLive("m-mine", true);
+    expect(put.ok).toBe(false);
+  });
+
+  it("getMeeting は backfill が読むフィールドまで検証する", async () => {
+    // status / latestSummaryVersion は §4 の backfill() がそのまま MeetingEvent に載せる。
+    // ここを通すと、壊れた値が失敗地点を受信側まで先送りされた形で現れる
+    const base = {
+      meetingId: "m", title: "t", status: "recording", chunkCounts: { mic: 1, system: 0 },
+      sttStatusCounts: {}, transcriptVersion: 1, latestSummaryVersion: null,
+      sttModelUsed: null, llmModelUsed: null, syncDriftMs: null,
+      liveState: "RUNNING", liveSttEnabled: true, languageRatio: { ja: 1 },
+      speakers: [], diarized: false, codecs: ["wav"],
+    };
+    const good = await client(JSON.stringify(base)).getMeeting("m");
+    expect(good.ok).toBe(true);
+    for (const bad of [{ status: "bogus" }, { status: undefined }, { latestSummaryVersion: "1" },
+                       { chunkCounts: undefined }, { chunkCounts: { mic: "1", system: 0 } }]) {
+      const res = await client(JSON.stringify({ ...base, ...bad })).getMeeting("m");
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.code).toBe("MALFORMED");
+    }
+  });
 });
 ```
 
@@ -1327,6 +1437,68 @@ describe("欠損 Chunk の逆同期", () => {
     for (let i = 0; i < 10; i++) await h.advance(100);
     expect(h.server.putCount).toBe(putsBefore + 1);
     expect((await h.chunkStore.getChunk(r0.chunkKey))?.save.status).toBe("DB_REGISTERED");
+  });
+
+  it("baseUrl が不正／許可 origin 外でも例外を投げず BAD_CONFIG として返す", async () => {
+    // new URL() と assertLocalHost() は throw する。設定画面のボタンから呼ばれる以上、
+    // ここを結果型の外に置くと「押しても何も起きない」形で表面化する
+    const h = await createHarness();
+    const neverCalled: typeof fetch = async () => {
+      throw new Error("fetch must not be called");
+    };
+    for (const baseUrl of ["not a url", "https://example.com"]) {
+      const result = await resyncMissingChunks(
+        { chunkStore: h.chunkStore, scheduler: h.scheduler, baseUrl, token: TOKEN, fetchImpl: neverCalled },
+        "m-bad",
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("BAD_CONFIG");
+    }
+  });
+
+  it("別会議の一覧応答は MALFORMED として捨て、再送キューに積まない", async () => {
+    // meetingId が文字列であることだけを見ると、この会議に存在しない Chunk を
+    // 「未登録」と見なして再送を始める
+    const h = await createHarness();
+    const otherMeeting: typeof fetch = async () =>
+      new Response(JSON.stringify({ meetingId: "m-other", chunks: [] }), { status: 200 });
+    const result = await resyncMissingChunks(
+      { chunkStore: h.chunkStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl: otherMeeting },
+      "m-mine",
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("MALFORMED");
+  });
+
+  it("IndexedDB の失敗を例外にせず STORAGE として返し、積んだ分は巻き戻さない", async () => {
+    const h = await createHarness();
+    const meetingId = "m-storage";
+    const r0 = await makeChunkRecord(meetingId, 0);
+    const r1 = await makeChunkRecord(meetingId, 1);
+    await h.chunkStore.putChunk(r0);
+    await h.chunkStore.putChunk(r1);
+    const entry = (sequenceNo: number) =>
+      ({ meetingId, source: "mic" as const, sequenceNo, sha256: "x", sizeBytes: 1, path: "p", registered: false });
+    const listAllMissing: typeof fetch = async () =>
+      new Response(JSON.stringify({ meetingId, chunks: [entry(0), entry(1)] }), { status: 200 });
+    let calls = 0;
+    const realEnqueue = h.scheduler.enqueue.bind(h.scheduler);
+    h.scheduler.enqueue = async (key: string) => {
+      calls++;
+      if (calls === 2) throw new DOMException("quota", "QuotaExceededError");
+      return await realEnqueue(key);
+    };
+    const result = await resyncMissingChunks(
+      { chunkStore: h.chunkStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl: listAllMissing },
+      meetingId,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("STORAGE");
+      expect(result.detail).toMatch(/after 1 requeued/);
+    }
+    // 1 件目は積んだまま残す（巻き戻すより進んだ状態を保つ方が Chunk を失わない）
+    expect((await h.chunkStore.getChunk(r0.chunkKey))?.save.status).toBe("LOCAL_SAVE_PENDING");
   });
 
   it("一覧取得がタイムアウトしても例外を投げず、失敗として返す", async () => {
