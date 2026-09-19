@@ -2939,10 +2939,22 @@ class SummaryTopic(BaseModel):
     sourceSegmentIds: list[str] = Field(default_factory=list)
 
 
+class EvidenceSpan(BaseModel):
+    """quote が引用元セグメント本文のどこにあるかを示す半開区間 [start, end)（v4.0 §66.1）。"""
+    model_config = ConfigDict(extra="ignore")
+    segmentId: str
+    start: int
+    end: int
+
+
 class SummaryDecision(BaseModel):
+    """決定事項は主張単位。sourceSegmentIds だけでは「実在するIDを引きながら
+    そのセグメントが述べていない決定」を止められないため、逐語引用と位置を必須にする（v4.0 §66.1）。"""
     model_config = ConfigDict(extra="ignore")
     text: str
     sourceSegmentIds: list[str] = Field(default_factory=list)
+    quote: str
+    evidenceSpan: EvidenceSpan
 
 
 class SummaryActionItem(BaseModel):
@@ -2951,6 +2963,8 @@ class SummaryActionItem(BaseModel):
     assignee: str | None = None
     deadline: str | None = None
     sourceSegmentIds: list[str] = Field(default_factory=list)
+    quote: str
+    evidenceSpan: EvidenceSpan
 
 
 class MeetingSummaryDraft(BaseModel):
@@ -2964,6 +2978,10 @@ class MeetingSummaryDraft(BaseModel):
 
 RejectionReason = Literal[
     "SEGMENT_ID_NOT_FOUND", "SEGMENT_ID_EMPTY", "ASSIGNEE_NOT_IN_TRANSCRIPT", "DEADLINE_NOT_IN_TRANSCRIPT", "DUPLICATE",
+    # v4.0 §66.2 段階2
+    "QUOTE_NOT_VERBATIM",        # quote が引用元セグメント本文に逐語で存在しない
+    "EVIDENCE_SPAN_MISMATCH",    # evidenceSpan が quote の位置と一致しない／引用元IDを指していない
+    "CLAIM_NOT_SUPPORTED",       # claim（決定内容・タスク）が quote に裏付けられていない
 ]
 
 
@@ -2992,6 +3010,8 @@ class SummaryValidationReport(BaseModel):
 
 
 def draft_json_schema() -> dict[str, Any]:
+    """quote / evidenceSpan は必須フィールドなので、生成される JSON Schema の
+    required にも入る。LLM への指示（§19.3）と検証（§19.4）が同じ定義を出所とする。"""
     return MeetingSummaryDraft.model_json_schema()
 ```
 
@@ -3053,7 +3073,7 @@ from pydantic import ValidationError
 
 from ..jobs.retry import BusinessValidationError, SchemaValidationError
 from ..merge.normalize import normalize
-from .schema import MeetingSummaryDraft, RejectedItem, RejectionReason, SummaryActionItem, SummaryDecision, SummaryTopic
+from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionReason, SummaryActionItem, SummaryDecision, SummaryTopic
 
 # 期限らしい表現（日本語・英語）。網羅性は基本設計 §28 の持ち越し事項。
 _DEADLINE_HINTS = re.compile(
@@ -3083,7 +3103,11 @@ class SegmentIndex:
         self.id_len = id_len
         self.full_by_short: dict[str, str] = {}
         self.norm_by_full: dict[str, str] = {}
+        # evidenceSpan は「セグメント本文の文字位置」なので、正規化後ではなく
+        # 生テキストに対して照合する必要がある（normalize は句読点を落とし長さを変える）
+        self.raw_by_full: dict[str, str] = {}
         for full, text in segments.items():
+            self.raw_by_full[full] = text
             self.norm_by_full[full] = normalize(text)
             short = full[:id_len]
             if short in self.full_by_short and self.full_by_short[short] != full:
@@ -3100,6 +3124,49 @@ class SegmentIndex:
 
     def text_of(self, ids: list[str]) -> str:
         return " ".join(self.norm_by_full.get(i, "") for i in ids)
+
+    def raw_of(self, segment_id: str) -> str | None:
+        return self.raw_by_full.get(segment_id)
+
+
+def _bigrams(s: str) -> set[str]:
+    return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) >= 2 else ({s} if s else set())
+
+
+def _supported_by(claim: str, quote_norm: str, threshold: float = 0.5) -> bool:
+    """claim が quote に裏付けられているかの決定的な近似（v4.0 §66.2 段階2）。
+
+    完全一致を求めると言い換え・要約表現がすべて落ち、含意判定をLLMに任せると
+    検証がLLMの出力に依存して意味を失う。claim の文字バイグラムのうち quote に
+    現れる割合を見る。全く別の内容を書いた場合は 0 になり、要約的な言い換えは通る。
+    落ちた項目は破棄ではなく「要確認送り」（v4.0 §66.2）なので、閾値は控えめにする。
+    """
+    grams = _bigrams(normalize(claim))
+    if not grams:
+        return False
+    return len(grams & _bigrams(quote_norm)) / len(grams) >= threshold
+
+
+def _check_evidence(ids: list[str], quote: str, span: EvidenceSpan, index: SegmentIndex) -> tuple[str, list[RejectionReason]]:
+    """戻り値は (正規化済み quote, 却下理由)。ids は解決済みの完全IDであること。"""
+    reasons: list[RejectionReason] = []
+    # LLM には短縮IDを渡しているので、span 側も同じ解決を通す（§11.5）
+    target = index.resolve(span.segmentId)
+    if target is None or target not in ids:
+        # 引用していないセグメントを根拠位置に指定させない
+        return "", ["EVIDENCE_SPAN_MISMATCH"]
+    raw = index.raw_of(target)
+    if raw is None:
+        return "", ["EVIDENCE_SPAN_MISMATCH"]
+    if not (0 <= span.start < span.end <= len(raw)):
+        return "", ["EVIDENCE_SPAN_MISMATCH"]
+    if quote == "":
+        return "", ["QUOTE_NOT_VERBATIM"]
+    if quote not in raw:
+        reasons.append("QUOTE_NOT_VERBATIM")          # 逐語一致しない＝本文にない文を引用した
+    elif raw[span.start:span.end] != quote:
+        reasons.append("EVIDENCE_SPAN_MISMATCH")      # 本文にはあるが位置指定が別の場所
+    return normalize(quote), reasons
 
 
 def _check_ids(ids: list[str], index: SegmentIndex, unresolved: list[str]) -> tuple[list[str], list[RejectionReason]]:
@@ -3119,7 +3186,12 @@ def _check_ids(ids: list[str], index: SegmentIndex, unresolved: list[str]) -> tu
 
 
 def validate(draft: MeetingSummaryDraft, index: SegmentIndex) -> tuple[MeetingSummaryDraft, list[RejectedItem], list[str]]:
-    """段 3〜7。戻り値は (採用分, rejected, unresolved ids)。"""
+    """段 3〜7。戻り値は (採用分, rejected, unresolved ids)。
+
+    決定事項・ActionItem は段階2（v4.0 §66.2）を通ったものだけを採用分に載せる。
+    落ちた項目は rejected に入り、呼び出し側が「要確認」として利用者に提示する。
+    MeetingSummary として確定するのはこの採用分だけである。
+    """
     unresolved: list[str] = []
     rejected: list[RejectedItem] = []
     seen: set[tuple[str, str]] = set()
@@ -3139,6 +3211,10 @@ def validate(draft: MeetingSummaryDraft, index: SegmentIndex) -> tuple[MeetingSu
     decisions: list[SummaryDecision] = []
     for d in draft.decisions:
         ids, reasons = _check_ids(d.sourceSegmentIds, index, unresolved)
+        quote_norm, quote_reasons = _check_evidence(ids, d.quote, d.evidenceSpan, index)
+        reasons.extend(quote_reasons)                               # 段階2（v4.0 §66.2）
+        if not quote_reasons and not _supported_by(d.text, quote_norm):
+            reasons.append("CLAIM_NOT_SUPPORTED")
         key = ("decision", normalize(d.text))
         if key in seen:
             reasons.append("DUPLICATE")
@@ -3146,16 +3222,23 @@ def validate(draft: MeetingSummaryDraft, index: SegmentIndex) -> tuple[MeetingSu
         if reasons:
             rejected.append(RejectedItem(kind="decision", item=d.model_dump(), reasons=reasons))
         else:
-            decisions.append(SummaryDecision(text=d.text, sourceSegmentIds=ids))
+            decisions.append(SummaryDecision(text=d.text, sourceSegmentIds=ids, quote=d.quote, evidenceSpan=d.evidenceSpan))
 
     actions: list[SummaryActionItem] = []
     for a in draft.actionItems:
         ids, reasons = _check_ids(a.sourceSegmentIds, index, unresolved)
-        evidence = index.text_of(ids)
+        quote_norm, quote_reasons = _check_evidence(ids, a.quote, a.evidenceSpan, index)
+        reasons.extend(quote_reasons)
+        # 担当者・期限は引用元セグメント全体ではなく quote に現れることを求める。
+        # セグメント全体を根拠にすると、同じセグメントに出てくる別人の名前を
+        # 担当者として書いた項目が通ってしまう（v4.0 §66.1 の典型的な失敗）
+        evidence = quote_norm
         if a.assignee and normalize(a.assignee) not in evidence:
             reasons.append("ASSIGNEE_NOT_IN_TRANSCRIPT")            # 段 4（v4.0 §63）
         if a.deadline and not (_DEADLINE_HINTS.search(evidence) or normalize(a.deadline) in evidence):
             reasons.append("DEADLINE_NOT_IN_TRANSCRIPT")            # 段 5
+        if not quote_reasons and not _supported_by(a.task, quote_norm):
+            reasons.append("CLAIM_NOT_SUPPORTED")
         key = ("action", normalize(a.task))
         if key in seen:
             reasons.append("DUPLICATE")                             # 段 6
@@ -3163,7 +3246,8 @@ def validate(draft: MeetingSummaryDraft, index: SegmentIndex) -> tuple[MeetingSu
         if reasons:
             rejected.append(RejectedItem(kind="actionItem", item=a.model_dump(), reasons=reasons))
         else:
-            actions.append(SummaryActionItem(task=a.task, assignee=a.assignee, deadline=a.deadline, sourceSegmentIds=ids))
+            actions.append(SummaryActionItem(task=a.task, assignee=a.assignee, deadline=a.deadline, sourceSegmentIds=ids,
+                                             quote=a.quote, evidenceSpan=a.evidenceSpan))
 
     if not draft.summary.strip():                                   # 段 7
         raise BusinessValidationError("summary is empty")
@@ -4356,13 +4440,20 @@ def silence_pcm(seconds: float) -> bytes:
 
 def valid_summary_response(req: LLMRequest) -> str:
     """transcript 中の [seg:xxxxxxxx] を根拠として引用する、検証を通る応答。"""
-    ids = re.findall(r"\[seg:([0-9a-f]{8,12})\]", req.user)
-    first = ids[:1]
+    # 段階2（v4.0 §66.2）を通すには、逐語引用とその位置まで揃える必要がある。
+    # 本文を伴わないダミー応答にすると検証が素通りし、回帰テストの意味がなくなる
+    hits = re.findall(r"\[seg:([0-9a-f]{8,12})\]\s*(.*)", req.user)
+    first = hits[:1]
+    ids = [h[0] for h in first]
+    quote = first[0][1] if first else ""
+    span = {"segmentId": ids[0], "start": 0, "end": len(quote)} if first else {"segmentId": "", "start": 0, "end": 0}
+    evidence = {"sourceSegmentIds": ids, "quote": quote, "evidenceSpan": span}
     return json.dumps({
         "summary": "テスト会議の要約",
-        "topics": [{"title": "話題A", "description": "説明", "sourceSegmentIds": first}],
-        "decisions": [{"text": "決定1", "sourceSegmentIds": first}],
-        "actionItems": [{"task": "タスク1", "assignee": None, "deadline": None, "sourceSegmentIds": first}],
+        "topics": [{"title": "話題A", "description": "説明", "sourceSegmentIds": ids}],
+        # claim は quote に裏付けられている必要があるので、引用本文から作る
+        "decisions": [{"text": quote, **evidence}],
+        "actionItems": [{"task": quote, "assignee": None, "deadline": None, **evidence}],
     }, ensure_ascii=False)
 
 
@@ -5009,6 +5100,13 @@ def test_parse_draft_stage1_and_2() -> None:
     assert d.topics[0].title == "t"
 
 
+# SEGS の本文をそのまま引用する根拠（段階2 を通る形）
+QA = SEGS[A]                                            # 田中さんが来週までに仕様書を更新します
+QB = SEGS[B]                                            # 予算は据え置きで決定しました
+EV_A = {"quote": QA, "evidenceSpan": {"segmentId": A[:8], "start": 0, "end": len(QA)}}
+EV_B = {"quote": QB, "evidenceSpan": {"segmentId": B[:8], "start": 0, "end": len(QB)}}
+
+
 def test_validate_stage3_to_7() -> None:
     index = SegmentIndex(SEGS)
     draft = _draft(
@@ -5016,25 +5114,54 @@ def test_validate_stage3_to_7() -> None:
                 {"title": "幻覚", "description": "d", "sourceSegmentIds": ["deadbeef"]},
                 {"title": "空", "description": "d", "sourceSegmentIds": []},
                 {"title": "仕様", "description": "dup", "sourceSegmentIds": [A[:8]]}],
-        decisions=[{"text": "予算据え置き", "sourceSegmentIds": [B[:8]]}],
-        actionItems=[{"task": "仕様書更新", "assignee": "田中", "deadline": "来週", "sourceSegmentIds": [A[:8]]},
-                     {"task": "捏造担当", "assignee": "佐藤", "deadline": None, "sourceSegmentIds": [A[:8]]},
-                     {"task": "捏造期限", "assignee": None, "deadline": "月末", "sourceSegmentIds": [B[:8]]}],
+        decisions=[{"text": "予算は据え置き", "sourceSegmentIds": [B[:8]], **EV_B}],
+        actionItems=[{"task": "仕様書を更新", "assignee": "田中", "deadline": "来週", "sourceSegmentIds": [A[:8]], **EV_A},
+                     {"task": "仕様書を更新", "assignee": "佐藤", "deadline": None, "sourceSegmentIds": [A[:8]], **EV_A},
+                     {"task": "予算を確定", "assignee": None, "deadline": "月末", "sourceSegmentIds": [B[:8]], **EV_B}],
     )
     accepted, rejected, unresolved = validate(draft, index)
     assert [t.title for t in accepted.topics] == ["仕様"]
     assert accepted.topics[0].sourceSegmentIds == [A]                     # 短縮 ID → 完全 ID
     assert len(accepted.decisions) == 1
-    assert [a.task for a in accepted.actionItems] == ["仕様書更新"]
-    reasons = {(r.kind, r.item.get("title") or r.item.get("task")): r.reasons for r in rejected}
+    assert [a.task for a in accepted.actionItems] == ["仕様書を更新"]
+    reasons = {(r.kind, r.item.get("title") or r.item.get("assignee") or r.item.get("task")): r.reasons for r in rejected}
     assert reasons[("topic", "幻覚")] == ["SEGMENT_ID_NOT_FOUND"]
     assert reasons[("topic", "空")] == ["SEGMENT_ID_EMPTY"]
     assert reasons[("topic", "仕様")] == ["DUPLICATE"]
-    assert reasons[("actionItem", "捏造担当")] == ["ASSIGNEE_NOT_IN_TRANSCRIPT"]
-    assert reasons[("actionItem", "捏造期限")] == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons[("actionItem", "佐藤")] == ["ASSIGNEE_NOT_IN_TRANSCRIPT", "DUPLICATE"]
+    assert reasons[("actionItem", "予算を確定")] == ["DEADLINE_NOT_IN_TRANSCRIPT", "CLAIM_NOT_SUPPORTED"]
     assert unresolved == ["deadbeef"]
     with pytest.raises(BusinessValidationError):
         validate(_draft(summary="   "), index)
+
+
+def test_validate_rejects_unquoted_and_misplaced_claims() -> None:
+    """sourceSegmentIds が実在するだけでは段階2 を通らない（v4.0 §66）。"""
+    index = SegmentIndex(SEGS)
+    off_by_one = {"quote": "予算は据え置き", "evidenceSpan": {"segmentId": B[:8], "start": 2, "end": 9}}
+    other_segment = {"quote": QB, "evidenceSpan": {"segmentId": A[:8], "start": 0, "end": len(QB)}}
+    draft = _draft(
+        decisions=[
+            # 実在するIDを引きながら、そのセグメントにない文を引用する
+            {"text": "全員リモート勤務へ移行", "sourceSegmentIds": [B[:8]],
+             "quote": "全員リモート勤務へ移行すると決定しました",
+             "evidenceSpan": {"segmentId": B[:8], "start": 0, "end": len(QB)}},
+            # 引用は本文にあるが、位置がずれている
+            {"text": "予算は据え置き", "sourceSegmentIds": [B[:8]], **off_by_one},
+            # 引用元として挙げていないセグメントを根拠位置に指定する
+            {"text": "予算は据え置きとする", "sourceSegmentIds": [B[:8]], **other_segment},
+            # 引用は正しいが、主張が引用に裏付けられていない
+            {"text": "来期の採用計画を承認", "sourceSegmentIds": [B[:8]], **EV_B},
+        ],
+    )
+    accepted, rejected, _ = validate(draft, index)
+    assert accepted.decisions == []
+    assert [r.reasons for r in rejected] == [
+        ["QUOTE_NOT_VERBATIM"],
+        ["EVIDENCE_SPAN_MISMATCH"],
+        ["EVIDENCE_SPAN_MISMATCH"],
+        ["CLAIM_NOT_SUPPORTED"],
+    ]
 
 
 def test_split_windows_respects_line_boundaries() -> None:
