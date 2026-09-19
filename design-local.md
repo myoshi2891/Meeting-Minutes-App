@@ -62,11 +62,11 @@ flowchart LR
 
 1. 次の7種類の成果物がすべて揃っている
    - ① TypeScriptインターフェース定義一式（`AudioPipelineConfig` / `SessionClock` / `ChunkTimingMetadata` / `VADConfig` / `VADResult` / `RecordingHealth` / ローカル保存State（Upload Stateに相当）の型。加えて`LocalBackendHealth`（ローカル常駐サーバーの起動状態を表す型）を含む）
-   - ② ローカル保存State Machineの状態遷移図（Mermaid形式。`GENERATED → IDB_STORED → LOCAL_SAVE_PENDING → SAVING → SAVED → DB_REGISTERED`、およびエラー分岐 `LOCAL_SAVE_FAILED / RETRYING / BACKEND_UNAVAILABLE` を含む全状態を網羅）
+   - ② ローカル保存State Machineの状態遷移図（Mermaid形式。`GENERATED → IDB_STORED → LOCAL_SAVE_PENDING → SAVING → SAVED → DB_REGISTERED`、およびエラー分岐 `LOCAL_SAVE_FAILED / RETRYING / BACKEND_UNAVAILABLE` を含む全状態を網羅）。ここでの`RETRYING`と`BACKEND_UNAVAILABLE`は**Phase 1のローカル保存先への再送**を指し、Phase 2のローカルQueueジョブのretry／DLQとは別の機構である
    - ③ IndexedDBスキーマ定義（object store名、keyPath、index、バージョン管理方法を含む）
    - ④ AudioWorkletProcessor実装コード（ネイティブsample rate取得 → 16kHzリサンプリング → モノラルミックス → Int16変換 → VADスコア算出 → 480,000サンプル蓄積 → WAV Builder呼び出しまでの一連の処理）
    - ⑤ WAVエンコーダ実装（44バイトWAVヘッダ生成を含む、PCM16 / Mono / 16kHz固定仕様に準拠）
-   - ⑥ テストコード（最低限「60分連続録音」「ローカル常駐サーバー停止5分からの復旧」「ブラウザクラッシュ後のIndexedDB復旧」「Chunk単体再生可能性の検証」の4パターンを含む）
+   - ⑥ テストコード（最低限「60分連続録音」「ローカル常駐サーバー停止5分からの復旧」（ローカル保存の再送で未保存Chunkが取り戻せることの検証。Queueのretryではない）「ブラウザクラッシュ後のIndexedDB復旧」「Chunk単体再生可能性の検証」の4パターンを含む）
    - ⑦ v4.0のDefinition of Doneチェックリスト（Audio / Network項目相当。ネットワーク断はローカル常駐サーバーの起動断に読み替える）に対する対応状況の明記
 2. v4.0の10個のInvariant（Invariant 1〜10）を一つも破っていないことが、設計書内の記述から明示的に確認できる（各Invariantに対応する設計上の担保箇所が示されている）
 3. v4.0で明確に否定された以下3つの誤った前提を再び採用していない
@@ -85,6 +85,10 @@ flowchart LR
   - ブラウザから`fetch`でlocalhost上の常駐APIサーバーへPUT/POSTする方式
   - File System Access API等でブラウザから直接ローカルファイルシステムへ書き出す方式
   - 上記いずれの方式でも、外部クラウドへの通信が一切発生しないことを設計上どう保証するか（CSP設定、通信先ホストのallowlist化等）を併記する
+  - ローカルAPIサーバー方式を採る場合、**サーバープロセス側のegress制御**も併記すること。CSPはブラウザの発信先しか縛らず、受け取ったWAVをサーバープロセスが外部へ送り出す経路には一切効かないため、CSPだけでは「外部クラウドへ出ない」ことの保証にならない。最低限、次の3点を明記する
+    - サーバーが接続してよい宛先ホストのallowlist（Phase 1では原則として空。ループバック内のプロセス間通信のみを許容し、モデル配布元等が必要な場合は取得タイミングと宛先を列挙する）
+    - allowlist外への接続を**拒否する仕組み**（OSファイアウォールのアウトバウンド規則、コンテナ実行時のネットワーク分離、プロキシ不使用の明示など、プロセスの善意に依存しない手段）
+    - 外部へ通信していないことの**検証方法**（録音〜保存の一連の操作中にアウトバウンド接続をパケットキャプチャ／`lsof`等で観測し、ループバック以外の宛先が現れないことを確認する手順。受け入れ時に実施可能な形で記述する）
 - Phase 1の範囲内では、ローカルQueue／ローカルDB／ローカルSTT／ローカル要約サービス（候補：SQLiteベースのジョブテーブル、faster-whisper／whisper.cpp、Ollama等）は「後続フェーズとの接続点」の説明にとどめ、実装コードは書かない
 - MediaRecorderのtimesliceベースのBlob生成は録音のSource of Truthとして採用しない（AudioWorkletベースのPCM生成のみを正とする）
 - 出力形式はMarkdown。コードブロックには`typescript`等の言語タグを付与する
@@ -95,7 +99,7 @@ flowchart LR
 
 ## 【やらないこと】
 
-- Phase 2（System Audio、サーバー側の高精度VAD〈Silero等〉、ローカルQueue、Retry、DLQ）およびPhase 3（Live STT、Speaker分離、FLAC移行、高度な復旧処理）の実装設計には踏み込まない（v4.0内での位置づけへの言及のみ可）。ただしPhase 1では、AudioWorklet内でフレームごとのRMSエネルギーから`vadScore`を算出し、ハングオーバー付きのしきい値判定で`hasVoice`を決めるところまでを実装範囲に含める（完了条件は両値を`ChunkTimingMetadata`に記録してローカル保存先へ渡すことまで）。Silero VAD等の学習済みモデルによる高精度化と、VADスコアに基づくSTTスキップ判断はPhase 2の範囲であり、ブラウザ側VADは「STTスキップ候補のヒント」に留める
+- Phase 2（System Audio、サーバー側の高精度VAD〈Silero等〉、ローカルQueue、**Queueジョブのretryとその失敗先であるDLQ**）およびPhase 3（Live STT、Speaker分離、FLAC移行、高度な復旧処理）の実装設計には踏み込まない（v4.0内での位置づけへの言及のみ可）。ただしPhase 1では、AudioWorklet内でフレームごとのRMSエネルギーから`vadScore`を算出し、ハングオーバー付きのしきい値判定で`hasVoice`を決めるところまでを実装範囲に含める（完了条件は両値を`ChunkTimingMetadata`に記録してローカル保存先へ渡すことまで）。Silero VAD等の学習済みモデルによる高精度化と、VADスコアに基づくSTTスキップ判断はPhase 2の範囲であり、ブラウザ側VADは「STTスキップ候補のヒント」に留める
 - ローカルSTT／ローカル要約／ローカルDB／エディタといった外部（クラウド・ローカル問わず）サービスそのものの実装コードは書かない（採用ツールが何であってもPhase 1の対象外）
 - DBスキーマ（meetings / audio_chunks / processing_jobsテーブル）の全面的な再設計は行わない。ローカル保存方式への変更に伴う軽微な追随的変更（例：カラム名、ストレージURLをローカルパスに読み替える等）以外は、Phase 1に必要な範囲でのみ参照する
 - v4.0で定義された10個のInvariantを緩和・変更する提案は行わない

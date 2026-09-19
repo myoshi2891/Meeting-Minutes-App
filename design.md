@@ -60,11 +60,11 @@ flowchart LR
 
 1. 次の7種類の成果物がすべて揃っている
    - ① TypeScriptインターフェース定義一式（`AudioPipelineConfig` / `SessionClock` / `ChunkTimingMetadata` / `VADConfig` / `VADResult` / `RecordingHealth` / Upload Stateの型）
-   - ② Upload State Machineの状態遷移図（Mermaid形式。`GENERATED → IDB_STORED → UPLOAD_PENDING → UPLOADING → UPLOADED → DB_REGISTERED`、およびエラー分岐 `UPLOAD_FAILED / RETRYING` を含む全状態を網羅）
+   - ② Upload State Machineの状態遷移図（Mermaid形式。`GENERATED → IDB_STORED → UPLOAD_PENDING → UPLOADING → UPLOADED → DB_REGISTERED`、およびエラー分岐 `UPLOAD_FAILED / RETRYING` を含む全状態を網羅）。ここでの`RETRYING`は**Phase 1の保存先（オブジェクトストレージ）へのアップロード再送**を指し、Phase 2のQueueジョブのretry／DLQとは別の機構である
    - ③ IndexedDBスキーマ定義（object store名、keyPath、index、バージョン管理方法を含む）
    - ④ AudioWorkletProcessor実装コード（ネイティブsample rate取得 → 16kHzリサンプリング → モノラルミックス → Int16変換 → VADスコア算出 → 480,000サンプル蓄積 → WAV Builder呼び出しまでの一連の処理）
    - ⑤ WAVエンコーダ実装（44バイトWAVヘッダ生成を含む、PCM16 / Mono / 16kHz固定仕様に準拠）
-   - ⑥ テストコード（最低限「60分連続録音」「Wi-Fi切断5分からの復旧」「ブラウザクラッシュ後のIndexedDB復旧」「Chunk単体再生可能性の検証」の4パターンを含む）
+   - ⑥ テストコード（最低限「60分連続録音」「Wi-Fi切断5分からの復旧」（アップロード再送で未送信Chunkが取り戻せることの検証。Queueのretryではない）「ブラウザクラッシュ後のIndexedDB復旧」「Chunk単体再生可能性の検証」の4パターンを含む）
    - ⑦ v4.0のDefinition of Doneチェックリスト（Audio / Network項目相当）に対する対応状況の明記
 2. v4.0の10個のInvariant（Invariant 1〜10）を一つも破っていないことが、設計書内の記述から明示的に確認できる（各Invariantに対応する設計上の担保箇所が示されている）
 3. v4.0で明確に否定された以下3つの誤った前提を再び採用していない
@@ -89,7 +89,7 @@ flowchart LR
 
 ## 【やらないこと】
 
-- Phase 2（System Audio、サーバー側の高精度VAD〈Silero等〉、Cloudflare Queue、Retry、DLQ）およびPhase 3（Live STT、Speaker分離、FLAC移行、高度な復旧処理）の実装設計には踏み込まない（v4.0内での位置づけへの言及のみ可）。ただしPhase 1では、AudioWorklet内でフレームごとのRMSエネルギーから`vadScore`を算出し、ハングオーバー付きのしきい値判定で`hasVoice`を決めるところまでを実装範囲に含める（完了条件は両値を`ChunkTimingMetadata`に記録してローカル保存先へ渡すことまで）。Silero VAD等の学習済みモデルによる高精度化と、VADスコアに基づくSTTスキップ判断はPhase 2の範囲であり、ブラウザ側VADは「STTスキップ候補のヒント」に留める
+- Phase 2（System Audio、サーバー側の高精度VAD〈Silero等〉、Cloudflare Queue、**Queueジョブのretryとその失敗先であるDLQ**）およびPhase 3（Live STT、Speaker分離、FLAC移行、高度な復旧処理）の実装設計には踏み込まない（v4.0内での位置づけへの言及のみ可）。ただしPhase 1では、AudioWorklet内でフレームごとのRMSエネルギーから`vadScore`を算出し、ハングオーバー付きのしきい値判定で`hasVoice`を決めるところまでを実装範囲に含める（完了条件は両値を`ChunkTimingMetadata`に記録してローカル保存先へ渡すことまで）。Silero VAD等の学習済みモデルによる高精度化と、VADスコアに基づくSTTスキップ判断はPhase 2の範囲であり、ブラウザ側VADは「STTスキップ候補のヒント」に留める
 - STT／要約／DB／エディタといった外部サービスそのものの実装コードは書かない（採用ベンダーが何であってもPhase 1の対象外）
 - DBスキーマ（meetings / audio_chunks / processing_jobsテーブル）の全面的な再設計は行わない。ストレージ選定変更に伴う軽微な追随的変更（例：カラム名）以外は、Phase 1に必要な範囲でのみ参照する
 - v4.0で定義された10個のInvariantを緩和・変更する提案は行わない
