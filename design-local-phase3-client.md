@@ -291,7 +291,7 @@ export class Phase3Client {
     try {
       const headers: Record<string, string> = { Authorization: `Bearer ${this.config.token}` };
       if (body !== undefined) headers["Content-Type"] = "application/json";
-      const res = await this.fetchImpl(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal, credentials: "omit" });
+      const res = await this.fetchImpl(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal, credentials: "omit", redirect: "error" });
       const json: unknown = res.status === 204 ? null : await res.json().catch(() => null);
       if (res.ok) {
         const value = decode(json);
@@ -457,11 +457,13 @@ stateDiagram-v2
 
 どの遷移も録音経路（Phase 1 §15〜§17）には触れない。`STOPPED` は「Live のプレビューが止まった」状態であり、録音・保存・確定 STT はそのまま進む。
 
-`disable()` による遷移は `PUT /live` がサーバーに受け付けられたときだけ起きる。応答を待たずにローカルを落とすと、サーバーが Live ジョブを回したまま UI だけ停止表示になる。失敗時は状態を据え置き、`poll()` が返す `liveState` との突き合わせに委ねる。
+`disable()` による遷移は `PUT /live` がサーバーに受け付けられたときだけ起きる。応答を待たずにローカルを落とすと、サーバーが Live ジョブを回したまま UI だけ停止表示になる。**「受け付けられた」の条件は `ok` かつ `allowed=true` かつ `liveSttEnabled=false` の 3 つが揃うことである**——`allowed=false` は要求自体を拒んだ回答、`liveSttEnabled=true` は無効化が反映されなかった回答であり、どちらも 200 で返りうる。状態 `ok` だけを見ると、この 2 つを「停止できた」と誤読する。条件を満たさない応答と失敗応答はいずれも状態を据え置き、`poll()` が返す `liveState` との突き合わせに委ねる。
 
 `enable()` も同じ規律に従う。失敗応答は `code` を問わず（`NETWORK` / `TIMEOUT` も 5xx も）「サーバーが有効化を受け付けたかどうか不明」であって無効の確認ではないため、状態を据え置いて `poll()` に委ねる。`DISABLED` へ落とすのは、サーバーが応答を返したうえで `liveSttEnabled=false` と回答した場合だけである。不明な失敗で `enabled=false` にすると、`onRecordingHealth()` の `!enabled` 早期 return が停止要求まで抑止し、サーバーが Live を回したままの食い違いが自動では戻らなくなる。
 
-**`poll()` は single-flight で、状態同期はサーバーの `liveState` を正とする。** SSE 再接続と定期タイマーが同時に呼びうるため、実行中の 1 本があればその Promise を共有し、`getLive` は常に 1 本だけ飛ばす。並走を許すと先に投げた古い応答が後着して `liveState` / `stopReason` / `cursor` / `lastUpdatedAt` を巻き戻す。応答が `DISABLED` を返したときは `state` だけでなく `enabled` も落とす（`enabled` は「サーバーで確認済みの有効状態」であり、片方だけ同期すると `onRecordingHealth()` が有効と誤認して無効な会議へ停止要求を投げる）。通信失敗で `STOPPED`（`stopReason=SERVER`）に倒すのは `RUNNING` / `DEGRADED` のときだけで、`DISABLED` / `STARTING` / `STOPPED` は据え置く。回っていなかった会議まで停止扱いにすると、偽の停止理由が UI に出る。
+**`poll()` は single-flight で、状態同期はサーバーの `liveState` を正とする。** SSE 再接続と定期タイマーが同時に呼びうるため、実行中の 1 本があればその Promise を共有し、`getLive` は常に 1 本だけ飛ばす。並走を許すと先に投げた古い応答が後着して `liveState` / `stopReason` / `cursor` / `lastUpdatedAt` を巻き戻す。`enabled` は `state` と同じ応答から導き、`liveState === "DISABLED"` のときだけ `false`、それ以外（`STOPPED` を含む）は `true` にする。サーバーの `compute_live_state()`（サーバー側 §10）は `live_stt_enabled=false` のときだけ `DISABLED` を返し、`STOPPED` は「有効だが止まっている」を表すためである。片方だけ同期すると `onRecordingHealth()` が有効・無効のどちらにも誤認しうる（無効な会議へ停止要求を投げる／`STOPPED` から `enable()` で再開した会議を無効と見なして停止要求を出せない）。通信失敗で `STOPPED`（`stopReason=SERVER`）に倒すのは `RUNNING` / `DEGRADED` のときだけで、`DISABLED` / `STARTING` / `STOPPED` は据え置く。回っていなかった会議まで停止扱いにすると、偽の停止理由が UI に出る。
+
+**single-flight だけでは足りず、`enable()` / `disable()` との交差も切る。** `inFlightPoll` が防ぐのは poll 同士の後着だけで、飛行中の `getLive` と `enable()` / `disable()` が交差すると、要求より前のサーバー状態を写した応答が確定済みの `enabled` / `state` を巻き戻す。`enable()` / `disable()` がサーバー応答で状態を確定させるたびに世代カウンタ（`opGeneration`）を進め、`pollOnce()` は開始時の世代を捕まえて、応答が戻った時点で進んでいたら応答ごと捨てる。捨てた分は次の `poll()` が同じ `cursor` から取り直すのでセグメントは落ちない。
 
 **`poll()` のカーソルは包括境界である。** サーバーは `since` を含む条件（`created_at >= ?`）でセグメントを返し、クライアントは受け取った最大 `created_at` を次の `since` にする。`created_at` は epoch ms であり、1 回の `live_transcribe_chunk` ジョブが複数セグメントを同じ `now_ms()` の値で書き込むため、一意でも単調増加でもない。ここを排他境界（`>`）にすると、`cursor` と同じミリ秒に後から挿入されたセグメントが次回以降の検索条件から永久に外れ、SSE も取りこぼしていた場合は復元不能になる。
 
@@ -496,6 +498,7 @@ export class LiveTranscriptStore {
   private state: LiveTranscriptState;
   private readonly byId = new Map<string, LiveSegment>();
   private inFlightPoll: Promise<void> | null = null;
+  private opGeneration = 0;   // enable() / disable() がサーバー応答で状態を確定させるたびに進む
 
   constructor(private readonly deps: LiveTranscriptDeps, meetingId: string, initial: { enabled: boolean; state: LiveState }) {
     this.state = { meetingId, enabled: initial.enabled, state: initial.state, stopReason: null, segments: [], cursor: 0, lastUpdatedAt: null };
@@ -523,7 +526,12 @@ export class LiveTranscriptStore {
   }
 
   private async pollOnce(): Promise<void> {
+    // single-flight は poll 同士の後着しか防げない。飛行中の getLive と enable() / disable() が
+    // 交差すると、要求より前のサーバー状態を写した応答が、確定済みの enabled / state を巻き戻す。
+    // 開始時の世代を捕まえ、戻った時点で進んでいたら応答ごと捨てる（次の poll が取り直す）。
+    const generation = this.opGeneration;
     const res = await this.deps.getLive(this.state.meetingId, this.state.cursor);
+    if (generation !== this.opGeneration) return;   // 応答中に enable() / disable() が状態を確定させた
     if (!res.ok) {
       // NETWORK / TIMEOUT は「回っていたはずの Live が切れた」ときだけ STOPPED に倒す。
       // DISABLED / STARTING / STOPPED まで巻き込むと、無効な会議を停止扱いにして stopReason を汚す。
@@ -532,10 +540,13 @@ export class LiveTranscriptStore {
       return;
     }
     this.upsert(res.value.segments);
-    // サーバーが DISABLED を返したら enabled も落とす。state だけ同期すると onRecordingHealth() が
-    // 有効と誤認し、既に無効な会議へ停止要求を投げ続ける（enabled は「サーバーで確認済みの有効状態」）。
+    // enabled はサーバーの liveState から導く。サーバー側 compute_live_state（サーバー側 §10）は
+    // live_stt_enabled=false のときだけ DISABLED を返し、STOPPED は「有効だが止まっている」を表す。
+    // したがって DISABLED なら false、それ以外（STOPPED を含む）は true が「サーバーで確認済みの有効状態」。
+    // 片方だけ同期すると onRecordingHealth() が有効／無効を誤認し、無効な会議へ停止要求を投げたり、
+    // 逆に有効なまま止まった会議へ停止要求を出せなくなる。
     this.set({ state: res.value.liveState, cursor: Math.max(this.state.cursor, res.value.cursor), lastUpdatedAt: this.deps.now(),
-               enabled: res.value.liveState === "DISABLED" ? false : this.state.enabled,
+               enabled: res.value.liveState !== "DISABLED",
                stopReason: res.value.liveState === "STOPPED" && this.state.stopReason === null ? "SERVER" : this.state.stopReason });
   }
 
@@ -550,6 +561,7 @@ export class LiveTranscriptStore {
   async enable(): Promise<boolean> {
     const res = await this.deps.setLive(this.state.meetingId, true);
     if (!res.ok) return false;                                              // 状態は変えず poll() に委ねる
+    this.opGeneration++;                                                    // 飛行中の poll 応答を無効化する
     if (!res.value.liveSttEnabled) {                                        // サーバーが明示的に無効と回答した
       this.set({ enabled: false, state: "DISABLED" });
       return false;
@@ -566,6 +578,10 @@ export class LiveTranscriptStore {
   async disable(reason: LiveStopReason): Promise<boolean> {
     const res = await this.deps.setLive(this.state.meetingId, false);
     if (!res.ok) return false;
+    // 200 でも「無効化された」とは限らない。allowed=false は要求そのものが拒まれた回答であり、
+    // liveSttEnabled=true は無効化が反映されなかったことを意味する。どちらも据え置いて poll() に委ねる。
+    if (!res.value.allowed || res.value.liveSttEnabled) return false;
+    this.opGeneration++;                                                    // 飛行中の poll 応答を無効化する
     this.set({ enabled: false, state: reason === "USER" ? "DISABLED" : "STOPPED", stopReason: reason });
     return true;
   }
@@ -792,7 +808,7 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
   // 無期限に待ち、設定画面のボタンが永久に返らない。timer の解除は全処理の完了後に行う。
   let missing: ChunkListResponse["chunks"];
   try {
-    const res = await fetchImpl(url, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", signal: controller.signal });
+    const res = await fetchImpl(url, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", signal: controller.signal, redirect: "error" });
     if (!res.ok) return { ok: false, reason: "HTTP", detail: `chunk list HTTP ${res.status}` };
     let body: unknown;
     try {
@@ -875,6 +891,8 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
 ## 7.1 `src/api/local-saver.ts`（変更）
 
 Phase 1 §17.1 の全文に、許可 origin の設定関数を加える。既定は loopback のみで、Phase 1・2 の挙動は変わらない。
+
+あわせて、サーバーへ出る `fetch` はすべて `redirect: "error"` にする（`Phase3Client.request()`、`resyncMissingChunks()`、`LocalSaver.put()`）。`assertLocalHost()` が検証するのは最初の URL だけで、既定の `redirect: "follow"` のままだと、リダイレクト応答を返すサーバー（または経路上の代理）に `Authorization` ヘッダと音声本文を検証していない別 origin まで運ばれうる。`"error"` なら `fetch` が `TypeError` で reject し、既存の catch が `NETWORK` として扱う。ローカル API はリダイレクトを返さないので、正常系の挙動は変わらない。
 
 ```typescript
 // src/api/local-saver.ts
@@ -980,6 +998,7 @@ export class LocalSaver {
         body: record.wav,
         signal: controller.signal,
         credentials: "omit",
+        redirect: "error",
       });
       return await this.interpret(response, record);
     } catch (error) {
@@ -997,10 +1016,18 @@ export class LocalSaver {
 
   private async interpret(response: Response, record: AudioChunkRecord): Promise<SaveOutcome> {
     const status = response.status;
+    const { meetingId, source, sequenceNo } = record.meta;
     if (status === 200 || status === 201) {
       const body: unknown = await response.json().catch(() => null);
       if (!isChunkResponse(body)) {
         return this.fail("SERVER", "malformed ChunkResponse", status);
+      }
+      // 応答が「いま送った Chunk のもの」であることを先に確かめる。別の会議・別トラック・別 seq の
+      // 応答をそのまま受けると、ハッシュ一致だけを頼りに他 Chunk の path を registered として記録し、
+      // 逆同期（§6）が実在しないファイルを正常扱いする。isChunkResponse（Phase 1 §17）は一覧応答と
+      // 共用するため sha256 / sizeBytes / registered しか見ない。同一性と path の型はここで確定させる。
+      if (body.meetingId !== meetingId || body.source !== source || body.sequenceNo !== sequenceNo || typeof body.path !== "string") {
+        return this.fail("SERVER", `ChunkResponse mismatch: server=${body.meetingId}/${body.source}/${body.sequenceNo} local=${meetingId}/${source}/${sequenceNo}`, status);
       }
       if (body.sha256 !== record.meta.sha256 || body.sizeBytes !== record.meta.sizeBytes) {
         return this.fail("HASH_MISMATCH", `server=${body.sha256}/${body.sizeBytes} local=${record.meta.sha256}/${record.meta.sizeBytes}`, status);
@@ -1125,15 +1152,17 @@ import type { ApiResult } from "../src/api/phase2-client";
 const seg = (id: string, startMs: number, createdAt: number): LiveSegment =>
   ({ id, source: "mic", startMs, endMs: startMs + 5000, text: id, language: "ja", confidence: 0.8, createdAt });
 
-function build(opts: { serverState?: LiveResponse["liveState"]; initialState?: LiveResponse["liveState"]; offline?: boolean; setLiveFails?: boolean; setLiveErrors?: boolean; setLiveReturnsDisabled?: boolean } = {}) {
+function build(opts: { serverState?: LiveResponse["liveState"]; initialState?: LiveResponse["liveState"]; offline?: boolean; setLiveFails?: boolean; setLiveErrors?: boolean; setLiveReturnsDisabled?: boolean; setLiveKeepsEnabled?: boolean; holdGetLive?: boolean } = {}) {
   let now = 1000;
   const states: LiveTranscriptState[] = [];
   const setCalls: boolean[] = [];
   let served: LiveSegment[] = [];
   let getCalls = 0;
+  let releaseGetLive: () => void = () => {};
   const deps = {
     getLive: async (_m: string, since: number): Promise<ApiResult<LiveResponse>> => {
       getCalls += 1;                                   // poll() の single-flight を検証するために数える
+      if (opts.holdGetLive === true) await new Promise<void>((r) => (releaseGetLive = r));   // 応答を飛行中のまま止める
       if (opts.offline === true) return { ok: false, status: 0, code: "NETWORK", message: "down" };
       // サーバーは since を含む境界で返す（§2.1・サーバー側 live_segments_since）。
       // ここを > にするとダブルだけが取りこぼしのない世界になり、回帰テストが素通りする
@@ -1146,13 +1175,15 @@ function build(opts: { serverState?: LiveResponse["liveState"]; initialState?: L
       if (opts.setLiveErrors === true) return { ok: false, status: 500, code: "INTERNAL", message: "boom" };
       // サーバーが要求を受け取ったうえで無効と回答する経路（allowed=false など）
       if (opts.setLiveReturnsDisabled === true) return { ok: true, status: 200, value: { meetingId: "m", liveSttEnabled: false, allowed: false } };
+      // 200 だが無効化が反映されていない経路（サーバーは Live を回したまま）
+      if (opts.setLiveKeepsEnabled === true) return { ok: true, status: 200, value: { meetingId: "m", liveSttEnabled: true, allowed: true } };
       return { ok: true, status: 200, value: { meetingId: "m", liveSttEnabled: enabled, allowed: true } };
     },
     now: () => now,
     onChange: (s: LiveTranscriptState) => states.push(s),
   };
   const store = new LiveTranscriptStore(deps, "m", { enabled: true, state: opts.initialState ?? "STARTING" });
-  return { store, states, setCalls, serve: (s: LiveSegment[]) => (served = s), tick: (ms: number) => (now += ms), getCalls: () => getCalls };
+  return { store, states, setCalls, serve: (s: LiveSegment[]) => (served = s), tick: (ms: number) => (now += ms), getCalls: () => getCalls, release: () => releaseGetLive() };
 }
 
 describe("LiveTranscriptStore", () => {
@@ -1224,6 +1255,46 @@ describe("LiveTranscriptStore", () => {
     expect(b.store.current.enabled).toBe(false);
     expect(await b.store.onRecordingHealth(["NO_AUDIO_FRAMES"])).toBe(false);
     expect(b.setCalls).toEqual([]);
+  });
+
+  it("poll() の enabled はサーバーの liveState に従い、STOPPED では有効のまま残す", async () => {
+    // STOPPED は「有効だが止まっている」（サーバー側 compute_live_state は live_stt_enabled=false の
+    // ときだけ DISABLED を返す）。ここで enabled を落とすと onRecordingHealth() の早期 return が
+    // 効いてしまい、サーバーが Live を回したままの会議へ停止要求を出せなくなる
+    const b = build({ serverState: "STOPPED", initialState: "STARTING" });
+    await b.store.poll();
+    expect(b.store.current.state).toBe("STOPPED");
+    expect(b.store.current.enabled).toBe(true);
+    expect(b.store.current.stopReason).toBe("SERVER");
+    expect(await b.store.onRecordingHealth(["NO_AUDIO_FRAMES"])).toBe(true);
+    expect(b.setCalls).toEqual([false]);
+  });
+
+  it("飛行中の poll 応答は disable() を跨いだら捨てる", async () => {
+    // single-flight が防ぐのは poll 同士の後着だけ。getLive の飛行中に disable() が確定すると、
+    // 後着した古い RUNNING が enabled / state を巻き戻す
+    const b = build({ holdGetLive: true, serverState: "RUNNING", initialState: "RUNNING" });
+    const inFlight = b.store.poll();
+    expect(await b.store.disable("USER")).toBe(true);
+    expect(b.store.current.state).toBe("DISABLED");
+    b.release();                                     // disable() の後に古い応答が戻る
+    await inFlight;
+    expect(b.store.current.state).toBe("DISABLED");
+    expect(b.store.current.enabled).toBe(false);
+  });
+
+  it("disable() は allowed=false や liveSttEnabled=true の 200 応答で状態を変えない", async () => {
+    // status だけを見ると、要求を拒んだ回答と反映されなかった回答を「停止できた」と誤読する
+    const denied = build({ setLiveReturnsDisabled: true });
+    expect(await denied.store.disable("USER")).toBe(false);
+    expect(denied.store.current.enabled).toBe(true);
+    expect(denied.store.current.state).toBe("STARTING");
+    expect(denied.store.current.stopReason).toBeNull();
+
+    const kept = build({ setLiveKeepsEnabled: true });
+    expect(await kept.store.disable("USER")).toBe(false);
+    expect(kept.store.current.enabled).toBe(true);
+    expect(kept.store.current.state).toBe("STARTING");
   });
 
   it("NO_AUDIO_FRAMES で Live を自動停止し、録音側の理由には触れない", async () => {
@@ -1454,7 +1525,7 @@ describe("言語バッジと要約言語", () => {
 import { afterEach, describe, expect, it } from "vitest";
 import { createHarness, makeChunkRecord, BASE_URL, TOKEN } from "./harness";
 import { resyncMissingChunks } from "../src/recording/resync";
-import { assertLocalHost, configureAllowedHosts, resetAllowedHosts } from "../src/api/local-saver";
+import { LocalSaver, assertLocalHost, configureAllowedHosts, resetAllowedHosts } from "../src/api/local-saver";
 import { applyConnection, validateConnection } from "../src/api/lan-settings";
 
 describe("欠損 Chunk の逆同期", () => {
@@ -1604,6 +1675,33 @@ describe("欠損 Chunk の逆同期", () => {
   });
 });
 
+describe("ChunkResponse の同一性検証", () => {
+  it("別 Chunk を指す応答は SERVER として捨て、registered として記録しない", async () => {
+    // sha256 と sizeBytes は一致しても、meetingId / source / sequenceNo が違えば別 Chunk の応答。
+    // そのまま受けると、逆同期（§6）が実在しないファイルを登録済みとして扱う
+    const record = await makeChunkRecord("m-1", 0);
+    const body = { meetingId: "m-1", source: "mic", sequenceNo: 1, sha256: record.meta.sha256,
+                   sizeBytes: record.meta.sizeBytes, path: "/data/m-1/mic/000001.wav", registered: true };
+    const saver = new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 },
+      async () => new Response(JSON.stringify(body), { status: 201, headers: { "Content-Type": "application/json" } }));
+    const out = await saver.put(record);
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error.kind).toBe("SERVER");
+  });
+
+  it("path が欠けた応答は serverPath に undefined を入れず SERVER として捨てる", async () => {
+    // isChunkResponse は一覧応答と共用するため path を見ない。ここで型を確かめないと、
+    // serverPath が undefined のまま DB_REGISTERED として記録される
+    const record = await makeChunkRecord("m-1", 0);
+    const body = { meetingId: "m-1", source: "mic", sequenceNo: 0, sha256: record.meta.sha256, sizeBytes: record.meta.sizeBytes, registered: true };
+    const saver = new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 },
+      async () => new Response(JSON.stringify(body), { status: 201, headers: { "Content-Type": "application/json" } }));
+    const out = await saver.put(record);
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error.kind).toBe("SERVER");
+  });
+});
+
 describe("LAN モードの許可ホスト", () => {
   afterEach(() => resetAllowedHosts());
 
@@ -1670,6 +1768,10 @@ describe("LAN モードの許可ホスト", () => {
 | 混在判定 0.6 と要約言語の選択規則 | `speakers-language.test.ts` |
 | `since` は境界を含み、同一 `createdAt` の後続挿入を取りこぼさない | `live-transcript.test.ts` |
 | 成功応答もエンドポイント別デコーダを通し、形状不一致は `MALFORMED` | `live-transcript.test.ts` |
+| `enabled` はサーバーの `liveState` から導く（`STOPPED` は有効のまま） | `live-transcript.test.ts` |
+| 飛行中の poll 応答は `enable()` / `disable()` の確定を跨いだら捨てる | `live-transcript.test.ts` |
+| `disable()` は `allowed=true` かつ `liveSttEnabled=false` でだけ反映 | `live-transcript.test.ts` |
+| `ChunkResponse` は同一 Chunk を指すことを検証してから registered 扱い | `resync-lan.test.ts` |
 | `registered=false` の逆同期 | `resync-lan.test.ts` |
 | 一覧応答の破損を例外にせず結果型で返す | `resync-lan.test.ts` |
 | LAN は許可ホスト + https 必須、既定は loopback のみ | `resync-lan.test.ts` |
