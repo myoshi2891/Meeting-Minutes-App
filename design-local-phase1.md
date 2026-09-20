@@ -1070,6 +1070,11 @@ export interface ApiErrorBody {
   readonly detail?: string;
 }
 
+/**
+ * 検証するのは全経路で共通して必要な 3 フィールドに限る。`meetingId` / `source` / `sequenceNo` /
+ * `path` は一覧応答（`ChunkListResponse.chunks`、Phase 3 §6）では省かれうるため、
+ * ここで必須にはしない。送信応答の同一性と `path` の型は §18 の `interpret()` が確かめる。
+ */
 export function isChunkResponse(value: unknown): value is ChunkResponse {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
@@ -1348,6 +1353,13 @@ class FrameVAD {
     this.scoreSum = 0;
     this.frameCount = 0;
     this.voicedSamples = 0;
+    // speechRun / hangoverLeft も Chunk 単位の集計状態として落とす。持ち越すと、直前 Chunk 末尾の
+    // 発話で立った hangover（300ms）が無音だけの Chunk に voicedSamples を積み、minSpeechMs（200ms）を
+    // 超えて hasVoice=true になる。無音 Chunk を STT / Live ジョブに流す誤判定は、境界をまたぐ発話の
+    // 先頭 200ms を数え直す代償より高くつく。frameBuf / frameFill は 160 サンプル境界の連続性を
+    // 保つためリセットしない（ここで捨てるとフレーム位相が Chunk ごとにずれる）。
+    this.speechRun = 0;
+    this.hangoverLeft = 0;
     return result;
   }
 }
@@ -1972,10 +1984,17 @@ export class LocalSaver {
 
   private async interpret(response: Response, record: AudioChunkRecord): Promise<SaveOutcome> {
     const status = response.status;
+    const { meetingId, source, sequenceNo } = record.meta;
     if (status === 200 || status === 201) {
       const body: unknown = await response.json().catch(() => null);
       if (!isChunkResponse(body)) {
         return this.fail("SERVER", "malformed ChunkResponse", status);
+      }
+      // 応答が「いま送った Chunk のもの」であることを先に確かめる。別の会議・別トラック・別 seq の
+      // 応答を受けると、他 Chunk の path を registered として記録することになる。
+      // isChunkResponse は 3 フィールドしか見ないので、serverPath に使う path の型もここで確定させる
+      if (body.meetingId !== meetingId || body.source !== source || body.sequenceNo !== sequenceNo || typeof body.path !== "string") {
+        return this.fail("SERVER", `ChunkResponse mismatch: server=${body.meetingId}/${body.source}/${body.sequenceNo} local=${meetingId}/${source}/${sequenceNo}`, status);
       }
       // v4.0 §93 相当：2xx だけでなくハッシュとサイズを照合する
       if (body.sha256 !== record.meta.sha256 || body.sizeBytes !== record.meta.sizeBytes) {
