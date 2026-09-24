@@ -11,7 +11,11 @@ export interface FinalizerDeps {
   readonly baseUrl: string;
   readonly token: string;
   readonly fetchImpl?: typeof fetch;
+  /** GET /chunks と POST /finalize それぞれのタイムアウト。既定 30000ms */
+  readonly timeoutMs?: number;
 }
+
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 export type FinalizeResult =
   | { readonly ok: true }
@@ -27,6 +31,7 @@ export type FinalizeResult =
  */
 export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const meeting = await deps.meetingStore.get(meetingId);
   if (meeting === undefined) return { ok: false, stage: "verify", detail: "meeting not found" };
 
@@ -46,15 +51,21 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
 
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
   assertLocalHost(listUrl);
+  // タイムアウトで abort すると fetch / json() が reject し、既存のエラー経路で Result になる
+  const listAbort = new AbortController();
+  const listTimer = setTimeout(() => listAbort.abort(), timeoutMs);
   let listRes: Response;
+  let list: unknown;
   try {
-    listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit" });
+    listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", signal: listAbort.signal });
+    // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
+    list = listRes.ok ? await listRes.json().catch(() => null) : null;
   } catch (error) {
     return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}` };
+  } finally {
+    clearTimeout(listTimer);
   }
   if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
-  // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
-  const list: unknown = await listRes.json().catch(() => null);
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
   for (const c of chunks) {
@@ -80,6 +91,8 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   };
   const finUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/finalize`, deps.baseUrl);
   assertLocalHost(finUrl);
+  const finAbort = new AbortController();
+  const finTimer = setTimeout(() => finAbort.abort(), timeoutMs);
   let finRes: Response;
   try {
     finRes = await fetchImpl(finUrl, {
@@ -87,12 +100,15 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
       headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
       credentials: "omit",
+      signal: finAbort.signal,
     });
   } catch (error) {
     // finalizing のまま残さない。次回の Barrier 再試行は stop_requested から行う
     meeting.status = "stop_requested";
     await deps.meetingStore.put(meeting);
     return { ok: false, stage: "finalize", detail: `finalize request failed: ${errorMessage(error)}` };
+  } finally {
+    clearTimeout(finTimer);
   }
   if (!finRes.ok) {
     meeting.status = "stop_requested";

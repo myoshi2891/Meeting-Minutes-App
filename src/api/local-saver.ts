@@ -107,9 +107,15 @@ export class LocalSaver {
     return {
       ok: false,
       error: { kind, message, httpStatus, at: performance.now() },
-      retryable: RETRYABLE.has(kind),
+      retryable: RETRYABLE.has(kind) && !isNonRetryableClientError(httpStatus),
     };
   }
+}
+
+/** 408 / 429 を除く 4xx は同じリクエストを送り直しても結果が変わらない（kind が UNKNOWN でも再試行しない）。 */
+function isNonRetryableClientError(httpStatus: number | null): boolean {
+  if (httpStatus === null || httpStatus < 400 || httpStatus >= 500) return false;
+  return httpStatus !== 408 && httpStatus !== 429;
 }
 
 function isApiErrorBody(value: unknown): value is ApiErrorBody {

@@ -49,6 +49,9 @@ async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response
     onBackendUnreachable: () => {
       backend.status = "UNREACHABLE";
     },
+    onBackendUnauthorized: () => {
+      backend.unauthorized = true;
+    },
   });
   const add = async (seq: number) => {
     const r = await makeChunkRecord("m", seq, 160);
@@ -130,6 +133,7 @@ describe("LocalSaveScheduler", () => {
       now: () => 0,
       setTimer: () => undefined,
       onBackendUnreachable: () => undefined,
+      onBackendUnauthorized: () => undefined,
     });
     const r = await makeChunkRecord("m", 9, 160);
     await s.chunkStore.putChunk(r);
@@ -149,5 +153,55 @@ describe("LocalSaveScheduler", () => {
     expect(s.stats().putCount).toBe(1);
     expect((await s.status(0))?.status).toBe("BACKEND_UNAVAILABLE");
     expect((await s.status(0))?.lastError?.kind).toBe("NETWORK");
+  });
+
+  it("401 は Monitor に unauthorized を通知して待機し、PUT を連打しない。resumeAll で再開する", async () => {
+    // Arrange：backend はまだ認証済みと認識しているがトークンが失効している
+    let tokenValid = false;
+    const s = await setup((r) => (tokenValid ? okResponse(r) : new Response(JSON.stringify({ error: "x", code: "UNAUTHORIZED" }), { status: 401 })));
+    // Act
+    await s.add(0);
+    for (let i = 0; i < 5; i++) await s.advance(10);
+    // Assert
+    expect(s.backend.unauthorized).toBe(true);
+    expect(s.stats().putCount).toBe(1);
+    expect((await s.status(0))?.status).toBe("BACKEND_UNAVAILABLE");
+
+    tokenValid = true;
+    s.backend.unauthorized = false;
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    expect(s.stats().putCount).toBe(2);
+  });
+
+  it("resumeAll で保存済みになった Chunk を、後から発火したリトライタイマーが再送しない", async () => {
+    const s = await setup((r, attempt) => (attempt === 1 ? new Response("{}", { status: 500 }) : okResponse(r)));
+    await s.add(0);
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("RETRYING");
+
+    await s.scheduler.resumeAll(); // backend 復帰通知などでタイマーより先に再投入される
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    expect(s.stats().putCount).toBe(2);
+
+    await s.advance(3_000); // リトライタイマー発火
+    expect(s.stats().putCount).toBe(2);
+    expect(s.health.pendingChunkCount).toBe(0);
+  });
+
+  it("同じ Chunk を二重に enqueue しても PUT は 1 回", async () => {
+    const s = await setup((r) => okResponse(r));
+    const r = await makeChunkRecord("m", 0, 160);
+    await s.chunkStore.putChunk(r);
+    s.backend.status = "UNREACHABLE";
+    await s.scheduler.enqueue(r.chunkKey);
+    await s.scheduler.enqueue(r.chunkKey);
+    s.backend.status = "HEALTHY";
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    await s.advance(0);
+    expect(s.stats().putCount).toBe(1);
   });
 });

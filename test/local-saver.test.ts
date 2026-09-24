@@ -96,7 +96,11 @@ describe("LocalSaver.put", () => {
     [507, "STORAGE_FULL", true],
     [500, "SERVER", true],
     [503, "SERVER", true],
-    [418, "UNKNOWN", true],
+    [418, "UNKNOWN", false],
+    [404, "UNKNOWN", false],
+    [413, "UNKNOWN", false],
+    [408, "UNKNOWN", true],
+    [429, "UNKNOWN", true],
   ] as const)("HTTP %i は %s（retryable=%s）", async (status, kind, retryable) => {
     const r = await makeChunkRecord("m1", 0, 160);
     const body = JSON.stringify({ error: "e", code: "INTERNAL" });

@@ -143,4 +143,27 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     };
     expect(await finalizeMeeting(deps(h, down), MEETING_ID)).toMatchObject({ ok: false, stage: "verify" });
   });
+
+  it("GET /chunks が応答しなければ timeoutMs で verify の失敗 Result を返す", async () => {
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    const hangsOnList: typeof fetch = (input, init) =>
+      String(input).endsWith("/chunks")
+        ? new Promise((_r, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason)))
+        : h.server.fetch(input, init);
+    const result = await finalizeMeeting({ ...deps(h, hangsOnList), timeoutMs: 20 }, MEETING_ID);
+    expect(result).toMatchObject({ ok: false, stage: "verify" });
+  });
+
+  it("POST /finalize が応答しなければ timeoutMs で finalize の失敗 Result を返し、stop_requested に戻る", async () => {
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    const hangsOnPost: typeof fetch = (input, init) =>
+      init?.method === "POST"
+        ? new Promise((_r, reject) => init.signal?.addEventListener("abort", () => reject(init.signal?.reason)))
+        : h.server.fetch(input, init);
+    const result = await finalizeMeeting({ ...deps(h, hangsOnPost), timeoutMs: 20 }, MEETING_ID);
+    expect(result).toMatchObject({ ok: false, stage: "finalize" });
+    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
+  });
 });

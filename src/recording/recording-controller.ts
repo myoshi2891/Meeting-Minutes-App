@@ -122,6 +122,9 @@ export class RecordingController {
     this.post({ type: "stop" });
     await flushed;
     await this.chunkQueue;
+    // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
+    this.meeting.updatedAt = Date.now();
+    await this.deps.meetingStore.put(this.meeting);
 
     this.sourceNode?.disconnect();
     this.node.port.onmessage = null;
@@ -236,9 +239,10 @@ export class RecordingController {
     try {
       await this.deps.chunkStore.putChunk(record);
     } catch (error) {
+      // 失敗理由を問わずメモリ待機に残す。sequenceNo は採番済みなので、捨てると欠番になり Finalizer が進めなくなる
+      this.memoryBacklog.push(record);
       if (isQuotaExceeded(error)) {
         // §3.4 段階3：メモリ待機。録音は止めない。
-        this.memoryBacklog.push(record);
         if (!this.deps.health.degradedReasons.includes("IDB_QUOTA_EXHAUSTED")) {
           this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "IDB_QUOTA_EXHAUSTED"];
         }

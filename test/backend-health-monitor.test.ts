@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { BackendHealthMonitor, type BackendHealthMonitorConfig } from "../src/api/backend-health-monitor";
 import { createInitialHealth } from "../src/recording/recording-health-monitor";
-import type { LocalBackendStatus } from "../src/types/recording";
+import type { LocalBackendCapabilities, LocalBackendStatus } from "../src/types/recording";
 
 const CONFIG: BackendHealthMonitorConfig = {
   baseUrl: "http://127.0.0.1:43117",
@@ -10,6 +10,19 @@ const CONFIG: BackendHealthMonitorConfig = {
   unreachableIntervalMs: 5_000,
   timeoutMs: 50,
   degradedLatencyMs: 1_000,
+};
+
+const CAPS: LocalBackendCapabilities = {
+  service: "minutes-local",
+  version: "0.1.0",
+  dataDir: "/data",
+  freeDiskBytes: 1,
+  gpu: { available: false, name: null, vramBytes: null },
+  cpuCores: 8,
+  totalMemoryBytes: 1,
+  sttModel: null,
+  llmModel: null,
+  maxConcurrentStt: 1,
 };
 
 function json(body: unknown, status = 200): Response {
@@ -75,7 +88,7 @@ describe("BackendHealthMonitor.checkOnce", () => {
     const health = createInitialHealth("running");
     let authorized = false;
     const m = new BackendHealthMonitor(CONFIG, health, async () =>
-      authorized ? json({ status: "ok", service: "minutes-local" }) : json({ error: "x", code: "UNAUTHORIZED" }, 401),
+      authorized ? json({ status: "ok", service: "minutes-local", capabilities: CAPS }) : json({ error: "x", code: "UNAUTHORIZED" }, 401),
     );
     const s1 = await m.checkOnce();
     expect(s1.unauthorized).toBe(true);
@@ -115,5 +128,68 @@ describe("BackendHealthMonitor.checkOnce", () => {
 
   it("外部ホストの baseUrl では生成できない", () => {
     expect(() => new BackendHealthMonitor({ ...CONFIG, baseUrl: "https://example.com" }, createInitialHealth("running"))).toThrow();
+  });
+
+  it("認証なしのヘルス応答（capabilities なし）では unauthorized を解除しない", async () => {
+    // Arrange：トークン不一致でも /v1/health は status と service だけを 200 で返す（§12）
+    const health = createInitialHealth("running");
+    const m = new BackendHealthMonitor(CONFIG, health, async () => json({ status: "ok", service: "minutes-local" }));
+    m.reportUnauthorized();
+    // Act
+    const s = await m.checkOnce();
+    // Assert
+    expect(s.unauthorized).toBe(true);
+    expect(health.degradedReasons).toContain("BACKEND_UNAUTHORIZED");
+  });
+
+  it("unauthorized の解除は status が変わらなくても onChange で通知される（保存再開の契機）", async () => {
+    let authorized = false;
+    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async () =>
+      json(authorized ? { status: "ok", service: "minutes-local", capabilities: CAPS } : { status: "ok", service: "minutes-local" }),
+    );
+    await m.checkOnce(); // HEALTHY
+    m.reportUnauthorized();
+    await m.checkOnce(); // HEALTHY のまま unauthorized
+    const seen: boolean[] = [];
+    m.onChange((s) => seen.push(s.unauthorized));
+    authorized = true;
+    await m.checkOnce();
+    expect(m.state.status).toBe("HEALTHY");
+    expect(seen).toEqual([false]);
+  });
+});
+
+describe("BackendHealthMonitor の定期ポーリング", () => {
+  it("実行中のチェックがある間に stop() しても、完了後にポーリングを再開しない", async () => {
+    // Arrange
+    let calls = 0;
+    let release: () => void = () => undefined;
+    const m = new BackendHealthMonitor({ ...CONFIG, healthyIntervalMs: 5, unreachableIntervalMs: 5 }, createInitialHealth("running"), async () => {
+      calls++;
+      await new Promise<void>((r) => {
+        release = r;
+      });
+      return json({ status: "ok", service: "minutes-local" });
+    });
+    // Act
+    m.start();
+    m.stop();
+    release();
+    await new Promise((r) => setTimeout(r, 40));
+    // Assert
+    expect(calls).toBe(1);
+  });
+
+  it("start() を重ねて呼んでもポーリングは 1 系統だけ", async () => {
+    let calls = 0;
+    const m = new BackendHealthMonitor({ ...CONFIG, healthyIntervalMs: 1_000 }, createInitialHealth("running"), async () => {
+      calls++;
+      return json({ status: "ok", service: "minutes-local" });
+    });
+    m.start();
+    m.start();
+    await new Promise((r) => setTimeout(r, 20));
+    m.stop();
+    expect(calls).toBe(1);
   });
 });

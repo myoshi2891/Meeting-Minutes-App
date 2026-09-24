@@ -14,12 +14,15 @@ export interface SchedulerDeps {
   readonly setTimer: (fn: () => void, ms: number) => unknown;
   /** PUT が NETWORK / TIMEOUT で失敗したとき呼ぶ。配線先は BackendHealthMonitor.reportUnreachable()（§18） */
   readonly onBackendUnreachable: () => void;
+  /** PUT が 401/403 で失敗したとき呼ぶ。配線先は BackendHealthMonitor.reportUnauthorized()（§18） */
+  readonly onBackendUnauthorized: () => void;
 }
 
 export class LocalSaveScheduler {
   /** LOCAL_SAVE_PENDING / RETRYING / BACKEND_UNAVAILABLE の chunkKey。sequenceNo 順を保つため sorted に保持。 */
   private readonly pending: string[] = [];
-  private inFlight = 0;
+  /** PUT 実行中の chunkKey。同じ Chunk を並行して二重送信しないために使う。 */
+  private readonly inFlight = new Set<string>();
   private pumping = false;
   /** pump 実行中に再度 pump が要求されたら true。実行終了後にもう一度回す。 */
   private pumpRequested = false;
@@ -31,7 +34,7 @@ export class LocalSaveScheduler {
       r.save.status = "LOCAL_SAVE_PENDING";
     });
     this.insertSorted(chunkKey);
-    this.deps.health.pendingChunkCount = this.pending.length + this.inFlight;
+    this.deps.health.pendingChunkCount = this.pendingCount;
     void this.pump();
   }
 
@@ -40,25 +43,28 @@ export class LocalSaveScheduler {
     const unfinished = await this.deps.chunkStore.listUnfinished();
     for (const r of unfinished) {
       const s = r.save.status;
-      if (s === "BACKEND_UNAVAILABLE" || s === "LOCAL_SAVE_FAILED" || s === "RETRYING" || s === "LOCAL_SAVE_PENDING" || s === "IDB_STORED") {
-        if (!this.pending.includes(r.chunkKey)) {
-          await this.deps.chunkStore.updateSaveState(r.chunkKey, (x) => {
-            x.save.status = "LOCAL_SAVE_PENDING";
-            x.save.nextRetryAt = null;
-          });
-          this.insertSorted(r.chunkKey);
-        }
+      if (isResumable(s) && !this.pending.includes(r.chunkKey) && !this.inFlight.has(r.chunkKey)) {
+        await this.deps.chunkStore.updateSaveState(r.chunkKey, (x) => {
+          // 一覧取得後に別経路で保存が進んでいたら書き戻さない
+          if (!isResumable(x.save.status)) return;
+          x.save.status = "LOCAL_SAVE_PENDING";
+          x.save.nextRetryAt = null;
+        });
+        this.insertSorted(r.chunkKey);
       }
     }
-    this.deps.health.pendingChunkCount = this.pending.length + this.inFlight;
+    this.deps.health.pendingChunkCount = this.pendingCount;
     void this.pump();
   }
 
   get pendingCount(): number {
-    return this.pending.length + this.inFlight;
+    // runOne 中の再投入で pending と inFlight の両方に同じキーが一時的に載りうるため、重複を数えない
+    return this.pending.filter((k) => !this.inFlight.has(k)).length + this.inFlight.size;
   }
 
   private insertSorted(chunkKey: string): void {
+    // 同じ Chunk の二重投入（enqueue / resumeAll / リトライタイマーの競合）を排除する
+    if (this.pending.includes(chunkKey)) return;
     // chunkKey は sequenceNo ゼロ埋めなので文字列順 = sequenceNo 順
     let i = 0;
     while (i < this.pending.length && this.pending[i] < chunkKey) i++;
@@ -73,7 +79,7 @@ export class LocalSaveScheduler {
     }
     this.pumping = true;
     try {
-      while (this.inFlight < this.deps.maxConcurrency && this.pending.length > 0) {
+      while (this.inFlight.size < this.deps.maxConcurrency && this.pending.length > 0) {
         const backend = this.deps.backend();
         const saver = this.deps.saver();
         // DEGRADED（応答は返るが遅い）は HEALTHY と同様に PUT を試みる（§18）
@@ -82,12 +88,14 @@ export class LocalSaveScheduler {
           await this.markAllPendingUnavailable();
           return;
         }
-        const chunkKey = this.pending.shift();
-        if (chunkKey === undefined) return;
-        this.inFlight++;
+        // 実行中の Chunk は完了後の pump で拾う（runOne 自身が再投入したキーもここで待たせる）
+        const index = this.pending.findIndex((k) => !this.inFlight.has(k));
+        if (index === -1) return;
+        const [chunkKey] = this.pending.splice(index, 1);
+        this.inFlight.add(chunkKey);
         void this.runOne(chunkKey, saver).finally(() => {
-          this.inFlight--;
-          this.deps.health.pendingChunkCount = this.pending.length + this.inFlight;
+          this.inFlight.delete(chunkKey);
+          this.deps.health.pendingChunkCount = this.pendingCount;
           void this.pump();
         });
       }
@@ -112,6 +120,8 @@ export class LocalSaveScheduler {
   private async runOne(chunkKey: string, saver: LocalSaver): Promise<void> {
     const record = await this.deps.chunkStore.getChunk(chunkKey);
     if (record === undefined) return;
+    // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
+    if (record.save.status === "DB_REGISTERED" || record.save.status === "SAVING") return;
     if (record.save.status === "RETRYING" && record.save.nextRetryAt !== null && record.save.nextRetryAt > this.deps.now()) {
       this.insertSorted(chunkKey);
       return;
@@ -138,11 +148,12 @@ export class LocalSaveScheduler {
 
     const { error, retryable } = outcome;
     if (error.kind === "UNAUTHORIZED") {
+      // Monitor が unauthorized を知らないままだと再投入 → 即 401 の連打になる。通知して resumeAll() まで待機させる
+      this.deps.onBackendUnauthorized();
       await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
         r.save.status = "BACKEND_UNAVAILABLE";
         r.save.lastError = error;
       });
-      this.insertSorted(chunkKey);
       return;
     }
     if (error.kind === "NETWORK" || error.kind === "TIMEOUT") {
@@ -178,6 +189,10 @@ export class LocalSaveScheduler {
       r.save.nextRetryAt = null;
     });
   }
+}
+
+function isResumable(status: AudioChunkRecord["save"]["status"]): boolean {
+  return status === "BACKEND_UNAVAILABLE" || status === "LOCAL_SAVE_FAILED" || status === "RETRYING" || status === "LOCAL_SAVE_PENDING" || status === "IDB_STORED";
 }
 
 export function isTerminal(record: AudioChunkRecord): boolean {

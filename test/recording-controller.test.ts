@@ -161,6 +161,8 @@ describe("RecordingController", () => {
     expect(last?.meta.sampleCount).toBe(1600);
     expect(last?.meta.startFrame).toBe(480000);
     expect(s.track.stop).toHaveBeenCalled();
+    // flush 後の最終フレーム数が IDB の会議レコードに反映されている（Finalizer の totalAudioFrames の元）
+    expect((await s.meetingStore.get("m1"))?.sessionClock.audioFrameCount).toBe(481600);
   });
 
   it("flush は録音を継続したまま部分 Chunk の IDB 書き込みまで待つ", async () => {
@@ -205,19 +207,32 @@ describe("RecordingController", () => {
     expect(s.enqueued).toContain("m1:mic:000000");
   });
 
-  it("QuotaExceeded 以外の保存エラーは onError に通知される（握りつぶさない）", async () => {
+  it("QuotaExceeded 以外の保存エラーは onError に通知しつつ、Chunk をメモリ待機に残して欠番を作らない", async () => {
+    // Arrange：最初の put だけ一般エラーで失敗させる
+    let failNext = true;
     const s = await setup(
       (db) =>
         new (class extends ChunkStore {
-          override async putChunk(): Promise<void> {
-            throw new Error("disk exploded");
+          override async putChunk(r: AudioChunkRecord): Promise<void> {
+            if (failNext) {
+              failNext = false;
+              throw new Error("disk exploded");
+            }
+            return super.putChunk(r);
           }
         })(db),
     );
     await s.controller.start("m1", "定例", 1);
+    // Act
     s.worklet.sendChunk(1600);
     await flushMessages();
+    // Assert
     expect(s.errors.map((e) => e.message)).toEqual(["disk exploded"]);
+    expect(s.controller.memoryBacklogCount).toBe(1);
+    expect(s.health.degradedReasons).not.toContain("IDB_QUOTA_EXHAUSTED");
+
+    expect(await s.controller.drainMemoryBacklog()).toBe(1);
+    expect((await s.chunkStore.getChunk("m1:mic:000000"))?.meta.sequenceNo).toBe(0);
   });
 
   it("Worklet の ready が報告するレートと AudioContext のレートが異なれば onError", async () => {

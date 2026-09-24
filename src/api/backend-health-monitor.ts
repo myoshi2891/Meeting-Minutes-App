@@ -23,6 +23,10 @@ export class BackendHealthMonitor {
     unauthorized: false,
   };
   private timer: ReturnType<typeof setTimeout> | null = null;
+  /** start() 〜 stop() の間だけ true。実行中のチェックが stop() 後にポーリングを再開しないための判定に使う。 */
+  private polling = false;
+  /** 最後に onChange で通知した (status, unauthorized)。どちらかが変わったら通知する。 */
+  private notified: { status: LocalBackendHealth["status"]; unauthorized: boolean } = { status: "UNKNOWN", unauthorized: false };
   private readonly listeners = new Set<(state: LocalBackendHealth) => void>();
   private readonly healthUrl: URL;
 
@@ -41,16 +45,25 @@ export class BackendHealthMonitor {
   }
 
   start(): void {
+    if (this.polling) return;
+    this.polling = true;
     void this.checkAndSchedule();
   }
 
   stop(): void {
+    this.polling = false;
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
   }
 
   /** PUT 失敗時に Scheduler から呼ばれる。ポーリングを待たず UNREACHABLE にする。 */
   reportUnreachable(): void {
+    this.transition("UNREACHABLE", null, null);
+  }
+
+  /** PUT が 401/403 を受けたときに Scheduler から呼ばれる。認証付きのヘルス応答が返るまで unauthorized を保持する。 */
+  reportUnauthorized(): void {
+    this.state.unauthorized = true;
     this.transition("UNREACHABLE", null, null);
   }
 
@@ -76,7 +89,8 @@ export class BackendHealthMonitor {
         this.transition("UNREACHABLE", latency, null);
         return this.state;
       }
-      this.state.unauthorized = false;
+      // capabilities は認証済みのときだけ返る（§12）。認証なしの応答ではトークンの正しさを判断できないので unauthorized を解除しない
+      if (body.capabilities !== undefined) this.state.unauthorized = false;
       const status = body.status === "degraded" || latency > this.config.degradedLatencyMs ? "DEGRADED" : "HEALTHY";
       this.transition(status, latency, body.capabilities ?? null);
       return this.state;
@@ -92,7 +106,6 @@ export class BackendHealthMonitor {
   }
 
   private transition(status: LocalBackendHealth["status"], latency: number | null, caps: LocalBackendHealth["capabilities"]): void {
-    const previous = this.state.status;
     this.state.status = status;
     this.state.latencyMs = latency;
     this.state.capabilities = caps ?? this.state.capabilities;
@@ -103,7 +116,9 @@ export class BackendHealthMonitor {
       this.state.consecutiveFailures += 1;
     }
     this.syncDegradedReasons();
-    if (previous !== status) {
+    // unauthorized の解除は status が HEALTHY のまま起こりうる。保存再開の契機を逃さないよう両方の変化を通知する
+    if (this.notified.status !== status || this.notified.unauthorized !== this.state.unauthorized) {
+      this.notified = { status, unauthorized: this.state.unauthorized };
       for (const l of this.listeners) l(this.state);
     }
   }
@@ -120,6 +135,7 @@ export class BackendHealthMonitor {
 
   private async checkAndSchedule(): Promise<void> {
     await this.checkOnce();
+    if (!this.polling) return;
     const interval = this.state.status === "UNREACHABLE" ? this.config.unreachableIntervalMs : this.config.healthyIntervalMs;
     // バックグラウンドタブで throttle されても可用性「表示」が遅れるだけで、録音には影響しない（Invariant 8 と同じ構造）。
     this.timer = setTimeout(() => void this.checkAndSchedule(), interval);

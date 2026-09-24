@@ -1,5 +1,5 @@
 // test/harness.ts
-// 設計書 §24.1 の共通ハーネス。差分：scheduler に onBackendUnreachable を配線（Monitor への即時通知の代替）。
+// 設計書 §24.1 の共通ハーネス。差分：scheduler に onBackendUnreachable / onBackendUnauthorized を配線（Monitor への即時通知の代替）。
 import "fake-indexeddb/auto";
 import { vi } from "vitest";
 import type { ChunkListResponse, ChunkResponse, HealthResponse } from "../src/api/contracts";
@@ -114,6 +114,9 @@ export async function createHarness(): Promise<Harness> {
       setTimer: (fn, ms) => timers.push({ fn, at: h.now + ms }),
       onBackendUnreachable: () => {
         backend.status = "UNREACHABLE";
+      },
+      onBackendUnauthorized: () => {
+        backend.unauthorized = true;
       },
     }),
     advance: async (ms) => {
