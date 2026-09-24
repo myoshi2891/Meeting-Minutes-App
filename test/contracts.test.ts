@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { encodeChunkMetaHeader, isChunkResponse, isHealthResponse } from "../src/api/contracts";
+import { encodeChunkMetaHeader, isChunkListResponse, isChunkResponse, isHealthResponse } from "../src/api/contracts";
 import { makeChunkRecord } from "./harness";
 
 describe("isChunkResponse", () => {
@@ -31,5 +31,25 @@ describe("encodeChunkMetaHeader", () => {
     expect(encoded).toMatch(/^[A-Za-z0-9_-]+$/);
     const json = new TextDecoder().decode(Buffer.from(encoded, "base64url"));
     expect(JSON.parse(json)).toEqual(meta);
+  });
+});
+
+describe("isChunkListResponse", () => {
+  const item = { source: "mic", sequenceNo: 0, sha256: "a", sizeBytes: 1, registered: true };
+
+  it("chunks 配列の各要素が source / sequenceNo / sha256 / sizeBytes / registered を持てば true（空配列も可）", () => {
+    expect(isChunkListResponse({ meetingId: "m", chunks: [item] })).toBe(true);
+    expect(isChunkListResponse({ meetingId: "m", chunks: [] })).toBe(true);
+  });
+
+  it.each([
+    null,
+    { meetingId: "m" },
+    { meetingId: "m", chunks: "x" },
+    { meetingId: "m", chunks: [{ ...item, source: "speaker" }] },
+    { meetingId: "m", chunks: [{ ...item, sequenceNo: "0" }] },
+    { meetingId: "m", chunks: [{ ...item, registered: undefined }] },
+  ])("%j は false", (v) => {
+    expect(isChunkListResponse(v)).toBe(false);
   });
 });

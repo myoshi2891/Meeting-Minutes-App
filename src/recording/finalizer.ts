@@ -1,0 +1,109 @@
+// src/recording/finalizer.ts
+import type { ChunkStore, MeetingStore } from "../storage/idb";
+import type { LocalSaveScheduler } from "./local-save-scheduler";
+import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
+import { assertLocalHost } from "../api/local-saver";
+
+export interface FinalizerDeps {
+  readonly chunkStore: ChunkStore;
+  readonly meetingStore: MeetingStore;
+  readonly scheduler: LocalSaveScheduler;
+  readonly baseUrl: string;
+  readonly token: string;
+  readonly fetchImpl?: typeof fetch;
+}
+
+export type FinalizeResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string };
+
+/**
+ * Finalization Barrier：
+ *   1. 最終 Chunk が IDB にある（呼び出し前提：RecordingController.stop() 完了）
+ *   2. IDB 上の全 Chunk が DB_REGISTERED
+ *   3. サーバーの一覧と件数・sha256 が一致
+ *   4. POST /finalize
+ * 1〜3 を満たさない限り finalizing へ遷移しない。
+ */
+export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const meeting = await deps.meetingStore.get(meetingId);
+  if (meeting === undefined) return { ok: false, stage: "verify", detail: "meeting not found" };
+
+  const chunks = await deps.chunkStore.listByMeeting(meetingId, "mic");
+  const notRegistered = chunks.filter((c) => c.save.status !== "DB_REGISTERED");
+  if (notRegistered.length > 0) {
+    await deps.scheduler.resumeAll();
+    return { ok: false, stage: "waiting_local_save", detail: `${notRegistered.length} chunks not registered` };
+  }
+
+  // sequenceNo の連続性（欠番なし）
+  for (let i = 0; i < chunks.length; i++) {
+    if (chunks[i].meta.sequenceNo !== i) {
+      return { ok: false, stage: "verify", detail: `sequence gap at ${i}` };
+    }
+  }
+
+  const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
+  assertLocalHost(listUrl);
+  let listRes: Response;
+  try {
+    listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit" });
+  } catch (error) {
+    return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}` };
+  }
+  if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
+  // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
+  const list: unknown = await listRes.json().catch(() => null);
+  if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
+  const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
+  for (const c of chunks) {
+    const s = serverByKey.get(`${c.meta.source}:${c.meta.sequenceNo}`);
+    if (s === undefined || s.sha256 !== c.meta.sha256 || !s.registered) {
+      await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
+        r.save.status = "LOCAL_SAVE_PENDING";
+      });
+      await deps.scheduler.resumeAll();
+      return { ok: false, stage: "verify", detail: `server mismatch at seq ${c.meta.sequenceNo}` };
+    }
+  }
+
+  meeting.status = "finalizing";
+  meeting.finalChunkCount = chunks.length;
+  meeting.endedAt = Date.now();
+  await deps.meetingStore.put(meeting);
+
+  const body: FinalizeRequest = {
+    expectedChunkCounts: { mic: chunks.length, system: 0 },
+    endedAtEpochMs: meeting.endedAt,
+    totalAudioFrames: meeting.sessionClock.audioFrameCount,
+  };
+  const finUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/finalize`, deps.baseUrl);
+  assertLocalHost(finUrl);
+  let finRes: Response;
+  try {
+    finRes = await fetchImpl(finUrl, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      credentials: "omit",
+    });
+  } catch (error) {
+    // finalizing のまま残さない。次回の Barrier 再試行は stop_requested から行う
+    meeting.status = "stop_requested";
+    await deps.meetingStore.put(meeting);
+    return { ok: false, stage: "finalize", detail: `finalize request failed: ${errorMessage(error)}` };
+  }
+  if (!finRes.ok) {
+    meeting.status = "stop_requested";
+    await deps.meetingStore.put(meeting);
+    return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}` };
+  }
+  meeting.status = "finalized";
+  await deps.meetingStore.put(meeting);
+  return { ok: true };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

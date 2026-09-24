@@ -95,3 +95,15 @@ export function encodeChunkMetaHeader(meta: ChunkTimingMetadata): string {
   for (const b of bytes) binary += String.fromCharCode(b);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
+
+/** GET /v1/meetings/{id}/chunks の応答。各要素は isChunkResponse の 3 フィールドに加え、照合キー（source / sequenceNo）を必須にする。 */
+export function isChunkListResponse(value: unknown): value is ChunkListResponse {
+  if (typeof value !== "object" || value === null) return false;
+  const chunks = (value as { chunks?: unknown }).chunks;
+  if (!Array.isArray(chunks)) return false;
+  return chunks.every((c: unknown) => {
+    if (!isChunkResponse(c)) return false;
+    const v = c as unknown as Record<string, unknown>;
+    return (v.source === "mic" || v.source === "system") && typeof v.sequenceNo === "number";
+  });
+}
