@@ -667,7 +667,7 @@ stateDiagram-v2
     GENERATED --> IDB_STORED : IndexedDB put 成功
     GENERATED --> GENERATED : QuotaExceededError（メモリ待機、§3.4 段階3）
     IDB_STORED --> LOCAL_SAVE_PENDING : 保存キューへ投入
-    LOCAL_SAVE_PENDING --> SAVING : backend=HEALTHY かつ 並列枠あり かつ sequenceNo 順序条件
+    LOCAL_SAVE_PENDING --> SAVING : backend=HEALTHY または DEGRADED かつ 並列枠あり かつ sequenceNo 順序条件
     LOCAL_SAVE_PENDING --> BACKEND_UNAVAILABLE : backend=UNREACHABLE または unauthorized
     SAVING --> SAVED : 2xx かつ sha256 一致
     SAVING --> LOCAL_SAVE_FAILED : NETWORK / TIMEOUT / SERVER / STORAGE_FULL / HASH_MISMATCH
@@ -695,7 +695,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `GENERATED → IDB_STORED` | `audio_chunks.put` の `complete` イベント | `RecordingHealth.lastChunkAt` 更新 |
 | `IDB_STORED → LOCAL_SAVE_PENDING` | 即時 | `pendingChunkCount` +1 |
-| `LOCAL_SAVE_PENDING → SAVING` | (a) `LocalBackendHealth.status === "HEALTHY"`、(b) 実行中の PUT が `maxConcurrency`（既定 2）未満、(c) 同一 `meetingId`・`source` で自分より小さい `sequenceNo` が `LOCAL_SAVE_FAILED`（non-retryable）でない | `attempts` +1 |
+| `LOCAL_SAVE_PENDING → SAVING` | (a) `LocalBackendHealth.status` が `"HEALTHY"` または `"DEGRADED"`（DEGRADED は応答が遅いだけで PUT は試みる。§18）、(b) 実行中の PUT が `maxConcurrency`（既定 2）未満、(c) 同一 `meetingId`・`source` で自分より小さい `sequenceNo` が `LOCAL_SAVE_FAILED`（non-retryable）でない | `attempts` +1 |
 | `SAVING → SAVED` | HTTP 2xx かつレスポンス JSON の `sha256` が送信前に計算した値と一致 | `lastSuccessfulLocalSaveAt` 更新、`pendingChunkCount` −1 |
 | `SAVING → LOCAL_SAVE_FAILED` | 上記以外の失敗 | `lastError` 記録 |
 | `LOCAL_SAVE_FAILED → RETRYING` | `kind ∈ {NETWORK, TIMEOUT, SERVER, STORAGE_FULL, HASH_MISMATCH, UNKNOWN}` かつ `attempts < 8` | `nextRetryAt = now + backoff(attempts)` |
@@ -2047,6 +2047,8 @@ export interface SchedulerDeps {
   readonly maxConcurrency: number;
   readonly now: () => number;
   readonly setTimer: (fn: () => void, ms: number) => unknown;
+  /** PUT が NETWORK / TIMEOUT で失敗したとき呼ぶ。配線先は BackendHealthMonitor.reportUnreachable()（§18） */
+  readonly onBackendUnreachable: () => void;
 }
 
 export class LocalSaveScheduler {
@@ -2109,7 +2111,9 @@ export class LocalSaveScheduler {
       while (this.inFlight < this.deps.maxConcurrency && this.pending.length > 0) {
         const backend = this.deps.backend();
         const saver = this.deps.saver();
-        if (backend.status !== "HEALTHY" || backend.unauthorized || saver === null) {
+        // DEGRADED（応答は返るが遅い）は HEALTHY と同様に PUT を試みる（§18）
+        const available = backend.status === "HEALTHY" || backend.status === "DEGRADED";
+        if (!available || backend.unauthorized || saver === null) {
           await this.markAllPendingUnavailable();
           return;
         }
@@ -2178,6 +2182,8 @@ export class LocalSaveScheduler {
     }
     if (error.kind === "NETWORK" || error.kind === "TIMEOUT") {
       // ポーリングを待たず即座に UNREACHABLE 扱いにする（§3.6）。BackendHealthMonitor 側も同じ判定を行う。
+      // backend() が HEALTHY のままだと再投入 → 即 pump → 再失敗の連打になるため、先に Monitor へ通知する。
+      this.deps.onBackendUnreachable();
       await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
         r.save.status = "BACKEND_UNAVAILABLE";
         r.save.lastError = error;
@@ -2350,7 +2356,7 @@ export class BackendHealthMonitor {
 }
 ```
 
-配線：アプリ初期化時に `monitor.onChange((s) => { if (s.status === "HEALTHY" || s.status === "DEGRADED") void scheduler.resumeAll(); })` を登録し、復帰時に `BACKEND_UNAVAILABLE` の Chunk を一括再投入する。Scheduler の `pump()` は実行中の再要求を `pumpRequested` で取りこぼさないため、復帰通知と `enqueue` が重なっても再開が漏れない。
+配線：アプリ初期化時に `monitor.onChange((s) => { if (s.status === "HEALTHY" || s.status === "DEGRADED") void scheduler.resumeAll(); })` を登録し、復帰時に `BACKEND_UNAVAILABLE` の Chunk を一括再投入する。あわせて Scheduler の `onBackendUnreachable` に `() => monitor.reportUnreachable()` を渡し、Scheduler の `backend` には `() => monitor.state` を渡す。PUT が NETWORK / TIMEOUT で失敗した時点で Monitor の状態が `UNREACHABLE` になるため、次のポーリングまで Scheduler が失敗 PUT を連打することはない。サーバーが復帰すると、次のポーリングで `HEALTHY` への変化が `onChange` に通知され、`resumeAll()` で再開する。Scheduler の `pump()` は実行中の再要求を `pumpRequested` で取りこぼさないため、復帰通知と `enqueue` が重なっても再開が漏れない。
 
 `DEGRADED`（応答は返るが遅い、またはサーバーが自己申告）は Scheduler 上 `HEALTHY` と同様に PUT を試みる。区別するのは UI 表示（「サーバーが高負荷です。保存は継続中」）のためである。
 
@@ -2843,6 +2849,10 @@ export async function createHarness(): Promise<Harness> {
       maxConcurrency: 2,
       now: () => h.now,
       setTimer: (fn, ms) => timers.push({ fn, at: h.now + ms }),
+      // 本番では BackendHealthMonitor.reportUnreachable() に配線する（§18）
+      onBackendUnreachable: () => {
+        backend.status = "UNREACHABLE";
+      },
     }),
     advance: async (ms) => {
       h.now += ms;
