@@ -674,7 +674,7 @@ stateDiagram-v2
     SAVING --> BACKEND_UNAVAILABLE : UNAUTHORIZED（401/403）
     SAVING --> SAVED : 409 CONFLICT かつ サーバー側 sha256 一致（冪等）
     LOCAL_SAVE_FAILED --> RETRYING : retryable かつ attempts < maxAttempts
-    LOCAL_SAVE_FAILED --> LOCAL_SAVE_FAILED : non-retryable（VALIDATION / CONFLICT hash 不一致）※UI 表示、手動再試行のみ
+    LOCAL_SAVE_FAILED --> LOCAL_SAVE_FAILED : non-retryable（VALIDATION / CONFLICT hash 不一致 / 408・429 以外の 4xx）※UI 表示、手動再試行のみ
     RETRYING --> LOCAL_SAVE_PENDING : nextRetryAt 到達
     RETRYING --> BACKEND_UNAVAILABLE : 待機中に backend=UNREACHABLE
     BACKEND_UNAVAILABLE --> LOCAL_SAVE_PENDING : backend=HEALTHY に復帰（attempts はリセットしない）
@@ -698,9 +698,9 @@ stateDiagram-v2
 | `LOCAL_SAVE_PENDING → SAVING` | (a) `LocalBackendHealth.status` が `"HEALTHY"` または `"DEGRADED"`（DEGRADED は応答が遅いだけで PUT は試みる。§18）、(b) 実行中の PUT が `maxConcurrency`（既定 2）未満、(c) 同一 `meetingId`・`source` で自分より小さい `sequenceNo` が `LOCAL_SAVE_FAILED`（non-retryable）でない | `attempts` +1 |
 | `SAVING → SAVED` | HTTP 2xx かつレスポンス JSON の `sha256` が送信前に計算した値と一致 | `lastSuccessfulLocalSaveAt` 更新、`pendingChunkCount` −1 |
 | `SAVING → LOCAL_SAVE_FAILED` | 上記以外の失敗 | `lastError` 記録 |
-| `LOCAL_SAVE_FAILED → RETRYING` | `kind ∈ {NETWORK, TIMEOUT, SERVER, STORAGE_FULL, HASH_MISMATCH, UNKNOWN}` かつ `attempts < 8` | `nextRetryAt = now + backoff(attempts)` |
+| `LOCAL_SAVE_FAILED → RETRYING` | `kind ∈ {NETWORK, TIMEOUT, SERVER, STORAGE_FULL, HASH_MISMATCH, UNKNOWN}` かつ HTTP 4xx（408 / 429 を除く）でない かつ `attempts < 8`。同じリクエストを送り直しても結果が変わらない 4xx は `kind` が `UNKNOWN` でも再試行しない | `nextRetryAt = now + backoff(attempts)` |
 | `RETRYING → LOCAL_SAVE_PENDING` | `now >= nextRetryAt` | なし |
-| `* → BACKEND_UNAVAILABLE` | `status ∈ {UNREACHABLE}` または `unauthorized` | `degradedReasons` に追加 |
+| `* → BACKEND_UNAVAILABLE` | `status ∈ {UNREACHABLE}` または `unauthorized` | `degradedReasons` に追加。PUT の NETWORK / TIMEOUT 失敗は `onBackendUnreachable`、401 / 403 は `onBackendUnauthorized` で Monitor へ即時通知する（§18）。401 / 403 の Chunk は保存キューに戻さず、`resumeAll()` まで待機する |
 | `BACKEND_UNAVAILABLE → LOCAL_SAVE_PENDING` | `HEALTHY` 復帰 | `sequenceNo` 昇順で再投入 |
 | `SAVED → DB_REGISTERED` | サーバーが SQLite 登録まで済ませたことを `registered: true` で返す | `serverPath` 確定。クォータ縮退で Blob 削除可能になる |
 
@@ -1094,6 +1094,18 @@ export function encodeChunkMetaHeader(meta: ChunkTimingMetadata): string {
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** GET /v1/meetings/{id}/chunks の応答。各要素は isChunkResponse の 3 フィールドに加え、照合キー（source / sequenceNo）を必須にする。 */
+export function isChunkListResponse(value: unknown): value is ChunkListResponse {
+  if (typeof value !== "object" || value === null) return false;
+  const chunks = (value as { chunks?: unknown }).chunks;
+  if (!Array.isArray(chunks)) return false;
+  return chunks.every((c: unknown) => {
+    if (!isChunkResponse(c)) return false;
+    const v = c as unknown as Record<string, unknown>;
+    return (v.source === "mic" || v.source === "system") && typeof v.sequenceNo === "number";
+  });
 }
 ```
 
@@ -1520,14 +1532,18 @@ import {
 import { createSessionClock, frameToOffsetMs } from "./session-clock";
 import { buildStandaloneWav } from "../audio/wav";
 import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
-import type { LocalSaveScheduler } from "./local-save-scheduler";
+
+/** Chunk を保存 State Machine に投入する口。LocalSaveScheduler が構造的に満たす（テストでは差し替える）。 */
+export interface ChunkEnqueuer {
+  enqueue(chunkKey: string): Promise<void>;
+}
 
 export interface RecordingControllerDeps {
   readonly audioContext: AudioContext;
   readonly mediaStream: MediaStream;
   readonly chunkStore: ChunkStore;
   readonly meetingStore: MeetingStore;
-  readonly scheduler: LocalSaveScheduler;
+  readonly scheduler: ChunkEnqueuer;
   readonly health: RecordingHealth;
   readonly workletModuleUrl: string;
   readonly onError: (error: Error) => void;
@@ -1624,6 +1640,9 @@ export class RecordingController {
     this.post({ type: "stop" });
     await flushed;
     await this.chunkQueue;
+    // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
+    this.meeting.updatedAt = Date.now();
+    await this.deps.meetingStore.put(this.meeting);
 
     this.sourceNode?.disconnect();
     this.node.port.onmessage = null;
@@ -1738,9 +1757,10 @@ export class RecordingController {
     try {
       await this.deps.chunkStore.putChunk(record);
     } catch (error) {
+      // 失敗理由を問わずメモリ待機に残す。sequenceNo は採番済みなので、捨てると欠番になり Finalizer が進めなくなる
+      this.memoryBacklog.push(record);
       if (isQuotaExceeded(error)) {
         // §3.4 段階3：メモリ待機。録音は止めない。
-        this.memoryBacklog.push(record);
         if (!this.deps.health.degradedReasons.includes("IDB_QUOTA_EXHAUSTED")) {
           this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "IDB_QUOTA_EXHAUSTED"];
         }
@@ -1760,6 +1780,12 @@ export class RecordingController {
 ```
 
 `sequenceNo` の採番はメインスレッドで行う。Worklet 側で採番すると flush で生じる部分 Chunk との整合を Worklet が知る必要が出るためである。Worklet からの `chunk` イベントは同一 `MessagePort` 上で順序が保証されるので、`chunkQueue` による直列化と合わせて `sequenceNo` と `startFrame` の単調増加が保たれる。
+
+IndexedDB への書き込みに失敗した Chunk は、失敗の理由を問わずメモリ待機キュー（`memoryBacklog`）に残す。`sequenceNo` は採番済みなので、捨てると欠番になり、Finalization Barrier（§22）の連続性検査を永久に通過できなくなるためである。`QuotaExceededError` は §3.4 段階3として `IDB_QUOTA_EXHAUSTED` を記録し、録音を継続する。それ以外のエラーは `onError` に通知したうえで同じく待機キューに残し、`drainMemoryBacklog()` で再書き込みする。
+
+`stop()` は `stop_requested` を先に永続化し、最終 Chunk の書き込み完了を待ってから会議レコードをもう一度保存する。最終 flush で確定した `sessionClock.audioFrameCount` を IndexedDB に残すためで、Finalizer はこの値を `totalAudioFrames` として送る。
+
+Scheduler への依存は `enqueue()` だけを持つ `ChunkEnqueuer` インターフェースに絞っている。`LocalSaveScheduler` はこのインターフェースを構造的に満たすため、呼び出し側の配線は変わらない。
 
 ---
 
@@ -2016,9 +2042,15 @@ export class LocalSaver {
     return {
       ok: false,
       error: { kind, message, httpStatus, at: performance.now() },
-      retryable: RETRYABLE.has(kind),
+      retryable: RETRYABLE.has(kind) && !isNonRetryableClientError(httpStatus),
     };
   }
+}
+
+/** 408 / 429 を除く 4xx は同じリクエストを送り直しても結果が変わらない（kind が UNKNOWN でも再試行しない）。 */
+function isNonRetryableClientError(httpStatus: number | null): boolean {
+  if (httpStatus === null || httpStatus < 400 || httpStatus >= 500) return false;
+  return httpStatus !== 408 && httpStatus !== 429;
 }
 
 function isApiErrorBody(value: unknown): value is ApiErrorBody {
@@ -2049,12 +2081,15 @@ export interface SchedulerDeps {
   readonly setTimer: (fn: () => void, ms: number) => unknown;
   /** PUT が NETWORK / TIMEOUT で失敗したとき呼ぶ。配線先は BackendHealthMonitor.reportUnreachable()（§18） */
   readonly onBackendUnreachable: () => void;
+  /** PUT が 401/403 で失敗したとき呼ぶ。配線先は BackendHealthMonitor.reportUnauthorized()（§18） */
+  readonly onBackendUnauthorized: () => void;
 }
 
 export class LocalSaveScheduler {
   /** LOCAL_SAVE_PENDING / RETRYING / BACKEND_UNAVAILABLE の chunkKey。sequenceNo 順を保つため sorted に保持。 */
   private readonly pending: string[] = [];
-  private inFlight = 0;
+  /** PUT 実行中の chunkKey。同じ Chunk を並行して二重送信しないために使う。 */
+  private readonly inFlight = new Set<string>();
   private pumping = false;
   /** pump 実行中に再度 pump が要求されたら true。実行終了後にもう一度回す。 */
   private pumpRequested = false;
@@ -2066,7 +2101,7 @@ export class LocalSaveScheduler {
       r.save.status = "LOCAL_SAVE_PENDING";
     });
     this.insertSorted(chunkKey);
-    this.deps.health.pendingChunkCount = this.pending.length + this.inFlight;
+    this.deps.health.pendingChunkCount = this.pendingCount;
     void this.pump();
   }
 
@@ -2075,25 +2110,28 @@ export class LocalSaveScheduler {
     const unfinished = await this.deps.chunkStore.listUnfinished();
     for (const r of unfinished) {
       const s = r.save.status;
-      if (s === "BACKEND_UNAVAILABLE" || s === "LOCAL_SAVE_FAILED" || s === "RETRYING" || s === "LOCAL_SAVE_PENDING" || s === "IDB_STORED") {
-        if (!this.pending.includes(r.chunkKey)) {
-          await this.deps.chunkStore.updateSaveState(r.chunkKey, (x) => {
-            x.save.status = "LOCAL_SAVE_PENDING";
-            x.save.nextRetryAt = null;
-          });
-          this.insertSorted(r.chunkKey);
-        }
+      if (isResumable(s) && !this.pending.includes(r.chunkKey) && !this.inFlight.has(r.chunkKey)) {
+        await this.deps.chunkStore.updateSaveState(r.chunkKey, (x) => {
+          // 一覧取得後に別経路で保存が進んでいたら書き戻さない
+          if (!isResumable(x.save.status)) return;
+          x.save.status = "LOCAL_SAVE_PENDING";
+          x.save.nextRetryAt = null;
+        });
+        this.insertSorted(r.chunkKey);
       }
     }
-    this.deps.health.pendingChunkCount = this.pending.length + this.inFlight;
+    this.deps.health.pendingChunkCount = this.pendingCount;
     void this.pump();
   }
 
   get pendingCount(): number {
-    return this.pending.length + this.inFlight;
+    // runOne 中の再投入で pending と inFlight の両方に同じキーが一時的に載りうるため、重複を数えない
+    return this.pending.filter((k) => !this.inFlight.has(k)).length + this.inFlight.size;
   }
 
   private insertSorted(chunkKey: string): void {
+    // 同じ Chunk の二重投入（enqueue / resumeAll / リトライタイマーの競合）を排除する
+    if (this.pending.includes(chunkKey)) return;
     // chunkKey は sequenceNo ゼロ埋めなので文字列順 = sequenceNo 順
     let i = 0;
     while (i < this.pending.length && this.pending[i] < chunkKey) i++;
@@ -2108,7 +2146,7 @@ export class LocalSaveScheduler {
     }
     this.pumping = true;
     try {
-      while (this.inFlight < this.deps.maxConcurrency && this.pending.length > 0) {
+      while (this.inFlight.size < this.deps.maxConcurrency && this.pending.length > 0) {
         const backend = this.deps.backend();
         const saver = this.deps.saver();
         // DEGRADED（応答は返るが遅い）は HEALTHY と同様に PUT を試みる（§18）
@@ -2117,12 +2155,14 @@ export class LocalSaveScheduler {
           await this.markAllPendingUnavailable();
           return;
         }
-        const chunkKey = this.pending.shift();
-        if (chunkKey === undefined) return;
-        this.inFlight++;
+        // 実行中の Chunk は完了後の pump で拾う（runOne 自身が再投入したキーもここで待たせる）
+        const index = this.pending.findIndex((k) => !this.inFlight.has(k));
+        if (index === -1) return;
+        const [chunkKey] = this.pending.splice(index, 1);
+        this.inFlight.add(chunkKey);
         void this.runOne(chunkKey, saver).finally(() => {
-          this.inFlight--;
-          this.deps.health.pendingChunkCount = this.pending.length + this.inFlight;
+          this.inFlight.delete(chunkKey);
+          this.deps.health.pendingChunkCount = this.pendingCount;
           void this.pump();
         });
       }
@@ -2147,6 +2187,8 @@ export class LocalSaveScheduler {
   private async runOne(chunkKey: string, saver: LocalSaver): Promise<void> {
     const record = await this.deps.chunkStore.getChunk(chunkKey);
     if (record === undefined) return;
+    // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
+    if (record.save.status === "DB_REGISTERED" || record.save.status === "SAVING") return;
     if (record.save.status === "RETRYING" && record.save.nextRetryAt !== null && record.save.nextRetryAt > this.deps.now()) {
       this.insertSorted(chunkKey);
       return;
@@ -2173,11 +2215,12 @@ export class LocalSaveScheduler {
 
     const { error, retryable } = outcome;
     if (error.kind === "UNAUTHORIZED") {
+      // Monitor が unauthorized を知らないままだと再投入 → 即 401 の連打になる。通知して resumeAll() まで待機させる
+      this.deps.onBackendUnauthorized();
       await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
         r.save.status = "BACKEND_UNAVAILABLE";
         r.save.lastError = error;
       });
-      this.insertSorted(chunkKey);
       return;
     }
     if (error.kind === "NETWORK" || error.kind === "TIMEOUT") {
@@ -2215,12 +2258,18 @@ export class LocalSaveScheduler {
   }
 }
 
+function isResumable(status: AudioChunkRecord["save"]["status"]): boolean {
+  return status === "BACKEND_UNAVAILABLE" || status === "LOCAL_SAVE_FAILED" || status === "RETRYING" || status === "LOCAL_SAVE_PENDING" || status === "IDB_STORED";
+}
+
 export function isTerminal(record: AudioChunkRecord): boolean {
   return record.save.status === "DB_REGISTERED";
 }
 ```
 
 `setTimer` を依存注入しているのは、テストで仮想時間を使うためと、バックグラウンドタブでの `setTimeout` throttle が「リトライが遅れる」以上の影響を持たないことを明示するためである。リトライが遅れても Chunk は IndexedDB にあり、録音は継続する。
+
+同じ Chunk の二重送信は 3 段で防ぐ。`enqueue()` / `resumeAll()` / リトライタイマーは同時に同じ Chunk を投入しうるため、第一に `insertSorted()` が `pending` 内の重複を排除する。第二に、PUT 実行中の `chunkKey` を `inFlight`（`Set`）で持ち、`pump()` は実行中のキーを取り出さない。`runOne()` が自分自身を再投入した場合も、完了後の `pump()` で拾われる。第三に、`runOne()` は送信直前に IndexedDB の状態を読み、`DB_REGISTERED` または `SAVING` なら送らない。これにより、`resumeAll()` で保存が完了した後に遅れて発火したリトライタイマーが再送することはない。`resumeAll()` は一覧取得後に別経路で状態が進んでいた Chunk を `LOCAL_SAVE_PENDING` に書き戻さない。
 
 ---
 
@@ -2252,6 +2301,10 @@ export class BackendHealthMonitor {
     unauthorized: false,
   };
   private timer: ReturnType<typeof setTimeout> | null = null;
+  /** start() 〜 stop() の間だけ true。実行中のチェックが stop() 後にポーリングを再開しないための判定に使う。 */
+  private polling = false;
+  /** 最後に onChange で通知した (status, unauthorized)。どちらかが変わったら通知する。 */
+  private notified: { status: LocalBackendHealth["status"]; unauthorized: boolean } = { status: "UNKNOWN", unauthorized: false };
   private readonly listeners = new Set<(state: LocalBackendHealth) => void>();
   private readonly healthUrl: URL;
 
@@ -2270,16 +2323,25 @@ export class BackendHealthMonitor {
   }
 
   start(): void {
+    if (this.polling) return;
+    this.polling = true;
     void this.checkAndSchedule();
   }
 
   stop(): void {
+    this.polling = false;
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
   }
 
   /** PUT 失敗時に Scheduler から呼ばれる。ポーリングを待たず UNREACHABLE にする。 */
   reportUnreachable(): void {
+    this.transition("UNREACHABLE", null, null);
+  }
+
+  /** PUT が 401/403 を受けたときに Scheduler から呼ばれる。認証付きのヘルス応答が返るまで unauthorized を保持する。 */
+  reportUnauthorized(): void {
+    this.state.unauthorized = true;
     this.transition("UNREACHABLE", null, null);
   }
 
@@ -2305,7 +2367,8 @@ export class BackendHealthMonitor {
         this.transition("UNREACHABLE", latency, null);
         return this.state;
       }
-      this.state.unauthorized = false;
+      // capabilities は認証済みのときだけ返る（§12）。認証なしの応答ではトークンの正しさを判断できないので unauthorized を解除しない
+      if (body.capabilities !== undefined) this.state.unauthorized = false;
       const status = body.status === "degraded" || latency > this.config.degradedLatencyMs ? "DEGRADED" : "HEALTHY";
       this.transition(status, latency, body.capabilities ?? null);
       return this.state;
@@ -2321,7 +2384,6 @@ export class BackendHealthMonitor {
   }
 
   private transition(status: LocalBackendHealth["status"], latency: number | null, caps: LocalBackendHealth["capabilities"]): void {
-    const previous = this.state.status;
     this.state.status = status;
     this.state.latencyMs = latency;
     this.state.capabilities = caps ?? this.state.capabilities;
@@ -2332,7 +2394,9 @@ export class BackendHealthMonitor {
       this.state.consecutiveFailures += 1;
     }
     this.syncDegradedReasons();
-    if (previous !== status) {
+    // unauthorized の解除は status が HEALTHY のまま起こりうる。保存再開の契機を逃さないよう両方の変化を通知する
+    if (this.notified.status !== status || this.notified.unauthorized !== this.state.unauthorized) {
+      this.notified = { status, unauthorized: this.state.unauthorized };
       for (const l of this.listeners) l(this.state);
     }
   }
@@ -2349,6 +2413,7 @@ export class BackendHealthMonitor {
 
   private async checkAndSchedule(): Promise<void> {
     await this.checkOnce();
+    if (!this.polling) return;
     const interval = this.state.status === "UNREACHABLE" ? this.config.unreachableIntervalMs : this.config.healthyIntervalMs;
     // バックグラウンドタブで throttle されても可用性「表示」が遅れるだけで、録音には影響しない（Invariant 8 と同じ構造）。
     this.timer = setTimeout(() => void this.checkAndSchedule(), interval);
@@ -2359,6 +2424,10 @@ export class BackendHealthMonitor {
 配線：アプリ初期化時に `monitor.onChange((s) => { if (s.status === "HEALTHY" || s.status === "DEGRADED") void scheduler.resumeAll(); })` を登録し、復帰時に `BACKEND_UNAVAILABLE` の Chunk を一括再投入する。あわせて Scheduler の `onBackendUnreachable` に `() => monitor.reportUnreachable()` を渡し、Scheduler の `backend` には `() => monitor.state` を渡す。PUT が NETWORK / TIMEOUT で失敗した時点で Monitor の状態が `UNREACHABLE` になるため、次のポーリングまで Scheduler が失敗 PUT を連打することはない。サーバーが復帰すると、次のポーリングで `HEALTHY` への変化が `onChange` に通知され、`resumeAll()` で再開する。Scheduler の `pump()` は実行中の再要求を `pumpRequested` で取りこぼさないため、復帰通知と `enqueue` が重なっても再開が漏れない。
 
 `DEGRADED`（応答は返るが遅い、またはサーバーが自己申告）は Scheduler 上 `HEALTHY` と同様に PUT を試みる。区別するのは UI 表示（「サーバーが高負荷です。保存は継続中」）のためである。
+
+認証エラーも同じ構造で配線する。Scheduler の `onBackendUnauthorized` に `() => monitor.reportUnauthorized()` を渡すと、PUT が 401 / 403 を受けた時点で `unauthorized` が立ち、Scheduler は PUT を止める。`/v1/health` は認証なしでも `status` と `service` だけを返す（§12）ため、`capabilities` を含まない応答ではトークンの正しさを判断できない。そのため `unauthorized` は、`capabilities` を含む認証済みの応答でだけ解除する。解除は `status` が `HEALTHY` のまま起こりうるので、`onChange` は `status` と `unauthorized` のどちらかが変わったときに通知する。これにより、トークン修正後の最初のポーリングで `resumeAll()` が呼ばれる。
+
+`start()` は多重に呼んでもポーリングを 1 系統しか作らない。`stop()` はポーリング中フラグを下ろしてタイマーを解除する。実行中の `checkOnce()` は、完了後にこのフラグを確認してから次のタイマーを仕掛けるので、`stop()` 後にポーリングが再開することはない。
 
 ---
 
@@ -2574,7 +2643,7 @@ stateDiagram-v2
 // src/recording/finalizer.ts
 import type { ChunkStore, MeetingStore } from "../storage/idb";
 import type { LocalSaveScheduler } from "./local-save-scheduler";
-import type { FinalizeRequest, ChunkListResponse } from "../api/contracts";
+import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
 
 export interface FinalizerDeps {
@@ -2584,7 +2653,11 @@ export interface FinalizerDeps {
   readonly baseUrl: string;
   readonly token: string;
   readonly fetchImpl?: typeof fetch;
+  /** GET /chunks と POST /finalize それぞれのタイムアウト。既定 30000ms */
+  readonly timeoutMs?: number;
 }
+
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 export type FinalizeResult =
   | { readonly ok: true }
@@ -2600,6 +2673,7 @@ export type FinalizeResult =
  */
 export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const meeting = await deps.meetingStore.get(meetingId);
   if (meeting === undefined) return { ok: false, stage: "verify", detail: "meeting not found" };
 
@@ -2619,9 +2693,22 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
 
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
   assertLocalHost(listUrl);
-  const listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit" });
+  // タイムアウトで abort すると fetch / json() が reject し、既存のエラー経路で Result になる
+  const listAbort = new AbortController();
+  const listTimer = setTimeout(() => listAbort.abort(), timeoutMs);
+  let listRes: Response;
+  let list: unknown;
+  try {
+    listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", signal: listAbort.signal });
+    // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
+    list = listRes.ok ? await listRes.json().catch(() => null) : null;
+  } catch (error) {
+    return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}` };
+  } finally {
+    clearTimeout(listTimer);
+  }
   if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
-  const list = (await listRes.json()) as ChunkListResponse;
+  if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
   for (const c of chunks) {
     const s = serverByKey.get(`${c.meta.source}:${c.meta.sequenceNo}`);
@@ -2646,12 +2733,25 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   };
   const finUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/finalize`, deps.baseUrl);
   assertLocalHost(finUrl);
-  const finRes = await fetchImpl(finUrl, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    credentials: "omit",
-  });
+  const finAbort = new AbortController();
+  const finTimer = setTimeout(() => finAbort.abort(), timeoutMs);
+  let finRes: Response;
+  try {
+    finRes = await fetchImpl(finUrl, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      credentials: "omit",
+      signal: finAbort.signal,
+    });
+  } catch (error) {
+    // finalizing のまま残さない。次回の Barrier 再試行は stop_requested から行う
+    meeting.status = "stop_requested";
+    await deps.meetingStore.put(meeting);
+    return { ok: false, stage: "finalize", detail: `finalize request failed: ${errorMessage(error)}` };
+  } finally {
+    clearTimeout(finTimer);
+  }
   if (!finRes.ok) {
     meeting.status = "stop_requested";
     await deps.meetingStore.put(meeting);
@@ -2661,9 +2761,15 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   await deps.meetingStore.put(meeting);
   return { ok: true };
 }
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 ```
 
 サーバー未起動のまま利用者が停止した場合、Meeting は `stop_requested` で IndexedDB に残り、次回起動時の復旧（§23）でサーバーが `HEALTHY` になった時点から自動的に Barrier を再試行する。「最後の Chunk を保存する前に finalizing へ遷移してはいけない」（v4.0 §43）は、`finalizeMeeting` が `RecordingController.stop()` の完了後にしか呼ばれない呼び出し規約と、`notRegistered.length > 0` の早期リターンで担保する。
+
+`finalizeMeeting` は失敗を例外ではなく `FinalizeResult` で返す。`GET /chunks` の応答は外部入力なので `isChunkListResponse` で検証し、契約に合わなければ `verify` の失敗とする。`GET /chunks` と `POST /finalize` にはそれぞれ `timeoutMs`（既定 30 秒）の `AbortController` を付ける。応答しないサーバーに対しても、接続失敗と同じ経路で失敗結果を返す。`POST /finalize` が失敗した場合（HTTP エラー、接続失敗、タイムアウトのいずれも）は会議を `stop_requested` に戻し、`finalizing` のまま残さない。
 
 ---
 
@@ -2852,6 +2958,10 @@ export async function createHarness(): Promise<Harness> {
       // 本番では BackendHealthMonitor.reportUnreachable() に配線する（§18）
       onBackendUnreachable: () => {
         backend.status = "UNREACHABLE";
+      },
+      // 本番では BackendHealthMonitor.reportUnauthorized() に配線する（§18）
+      onBackendUnauthorized: () => {
+        backend.unauthorized = true;
       },
     }),
     advance: async (ms) => {
