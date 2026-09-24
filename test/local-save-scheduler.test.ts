@@ -1,0 +1,153 @@
+import { IDBFactory } from "fake-indexeddb";
+import { describe, expect, it } from "vitest";
+import { LocalSaver } from "../src/api/local-saver";
+import { LocalSaveScheduler } from "../src/recording/local-save-scheduler";
+import { createInitialHealth } from "../src/recording/recording-health-monitor";
+import { ChunkStore, openDatabase } from "../src/storage/idb";
+import type { AudioChunkRecord, LocalBackendHealth } from "../src/types/recording";
+import { BASE_URL, makeChunkRecord, TOKEN } from "./harness";
+
+type Responder = (record: { sequenceNo: number; attempt: number }) => Response | "network-error";
+
+function okResponse(r: AudioChunkRecord, registered = true): Response {
+  const { meetingId, source, sequenceNo, sha256, sizeBytes } = r.meta;
+  return new Response(JSON.stringify({ meetingId, source, sequenceNo, sha256, sizeBytes, path: `p/${sequenceNo}`, registered }), { status: 201 });
+}
+
+async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response | "network-error", backendStatus: LocalBackendHealth["status"] = "HEALTHY") {
+  const chunkStore = new ChunkStore(await openDatabase(new IDBFactory()));
+  const backend: LocalBackendHealth = { status: backendStatus, lastCheckedAt: 0, lastHealthyAt: 0, latencyMs: 5, consecutiveFailures: 0, capabilities: null, unauthorized: false };
+  const health = createInitialHealth("running");
+  const timers: Array<{ fn: () => void; at: number }> = [];
+  const records = new Map<number, AudioChunkRecord>();
+  const attempts = new Map<number, number>();
+  let now = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let putCount = 0;
+  const fetchImpl: typeof fetch = async (input) => {
+    putCount++;
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((r) => setTimeout(r, 0));
+    inFlight--;
+    const seq = Number(String(input).split("/").pop());
+    const attempt = (attempts.get(seq) ?? 0) + 1;
+    attempts.set(seq, attempt);
+    const res = respond(records.get(seq) as AudioChunkRecord, attempt);
+    if (res === "network-error") throw new TypeError("Failed to fetch");
+    return res;
+  };
+  const scheduler = new LocalSaveScheduler({
+    chunkStore,
+    saver: () => new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, fetchImpl),
+    backend: () => backend,
+    health,
+    maxConcurrency: 2,
+    now: () => now,
+    setTimer: (fn, ms) => timers.push({ fn, at: now + ms }),
+    onBackendUnreachable: () => {
+      backend.status = "UNREACHABLE";
+    },
+  });
+  const add = async (seq: number) => {
+    const r = await makeChunkRecord("m", seq, 160);
+    records.set(seq, r);
+    await chunkStore.putChunk(r);
+    await scheduler.enqueue(r.chunkKey);
+    return r;
+  };
+  const advance = async (ms: number) => {
+    now += ms;
+    for (const t of timers.filter((x) => x.at <= now)) {
+      timers.splice(timers.indexOf(t), 1);
+      t.fn();
+    }
+    for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 0));
+  };
+  const status = async (seq: number) => (await chunkStore.getChunk(`m:mic:${String(seq).padStart(6, "0")}`))?.save;
+  return { scheduler, chunkStore, backend, health, timers, add, advance, status, stats: () => ({ putCount, maxInFlight }) };
+}
+
+describe("LocalSaveScheduler", () => {
+  it("registered=false の応答は SAVED で止まる（DB 登録は後から確認）", async () => {
+    const s = await setup((r) => okResponse(r, false));
+    await s.add(0);
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("SAVED");
+    expect((await s.status(0))?.savedVia).toBe("api");
+  });
+
+  it("並列 PUT は maxConcurrency（2）を超えない", async () => {
+    const s = await setup((r) => okResponse(r));
+    for (let i = 0; i < 6; i++) await s.add(i);
+    await s.advance(0);
+    await s.advance(0);
+    for (let i = 0; i < 6; i++) expect((await s.status(i))?.status).toBe("DB_REGISTERED");
+    expect(s.stats().maxInFlight).toBeLessThanOrEqual(2);
+    expect(s.health.pendingChunkCount).toBe(0);
+  });
+
+  it("5xx は RETRYING になり、バックオフ経過後の再送で成功する", async () => {
+    const s = await setup((r, attempt) => (attempt === 1 ? new Response("{}", { status: 500 }) : okResponse(r)));
+    await s.add(0);
+    await s.advance(0);
+    const retrying = await s.status(0);
+    expect(retrying?.status).toBe("RETRYING");
+    expect(retrying?.lastError?.kind).toBe("SERVER");
+    expect(retrying?.nextRetryAt).toBeGreaterThan(0);
+    await s.advance(3_000); // 2s ± 20% を確実に越える
+    const done = await s.status(0);
+    expect(done?.status).toBe("DB_REGISTERED");
+    expect(done?.attempts).toBe(2);
+  });
+
+  it("non-retryable（422）は LOCAL_SAVE_FAILED に留まり、後続 Chunk は詰まらない", async () => {
+    const s = await setup((r) => (r.meta.sequenceNo === 0 ? new Response("{}", { status: 422 }) : okResponse(r)));
+    await s.add(0);
+    await s.add(1);
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+    expect((await s.status(1))?.status).toBe("DB_REGISTERED");
+    expect(s.timers).toHaveLength(0);
+  });
+
+  it("DEGRADED（遅いが応答あり）の backend には PUT を試みる（§18）", async () => {
+    const s = await setup((r) => okResponse(r), "DEGRADED");
+    await s.add(0);
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+  });
+
+  it("saver 未設定（トークン未入力）なら BACKEND_UNAVAILABLE で待機", async () => {
+    const s = await setup((r) => okResponse(r));
+    const noSaver = new LocalSaveScheduler({
+      chunkStore: s.chunkStore,
+      saver: () => null,
+      backend: () => s.backend,
+      health: s.health,
+      maxConcurrency: 2,
+      now: () => 0,
+      setTimer: () => undefined,
+      onBackendUnreachable: () => undefined,
+    });
+    const r = await makeChunkRecord("m", 9, 160);
+    await s.chunkStore.putChunk(r);
+    await noSaver.enqueue(r.chunkKey);
+    await s.advance(0);
+    expect((await s.status(9))?.status).toBe("BACKEND_UNAVAILABLE");
+  });
+
+  it("接続不能（NETWORK）はポーリングを待たず backend を UNREACHABLE にし、PUT を連打しない", async () => {
+    // Arrange：backend はまだ HEALTHY と認識しているがサーバーは落ちている
+    const s = await setup(() => "network-error");
+    // Act
+    await s.add(0);
+    for (let i = 0; i < 5; i++) await s.advance(10);
+    // Assert
+    expect(s.backend.status).toBe("UNREACHABLE");
+    expect(s.stats().putCount).toBe(1);
+    expect((await s.status(0))?.status).toBe("BACKEND_UNAVAILABLE");
+    expect((await s.status(0))?.lastError?.kind).toBe("NETWORK");
+  });
+});

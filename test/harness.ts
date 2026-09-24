@@ -1,10 +1,134 @@
 // test/harness.ts
-// 設計書 §24.1 の共通ハーネス。実装 Step の進行に合わせて段階的に追記する。
+// 設計書 §24.1 の共通ハーネス。差分：scheduler に onBackendUnreachable を配線（Monitor への即時通知の代替）。
 import "fake-indexeddb/auto";
 import { vi } from "vitest";
-import type { AudioChunkRecord } from "../src/types/recording";
+import type { ChunkListResponse, ChunkResponse, HealthResponse } from "../src/api/contracts";
+import type { AudioChunkRecord, LocalBackendHealth, RecordingHealth } from "../src/types/recording";
+import { ChunkStore, MeetingStore, openDatabase } from "../src/storage/idb";
+import { LocalSaveScheduler } from "../src/recording/local-save-scheduler";
+import { LocalSaver } from "../src/api/local-saver";
+import { createInitialHealth } from "../src/recording/recording-health-monitor";
 import { buildStandaloneWav } from "../src/audio/wav";
 import { makeChunkKey, sha256Hex } from "../src/recording/recording-controller";
+
+export const BASE_URL = "http://127.0.0.1:43117";
+export const TOKEN = "test-token";
+
+/** 常駐サーバーの振る舞いを最小限で模倣する fetch 実装。 */
+export class FakeLocalServer {
+  up = true;
+  readonly stored = new Map<string, { sha256: string; sizeBytes: number }>();
+  /** PUT がサーバーに到達した順（sequenceNo 順序保証の検証用） */
+  readonly arrivalOrder: string[] = [];
+  putCount = 0;
+
+  readonly fetch: typeof fetch = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (!this.up) throw new TypeError("Failed to fetch");
+    if (url.pathname === "/v1/health") {
+      const body: HealthResponse = { status: "ok", service: "minutes-local" };
+      return new Response(JSON.stringify(body), { status: 200 });
+    }
+    const auth = new Headers(init?.headers).get("Authorization");
+    if (auth !== `Bearer ${TOKEN}`) return new Response(JSON.stringify({ error: "unauthorized", code: "UNAUTHORIZED" }), { status: 401 });
+
+    const putMatch = url.pathname.match(/^\/v1\/meetings\/([^/]+)\/chunks\/(mic|system)\/(\d+)$/);
+    if (putMatch !== null && init?.method === "PUT") {
+      this.putCount++;
+      this.arrivalOrder.push(`${putMatch[1]}:${putMatch[2]}:${putMatch[3]}`);
+      const body = init.body;
+      const bytes = body instanceof Blob ? await body.arrayBuffer() : new ArrayBuffer(0);
+      const sha = await sha256Hex(bytes);
+      const key = `${putMatch[1]}:${putMatch[2]}:${putMatch[3]}`;
+      const existing = this.stored.get(key);
+      if (existing !== undefined && existing.sha256 !== sha) {
+        return new Response(JSON.stringify({ error: "hash mismatch", code: "CONFLICT_HASH_MISMATCH" }), { status: 409 });
+      }
+      this.stored.set(key, { sha256: sha, sizeBytes: bytes.byteLength });
+      const res: ChunkResponse = {
+        meetingId: putMatch[1],
+        source: putMatch[2] as "mic" | "system",
+        sequenceNo: Number(putMatch[3]),
+        sha256: sha,
+        sizeBytes: bytes.byteLength,
+        path: `recordings/${putMatch[1]}/${putMatch[2]}/${putMatch[3].padStart(6, "0")}.wav`,
+        registered: true,
+      };
+      return new Response(JSON.stringify(res), { status: existing === undefined ? 201 : 200 });
+    }
+
+    const listMatch = url.pathname.match(/^\/v1\/meetings\/([^/]+)\/chunks$/);
+    if (listMatch !== null) {
+      const chunks = [...this.stored.entries()]
+        .filter(([k]) => k.startsWith(`${listMatch[1]}:`))
+        .map(([k, v]) => {
+          const [, source, seq] = k.split(":");
+          return { source: source as "mic" | "system", sequenceNo: Number(seq), sha256: v.sha256, sizeBytes: v.sizeBytes, registered: true };
+        });
+      const res: ChunkListResponse = { meetingId: listMatch[1], chunks };
+      return new Response(JSON.stringify(res), { status: 200 });
+    }
+
+    if (url.pathname.endsWith("/finalize") && init?.method === "POST") {
+      return new Response(JSON.stringify({ meetingId: "x", status: "finalized", registeredChunkCounts: { mic: this.stored.size, system: 0 } }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+}
+
+export interface Harness {
+  readonly db: IDBDatabase;
+  readonly chunkStore: ChunkStore;
+  readonly meetingStore: MeetingStore;
+  readonly server: FakeLocalServer;
+  readonly backend: LocalBackendHealth;
+  readonly health: RecordingHealth;
+  readonly scheduler: LocalSaveScheduler;
+  readonly timers: Array<{ fn: () => void; at: number }>;
+  now: number;
+  readonly advance: (ms: number) => Promise<void>;
+}
+
+export async function createHarness(): Promise<Harness> {
+  const db = await openDatabase();
+  const server = new FakeLocalServer();
+  const backend: LocalBackendHealth = { status: "HEALTHY", lastCheckedAt: 0, lastHealthyAt: 0, latencyMs: 5, consecutiveFailures: 0, capabilities: null, unauthorized: false };
+  const health = createInitialHealth("running");
+  const timers: Array<{ fn: () => void; at: number }> = [];
+  const h: Harness = {
+    db,
+    chunkStore: new ChunkStore(db),
+    meetingStore: new MeetingStore(db),
+    server,
+    backend,
+    health,
+    timers,
+    now: 0,
+    scheduler: new LocalSaveScheduler({
+      chunkStore: new ChunkStore(db),
+      saver: () => new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, server.fetch),
+      backend: () => backend,
+      health,
+      maxConcurrency: 2,
+      now: () => h.now,
+      setTimer: (fn, ms) => timers.push({ fn, at: h.now + ms }),
+      onBackendUnreachable: () => {
+        backend.status = "UNREACHABLE";
+      },
+    }),
+    advance: async (ms) => {
+      h.now += ms;
+      const due = timers.filter((t) => t.at <= h.now);
+      for (const t of due) {
+        timers.splice(timers.indexOf(t), 1);
+        t.fn();
+      }
+      // fake-indexeddb と crypto.subtle はマクロタスクで完了するため、setTimeout(0) で数周回す
+      for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0));
+    },
+  };
+  return h;
+}
 
 export function makeSine(freqHz: number, sampleRate: number, samples: number, amplitude = 0.5): Float32Array {
   const out = new Float32Array(samples);
