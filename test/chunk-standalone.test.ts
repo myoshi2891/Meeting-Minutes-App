@@ -1,6 +1,8 @@
 // test/chunk-standalone.test.ts
 import { describe, expect, it } from "vitest";
 import { buildStandaloneWav, extractPcm, parseWavHeader, WAV_HEADER_BYTES } from "../src/audio/wav";
+import { ChunkStore, openDatabase } from "../src/storage/idb";
+import { makeChunkRecord } from "./harness";
 
 describe("Chunk 単体再生可能性", () => {
   it("44 バイトヘッダの全フィールドが固定仕様と一致する", () => {
@@ -21,6 +23,23 @@ describe("Chunk 単体再生可能性", () => {
     expect(view.getUint16(34, true)).toBe(16);
     expect(String.fromCharCode(...new Uint8Array(wav, 36, 4))).toBe("data");
     expect(view.getUint32(40, true)).toBe(960000);
+  });
+
+  it("IndexedDB から読み戻した Blob を単独でパースでき、PCM がラウンドトリップする", async () => {
+    const chunkStore = new ChunkStore(await openDatabase());
+    const r = await makeChunkRecord("m-standalone", 7);
+    await chunkStore.putChunk(r);
+    const loaded = await chunkStore.getChunk(r.chunkKey);
+    if (loaded === undefined || loaded.wav === null) throw new Error("chunk missing");
+    const buf = await loaded.wav.arrayBuffer();
+    const parsed = parseWavHeader(buf);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.header.sampleCount).toBe(480000);
+    expect(parsed.header.dataBytes).toBe(buf.byteLength - WAV_HEADER_BYTES);
+    const pcm = extractPcm(buf);
+    expect(pcm.length).toBe(480000);
+    expect(pcm[0]).toBe(7); // makeChunkRecord は seq をオフセットとして加えている
   });
 
   it("部分 Chunk（flush 由来）も単体で整合したヘッダを持つ", () => {
