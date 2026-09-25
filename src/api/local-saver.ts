@@ -57,6 +57,8 @@ export class LocalSaver {
         signal: controller.signal,
         // ローカルサーバーなので credentials は不要。Cookie 方式（§4.3）の場合のみ "include"。
         credentials: "omit",
+        // リダイレクト先は assertLocalHost を通らないため追従しない（録音データを外部へ再送させない、§4.4）
+        redirect: "error",
       });
       return await this.interpret(response, record);
     } catch (error) {

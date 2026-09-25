@@ -61,6 +61,8 @@ describe("LocalSaver.put", () => {
     expect(headers.get("Authorization")).toBe("Bearer tok");
     expect(headers.get("X-Chunk-SHA256")).toBe(r.meta.sha256);
     expect(headers.get("X-Chunk-Meta")).not.toBeNull();
+    // リダイレクトに従うと録音データを外部ホストへ再送しうるので、追従せずエラーにする（§4.4）
+    expect(c.init.redirect).toBe("error");
   });
 
   it("200 は冪等再送として成功扱い", async () => {
