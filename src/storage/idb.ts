@@ -216,5 +216,8 @@ export function isAudioChunkRecord(value: unknown): value is AudioChunkRecord {
 export function isMeetingRecord(value: unknown): value is MeetingRecord {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return typeof v.meetingId === "string" && typeof v.status === "string" && typeof v.sessionClock === "object";
+  if (typeof v.meetingId !== "string" || typeof v.status !== "string") return false;
+  // Finalizer と復旧が sessionClock.audioFrameCount を読むため、null や欠落を通さない
+  if (typeof v.sessionClock !== "object" || v.sessionClock === null) return false;
+  return typeof (v.sessionClock as Record<string, unknown>).audioFrameCount === "number";
 }

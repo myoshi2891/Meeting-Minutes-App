@@ -201,4 +201,12 @@ describe("型ガード", () => {
     expect(isMeetingRecord({ meetingId: "m" })).toBe(false);
     expect(isMeetingRecord(makeMeeting("m", "created"))).toBe(true);
   });
+
+  it("isMeetingRecord は sessionClock が null、または audioFrameCount が数値でない値を拒否する", () => {
+    // Arrange
+    const valid = makeMeeting("m", "created");
+    // Act / Assert
+    expect(isMeetingRecord({ ...valid, sessionClock: null })).toBe(false);
+    expect(isMeetingRecord({ ...valid, sessionClock: { ...valid.sessionClock, audioFrameCount: "0" } })).toBe(false);
+  });
 });
