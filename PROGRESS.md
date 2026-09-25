@@ -24,13 +24,12 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-25 時点・2 回目のレビュー対応）
+### 未コミットの変更（2026-09-25 時点・3 回目のレビュー対応）
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/**`、`test/**` | レビュー指摘の修正（Finalizer の状態の前提条件、Scheduler の runOne 例外からの復旧、HealthMonitor の UNREACHABLE 時の null 化、flush/stop の requestId＋タイムアウト）と回帰テスト。HealthMonitor のポーリングテストをフェイクタイマー化 | `fix(recording): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を設計書に反映。phase2-client は stop の最終フレーム数の永続化、persistChunk の全エラーでのメモリ待機、Finalizer の型ガードも修正 | `docs(phase1): ...` |
-| `.gitignore` | `.env`、`*.wav`、`recordings/` を除外 | `chore(setup): ...` |
+| `src/**`、`test/**` | `isChunkListResponse` が `meetingId` を必須にし、Finalizer が要求した会議との一致を確認。`isHealthResponse` が `capabilities: null` などを拒否。`dropBlob` は DB_REGISTERED の Chunk だけ WAV を削除。`SincResampler.push()` が出力バッファを再利用。リサンプラのテストを MessagePort のイベントで同期 | `fix(recording): ...` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を設計書に反映（phase2-client は Finalizer の meetingId 検査） | `docs(phase1): ...` |
 
 ---
 
@@ -77,6 +76,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 1-d・1-e には実サーバーが要る。Phase 2 サーバー設計（[design-local-phase2-server.md](design-local-phase2-server.md)、Python）から、`/v1/health`・`PUT chunk`・`GET chunks`・`POST finalize` だけの最小スタブを作るかを判断する。
 - 結果は [design-local-phase1.md](design-local-phase1.md) §28 の「状況」列に反映する。
 
+### T5. 録音中の会議を起動時復旧から守る【T3 の前に方針決定が必要】
+
+- 2026-09-25 のレビュー指摘（3 回目）で有効と判定したが見送った。別タブで録音中に新しいタブが開くと、`recoverOnStartup` がその会議を `stop_requested` に落とし、Barrier の自動再試行で録音中に finalize されうる（§3.1 で複数タブの同時録音を許している）。
+- 候補: 録音中は会議ごとの Web Lock（`navigator.locks.request("minutes:meeting:<id>")`）を保持し、復旧はロックを `ifAvailable` で取れた会議だけを処理する。ロック API は依存注入してテストで Fake にする。`RecordingControllerDeps` と `recoverOnStartup` の引数が増えるので、着手前に利用者に確認する。
+
 ### 保留・メモ
 
 - `package.json` に lint スクリプトがない。コミット前の確認は現状 `typecheck` + `test` のみ。
@@ -87,6 +91,10 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-25（3 回目）
+
+- CodeRabbit の指摘 6 件（インライン 5・nitpick 1）を検証した。5 件を修正し、回帰テスト 6 件は修正前のコードで Red になることを確認した。Web Lock による復旧との排他は設計判断が要るため T5 に回した。
 
 ### 2026-09-25（2 回目）
 
