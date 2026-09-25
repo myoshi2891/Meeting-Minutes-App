@@ -64,7 +64,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### T1-f. IDB 書き込みの非クォータ失敗と versionchange からの回復【要判断・利用者に確認】
 
-8・9 回目のレビュー指摘。9 回目で `IDB_WRITE_FAILED` の記録は対応済み。残りは再オープン経路で、`persistChunk` の非クォータ失敗（別タブの versionchange で接続が閉じた後の `InvalidStateError` など）は degradedReasons に出ず、`drainMemoryBacklog` も同じ例外で進まないため、Finalizer が `waiting_local_save` のまま止まる。現設計（§10 `openDatabase`）は「接続を閉じて再読み込みを促す」方針で、ChunkStore の再オープンは設計にない。ただし別タブが新しい `DB_VERSION` へアップグレードした後は、旧コードの `open(DB_NAME, 旧版)` が `VersionError` になるため再オープンでは直らない。メモリ待機を失わずに済む経路（例: 待機分をサーバーへ直接 PUT、または UI でエクスポートを促してから再読み込み）を決めてから、設計書 → テスト → 実装の順で進める。
+8・9 回目のレビュー指摘。9 回目で `IDB_WRITE_FAILED` の記録は対応済み。残りは再オープン経路で、`persistChunk` の非クォータ失敗（別タブの versionchange で接続が閉じた後の `InvalidStateError` など）は `IDB_WRITE_FAILED` として表示されるが、`drainMemoryBacklog` が同じ例外で止まりメモリ待機分を救済する経路がないため、Finalizer が `waiting_local_save` のまま止まる。現設計（§10 `openDatabase`）は「接続を閉じて再読み込みを促す」方針で、ChunkStore の再オープンは設計にない。ただし別タブが新しい `DB_VERSION` へアップグレードした後は、旧コードの `open(DB_NAME, 旧版)` が `VersionError` になるため再オープンでは直らない。メモリ待機を失わずに済む経路（例: 待機分をサーバーへ直接 PUT、または UI でエクスポートを促してから再読み込み）を決めてから、設計書 → テスト → 実装の順で進める。
 
 ### T1-e. stop タイムアウト時の扱い【要判断・利用者に確認】
 
@@ -96,10 +96,10 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 1-d・1-e には実サーバーが要る。Phase 2 サーバー設計（[design-local-phase2-server.md](design-local-phase2-server.md)、Python）から、`/v1/health`・`PUT chunk`・`GET chunks`・`POST finalize` だけの最小スタブを作るかを判断する。
 - 結果は [design-local-phase1.md](design-local-phase1.md) §28 の「状況」列に反映する。
 
-### T5. 録音中の会議を起動時復旧から守る【T3 の前に方針決定が必要】
+### T5. 録音中の会議を起動時復旧から守る ✅ 完了（9 回目のレビュー対応）
 
-- 2026-09-25 のレビュー指摘（3 回目）で有効と判定したが見送った。別タブで録音中に新しいタブが開くと、`recoverOnStartup` がその会議を `stop_requested` に落とし、Barrier の自動再試行で録音中に finalize されうる（§3.1 で複数タブの同時録音を許している）。
-- 候補: 録音中は会議ごとの Web Lock（`navigator.locks.request("minutes:meeting:<id>")`）を保持し、復旧はロックを `ifAvailable` で取れた会議だけを処理する。ロック API は依存注入してテストで Fake にする。`RecordingControllerDeps` と `recoverOnStartup` の引数が増えるので、着手前に利用者に確認する。
+- 2026-09-25 のレビュー指摘（3 回目）。別タブで録音中に新しいタブが開くと、`recoverOnStartup` がその会議を `stop_requested` に落とし、Barrier の自動再試行で録音中に finalize されうる（§3.1 で複数タブの同時録音を許している）。
+- 対応: 会議ごとの Web Lock（`src/recording/meeting-lock.ts`）。`start()` が recording を書く前に取得し `stop()` の finally で解放、`recoverOnStartup` はロック保持中の会議と Chunk に触らない。`RecordingControllerDeps.locks` と `recoverOnStartup` の第 4 引数 `locks` を追加し、テストはハーネスの `FakeLockManager` を使う。
 
 ### T6. stop() の Worklet 無応答をどう扱うか【方針決定が必要】
 
