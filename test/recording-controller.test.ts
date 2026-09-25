@@ -308,6 +308,8 @@ describe("RecordingController", () => {
     expect(s.errors.map((e) => e.message)).toEqual(["disk exploded"]);
     expect(s.controller.memoryBacklogCount).toBe(1);
     expect(s.health.degradedReasons).not.toContain("IDB_QUOTA_EXHAUSTED");
+    // メモリ待機はクラッシュで失われるので、クォータ以外の失敗も UI に出す
+    expect(s.health.degradedReasons).toContain("IDB_WRITE_FAILED");
 
     expect(await s.controller.drainMemoryBacklog()).toBe(1);
     expect((await s.chunkStore.getChunk("m1:mic:000000"))?.meta.sequenceNo).toBe(0);

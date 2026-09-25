@@ -265,13 +265,12 @@ export class RecordingController {
     } catch (error) {
       // 失敗理由を問わずメモリ待機に残す。sequenceNo は採番済みなので、捨てると欠番になり Finalizer が進めなくなる
       this.memoryBacklog.push(record);
-      if (isQuotaExceeded(error)) {
-        // §3.4 段階3：メモリ待機。録音は止めない。
-        if (!this.deps.health.degradedReasons.includes("IDB_QUOTA_EXHAUSTED")) {
-          this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "IDB_QUOTA_EXHAUSTED"];
-        }
-        return;
+      // §3.4 段階3：メモリ待機。録音は止めない。メモリ待機はクラッシュで失われるため、理由を問わず UI に出す
+      const reason = isQuotaExceeded(error) ? "IDB_QUOTA_EXHAUSTED" : "IDB_WRITE_FAILED";
+      if (!this.deps.health.degradedReasons.includes(reason)) {
+        this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, reason];
       }
+      if (reason === "IDB_QUOTA_EXHAUSTED") return;
       throw error;
     }
 
