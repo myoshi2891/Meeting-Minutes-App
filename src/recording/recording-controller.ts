@@ -14,6 +14,7 @@ import {
 import { createSessionClock, frameToOffsetMs } from "./session-clock";
 import { buildStandaloneWav } from "../audio/wav";
 import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
+import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
 
 /** Chunk を保存 State Machine に投入する口。LocalSaveScheduler が構造的に満たす（テストでは差し替える）。 */
 export interface ChunkEnqueuer {
@@ -31,6 +32,8 @@ export interface RecordingControllerDeps {
   readonly onError: (error: Error) => void;
   /** flush / stop の応答待ちタイムアウト用。既定は setTimeout（テストでは差し替える） */
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
+  /** 録音中の会議ロック（本番は navigator.locks）。§23 の復旧はロック保持中の会議に触らない */
+  readonly locks: MeetingLockManager;
 }
 
 /** Worklet が flush / stop に応答しない（AudioContext が閉じられた等）ときに待機を打ち切るまでの時間 */
@@ -58,6 +61,8 @@ export class RecordingController {
   /** requestId → flushed 待機。応答は要求 ID で対応付ける（タイムアウト後の遅れた応答が別の要求を解放しないように） */
   private readonly flushWaiters = new Map<number, () => void>();
   private nextRequestId = 0;
+  /** 会議ロックの解放。start で取得し、stop の完了で解放する */
+  private releaseLock: (() => void) | null = null;
 
   constructor(private readonly deps: RecordingControllerDeps) {}
 
@@ -66,6 +71,21 @@ export class RecordingController {
   }
 
   async start(meetingId: string, title: string, consentConfirmedAt: number): Promise<void> {
+    const { audioContext, mediaStream, workletModuleUrl } = this.deps;
+
+    // recording を書く前にロックを取る。先に書くと、別タブの復旧がロックのない recording を中断扱いにできてしまう
+    const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
+    if (release === null) throw new Error(`meeting ${meetingId} is already being recorded`);
+    this.releaseLock = release;
+    try {
+      await this.setUp(meetingId, title, consentConfirmedAt);
+    } catch (error) {
+      this.unlock();
+      throw error;
+    }
+  }
+
+  private async setUp(meetingId: string, title: string, consentConfirmedAt: number): Promise<void> {
     const { audioContext, mediaStream, workletModuleUrl } = this.deps;
 
     // AudioContext は sampleRate を指定せずに生成されている前提。実際の値はここで取得する。
@@ -136,7 +156,13 @@ export class RecordingController {
       if (this.node !== null) this.node.port.onmessage = null;
       this.node = null;
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
+      this.unlock();
     }
+  }
+
+  private unlock(): void {
+    this.releaseLock?.();
+    this.releaseLock = null;
   }
 
   /** IDB クォータが回復したときに UI / QuotaMonitor から呼ぶ。 */

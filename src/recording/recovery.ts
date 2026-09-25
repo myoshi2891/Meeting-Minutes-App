@@ -1,6 +1,7 @@
 // src/recording/recovery.ts
 import type { ChunkStore, MeetingStore } from "../storage/idb";
 import { isResumable, type LocalSaveScheduler } from "./local-save-scheduler";
+import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
 import type { AudioChunkRecord, MeetingRecord } from "../types/recording";
 
 export interface RecoveryReport {
@@ -15,31 +16,50 @@ export interface RecoveryReport {
  *   non-retryable の LOCAL_SAVE_FAILED は resumeAll の判定に任せ、SAVED は Finalizer のサーバー一覧照合に任せる
  * - recording のまま残っていた会議は stop_requested に落とす（音声はもう来ない）
  *   audioFrameCount は stop() でしか永続化されないため、保存済み Chunk の最大 endFrame から復元する
+ * - 会議ロック（§15）が保持中の会議は別タブで録音中なので、会議も Chunk も触らない
  */
-export async function recoverOnStartup(meetingStore: MeetingStore, chunkStore: ChunkStore, scheduler: LocalSaveScheduler): Promise<RecoveryReport> {
+export async function recoverOnStartup(
+  meetingStore: MeetingStore,
+  chunkStore: ChunkStore,
+  scheduler: LocalSaveScheduler,
+  locks: MeetingLockManager,
+): Promise<RecoveryReport> {
   const interrupted: Array<{ meetingId: string; status: MeetingRecord["status"]; chunkCount: number }> = [];
   const seen = new Set<string>();
+  const active = new Set<string>();
   for (const status of ["recording", "stop_requested", "finalizing"] as const) {
     for (const m of await meetingStore.listByStatus(status)) {
       // recording → stop_requested に更新した会議を次の status で二重に拾わない
       if (seen.has(m.meetingId)) continue;
       seen.add(m.meetingId);
-      const chunks = await chunkStore.listByMeeting(m.meetingId, "mic");
-      if (m.status === "recording") {
-        // Finalizer が totalAudioFrames として送る値。既に大きい値があれば維持する
-        const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
-        m.sessionClock.audioFrameCount = Math.max(m.sessionClock.audioFrameCount, lastEndFrame);
-        m.status = "stop_requested";
-        m.updatedAt = Date.now();
-        await meetingStore.put(m);
+      // 復旧中もロックを持ち、録音タブと同時に会議を書き換えない
+      const release = await tryAcquireMeetingLock(locks, m.meetingId);
+      if (release === null) {
+        active.add(m.meetingId);
+        continue;
       }
-      interrupted.push({ meetingId: m.meetingId, status: m.status, chunkCount: chunks.length });
+      try {
+        const chunks = await chunkStore.listByMeeting(m.meetingId, "mic");
+        if (m.status === "recording") {
+          // Finalizer が totalAudioFrames として送る値。既に大きい値があれば維持する
+          const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
+          m.sessionClock.audioFrameCount = Math.max(m.sessionClock.audioFrameCount, lastEndFrame);
+          m.status = "stop_requested";
+          m.updatedAt = Date.now();
+          await meetingStore.put(m);
+        }
+        interrupted.push({ meetingId: m.meetingId, status: m.status, chunkCount: chunks.length });
+      } finally {
+        release();
+      }
     }
   }
 
   const unfinished = await chunkStore.listUnfinished();
   let requeued = 0;
   for (const c of unfinished) {
+    // 録音中のタブが PUT している最中の Chunk。書き戻すと SAVING が PENDING に巻き戻る
+    if (active.has(c.meta.meetingId)) continue;
     if (isInterrupted(c)) {
       // SAVING のまま落ちた Chunk はサーバー側に届いているかもしれない。冪等 PUT で再送し、200/201 どちらでも SAVED にする。
       await chunkStore.updateSaveState(c.chunkKey, (r) => {

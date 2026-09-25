@@ -5,6 +5,8 @@ import { parseWavHeader } from "../src/audio/wav";
 import { makeChunkKey, RecordingController, sha256Hex } from "../src/recording/recording-controller";
 import { ChunkStore, MeetingStore, openDatabase } from "../src/storage/idb";
 import type { AudioChunkRecord, RecordingHealth, WorkletCommand } from "../src/types/recording";
+import { meetingLockName, tryAcquireMeetingLock } from "../src/recording/meeting-lock";
+import { FakeLockManager } from "./harness";
 
 function createHealth(): RecordingHealth {
   return {
@@ -76,6 +78,7 @@ interface Setup {
   enqueued: string[];
   health: RecordingHealth;
   errors: Error[];
+  locks: FakeLockManager;
   track: EventTarget & { stop: ReturnType<typeof vi.fn> };
   /** 注入したタイマー。fireTimers() で期限を待たずに発火させる */
   fireTimers: () => void;
@@ -110,6 +113,7 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Prom
   const health = createHealth();
   const errors: Error[] = [];
   const timers: Array<() => void> = [];
+  const locks = new FakeLockManager();
   const controller = new RecordingController({
     audioContext,
     mediaStream,
@@ -128,13 +132,14 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Prom
       signal.notify();
     },
     setTimer: (fn) => timers.push(fn),
+    locks,
   });
   const fireTimers = () => {
     for (const fn of timers.splice(0)) fn();
   };
   const until = (condition: () => boolean) => signal.until(condition);
   const untilCommand = (type: WorkletCommand["type"]) => until(() => worklet.commands.some((c) => c.type === type));
-  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, track, fireTimers, until, untilCommand };
+  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, locks, track, fireTimers, until, untilCommand };
 }
 
 describe("makeChunkKey / sha256Hex", () => {
@@ -187,6 +192,44 @@ describe("RecordingController", () => {
     expect(await sha256Hex(buf)).toBe(rec.meta.sha256);
     expect(s.health.lastChunkAt).toBeGreaterThan(0);
     expect(s.controller.sessionClock?.audioFrameCount).toBe(960000);
+  });
+
+  it("録音中は会議ロックを保持し、stop の完了で解放する", async () => {
+    // Arrange
+    const s = await setup();
+    // Act
+    await s.controller.start("m1", "定例", 1);
+    const heldWhileRecording = s.locks.held.has(meetingLockName("m1"));
+    await s.controller.stop();
+    // Assert
+    expect(heldWhileRecording).toBe(true);
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(false);
+  });
+
+  it("同じ会議のロックを他が保持していれば start は失敗し、会議を保存しない", async () => {
+    // Arrange
+    const s = await setup();
+    const release = await tryAcquireMeetingLock(s.locks, "m1");
+    // Act / Assert
+    await expect(s.controller.start("m1", "定例", 1)).rejects.toThrow("already being recorded");
+    expect(await s.meetingStore.get("m1")).toBeUndefined();
+    release?.();
+  });
+
+  it("start が途中で失敗したら会議ロックを解放する", async () => {
+    // Arrange：Worklet モジュールの読み込みに失敗する
+    const s = await setup();
+    vi.stubGlobal(
+      "AudioWorkletNode",
+      class {
+        constructor() {
+          throw new Error("node failed");
+        }
+      },
+    );
+    // Act / Assert
+    await expect(s.controller.start("m1", "定例", 1)).rejects.toThrow("node failed");
+    expect(s.locks.held.size).toBe(0);
   });
 
   it("stop は stop_requested を記録し、最終の部分 Chunk の保存完了まで待ってからトラックを止める", async () => {

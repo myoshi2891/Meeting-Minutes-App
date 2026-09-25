@@ -10,6 +10,7 @@ import { LocalSaver } from "../src/api/local-saver";
 import { createInitialHealth } from "../src/recording/recording-health-monitor";
 import { buildStandaloneWav } from "../src/audio/wav";
 import { makeChunkKey, sha256Hex } from "../src/recording/recording-controller";
+import type { MeetingLockManager } from "../src/recording/meeting-lock";
 
 export const BASE_URL = "http://127.0.0.1:43117";
 export const TOKEN = "test-token";
@@ -76,6 +77,21 @@ export class FakeLocalServer {
   };
 }
 
+/** navigator.locks の ifAvailable 付き排他ロックだけを模倣する。インスタンスごとに別ブラウザ（クラッシュ後の再起動）とみなす。 */
+export class FakeLockManager implements MeetingLockManager {
+  readonly held = new Set<string>();
+
+  async request(name: string, _options: { ifAvailable: true }, callback: (lock: Lock | null) => Promise<void>): Promise<void> {
+    if (this.held.has(name)) return callback(null);
+    this.held.add(name);
+    try {
+      await callback({ name, mode: "exclusive" });
+    } finally {
+      this.held.delete(name);
+    }
+  }
+}
+
 export interface Harness {
   readonly db: IDBDatabase;
   readonly chunkStore: ChunkStore;
@@ -84,6 +100,7 @@ export interface Harness {
   readonly backend: LocalBackendHealth;
   readonly health: RecordingHealth;
   readonly scheduler: LocalSaveScheduler;
+  readonly locks: FakeLockManager;
   readonly timers: Array<{ fn: () => void; at: number }>;
   now: number;
   readonly advance: (ms: number) => Promise<void>;
@@ -102,6 +119,7 @@ export async function createHarness(): Promise<Harness> {
     server,
     backend,
     health,
+    locks: new FakeLockManager(),
     timers,
     now: 0,
     scheduler: new LocalSaveScheduler({
