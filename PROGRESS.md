@@ -20,7 +20,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 177 件がすべて通過。`npm run typecheck` もエラーなし。
+- 自動テスト: 17 ファイル / 179 件がすべて通過。`npm run typecheck` もエラーなし。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
@@ -32,6 +32,14 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | `test/**`（テストの同期方法） | health monitor のテストをフェイクタイマー・`performance.now` スタブに変更。Worklet テストを `startProcessor` / `nextFlushed` / `nthChunk`（`test/harness.ts` に移設）のイベント同期に変更 | `test(worklet): ...` |
 | `.claude/skills/design-doc-sync/scripts/check_design_sync.py` | 前後の空白を削らずにファイル全体と比較する | `chore(claude): ...` |
 | `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を設計書に反映。phase2-client は `fetchWithTimeout` が本文をタイムアウト内で読み、Finalizer の不一致を一括再投入 | `docs(phase1): ...` |
+
+### 未コミットの変更（2026-09-25・5 回目のレビュー対応）
+
+| 変更 | 内容 | 推奨コミット |
+| --- | --- | --- |
+| `src/recording/local-save-scheduler.ts`、`src/recording/recovery.ts`、`test/crash-recovery.test.ts`、`test/local-save-scheduler.test.ts` | `runOne` が SAVED を送らない。`recoverOnStartup` は GENERATED / SAVING だけを書き戻し、`requeuedChunks` は再投入対象だけを数える（`isResumable` を export）。回帰テスト 2 件 | `fix(recording): ...` |
+| `test/recording-controller.test.ts` | 固定回数のタイマー待ち `flushMessages` を、コマンド受信・enqueue・onError の観測で待つ `until` に置換 | `test(recording): ...` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映。phase2-client の Finalizer は失敗時に status を常に `stop_requested` へ戻す | `docs(phase1): ...` |
 
 ---
 
@@ -54,6 +62,12 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | T1-b | LocalSaveScheduler | backend 停止中に N 回 `enqueue` しても、各キーへの `BACKEND_UNAVAILABLE` 書き込みは 1 回だけ。復帰 → 再停止したら再び書く | `test/local-save-scheduler.test.ts` |
 | T1-c | RecordingController | ~~`flush()` と `stop()` が重なっても、`stop()` は自分の `flushed` まで解決しない~~ → requestId 化の回帰テストで対応済み（2026-09-25） | — |
 | T1-d | RecordingController | `meetingStore.put` が reject しても、トラック停止と `onmessage` の解除が行われる | `test/recording-controller.test.ts`（T1-c と同じファイルなので直列） |
+
+### T1-e. stop タイムアウト時の扱い【要判断・利用者に確認】
+
+- Worklet が 5 秒以内に `stop` に応答しないと、最終の部分 Chunk がないまま `stop_requested` が確定し、Finalizer は欠けた末尾に気づけない。
+- レビューでは「stop 未完了」状態の追加が提案されたが、`MeetingStatus` の変更（Phase 2 / 3 設計書と復旧・UI に波及）になり、Worklet は既に切断済みで失われた音声を取り戻す経路がない。状態を足すか、`totalAudioFrames` と Chunk の `endFrame` の差で検出して UI に警告するかを決める。
+- phase2-client §22 の「finalizing から再試行して失敗しても stop_requested に戻る」テストは、Phase 2 実装時に追加する。
 
 ### T2. Step 1-f: §20 / §21 の実装【T0 の後／T2-a と T2-b は並行可】
 
