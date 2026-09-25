@@ -138,9 +138,10 @@ export class ChunkStore {
     return all.filter(isAudioChunkRecord).filter((r) => r.save.status !== "DB_REGISTERED");
   }
 
-  /** クォータ縮退：Blob 本体を削除しメタデータのみ残す。 */
+  /** クォータ縮退（§3.4 段階1）：DB_REGISTERED の Chunk だけ Blob 本体を削除しメタデータのみ残す。未検証の Chunk は再送のため残す。 */
   async dropBlob(chunkKey: string): Promise<void> {
     await this.updateSaveState(chunkKey, (record) => {
+      if (record.save.status !== "DB_REGISTERED") return;
       record.wav = null;
     });
   }

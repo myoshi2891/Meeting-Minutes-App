@@ -50,6 +50,7 @@ class SincResampler {
   private history: Float32Array;           // 直近入力（タップ幅 + 未消費分）
   private historyLen = 0;
   private position = 0;                    // 次の出力サンプルに対応する history 内の実数インデックス
+  private out = new Float32Array(0);       // 出力バッファ（オーディオスレッドで毎回確保しないよう再利用）
 
   constructor(inputRate: number, outputRate: number) {
     if (inputRate <= 0 || outputRate <= 0) throw new Error("invalid sample rate");
@@ -82,7 +83,7 @@ class SincResampler {
     this.position = this.halfTaps;
   }
 
-  /** 入力を追加し、生成できる出力サンプルをすべて返す。 */
+  /** 入力を追加し、生成できる出力サンプルをすべて返す。戻り値は内部バッファのビューで、次の push まで有効。 */
   push(input: Float32Array): Float32Array {
     // history に追記（必要なら拡張）
     if (this.historyLen + input.length > this.history.length) {
@@ -95,7 +96,8 @@ class SincResampler {
 
     const taps = this.halfTaps * 2;
     const maxOutputs = Math.floor((this.historyLen - this.halfTaps - this.position) / this.ratio) + 1;
-    const out = new Float32Array(Math.max(0, maxOutputs));
+    if (maxOutputs > this.out.length) this.out = new Float32Array(maxOutputs);
+    const out = this.out;
     let produced = 0;
 
     while (this.position + this.halfTaps <= this.historyLen - 1) {
@@ -124,7 +126,7 @@ class SincResampler {
       this.historyLen -= keepFrom;
       this.position -= keepFrom;
     }
-    return produced === out.length ? out : out.subarray(0, produced);
+    return out.subarray(0, produced);
   }
 }
 

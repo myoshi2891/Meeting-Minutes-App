@@ -110,14 +110,28 @@ describe("ChunkStore", () => {
     expect(await store.countByStatus("m2", "GENERATED")).toBe(0);
   });
 
-  it("dropBlob は WAV 本体だけを消しメタデータを残す", async () => {
+  it("dropBlob は DB_REGISTERED の Chunk の WAV 本体だけを消しメタデータを残す", async () => {
+    // Arrange
     const store = new ChunkStore(await freshDb());
     const r = await makeChunkRecord("m1", 0, 160);
-    await store.putChunk(r);
+    await store.putChunk({ ...r, save: { ...r.save, status: "DB_REGISTERED" } });
+    // Act
     await store.dropBlob(r.chunkKey);
+    // Assert
     const loaded = await store.getChunk(r.chunkKey);
     expect(loaded?.wav).toBeNull();
     expect(loaded?.meta.sha256).toBe(r.meta.sha256);
+  });
+
+  it("dropBlob はサーバー未検証（GENERATED）の Chunk の WAV を消さない", async () => {
+    // Arrange
+    const store = new ChunkStore(await freshDb());
+    const r = await makeChunkRecord("m1", 0, 160);
+    await store.putChunk(r);
+    // Act
+    await store.dropBlob(r.chunkKey);
+    // Assert
+    expect((await store.getChunk(r.chunkKey))?.wav).not.toBeNull();
   });
 });
 

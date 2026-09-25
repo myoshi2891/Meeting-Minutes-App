@@ -172,6 +172,17 @@ describe("BackendHealthMonitor.checkOnce", () => {
     expect(health.degradedReasons).toContain("BACKEND_UNAUTHORIZED");
   });
 
+  it("capabilities が null のヘルス応答では unauthorized を解除しない", async () => {
+    // Arrange
+    const health = createInitialHealth("running");
+    const m = new BackendHealthMonitor(CONFIG, health, async () => json({ status: "ok", service: "minutes-local", capabilities: null }));
+    m.reportUnauthorized();
+    // Act
+    const s = await m.checkOnce();
+    // Assert
+    expect(s.unauthorized).toBe(true);
+  });
+
   it("unauthorized の解除は status が変わらなくても onChange で通知される（保存再開の契機）", async () => {
     let authorized = false;
     const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async () =>

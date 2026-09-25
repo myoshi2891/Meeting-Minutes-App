@@ -22,6 +22,12 @@ describe("isHealthResponse", () => {
     expect(isHealthResponse({ status: "ok", service: "other-app" })).toBe(false);
     expect(isHealthResponse({ status: "down", service: "minutes-local" })).toBe(false);
   });
+
+  it("capabilities は省略可だが、あるならオブジェクトでなければ false", () => {
+    expect(isHealthResponse({ status: "ok", service: "minutes-local", capabilities: {} })).toBe(true);
+    expect(isHealthResponse({ status: "ok", service: "minutes-local", capabilities: null })).toBe(false);
+    expect(isHealthResponse({ status: "ok", service: "minutes-local", capabilities: "x" })).toBe(false);
+  });
 });
 
 describe("encodeChunkMetaHeader", () => {
@@ -45,6 +51,8 @@ describe("isChunkListResponse", () => {
   it.each([
     null,
     { meetingId: "m" },
+    { chunks: [item] },
+    { meetingId: 1, chunks: [item] },
     { meetingId: "m", chunks: "x" },
     { meetingId: "m", chunks: [{ ...item, source: "speaker" }] },
     { meetingId: "m", chunks: [{ ...item, sequenceNo: "0" }] },

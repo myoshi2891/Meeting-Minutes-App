@@ -84,7 +84,9 @@ export function isChunkResponse(value: unknown): value is ChunkResponse {
 export function isHealthResponse(value: unknown): value is HealthResponse {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return (v.status === "ok" || v.status === "degraded") && v.service === "minutes-local";
+  // capabilities は認証済みのときだけ含まれる（省略可）。null などを通すと unauthorized の解除判定を誤る
+  const capsOk = v.capabilities === undefined || (typeof v.capabilities === "object" && v.capabilities !== null);
+  return (v.status === "ok" || v.status === "degraded") && v.service === "minutes-local" && capsOk;
 }
 
 /** ChunkTimingMetadata を X-Chunk-Meta ヘッダ用に Base64URL 化する（ヘッダに非 ASCII を載せない）。 */
@@ -99,8 +101,8 @@ export function encodeChunkMetaHeader(meta: ChunkTimingMetadata): string {
 /** GET /v1/meetings/{id}/chunks の応答。各要素は isChunkResponse の 3 フィールドに加え、照合キー（source / sequenceNo）を必須にする。 */
 export function isChunkListResponse(value: unknown): value is ChunkListResponse {
   if (typeof value !== "object" || value === null) return false;
-  const chunks = (value as { chunks?: unknown }).chunks;
-  if (!Array.isArray(chunks)) return false;
+  const { meetingId, chunks } = value as { meetingId?: unknown; chunks?: unknown };
+  if (typeof meetingId !== "string" || !Array.isArray(chunks)) return false;
   return chunks.every((c: unknown) => {
     if (!isChunkResponse(c)) return false;
     const v = c as unknown as Record<string, unknown>;

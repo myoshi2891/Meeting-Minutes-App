@@ -194,6 +194,28 @@ describe("finalizeMeeting（Barrier の追加条件）", () => {
     expect(result).toEqual({ ok: true });
     expect((await h.chunkStore.getChunk(first.chunkKey))?.save.status).toBe("DB_REGISTERED");
   });
+
+  it("GET /chunks の応答が別会議の一覧なら verify で失敗し、SAVED の Chunk を DB_REGISTERED にしない", async () => {
+    // Arrange：サーバーが中身は一致するが meetingId の違う一覧を返す
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    const [first] = await h.chunkStore.listByMeeting(MEETING_ID, "mic");
+    await h.chunkStore.updateSaveState(first.chunkKey, (r) => {
+      r.save.status = "SAVED";
+    });
+    const otherMeeting: typeof fetch = async (input, init) => {
+      const res = await h.server.fetch(input, init);
+      if (!String(input).endsWith("/chunks")) return res;
+      const body: unknown = await res.json();
+      return new Response(JSON.stringify({ ...(body as object), meetingId: "other" }), { status: 200 });
+    };
+    // Act
+    const result = await finalizeMeeting(deps(h, otherMeeting), MEETING_ID);
+    // Assert
+    expect(result.ok).toBe(false);
+    expect((await h.chunkStore.getChunk(first.chunkKey))?.save.status).toBe("SAVED");
+    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
+  });
 });
 
 describe("finalizeMeeting（会議の状態による前提条件）", () => {
