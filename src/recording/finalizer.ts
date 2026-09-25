@@ -120,6 +120,14 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     return { ok: false, stage: "verify", detail: `server mismatch at seq ${mismatched.join(", ")}` };
   }
 
+  // finalizing へ進める前の値を控える。POST が失敗・タイムアウトしたら status と一緒にここへ戻す
+  const before = { finalChunkCount: meeting.finalChunkCount };
+  const restore = async (): Promise<void> => {
+    meeting.status = "stop_requested";
+    meeting.finalChunkCount = before.finalChunkCount;
+    await deps.meetingStore.put(meeting);
+  };
+
   meeting.status = "finalizing";
   meeting.finalChunkCount = chunks.length;
   // 再試行で終了時刻を書き換えない（前回の POST がサーバーに届いていた場合と値を揃える）
@@ -146,15 +154,13 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     });
   } catch (error) {
     // finalizing のまま残さない。次回の Barrier 再試行は stop_requested から行う
-    meeting.status = "stop_requested";
-    await deps.meetingStore.put(meeting);
+    await restore();
     return { ok: false, stage: "finalize", detail: `finalize request failed: ${errorMessage(error)}` };
   } finally {
     clearTimeout(finTimer);
   }
   if (!finRes.ok) {
-    meeting.status = "stop_requested";
-    await deps.meetingStore.put(meeting);
+    await restore();
     return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}` };
   }
   meeting.status = "finalized";

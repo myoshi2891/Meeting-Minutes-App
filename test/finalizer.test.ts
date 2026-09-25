@@ -125,7 +125,9 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     const conflict: typeof fetch = async (input, init) =>
       init?.method === "POST" ? new Response(JSON.stringify({ error: "missing", code: "CONFLICT_CHUNKS_MISSING" }), { status: 409 }) : h.server.fetch(input, init);
     expect(await finalizeMeeting(deps(h, conflict), MEETING_ID)).toMatchObject({ ok: false, stage: "finalize" });
-    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
+    const m = await h.meetingStore.get(MEETING_ID);
+    expect(m?.status).toBe("stop_requested");
+    expect(m?.finalChunkCount).toBeNull();
   });
 
   it("同じ会議への finalize が重なっても POST は 1 回だけで、両方の呼び出しが同じ結果を受け取る", async () => {
@@ -167,7 +169,9 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
       return h.server.fetch(input, init);
     };
     expect(await finalizeMeeting(deps(h, dropsOnPost), MEETING_ID)).toMatchObject({ ok: false, stage: "finalize" });
-    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
+    const m = await h.meetingStore.get(MEETING_ID);
+    expect(m?.status).toBe("stop_requested");
+    expect(m?.finalChunkCount).toBeNull();
   });
 
   it("POST /finalize の失敗後に再試行しても、最初に記録した endedAt を送り直して書き換えない", async () => {
