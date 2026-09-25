@@ -13,6 +13,8 @@ export interface FinalizerDeps {
   readonly fetchImpl?: typeof fetch;
   /** GET /chunks と POST /finalize それぞれのタイムアウト。既定 30000ms */
   readonly timeoutMs?: number;
+  /** IDB に書けずメモリ待機中の Chunk 数（RecordingController.memoryBacklogCount）。0 でない限り Barrier を通さない。 */
+  readonly unpersistedChunkCount: () => number;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -23,8 +25,8 @@ export type FinalizeResult =
 
 /**
  * Finalization Barrier：
- *   1. 最終 Chunk が IDB にある（呼び出し前提：RecordingController.stop() 完了）
- *   2. IDB 上の全 Chunk が DB_REGISTERED
+ *   1. 最終 Chunk が IDB にある（呼び出し前提：RecordingController.stop() 完了）かつメモリ待機中の Chunk がない
+ *   2. IDB 上の全 Chunk が DB_REGISTERED（SAVED はサーバー一覧で登録確認できれば DB_REGISTERED に進める）
  *   3. サーバーの一覧と件数・sha256 が一致
  *   4. POST /finalize
  * 1〜3 を満たさない限り finalizing へ遷移しない。
@@ -35,8 +37,15 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   const meeting = await deps.meetingStore.get(meetingId);
   if (meeting === undefined) return { ok: false, stage: "verify", detail: "meeting not found" };
 
+  // 末尾の Chunk がメモリ待機中だと IDB 上は欠番なしに見えるため、件数不足のまま finalize しないよう先に弾く
+  const unpersisted = deps.unpersistedChunkCount();
+  if (unpersisted > 0) {
+    return { ok: false, stage: "waiting_local_save", detail: `${unpersisted} chunks not persisted to IDB` };
+  }
+
   const chunks = await deps.chunkStore.listByMeeting(meetingId, "mic");
-  const notRegistered = chunks.filter((c) => c.save.status !== "DB_REGISTERED");
+  // SAVED（ファイル保存済み・DB 未登録）は再送しても registered: false が続きうるため、サーバー一覧で確認する
+  const notRegistered = chunks.filter((c) => c.save.status !== "DB_REGISTERED" && c.save.status !== "SAVED");
   if (notRegistered.length > 0) {
     await deps.scheduler.resumeAll();
     return { ok: false, stage: "waiting_local_save", detail: `${notRegistered.length} chunks not registered` };
@@ -76,6 +85,11 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
       });
       await deps.scheduler.resumeAll();
       return { ok: false, stage: "verify", detail: `server mismatch at seq ${c.meta.sequenceNo}` };
+    }
+    if (c.save.status === "SAVED") {
+      await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
+        r.save.status = "DB_REGISTERED";
+      });
     }
   }
 

@@ -36,7 +36,7 @@ async function recordAndSave(h: Harness, n: number): Promise<void> {
 }
 
 function deps(h: Harness, fetchImpl: typeof fetch = h.server.fetch): FinalizerDeps {
-  return { chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl };
+  return { chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl, unpersistedChunkCount: () => 0 };
 }
 
 describe("finalizeMeeting（Finalization Barrier）", () => {
@@ -165,5 +165,33 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     const result = await finalizeMeeting({ ...deps(h, hangsOnPost), timeoutMs: 20 }, MEETING_ID);
     expect(result).toMatchObject({ ok: false, stage: "finalize" });
     expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
+  });
+});
+
+describe("finalizeMeeting（Barrier の追加条件）", () => {
+  it("メモリ待機中の Chunk があれば IDB 上が揃っていても finalizing に進まない", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 2);
+    // Act
+    const result = await finalizeMeeting({ ...deps(h), unpersistedChunkCount: () => 1 }, MEETING_ID);
+    // Assert
+    expect(result).toMatchObject({ ok: false, stage: "waiting_local_save" });
+    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
+  });
+
+  it("SAVED の Chunk はサーバー一覧で登録確認できれば DB_REGISTERED に進み finalized になる", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 2);
+    const [first] = await h.chunkStore.listByMeeting(MEETING_ID, "mic");
+    await h.chunkStore.updateSaveState(first.chunkKey, (r) => {
+      r.save.status = "SAVED";
+    });
+    // Act
+    const result = await finalizeMeeting(deps(h), MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: true });
+    expect((await h.chunkStore.getChunk(first.chunkKey))?.save.status).toBe("DB_REGISTERED");
   });
 });

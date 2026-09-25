@@ -26,6 +26,8 @@ export class LocalSaveScheduler {
   private pumping = false;
   /** pump 実行中に再度 pump が要求されたら true。実行終了後にもう一度回す。 */
   private pumpRequested = false;
+  /** BACKEND_UNAVAILABLE を書き込み済みの pending キー。backend 停止中の enqueue ごとに全件を書き直さないために使う。 */
+  private readonly markedUnavailable = new Set<string>();
 
   constructor(private readonly deps: SchedulerDeps) {}
 
@@ -33,6 +35,8 @@ export class LocalSaveScheduler {
     await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
       r.save.status = "LOCAL_SAVE_PENDING";
     });
+    // 状態を LOCAL_SAVE_PENDING に書き戻したので、停止中なら再度 BACKEND_UNAVAILABLE を書く必要がある
+    this.markedUnavailable.delete(chunkKey);
     this.insertSorted(chunkKey);
     this.deps.health.pendingChunkCount = this.pendingCount;
     void this.pump();
@@ -92,6 +96,7 @@ export class LocalSaveScheduler {
         const index = this.pending.findIndex((k) => !this.inFlight.has(k));
         if (index === -1) return;
         const [chunkKey] = this.pending.splice(index, 1);
+        this.markedUnavailable.delete(chunkKey);
         this.inFlight.add(chunkKey);
         void this.runOne(chunkKey, saver).finally(() => {
           this.inFlight.delete(chunkKey);
@@ -110,6 +115,8 @@ export class LocalSaveScheduler {
 
   private async markAllPendingUnavailable(): Promise<void> {
     for (const key of this.pending) {
+      if (this.markedUnavailable.has(key)) continue;
+      this.markedUnavailable.add(key);
       await this.deps.chunkStore.updateSaveState(key, (r) => {
         r.save.status = "BACKEND_UNAVAILABLE";
       });

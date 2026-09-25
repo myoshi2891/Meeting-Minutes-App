@@ -115,21 +115,25 @@ export class RecordingController {
   /** stop_requested → 最終 Chunk 生成 → IDB 書き込み完了まで待つ。Finalization Barrier は §22。 */
   async stop(): Promise<void> {
     if (this.node === null || this.meeting === null) return;
-    this.meeting.status = "stop_requested";
-    await this.deps.meetingStore.put(this.meeting);
+    const meeting = this.meeting;
+    try {
+      meeting.status = "stop_requested";
+      await this.deps.meetingStore.put(meeting);
 
-    const flushed = new Promise<void>((resolve) => this.flushWaiters.push(resolve));
-    this.post({ type: "stop" });
-    await flushed;
-    await this.chunkQueue;
-    // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
-    this.meeting.updatedAt = Date.now();
-    await this.deps.meetingStore.put(this.meeting);
-
-    this.sourceNode?.disconnect();
-    this.node.port.onmessage = null;
-    this.node = null;
-    for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
+      const flushed = new Promise<void>((resolve) => this.flushWaiters.push(resolve));
+      this.post({ type: "stop" });
+      await flushed;
+      await this.chunkQueue;
+      // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
+      meeting.updatedAt = Date.now();
+      await this.deps.meetingStore.put(meeting);
+    } finally {
+      // 途中で reject してもマイクと Worklet を解放する
+      this.sourceNode?.disconnect();
+      if (this.node !== null) this.node.port.onmessage = null;
+      this.node = null;
+      for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
+    }
   }
 
   /** IDB クォータが回復したときに UI / QuotaMonitor から呼ぶ。 */
@@ -182,10 +186,9 @@ export class RecordingController {
       case "flushed":
         if (this.clock !== null) this.clock.audioFrameCount = event.audioFrameCount;
         // chunk イベントは flushed より先に届く（同一 MessagePort は順序保証）。
+        // flush / stop コマンド 1 回につき flushed 1 回。最古の待機だけを解放し、後続コマンドの待機は自分の flushed まで残す。
         this.chunkQueue = this.chunkQueue.then(() => {
-          const waiters = this.flushWaiters;
-          this.flushWaiters = [];
-          for (const resolve of waiters) resolve();
+          this.flushWaiters.shift()?.();
         });
         break;
     }

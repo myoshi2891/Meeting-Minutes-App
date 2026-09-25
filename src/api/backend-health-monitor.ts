@@ -25,6 +25,8 @@ export class BackendHealthMonitor {
   private timer: ReturnType<typeof setTimeout> | null = null;
   /** start() 〜 stop() の間だけ true。実行中のチェックが stop() 後にポーリングを再開しないための判定に使う。 */
   private polling = false;
+  /** start()/stop() ごとに進める世代番号。stop() → start() を挟んだ古いチェックが 2 本目のループを作らないために使う。 */
+  private generation = 0;
   /** 最後に onChange で通知した (status, unauthorized)。どちらかが変わったら通知する。 */
   private notified: { status: LocalBackendHealth["status"]; unauthorized: boolean } = { status: "UNKNOWN", unauthorized: false };
   private readonly listeners = new Set<(state: LocalBackendHealth) => void>();
@@ -47,11 +49,13 @@ export class BackendHealthMonitor {
   start(): void {
     if (this.polling) return;
     this.polling = true;
-    void this.checkAndSchedule();
+    this.generation++;
+    void this.checkAndSchedule(this.generation);
   }
 
   stop(): void {
     this.polling = false;
+    this.generation++;
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
   }
@@ -133,11 +137,11 @@ export class BackendHealthMonitor {
     this.recordingHealth.degradedReasons = reasons;
   }
 
-  private async checkAndSchedule(): Promise<void> {
+  private async checkAndSchedule(generation: number): Promise<void> {
     await this.checkOnce();
-    if (!this.polling) return;
+    if (!this.polling || generation !== this.generation) return;
     const interval = this.state.status === "UNREACHABLE" ? this.config.unreachableIntervalMs : this.config.healthyIntervalMs;
     // バックグラウンドタブで throttle されても可用性「表示」が遅れるだけで、録音には影響しない（Invariant 8 と同じ構造）。
-    this.timer = setTimeout(() => void this.checkAndSchedule(), interval);
+    this.timer = setTimeout(() => void this.checkAndSchedule(generation), interval);
   }
 }
