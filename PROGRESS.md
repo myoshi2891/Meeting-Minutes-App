@@ -20,16 +20,18 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 164 件がすべて通過。`npm run typecheck` もエラーなし。
+- 自動テスト: 17 ファイル / 177 件がすべて通過。`npm run typecheck` もエラーなし。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-25 時点・3 回目のレビュー対応）
+### 未コミットの変更（2026-09-25 時点・4 回目のレビュー対応）
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/**`、`test/**` | `isChunkListResponse` が `meetingId` を必須にし、Finalizer が要求した会議との一致を確認。`isHealthResponse` が `capabilities: null` などを拒否。`dropBlob` は DB_REGISTERED の Chunk だけ WAV を削除。`SincResampler.push()` が出力バッファを再利用。リサンプラのテストを MessagePort のイベントで同期 | `fix(recording): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を設計書に反映（phase2-client は Finalizer の meetingId 検査） | `docs(phase1): ...` |
+| `src/**`、`test/**` | `resumeAll` が non-retryable の `LOCAL_SAVE_FAILED` を再投入しない（`isRetryableError` を `LocalSaver` と共有）。復旧が `recording` の会議の `audioFrameCount` を Chunk の最大 `endFrame` から復元。`openDatabase` が blocked 後の接続を閉じる。`listUnfinished` が索引の範囲で DB_REGISTERED を除く。Finalizer が不一致をすべて再投入。テスト 7 件追加（うち回帰 4 件） | `fix(recording): ...` |
+| `test/**`（テストの同期方法） | health monitor のテストをフェイクタイマー・`performance.now` スタブに変更。Worklet テストを `startProcessor` / `nextFlushed` / `nthChunk`（`test/harness.ts` に移設）のイベント同期に変更 | `test(worklet): ...` |
+| `.claude/skills/design-doc-sync/scripts/check_design_sync.py` | 前後の空白を削らずにファイル全体と比較する | `chore(claude): ...` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を設計書に反映。phase2-client は `fetchWithTimeout` が本文をタイムアウト内で読み、Finalizer の不一致を一括再投入 | `docs(phase1): ...` |
 
 ---
 
@@ -81,6 +83,15 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 2026-09-25 のレビュー指摘（3 回目）で有効と判定したが見送った。別タブで録音中に新しいタブが開くと、`recoverOnStartup` がその会議を `stop_requested` に落とし、Barrier の自動再試行で録音中に finalize されうる（§3.1 で複数タブの同時録音を許している）。
 - 候補: 録音中は会議ごとの Web Lock（`navigator.locks.request("minutes:meeting:<id>")`）を保持し、復旧はロックを `ifAvailable` で取れた会議だけを処理する。ロック API は依存注入してテストで Fake にする。`RecordingControllerDeps` と `recoverOnStartup` の引数が増えるので、着手前に利用者に確認する。
 
+### T6. stop() の Worklet 無応答をどう扱うか【方針決定が必要】
+
+- 2026-09-25 のレビュー指摘（4 回目）で有効と判定したが見送った。`stop()` の `requestFlush` がタイムアウトすると、最終の部分 Chunk が届かないまま会議が `stop_requested` になり、Barrier は末尾が欠けたまま finalize できてしまう（`onError` の通知だけ）。
+- 指摘の案は「専用の失敗状態（例: `stop_failed`）を追加し、Finalizer と復旧で進めない」。ただし `MeetingStatus` の追加は Phase 2 以降の設計とサーバー契約にも影響し、その会議を利用者が確定させる手段（手動 finalize）も要るため、着手前に利用者に確認する。
+
+### T7. 起動時復旧が non-retryable の Chunk も再送する【小・T0 の後】
+
+- `recoverOnStartup` は DB_REGISTERED 以外の Chunk をすべて `LOCAL_SAVE_PENDING` に戻すため、non-retryable の `LOCAL_SAVE_FAILED` も起動のたびに 1 回再送される（`resumeAll` 側は 4 回目のレビューで修正済み）。`isRetryableError` で除外するかを決める。
+
 ### 保留・メモ
 
 - `package.json` に lint スクリプトがない。コミット前の確認は現状 `typecheck` + `test` のみ。
@@ -91,6 +102,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-25（4 回目）
+
+- CodeRabbit の指摘 11 件（インライン 9・nitpick 2）を検証した。10 件を修正し、`stop()` タイムアウト時の専用状態は設計判断が要るため T6 に回した。回帰テスト 4 件（scheduler・recovery・finalizer・idb）は修正前のコードで Red になることを確認した。
+- `listUnfinished` の索引化は振る舞いが変わらないため、既存テストで確認した。起動時復旧の non-retryable 再送は T7 に積んだ。
 
 ### 2026-09-25（3 回目）
 
