@@ -206,7 +206,7 @@ Content-Security-Policy:
 
    `connect-src` により、`fetch` / `XMLHttpRequest` / `WebSocket` / `EventSource` の接続先が列挙したホストに限定される。`worker-src 'self'` で AudioWorklet モジュールも同一オリジンに限定する。
 
-2. **アプリケーション側 allowlist（§17）**：`LocalSaver` は URL を組み立てる直前に `assertLocalHost(url)` を呼び、ホスト名が `127.0.0.1` / `localhost` / `[::1]` 以外なら例外を投げる。設定画面でサーバー URL を変更できる場合でも、この関数がゲートになる。CSP が何らかの理由で効かない配信経路（ローカルファイルから開いた場合など）への二重防御である。
+2. **アプリケーション側 allowlist（§17）**：`LocalSaver` は URL を組み立てる直前に `assertLocalHost(url)` を呼び、ホスト名が `127.0.0.1` / `localhost` / `[::1]` 以外なら例外を投げる。設定画面でサーバー URL を変更できる場合でも、この関数がゲートになる。`assertLocalHost()` が検証するのは最初の URL だけなので、`fetch` は `redirect: "error"` で送り、リダイレクト応答に従って音声本文や `Authorization` を別ホストへ再送しない（`fetch` は `TypeError` で reject し、`NETWORK` として扱う）。CSP が何らかの理由で効かない配信経路（ローカルファイルから開いた場合など）への二重防御である。
 
 3. **常駐サーバー側**：`127.0.0.1` にのみ bind し、`0.0.0.0` への bind はコマンドライン引数で明示した場合だけ許可する。サーバー自体が外部へ通信する経路（モデルの自動ダウンロード等）は Phase 2 の論点であり、本書では「モデルファイルは利用者が事前に配置する」前提に立つ（§25）。
 
@@ -1202,13 +1202,14 @@ flowchart TB
     Q -->|"yes（Mic 切断等）"| HB[heartbeat のみ送信] --> R[return true]
     Q -->|no| MM["Mono Mix<br/>全チャンネル平均（Float32）"]
     MM --> RS["SincResampler.push<br/>FIR LPF + 分数位相補間<br/>native → 16kHz"]
-    RS --> VAD["FrameVAD.feed<br/>10ms フレームごとに RMS → score"]
+    RS --> SEG["Chunk 境界までの区間に分割"]
+    SEG --> VAD["FrameVAD.feed（区間ごと）<br/>10ms フレームごとに RMS → score"]
     VAD --> I16["Int16 変換<br/>clamp(-1..1) × 32767"]
     I16 --> ACC["Int16Array(480000) へ書き込み"]
     ACC --> FULL{"writePos == 480000?"}
     FULL -->|yes| POST["port.postMessage(chunk, [pcm.buffer])<br/>新しいバッファを確保"]
-    FULL -->|no| R
-    POST --> R
+    FULL -->|"no（区間が残っていれば SEG へ）"| R
+    POST -->|"残りの区間は新バッファへ"| SEG
 ```
 
 ## 14.2 断定しない事項の実装への反映
@@ -1498,12 +1499,18 @@ class PcmChunkerProcessor extends AudioWorkletProcessor implements AudioWorkletP
     }
 
     const resampled = this.resampler.push(mono);
-    this.vad.feed(resampled);
 
-    for (let i = 0; i < resampled.length; i++) {
-      const s = Math.max(-1, Math.min(1, resampled[i]));
-      this.buffer[this.writePos++] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
-      this.audioFrameCount++;
+    // VAD は Chunk 境界で区切って渡す。quantum ごとまとめて渡すと、境界後のサンプルの VAD 結果が前の Chunk に入る
+    let offset = 0;
+    while (offset < resampled.length) {
+      const count = Math.min(resampled.length - offset, SAMPLES_PER_CHUNK - this.writePos);
+      this.vad.feed(resampled.subarray(offset, offset + count));
+      for (let i = offset; i < offset + count; i++) {
+        const s = Math.max(-1, Math.min(1, resampled[i]));
+        this.buffer[this.writePos++] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
+      }
+      this.audioFrameCount += count;
+      offset += count;
       if (this.writePos === SAMPLES_PER_CHUNK) {
         this.emitChunk(false);
       }
@@ -1559,7 +1566,7 @@ export {};
 | 項目 | 内容 |
 | --- | --- |
 | Transferable | `pcm.buffer` の所有権をメインスレッドへ移す。コピーを避けるため、Worklet 側は転送後に新しい `Int16Array` を確保する。`partial` のときは `slice` で必要長だけ切り出す |
-| 480,000 サンプル境界 | 1 回の `process()` で生成される出力（約 42 サンプル）が境界を跨ぐ場合、ループ内で `writePos === SAMPLES_PER_CHUNK` を検出して即座に `emitChunk` し、残りは新バッファに書く。境界でサンプルを落とさない |
+| 480,000 サンプル境界 | 1 回の `process()` で生成される出力（約 42 サンプル）が境界を跨ぐ場合、出力を境界までの区間に分けて処理し、`writePos === SAMPLES_PER_CHUNK` で即座に `emitChunk` し、残りは新バッファに書く。境界でサンプルを落とさない。VAD にも区間ごとに渡すため、境界後のサンプルの判定が前の Chunk の `vad` に入ることはない（`takeResult()` は PCM と同じ境界で集計をリセットする）。10ms フレームが境界をまたぐ場合は、そのフレームが完成した側の Chunk に数える |
 | flush / stop | `stop` は `emitChunk(true)` 後に `process()` が `false` を返し Processor が破棄される。`flush` は録音を継続したまま部分 Chunk を吐く（`pagehide` 用）。flush 後の次 Chunk は `partial=false` で 480,000 サンプルまで蓄積する。したがって flush が挟まった会議では途中に短い Chunk が存在しうる。`startFrame` / `endFrame` が連続していれば Phase 2 の STT はそれを結合して扱える |
 | VAD の位置 | リサンプリング後（16kHz）で評価する。ネイティブレートで評価すると `minSpeechMs` のサンプル換算がレート依存になるため |
 | リサンプラの遅延 | FIR の群遅延（`halfTaps` サンプル、48kHz で約 0.7ms）ぶん出力が遅れる。Session Clock は出力サンプル数で数えるため、この遅延は全 Chunk に一様にかかり、Chunk 間の相対時刻には影響しない |
@@ -1680,28 +1687,54 @@ export class RecordingController {
     await this.deps.meetingStore.put(meeting);
     this.meeting = meeting;
 
-    const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
-      numberOfInputs: 1,
-      numberOfOutputs: 0,
-      channelCount: 1,
-      channelCountMode: "explicit",
-    });
-    node.port.onmessage = (event: MessageEvent<unknown>) => {
-      if (!isWorkletEvent(event.data)) return;
-      this.handleWorkletEvent(event.data);
-    };
-    this.sourceNode = audioContext.createMediaStreamSource(mediaStream);
-    this.sourceNode.connect(node);
-    this.node = node;
+    try {
+      const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        channelCount: 1,
+        channelCountMode: "explicit",
+      });
+      node.port.onmessage = (event: MessageEvent<unknown>) => {
+        if (!isWorkletEvent(event.data)) return;
+        this.handleWorkletEvent(event.data);
+      };
+      this.node = node;
+      this.sourceNode = audioContext.createMediaStreamSource(mediaStream);
+      this.sourceNode.connect(node);
+
+      this.post({ type: "configure", vad: DEFAULT_VAD_CONFIG });
+      this.post({ type: "start" });
+    } catch (error) {
+      await this.rollBackStart(meeting);
+      throw error;
+    }
 
     for (const track of mediaStream.getAudioTracks()) {
       track.addEventListener("ended", () => {
         this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "MIC_TRACK_ENDED"];
       });
     }
+  }
 
-    this.post({ type: "configure", vad: DEFAULT_VAD_CONFIG });
-    this.post({ type: "start" });
+  /**
+   * recording を保存した後の start 失敗を巻き戻す。Worklet を切り離し、会議を created に戻す。
+   * recording のまま残すと、次回起動の復旧が stop_requested に落として Chunk のない会議を finalize しうる。
+   * 巻き戻しの保存失敗は onError に通知し、呼び出し元には元の例外を返す。
+   */
+  private async rollBackStart(meeting: MeetingRecord): Promise<void> {
+    this.sourceNode?.disconnect();
+    this.sourceNode = null;
+    if (this.node !== null) this.node.port.onmessage = null;
+    this.node = null;
+    this.meeting = null;
+    this.clock = null;
+    meeting.status = "created";
+    meeting.updatedAt = Date.now();
+    try {
+      await this.deps.meetingStore.put(meeting);
+    } catch (rollbackError) {
+      this.deps.onError(rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)));
+    }
   }
 
   /** pagehide 用。Worklet に flush を要求し、部分 Chunk の IDB 書き込みまで待つ。 */
@@ -1896,7 +1929,7 @@ Worklet が応答しない場合（AudioContext が閉じられた、Processor �
 
 Scheduler への依存は `enqueue()` だけを持つ `ChunkEnqueuer` インターフェースに絞っている。`LocalSaveScheduler` はこのインターフェースを構造的に満たすため、呼び出し側の配線は変わらない。
 
-録音中の会議は、会議ごとの Web Lock（会議ロック）で示す。Phase 1 は複数タブでの同時録音を許すため、あとから開いたタブの起動時復旧（§23）が、別タブで録音中の `recording` を中断と誤認して `stop_requested` に落とさないようにするためである。`start()` は `recording` を書く**前**にロックを取り（先に書くと、ロックのない `recording` を他タブの復旧が拾える）、取れなければ失敗する。ロックは `stop()` の finally、または `start()` が途中で失敗したときに解放する。タブが閉じたり落ちたりした場合はブラウザが自動で解放するので、クラッシュした会議は従来どおり復旧の対象になる。ロックマネージャは `locks` で依存注入する（本番は `navigator.locks`。`LockManager` は `MeetingLockManager` を構造的に満たす）。
+録音中の会議は、会議ごとの Web Lock（会議ロック）で示す。Phase 1 は複数タブでの同時録音を許すため、あとから開いたタブの起動時復旧（§23）が、別タブで録音中の `recording` を中断と誤認して `stop_requested` に落とさないようにするためである。`start()` は `recording` を書く**前**にロックを取り（先に書くと、ロックのない `recording` を他タブの復旧が拾える）、取れなければ失敗する。ロックは `stop()` の finally、または `start()` が途中で失敗したときに解放する。`recording` を保存した後に失敗した場合（Worklet ノードの生成失敗など）は、`rollBackStart()` が Worklet を切り離し、会議を `created` に戻してから例外を返す。`recording` のまま残すと、ロックの解放後に次回起動の復旧（§23）が `stop_requested` に落とし、Chunk のない会議を finalize しうるためである。`created` は復旧の対象外である。タブが閉じたり落ちたりした場合はブラウザが自動で解放するので、クラッシュした会議は従来どおり復旧の対象になる。ロックマネージャは `locks` で依存注入する（本番は `navigator.locks`。`LockManager` は `MeetingLockManager` を構造的に満たす）。
 
 ```typescript
 // src/recording/meeting-lock.ts
@@ -2136,6 +2169,8 @@ export class LocalSaver {
         signal: controller.signal,
         // ローカルサーバーなので credentials は不要。Cookie 方式（§4.3）の場合のみ "include"。
         credentials: "omit",
+        // リダイレクト先は assertLocalHost を通らないため追従しない（録音データを外部へ再送させない、§4.4）
+        redirect: "error",
       });
       return await this.interpret(response, record);
     } catch (error) {
@@ -3368,6 +3403,38 @@ export async function loadWorkletProcessor(nativeSampleRate: number): Promise<{
   const processor = new holder.ctor();
   return { processor, nodePort: channel.port2, received };
 }
+
+/** port に条件を満たすメッセージが届くまで待つ（タイマーに頼らずメッセージ順序で同期する）。 */
+export function nextMessage<T>(port: MessagePort, match: (data: unknown) => data is T): Promise<T> {
+  return new Promise((resolve) => {
+    const onMessage = (e: MessageEvent): void => {
+      if (!match(e.data)) return;
+      port.removeEventListener("message", onMessage);
+      resolve(e.data);
+    };
+    port.addEventListener("message", onMessage);
+  });
+}
+
+/** start を送り、Processor 側の onmessage が処理し終えるまで待つ。Processor は ack を返さないため、後から登録したリスナーの発火で完了を知る。 */
+export async function startProcessor(processorPort: MessagePort, nodePort: MessagePort): Promise<void> {
+  const handled = nextMessage(processorPort, (d): d is { type: "start" } => typeof d === "object" && d !== null && (d as { type?: unknown }).type === "start");
+  nodePort.postMessage({ type: "start" });
+  await handled;
+}
+
+/** 指定 requestId の flushed を待つ。同一 port は順序保証なので、これより前に送られた chunk はすべて届いている。 */
+export function nextFlushed(nodePort: MessagePort, requestId: number): Promise<{ type: "flushed"; requestId: number }> {
+  return nextMessage(nodePort, (d): d is { type: "flushed"; requestId: number } =>
+    typeof d === "object" && d !== null && (d as { type?: unknown }).type === "flushed" && (d as { requestId?: unknown }).requestId === requestId,
+  );
+}
+
+/** n 個目の chunk が届くまで待つ。 */
+export function nthChunk(nodePort: MessagePort, n: number): Promise<unknown> {
+  let seen = 0;
+  return nextMessage(nodePort, (d): d is unknown => typeof d === "object" && d !== null && (d as { type?: unknown }).type === "chunk" && ++seen === n);
+}
 ```
 
 ## 24.2 60 分連続録音
@@ -3375,7 +3442,7 @@ export async function loadWorkletProcessor(nativeSampleRate: number): Promise<{
 ```typescript
 // test/long-recording.test.ts
 import { describe, expect, it } from "vitest";
-import { loadWorkletProcessor, makeSine } from "./harness";
+import { loadWorkletProcessor, makeSine, nextFlushed, nthChunk, startProcessor } from "./harness";
 import { buildStandaloneWav, parseWavHeader } from "../src/audio/wav";
 
 interface ChunkEvent {
@@ -3395,8 +3462,8 @@ describe("60 分連続録音（48kHz ネイティブ → 16kHz、120 Chunk）", 
   it("120 個の完全な Chunk が連番・連続フレームで生成される", async () => {
     const native = 48000;
     const { processor, nodePort, received } = await loadWorkletProcessor(native);
-    nodePort.postMessage({ type: "start" });
-    await flushMessages();
+    await startProcessor(processor.port, nodePort);
+    const lastChunk = nthChunk(nodePort, 120);
 
     const quantum = 128;
     // 60 分 + 1 秒。FIR の群遅延ぶん末尾が不足するので、120 個目を完全 Chunk にするため 1 秒余分に流す
@@ -3405,7 +3472,7 @@ describe("60 分連続録音（48kHz ネイティブ → 16kHz、120 Chunk）", 
     for (let done = 0; done < totalNativeSamples; done += quantum) {
       processor.process([[signal, signal]]); // ステレオ入力 → モノミックス
     }
-    await flushMessages();
+    await lastChunk;
 
     const chunks = received.filter(isChunkEvent);
     expect(chunks.length).toBeGreaterThanOrEqual(120);
@@ -3425,8 +3492,7 @@ describe("60 分連続録音（48kHz ネイティブ → 16kHz、120 Chunk）", 
   it("44.1kHz（非整数比）でも出力サンプル数が理論値と群遅延分（64 サンプル）以内で一致する", async () => {
     const native = 44100;
     const { processor, nodePort, received } = await loadWorkletProcessor(native);
-    nodePort.postMessage({ type: "start" });
-    await flushMessages();
+    await startProcessor(processor.port, nodePort);
     const quantum = 128;
     const seconds = 600; // 10 分
     const signal = makeSine(300, native, quantum);
@@ -3435,18 +3501,16 @@ describe("60 分連続録音（48kHz ネイティブ → 16kHz、120 Chunk）", 
       processor.process([[signal]]);
       fed += quantum;
     }
+    const flushed = nextFlushed(nodePort, 1);
     nodePort.postMessage({ type: "flush", requestId: 1 });
-    await flushMessages();
+    // requestId 1 の flushed より前の chunk はすべて届いている（同一 port の順序保証）
+    await flushed;
     const total = received.filter(isChunkEvent).reduce((acc, c) => acc + c.sampleCount, 0);
     const expected = Math.floor((fed / native) * 16000);
     // FIR の群遅延ぶん（halfTaps）だけ末尾が未出力になる。それ以外の累積誤差は 1 以内。
     expect(Math.abs(total - expected)).toBeLessThanOrEqual(64);
   }, 60_000);
 });
-
-async function flushMessages(): Promise<void> {
-  for (let i = 0; i < 50; i++) await new Promise((r) => setTimeout(r, 0));
-}
 ```
 
 ## 24.3 ローカル常駐サーバー停止 5 分からの復旧
@@ -3523,6 +3587,7 @@ describe("常駐サーバー停止 5 分 → 復旧", () => {
 import { describe, expect, it } from "vitest";
 import { createHarness, makeChunkRecord } from "./harness";
 import { recoverOnStartup } from "../src/recording/recovery";
+import { tryAcquireMeetingLock } from "../src/recording/meeting-lock";
 import type { MeetingRecord } from "../src/types/recording";
 
 describe("ブラウザクラッシュ後の復旧", () => {
@@ -3573,6 +3638,151 @@ describe("ブラウザクラッシュ後の復旧", () => {
     const chunks = await after.chunkStore.listByMeeting(meetingId, "mic");
     expect(chunks.map((c) => c.save.status)).toEqual(["DB_REGISTERED", "DB_REGISTERED", "DB_REGISTERED"]);
     expect((await after.meetingStore.get(meetingId))?.status).toBe("stop_requested");
+  });
+
+  it("recording 中に落ちた会議は、保存済み Chunk の最大 endFrame から audioFrameCount を復元する", async () => {
+    // Arrange：audioFrameCount は stop() でしか永続化されないため、録音中のクラッシュでは初期値のまま残る
+    const h = await createHarness();
+    const meetingId = "m-crash-frames";
+    const stale: MeetingRecord = {
+      meetingId,
+      title: "frames",
+      status: "recording",
+      sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 0 },
+      consentConfirmedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      endedAt: null,
+      finalChunkCount: null,
+    };
+    await h.meetingStore.put(stale);
+    for (let seq = 0; seq < 2; seq++) {
+      const r = await makeChunkRecord(meetingId, seq, 1600);
+      r.save.status = "DB_REGISTERED";
+      await h.chunkStore.putChunk(r);
+    }
+    // Act
+    await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    // Assert：seq 1 の endFrame = 480000 + 1600
+    expect((await h.meetingStore.get(meetingId))?.sessionClock.audioFrameCount).toBe(481600);
+  });
+
+  it("保存済みの audioFrameCount が Chunk の最大 endFrame より大きければ維持する", async () => {
+    const h = await createHarness();
+    const meetingId = "m-crash-frames-keep";
+    await h.meetingStore.put({
+      meetingId,
+      title: "frames",
+      status: "recording",
+      sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 999_999 },
+      consentConfirmedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      endedAt: null,
+      finalChunkCount: null,
+    });
+    const r = await makeChunkRecord(meetingId, 0, 1600);
+    r.save.status = "DB_REGISTERED";
+    await h.chunkStore.putChunk(r);
+    await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    expect((await h.meetingStore.get(meetingId))?.sessionClock.audioFrameCount).toBe(999_999);
+  });
+
+  it("finalizing の会議は中断扱いで列挙し、created / finalized は対象外", async () => {
+    const h = await createHarness();
+    const base = (meetingId: string, status: MeetingRecord["status"]): MeetingRecord => ({
+      meetingId,
+      title: meetingId,
+      status,
+      sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 0 },
+      consentConfirmedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      endedAt: null,
+      finalChunkCount: null,
+    });
+    await h.meetingStore.put(base("r-fin", "finalizing"));
+    await h.meetingStore.put(base("r-done", "finalized"));
+    await h.meetingStore.put(base("r-new", "created"));
+    const report = await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    // 同一ファイルの前テストの会議（グローバル IDB を共有）を除外して検証する
+    expect(report.interruptedMeetings.map((m) => m.meetingId).filter((id) => id.startsWith("r-"))).toEqual(["r-fin"]);
+    expect(report.requeuedChunks).toBe(0);
+  });
+
+  it("中断状態（GENERATED / SAVING）だけを書き戻し、non-retryable の LOCAL_SAVE_FAILED と SAVED は再送しない", async () => {
+    // Arrange
+    const h = await createHarness();
+    const meetingId = "m-crash-terminal";
+    const statuses = ["LOCAL_SAVE_FAILED", "SAVED", "GENERATED", "SAVING"] as const;
+    for (let seq = 0; seq < statuses.length; seq++) {
+      const r = await makeChunkRecord(meetingId, seq, 160);
+      r.save.status = statuses[seq];
+      if (statuses[seq] === "LOCAL_SAVE_FAILED") r.save.lastError = { kind: "VALIDATION", message: "422", httpStatus: 422, at: 0 };
+      await h.chunkStore.putChunk(r);
+    }
+    // Act
+    const report = await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    for (let i = 0; i < 20; i++) await h.advance(100);
+    // Assert：再投入は GENERATED と SAVING の 2 件だけ
+    expect(report.requeuedChunks).toBe(2);
+    expect(h.server.putCount).toBe(2);
+    const chunks = await h.chunkStore.listByMeeting(meetingId, "mic");
+    expect(chunks.map((c) => c.save.status)).toEqual(["LOCAL_SAVE_FAILED", "SAVED", "DB_REGISTERED", "DB_REGISTERED"]);
+  });
+
+  it("会議ロックが保持中（別タブで録音中）の会議は stop_requested に変えず、Chunk も書き戻さない", async () => {
+    // Arrange：別タブが録音中。会議は recording、PUT 中の Chunk は SAVING
+    const h = await createHarness();
+    const meetingId = "m-crash-active";
+    await h.meetingStore.put({
+      meetingId,
+      title: "active",
+      status: "recording",
+      sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 0 },
+      consentConfirmedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      endedAt: null,
+      finalChunkCount: null,
+    });
+    const r = await makeChunkRecord(meetingId, 0, 160);
+    r.save.status = "SAVING";
+    await h.chunkStore.putChunk(r);
+    const release = await tryAcquireMeetingLock(h.locks, meetingId);
+    // Act
+    const report = await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    // Assert
+    const meeting = await h.meetingStore.get(meetingId);
+    expect(meeting?.status).toBe("recording");
+    expect(meeting?.updatedAt).toBe(1);
+    expect(report.interruptedMeetings.map((m) => m.meetingId)).not.toContain(meetingId);
+    expect((await h.chunkStore.getChunk(r.chunkKey))?.save.status).toBe("SAVING");
+    release?.();
+  });
+
+  it("会議ロックが解放済み（録音タブが落ちた）なら、従来どおり stop_requested に落とす", async () => {
+    // Arrange
+    const h = await createHarness();
+    const meetingId = "m-crash-released";
+    await h.meetingStore.put({
+      meetingId,
+      title: "released",
+      status: "recording",
+      sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 0 },
+      consentConfirmedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      endedAt: null,
+      finalChunkCount: null,
+    });
+    const release = await tryAcquireMeetingLock(h.locks, meetingId);
+    release?.();
+    // Act
+    await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    // Assert：復旧中に取ったロックも解放されている
+    expect((await h.meetingStore.get(meetingId))?.status).toBe("stop_requested");
+    expect(h.locks.held.size).toBe(0);
   });
 });
 ```
@@ -3718,7 +3928,7 @@ describe("リサンプラのアンチエイリアシング", () => {
 | Chunk 単体再生可能性 | `chunk-standalone.test.ts` | 44 バイトヘッダの全フィールド、IDB 読み戻しのラウンドトリップ、部分 Chunk、壊れたヘッダの拒否 |
 | （追加）DSP 品質 | `resampler-aliasing.test.ts` | 折り返し成分 -40dB 以下、通過帯域 -1dB 以内 |
 
-本書のコードブロック 22 個は `tsc --noEmit`（strict）を通過し、§24 の 5 ファイル 11 テストは Node 22 + Vitest 2 + fake-indexeddb 6 で全件通過することを設計時点で確認している（60 分相当の合成入力で約 13 秒）。
+本書のコードブロック 22 個は `tsc --noEmit`（strict）を通過し、§24 の 5 ファイル 17 テストは Node 22 + Vitest 2 + fake-indexeddb 6 で全件通過することを設計時点で確認している（60 分相当の合成入力で約 13 秒）。
 
 「ブラウザで実際に再生できる」ことは Node 上のテストでは検証できない。結合テストとして、生成した WAV を `<audio src>` と `AudioContext.decodeAudioData` の両方で再生・デコードできることを Chrome / Edge で手動確認し、DoD（§28）に記録する。
 

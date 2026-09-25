@@ -697,19 +697,27 @@ export class RecordingController {
       await this.deps.meetingStore.put(meeting);
     }
 
-    const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
-      numberOfInputs: 1,
-      numberOfOutputs: 0,
-      channelCount: 1,
-      channelCountMode: "explicit",
-    });
-    node.port.onmessage = (event: MessageEvent<unknown>) => {
-      if (!isWorkletEvent(event.data)) return;
-      this.handleWorkletEvent(event.data);
-    };
-    this.sourceNode = audioContext.createMediaStreamSource(mediaStream);
-    this.sourceNode.connect(node);
-    this.node = node;
+    try {
+      const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        channelCount: 1,
+        channelCountMode: "explicit",
+      });
+      node.port.onmessage = (event: MessageEvent<unknown>) => {
+        if (!isWorkletEvent(event.data)) return;
+        this.handleWorkletEvent(event.data);
+      };
+      this.node = node;
+      this.sourceNode = audioContext.createMediaStreamSource(mediaStream);
+      this.sourceNode.connect(node);
+
+      this.post({ type: "configure", vad: DEFAULT_VAD_CONFIG });
+      this.post({ type: "start" });
+    } catch (error) {
+      await this.rollBackStart(meetingId, options);
+      throw error;
+    }
 
     const endedReason = this.source === "mic" ? "MIC_TRACK_ENDED" : "SYSTEM_TRACK_ENDED";
     for (const track of mediaStream.getAudioTracks()) {
@@ -719,9 +727,26 @@ export class RecordingController {
         }
       });
     }
+  }
 
-    this.post({ type: "configure", vad: DEFAULT_VAD_CONFIG });
-    this.post({ type: "start" });
+  /**
+   * recording を保存した後の start 失敗を巻き戻す（Phase 1 §15 と同じ）。Worklet を切り離し、
+   * このインスタンスが登録した会議だけを created に戻す。巻き戻しの保存失敗は onError に通知する。
+   */
+  private async rollBackStart(meetingId: string, options: StartOptions): Promise<void> {
+    this.sourceNode?.disconnect();
+    this.sourceNode = null;
+    if (this.node !== null) this.node.port.onmessage = null;
+    this.node = null;
+    this.meetingId = null;
+    this.clock = null;
+    if (options.registerMeeting === false) return;
+    try {
+      const meeting = await this.deps.meetingStore.get(meetingId);
+      if (meeting !== undefined) await this.deps.meetingStore.put({ ...meeting, status: "created", updatedAt: Date.now() });
+    } catch (rollbackError) {
+      this.deps.onError(rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)));
+    }
   }
 
   async flush(): Promise<void> {
