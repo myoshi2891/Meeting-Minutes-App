@@ -20,19 +20,20 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 180 件がすべて通過。`npm run typecheck` もエラーなし。
+- 自動テスト: 17 ファイル / 182 件がすべて通過。`npm run typecheck` もエラーなし。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-25・6 回目のレビュー対応）
+### 未コミットの変更（2026-09-25・6〜7 回目のレビュー対応）
 
 4・5 回目の変更はコミット済み。
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/recording/finalizer.ts`、`test/finalizer.test.ts` | POST /finalize の失敗後に再試行しても `endedAt` を書き換えない（`??=`）。回帰テスト 1 件 | `fix(recording): ...` |
-| `.claude/skills/design-doc-sync/scripts/check_design_sync.py` | 閉じフェンスを「行頭・同じ記号・開き以上の長さ」に限定。`--diff` で末尾改行の差を表示 | `chore(claude): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映。phase2-client は失敗時の復元対象から `endedAt` を外し、テストの期待値を変更 | `docs(phase1): ...` |
+| `src/recording/finalizer.ts`、`test/finalizer.test.ts` | 6 回目: POST /finalize の失敗後に再試行しても `endedAt` を書き換えない（`??=`）。7 回目: 同じ会議への `finalizeMeeting` の重複呼び出しを実行中 Promise の共有で 1 本にする（本体は `finalizeMeetingOnce`）。回帰テスト 2 件 | `fix(recording): ...` |
+| `src/storage/idb.ts`、`test/idb.test.ts` | `isMeetingRecord` が `sessionClock` の null と非数値の `audioFrameCount` を拒否。回帰テスト 1 件 | `fix(storage): ...` |
+| `.claude/skills/design-doc-sync/scripts/check_design_sync.py`、`CLAUDE.md` | 照合スクリプト: 閉じフェンスを「行頭・同じ記号・開き以上の長さ」に限定、開きフェンス行末の空白を許容、`--diff` で末尾改行の差を表示。CLAUDE.md: `flushed` は FIFO ではなく `requestId` で対応付けると記載を修正 | `chore(claude): ...` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映。phase2-client は失敗時の復元対象から `endedAt` を外し、Finalizer の重複呼び出しを束ね、`RecordingControllerDeps.scheduler` を `ChunkEnqueuer` にした | `docs(phase1): ...` |
 
 ---
 
@@ -110,6 +111,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-25（7 回目）
+
+- CodeRabbit の指摘 6 件を検証し、5 件を修正した。回帰テスト 2 件（Finalizer の重複呼び出し、`isMeetingRecord`）は修正前に Red を確認した。
+- 設計書 §24.1 / §24.2 のテストブロックを実装のイベント同期に揃える指摘は、テストブロックは「最低限の集合」で差分を許容する方針のため見送った。
 
 ### 2026-09-25（6 回目）
 
