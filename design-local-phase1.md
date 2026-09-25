@@ -2282,7 +2282,8 @@ export class LocalSaveScheduler {
     const record = await this.deps.chunkStore.getChunk(chunkKey);
     if (record === undefined) return;
     // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
-    if (record.save.status === "DB_REGISTERED" || record.save.status === "SAVING") return;
+    // SAVED（ファイル保存済み・DB 未登録）の登録確認は Finalizer のサーバー一覧照合に任せる
+    if (record.save.status === "DB_REGISTERED" || record.save.status === "SAVED" || record.save.status === "SAVING") return;
     if (record.save.status === "RETRYING" && record.save.nextRetryAt !== null && record.save.nextRetryAt > this.deps.now()) {
       this.insertSorted(chunkKey);
       return;
@@ -2352,7 +2353,7 @@ export class LocalSaveScheduler {
   }
 }
 
-function isResumable(record: AudioChunkRecord): boolean {
+export function isResumable(record: AudioChunkRecord): boolean {
   const { status, lastError } = record.save;
   // non-retryable（VALIDATION / CONFLICT / 408・429 以外の 4xx）は送り直しても結果が変わらないため、手動再試行のみ（§17）
   if (status === "LOCAL_SAVE_FAILED") return lastError === null || isRetryableError(lastError);
@@ -2910,7 +2911,7 @@ function errorMessage(error: unknown): string {
 
 サーバー未起動のまま利用者が停止した場合、Meeting は `stop_requested` で IndexedDB に残り、次回起動時の復旧（§23）でサーバーが `HEALTHY` になった時点から自動的に Barrier を再試行する。「最後の Chunk を保存する前に finalizing へ遷移してはいけない」（v4.0 §43）は、`finalizeMeeting` が `RecordingController.stop()` の完了後にしか呼ばれない呼び出し規約、会議の `status` が `stop_requested`（または POST 中に中断された `finalizing`）でなければ `verify` で失敗させる検査、`unpersistedChunkCount() > 0` および `notRegistered.length > 0` の早期リターンで担保する。`unpersistedChunkCount` には `() => controller.memoryBacklogCount` を渡す。すでに `finalized` の会議に対しては POST せずに成功を返し、二重の finalize で `endedAt` を書き換えない。IndexedDB に書けずメモリ待機中の末尾 Chunk は IndexedDB の一覧に現れず、連続性検査をすり抜けるためである。
 
-`SAVED`（サーバーがファイル書き込みだけ成功し `registered: false` を返した Chunk）は Scheduler の再開対象ではない。PUT を再送しても `registered: false` が続きうるため、`notRegistered` からは除外してサーバー一覧の照合へ進める。一覧で `registered: true` かつ sha256 一致が確認できたら `DB_REGISTERED` に更新する。確認できなければ他の不一致と同様に `LOCAL_SAVE_PENDING` に戻して再投入する。
+`SAVED`（サーバーがファイル書き込みだけ成功し `registered: false` を返した Chunk）は Scheduler の再開対象ではない（`resumeAll`・起動時の復旧・遅れて発火したリトライタイマーのいずれも送らない）。PUT を再送しても `registered: false` が続きうるため、`notRegistered` からは除外してサーバー一覧の照合へ進める。一覧で `registered: true` かつ sha256 一致が確認できたら `DB_REGISTERED` に更新する。確認できなければ他の不一致と同様に `LOCAL_SAVE_PENDING` に戻して再投入する。
 
 サーバー一覧との照合は、最初の不一致で打ち切らずに全 Chunk を確かめる。不一致の Chunk はすべて `LOCAL_SAVE_PENDING` に戻し、`resumeAll()` を 1 回だけ呼んでから、不一致の `sequenceNo` をすべて `detail` に並べて `verify` の失敗を返す（例: `server mismatch at seq 0, 2`）。1 件ずつ直すと、不一致の件数だけ Barrier の再試行が必要になるためである。
 
@@ -2923,8 +2924,8 @@ function errorMessage(error: unknown): string {
 ```typescript
 // src/recording/recovery.ts
 import type { ChunkStore, MeetingStore } from "../storage/idb";
-import type { LocalSaveScheduler } from "./local-save-scheduler";
-import type { MeetingRecord } from "../types/recording";
+import { isResumable, type LocalSaveScheduler } from "./local-save-scheduler";
+import type { AudioChunkRecord, MeetingRecord } from "../types/recording";
 
 export interface RecoveryReport {
   readonly interruptedMeetings: ReadonlyArray<{ readonly meetingId: string; readonly status: MeetingRecord["status"]; readonly chunkCount: number }>;
@@ -2934,7 +2935,8 @@ export interface RecoveryReport {
 /**
  * アプリ起動時に 1 回呼ぶ。
  * - status が recording / stop_requested / finalizing の会議を「中断された会議」として列挙
- * - DB_REGISTERED 以外の Chunk を Scheduler に再投入（SAVING で止まっていたものも含む。冪等 PUT なので安全）
+ * - 保存の途中で止まった Chunk（GENERATED / SAVING）を LOCAL_SAVE_PENDING に書き戻し、resumeAll で再投入する（冪等 PUT なので安全）
+ *   non-retryable の LOCAL_SAVE_FAILED は resumeAll の判定に任せ、SAVED は Finalizer のサーバー一覧照合に任せる
  * - recording のまま残っていた会議は stop_requested に落とす（音声はもう来ない）
  *   audioFrameCount は stop() でしか永続化されないため、保存済み Chunk の最大 endFrame から復元する
  */
@@ -2960,19 +2962,33 @@ export async function recoverOnStartup(meetingStore: MeetingStore, chunkStore: C
   }
 
   const unfinished = await chunkStore.listUnfinished();
+  let requeued = 0;
   for (const c of unfinished) {
-    // SAVING のまま落ちた Chunk はサーバー側に届いているかもしれない。冪等 PUT で再送し、200/201 どちらでも SAVED にする。
-    await chunkStore.updateSaveState(c.chunkKey, (r) => {
-      r.save.status = "LOCAL_SAVE_PENDING";
-      r.save.nextRetryAt = null;
-    });
+    if (isInterrupted(c)) {
+      // SAVING のまま落ちた Chunk はサーバー側に届いているかもしれない。冪等 PUT で再送し、200/201 どちらでも SAVED にする。
+      await chunkStore.updateSaveState(c.chunkKey, (r) => {
+        if (!isInterrupted(r)) return;
+        r.save.status = "LOCAL_SAVE_PENDING";
+        r.save.nextRetryAt = null;
+      });
+    } else if (!isResumable(c)) {
+      continue;
+    }
+    requeued++;
   }
   await scheduler.resumeAll();
-  return { interruptedMeetings: interrupted, requeuedChunks: unfinished.length };
+  return { interruptedMeetings: interrupted, requeuedChunks: requeued };
+}
+
+/** IDB 書き込み直後（GENERATED）や PUT 中（SAVING）に落ちた Chunk。どの経路からも再開されないため復旧で書き戻す。 */
+function isInterrupted(record: AudioChunkRecord): boolean {
+  return record.save.status === "GENERATED" || record.save.status === "SAVING";
 }
 ```
 
 `recording` のまま残っていた会議は、`stop_requested` に落とす前に `sessionClock.audioFrameCount` を保存済み Chunk の最大 `endFrame` から復元する。この値は `stop()` でしか永続化されないため、録音中のクラッシュでは初期値のまま残り、Finalizer が誤った `totalAudioFrames` を送ることになる。すでに大きい値が保存されていれば維持する。
+
+Chunk の状態を書き戻すのは、保存の途中で落ちた `GENERATED`（IDB 書き込み直後）と `SAVING`（PUT 中）だけである。どちらも `resumeAll` の再開対象ではなく、復旧で `LOCAL_SAVE_PENDING` に戻さないと送られない。non-retryable の `LOCAL_SAVE_FAILED` を書き戻すと `resumeAll` の分類を迂回して結果の変わらない PUT を繰り返すため残し、`SAVED` は Finalizer のサーバー一覧照合に任せる。`requeuedChunks` は書き戻した Chunk と `resumeAll` が再開する Chunk の合計である。
 
 復旧の前提は「IndexedDB の `put` が `complete` した Chunk は、ブラウザプロセスの異常終了後も残る」ことである。これは IndexedDB の永続性保証に依存しており、OS のクラッシュやディスク障害までは保証しない。`navigator.storage.persist()` はブラウザによる自動削除（ストレージ逼迫時の LRU eviction）を防ぐためのもので、これも保証ではなく要求である（§5）。
 

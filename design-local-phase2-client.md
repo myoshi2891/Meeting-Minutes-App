@@ -1198,9 +1198,10 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
 
   // finalizing へ進める前の値を控える。POST が失敗・タイムアウトしたらここへ戻す。
   // 戻さないと、IndexedDB に finalizing のまま取り残された会議ができ、再開経路がなくなる。
-  const before = { status: meeting.status, endedAt: meeting.endedAt, finalChunkCount: meeting.finalChunkCount };
+  // finalizing から再試行した場合も含め、status は常に stop_requested へ戻す（Phase 1 §22）
+  const before = { endedAt: meeting.endedAt, finalChunkCount: meeting.finalChunkCount };
   const restore = async (): Promise<void> => {
-    meeting.status = before.status;
+    meeting.status = "stop_requested";
     meeting.endedAt = before.endedAt;
     meeting.finalChunkCount = before.finalChunkCount;
     await deps.meetingStore.put(meeting);
