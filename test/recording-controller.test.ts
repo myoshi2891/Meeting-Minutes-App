@@ -21,8 +21,15 @@ function createHealth(): RecordingHealth {
   };
 }
 
-async function flushMessages(): Promise<void> {
-  for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 0));
+/** 観測できる変化（Worklet へのコマンド・enqueue・onError）のたびに条件を再評価する。固定回数のタイマー待ちはしない */
+class Signal {
+  private waiters: Array<() => void> = [];
+  notify(): void {
+    for (const w of this.waiters.splice(0)) w();
+  }
+  async until(condition: () => boolean): Promise<void> {
+    while (!condition()) await new Promise<void>((r) => this.waiters.push(r));
+  }
 }
 
 /** Worklet 側の端。受け取ったコマンドを記録し、stop / flush には部分 Chunk + flushed（同じ requestId）で応答する。 */
@@ -31,9 +38,13 @@ class FakeWorkletSide {
   /** true の間は flush / stop に応答しない（AudioContext が閉じられた Worklet を模す） */
   silent = false;
   private frame = 0;
-  constructor(readonly port: MessagePort) {
+  constructor(
+    readonly port: MessagePort,
+    private readonly signal: Signal,
+  ) {
     port.onmessage = (e: MessageEvent<WorkletCommand>) => {
       this.commands.push(e.data);
+      this.signal.notify();
       if (this.silent) return;
       if (e.data.type === "stop" || e.data.type === "flush") {
         this.sendChunk(1600, true);
@@ -68,6 +79,10 @@ interface Setup {
   track: EventTarget & { stop: ReturnType<typeof vi.fn> };
   /** 注入したタイマー。fireTimers() で期限を待たずに発火させる */
   fireTimers: () => void;
+  /** Worklet へのコマンド・enqueue・onError のいずれかで condition が真になるまで待つ */
+  until: (condition: () => boolean) => Promise<void>;
+  /** 指定した種類のコマンドを Worklet が受け取るまで待つ */
+  untilCommand: (type: WorkletCommand["type"]) => Promise<void>;
 }
 
 async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Promise<Setup> {
@@ -75,7 +90,8 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Prom
   const chunkStore = chunkStoreOverride?.(db) ?? new ChunkStore(db);
   const meetingStore = new MeetingStore(db);
   const channel = new MessageChannel();
-  const worklet = new FakeWorkletSide(channel.port2);
+  const signal = new Signal();
+  const worklet = new FakeWorkletSide(channel.port2, signal);
   vi.stubGlobal(
     "AudioWorkletNode",
     class {
@@ -99,16 +115,26 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Prom
     mediaStream,
     chunkStore,
     meetingStore,
-    scheduler: { enqueue: async (key: string) => void enqueued.push(key) },
+    scheduler: {
+      enqueue: async (key: string) => {
+        enqueued.push(key);
+        signal.notify();
+      },
+    },
     health,
     workletModuleUrl: "/worklet.js",
-    onError: (e) => errors.push(e),
+    onError: (e) => {
+      errors.push(e);
+      signal.notify();
+    },
     setTimer: (fn) => timers.push(fn),
   });
   const fireTimers = () => {
     for (const fn of timers.splice(0)) fn();
   };
-  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, track, fireTimers };
+  const until = (condition: () => boolean) => signal.until(condition);
+  const untilCommand = (type: WorkletCommand["type"]) => until(() => worklet.commands.some((c) => c.type === type));
+  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, track, fireTimers, until, untilCommand };
 }
 
 describe("makeChunkKey / sha256Hex", () => {
@@ -136,7 +162,7 @@ describe("RecordingController", () => {
     const s = await setup();
     // Act
     await s.controller.start("m1", "定例", 123);
-    await flushMessages();
+    await s.untilCommand("start");
     // Assert
     const meeting = await s.meetingStore.get("m1");
     expect(meeting?.status).toBe("recording");
@@ -150,7 +176,7 @@ describe("RecordingController", () => {
     await s.controller.start("m1", "定例", 1);
     s.worklet.sendChunk(480000);
     s.worklet.sendChunk(480000);
-    await flushMessages();
+    await s.until(() => s.enqueued.length >= 2);
 
     expect(s.enqueued).toEqual(["m1:mic:000000", "m1:mic:000001"]);
     const rec = (await s.chunkStore.getChunk("m1:mic:000001")) as AudioChunkRecord;
@@ -186,10 +212,11 @@ describe("RecordingController", () => {
     s.worklet.silent = true;
     // Act
     const stopped = s.controller.stop().then(() => "done");
-    await flushMessages();
+    // stop の送信より前にタイムアウトのタイマーが登録されている
+    await s.untilCommand("stop");
     s.fireTimers();
     // Assert
-    expect(await Promise.race([stopped, flushMessages().then(() => "pending")])).toBe("done");
+    expect(await stopped).toBe("done");
     expect(s.errors.map((e) => e.message)).toEqual([expect.stringContaining("stop")]);
     expect(s.track.stop).toHaveBeenCalled();
   });
@@ -200,25 +227,23 @@ describe("RecordingController", () => {
     await s.controller.start("m1", "定例", 1);
     s.worklet.silent = true;
     const flushed = s.controller.flush();
-    await flushMessages();
+    await s.untilCommand("flush");
     s.fireTimers();
     await flushed;
     const flushCmd = s.worklet.commands.find((c) => c.type === "flush");
+    if (flushCmd?.type !== "flush") throw new Error("flush command not sent");
     // Act：stop を送った直後に、flush への遅れた応答だけが届く
     const stopped = s.controller.stop().then(() => "done");
-    await flushMessages();
-    if (flushCmd?.type !== "flush") throw new Error("flush command not sent");
+    await s.untilCommand("stop");
     s.worklet.sendFlushed(flushCmd.requestId);
-    // Assert：stop はまだ自分の flushed を待っている
-    expect(await Promise.race([stopped, flushMessages().then(() => "pending")])).toBe("pending");
-    expect(s.track.stop).not.toHaveBeenCalled();
-    // stop への応答（最終 Chunk + flushed）で完了する
-    const stopCmd = s.worklet.commands.find((c) => c.type === "stop");
-    if (stopCmd?.type !== "stop") throw new Error("stop command not sent");
+    // flushed の待機解放と Chunk の保存は同じ chunkQueue に順に積まれるので、後続 Chunk の enqueue で遅れた flushed の処理済みを確認できる
     s.worklet.sendChunk(1600, true);
-    s.worklet.sendFlushed(stopCmd.requestId);
+    await s.until(() => s.enqueued.length >= 1);
+    s.fireTimers();
+    // Assert：遅れた flushed で stop の待機は外れておらず、stop のタイムアウトが発火してから完了する
     expect(await stopped).toBe("done");
-    expect(s.enqueued).toEqual(["m1:mic:000000"]);
+    expect(s.errors.map((e) => e.message)).toEqual([expect.stringContaining("flush"), expect.stringContaining("stop")]);
+    expect(s.track.stop).toHaveBeenCalled();
   });
 
   it("flush は録音を継続したまま部分 Chunk の IDB 書き込みまで待つ", async () => {
@@ -245,17 +270,14 @@ describe("RecordingController", () => {
         })(db),
     );
     await s.controller.start("m1", "定例", 1);
-    // Act
+    // Act：Chunk は直列に処理されるので、2 件目の enqueue で 1 件目の処理完了を確認できる
     s.worklet.sendChunk(1600);
-    await flushMessages();
+    s.worklet.sendChunk(1600); // 録音は継続し、次の Chunk は保存される
+    await s.until(() => s.enqueued.length >= 1);
     // Assert
     expect(s.controller.memoryBacklogCount).toBe(1);
     expect(s.health.degradedReasons).toContain("IDB_QUOTA_EXHAUSTED");
     expect(s.errors).toHaveLength(0);
-    expect(s.enqueued).toHaveLength(0);
-
-    s.worklet.sendChunk(1600); // 録音は継続し、次の Chunk は保存される
-    await flushMessages();
     expect(s.enqueued).toEqual(["m1:mic:000001"]);
 
     expect(await s.controller.drainMemoryBacklog()).toBe(1);
@@ -281,7 +303,7 @@ describe("RecordingController", () => {
     await s.controller.start("m1", "定例", 1);
     // Act
     s.worklet.sendChunk(1600);
-    await flushMessages();
+    await s.until(() => s.errors.length >= 1);
     // Assert
     expect(s.errors.map((e) => e.message)).toEqual(["disk exploded"]);
     expect(s.controller.memoryBacklogCount).toBe(1);
@@ -295,7 +317,7 @@ describe("RecordingController", () => {
     const s = await setup();
     await s.controller.start("m1", "定例", 1);
     s.worklet.port.postMessage({ type: "ready", nativeSampleRate: 44100, renderQuantum: 128 });
-    await flushMessages();
+    await s.until(() => s.errors.length >= 1);
     expect(s.errors[0]?.message).toContain("sampleRate mismatch");
   });
 
