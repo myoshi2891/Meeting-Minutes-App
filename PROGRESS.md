@@ -20,26 +20,19 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 179 件がすべて通過。`npm run typecheck` もエラーなし。
+- 自動テスト: 17 ファイル / 180 件がすべて通過。`npm run typecheck` もエラーなし。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-25 時点・4 回目のレビュー対応）
+### 未コミットの変更（2026-09-25・6 回目のレビュー対応）
+
+4・5 回目の変更はコミット済み。
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/**`、`test/**` | `resumeAll` が non-retryable の `LOCAL_SAVE_FAILED` を再投入しない（`isRetryableError` を `LocalSaver` と共有）。復旧が `recording` の会議の `audioFrameCount` を Chunk の最大 `endFrame` から復元。`openDatabase` が blocked 後の接続を閉じる。`listUnfinished` が索引の範囲で DB_REGISTERED を除く。Finalizer が不一致をすべて再投入。テスト 7 件追加（うち回帰 4 件） | `fix(recording): ...` |
-| `test/**`（テストの同期方法） | health monitor のテストをフェイクタイマー・`performance.now` スタブに変更。Worklet テストを `startProcessor` / `nextFlushed` / `nthChunk`（`test/harness.ts` に移設）のイベント同期に変更 | `test(worklet): ...` |
-| `.claude/skills/design-doc-sync/scripts/check_design_sync.py` | 前後の空白を削らずにファイル全体と比較する | `chore(claude): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を設計書に反映。phase2-client は `fetchWithTimeout` が本文をタイムアウト内で読み、Finalizer の不一致を一括再投入 | `docs(phase1): ...` |
-
-### 未コミットの変更（2026-09-25・5 回目のレビュー対応）
-
-| 変更 | 内容 | 推奨コミット |
-| --- | --- | --- |
-| `src/recording/local-save-scheduler.ts`、`src/recording/recovery.ts`、`test/crash-recovery.test.ts`、`test/local-save-scheduler.test.ts` | `runOne` が SAVED を送らない。`recoverOnStartup` は GENERATED / SAVING だけを書き戻し、`requeuedChunks` は再投入対象だけを数える（`isResumable` を export）。回帰テスト 2 件 | `fix(recording): ...` |
-| `test/recording-controller.test.ts` | 固定回数のタイマー待ち `flushMessages` を、コマンド受信・enqueue・onError の観測で待つ `until` に置換 | `test(recording): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映。phase2-client の Finalizer は失敗時に status を常に `stop_requested` へ戻す | `docs(phase1): ...` |
+| `src/recording/finalizer.ts`、`test/finalizer.test.ts` | POST /finalize の失敗後に再試行しても `endedAt` を書き換えない（`??=`）。回帰テスト 1 件 | `fix(recording): ...` |
+| `.claude/skills/design-doc-sync/scripts/check_design_sync.py` | 閉じフェンスを「行頭・同じ記号・開き以上の長さ」に限定。`--diff` で末尾改行の差を表示 | `chore(claude): ...` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映。phase2-client は失敗時の復元対象から `endedAt` を外し、テストの期待値を変更 | `docs(phase1): ...` |
 
 ---
 
@@ -101,10 +94,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 2026-09-25 のレビュー指摘（4 回目）で有効と判定したが見送った。`stop()` の `requestFlush` がタイムアウトすると、最終の部分 Chunk が届かないまま会議が `stop_requested` になり、Barrier は末尾が欠けたまま finalize できてしまう（`onError` の通知だけ）。
 - 指摘の案は「専用の失敗状態（例: `stop_failed`）を追加し、Finalizer と復旧で進めない」。ただし `MeetingStatus` の追加は Phase 2 以降の設計とサーバー契約にも影響し、その会議を利用者が確定させる手段（手動 finalize）も要るため、着手前に利用者に確認する。
+- 6 回目のレビューでも同系統の指摘があった（`stop()` の flush 完了後に `finalChunkCount` を確定・永続化し、Finalizer は未確定や件数不一致を拒否する）。クラッシュ復旧した会議は `stop()` を通らず確定値を持たないため、復旧経路の扱いと合わせて本タスクで決める。
 
-### T7. 起動時復旧が non-retryable の Chunk も再送する【小・T0 の後】
+### T7. 起動時復旧が non-retryable の Chunk も再送する ✅ 完了（5 回目のレビュー対応）
 
-- `recoverOnStartup` は DB_REGISTERED 以外の Chunk をすべて `LOCAL_SAVE_PENDING` に戻すため、non-retryable の `LOCAL_SAVE_FAILED` も起動のたびに 1 回再送される（`resumeAll` 側は 4 回目のレビューで修正済み）。`isRetryableError` で除外するかを決める。
+- `recoverOnStartup` は GENERATED / SAVING の Chunk だけを `LOCAL_SAVE_PENDING` に書き戻すようにした。non-retryable の `LOCAL_SAVE_FAILED` は `isResumable` で除外され、再送されない。
 
 ### 保留・メモ
 
@@ -116,6 +110,10 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-25（6 回目）
+
+- CodeRabbit の指摘 5 件を検証した。4 件（照合スクリプト 2・PROGRESS の T7・Finalizer の `endedAt`）を修正し、`finalChunkCount` を `stop()` で確定させる案は復旧経路に影響するため T6 に追記して見送った。`endedAt` の回帰テストは修正前に Red を確認した。
 
 ### 2026-09-25（4 回目）
 
