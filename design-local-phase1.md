@@ -726,7 +726,7 @@ export function backoffMs(attempts: number, random: () => number = Math.random):
 export const MAX_SAVE_ATTEMPTS = 8;
 ```
 
-クラウド版の 30s 起点（v4.0 §51）より短い 2s 起点にしているのは、ローカルサーバーの一時的な失敗（起動直後のディスク同期など）は数秒で回復することが多く、また外部レートリミットへの配慮が不要なためである。上限 600s は変更しない。`attempts` が上限に達した Chunk は `LOCAL_SAVE_FAILED` に留まり、UI の手動再試行または `BACKEND_UNAVAILABLE → HEALTHY` 復帰時の一括再投入（`attempts` は保持、上限判定はスキップ）で再開する。
+クラウド版の 30s 起点（v4.0 §51）より短い 2s 起点にしているのは、ローカルサーバーの一時的な失敗（起動直後のディスク同期など）は数秒で回復することが多く、また外部レートリミットへの配慮が不要なためである。上限 600s は変更しない。retryable な失敗でも `attempts` が上限に達した Chunk は `LOCAL_SAVE_FAILED` に留まり、UI の手動再試行または `BACKEND_UNAVAILABLE → HEALTHY` 復帰時の一括再投入（`resumeAll()`。`attempts` は保持、上限判定はスキップ）で再開する。non-retryable な失敗（`lastError` が `isRetryableError()` を満たさない）の `LOCAL_SAVE_FAILED` は `resumeAll()` の対象外で、手動再試行のみで再開する。送り直しても結果が変わらない 4xx を、backend 復帰や Barrier の再試行のたびに再送しないためである。判定は `LocalSaver.fail()` と同じ `isRetryableError()` を使う。
 
 ---
 
@@ -799,6 +799,8 @@ const MIGRATIONS: ReadonlyArray<{ readonly toVersion: number; readonly run: Migr
 export function openDatabase(indexedDbFactory: IDBFactory = indexedDB): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDbFactory.open(DB_NAME, DB_VERSION);
+    // blocked で reject した後に別タブが閉じると onsuccess が来る。その接続は呼び出し元に渡らないので閉じる
+    let blockedRejected = false;
 
     request.onupgradeneeded = (event) => {
       const db = request.result;
@@ -817,11 +819,17 @@ export function openDatabase(indexedDbFactory: IDBFactory = indexedDB): Promise<
 
     request.onblocked = () => {
       // 別タブが旧バージョンを開いたまま。閉じるまで待つ（UI で通知）。
+      blockedRejected = true;
       reject(new Error("IndexedDB upgrade blocked by another tab"));
     };
 
     request.onsuccess = () => {
       const db = request.result;
+      if (blockedRejected) {
+        // 開いたままだと、次の openDatabase のアップグレードをこの接続が塞ぐ
+        db.close();
+        return;
+      }
       db.onversionchange = () => {
         // 別タブがアップグレードを要求した。自タブは接続を閉じて再読み込みを促す。
         db.close();
@@ -896,8 +904,12 @@ export class ChunkStore {
   async listUnfinished(): Promise<AudioChunkRecord[]> {
     const tx = this.db.transaction(STORE_CHUNKS, "readonly");
     const index = tx.objectStore(STORE_CHUNKS).index("by_status");
-    const all = await requestToPromise(index.getAll());
-    return all.filter(isAudioChunkRecord).filter((r) => r.save.status !== "DB_REGISTERED");
+    // 完了済み（DB_REGISTERED）の WAV まで読み込まないよう、索引の範囲でその前後だけを取る
+    const [before, after] = await Promise.all([
+      requestToPromise(index.getAll(IDBKeyRange.upperBound("DB_REGISTERED", true))),
+      requestToPromise(index.getAll(IDBKeyRange.lowerBound("DB_REGISTERED", true))),
+    ]);
+    return [...before, ...after].filter(isAudioChunkRecord).filter((r) => r.save.status !== "DB_REGISTERED");
   }
 
   /** クォータ縮退（§3.4 段階1）：DB_REGISTERED の Chunk だけ Blob 本体を削除しメタデータのみ残す。未検証の Chunk は再送のため残す。 */
@@ -970,7 +982,7 @@ export function isMeetingRecord(value: unknown): value is MeetingRecord {
 }
 ```
 
-将来のバージョン 2 で `by_meeting_seq` に `vadScore` を追加するような変更は、`MIGRATIONS` に `{ toVersion: 2, run: (db, tx) => { tx.objectStore(STORE_CHUNKS).createIndex(...) } }` を追記し `DB_VERSION` を上げるだけで、既存データを壊さずに適用できる。`onblocked` は別タブが旧バージョンを開いたままのケースで発生し、UI で「他のタブを閉じてください」と案内する。
+将来のバージョン 2 で `by_meeting_seq` に `vadScore` を追加するような変更は、`MIGRATIONS` に `{ toVersion: 2, run: (db, tx) => { tx.objectStore(STORE_CHUNKS).createIndex(...) } }` を追記し `DB_VERSION` を上げるだけで、既存データを壊さずに適用できる。`onblocked` は別タブが旧バージョンを開いたままのケースで発生し、UI で「他のタブを閉じてください」と案内する。`onblocked` で reject した後に別タブが閉じると `onsuccess` が遅れて届くが、その接続は呼び出し元に渡らないため、開いたまま残さずに閉じる（残すと次回のアップグレードをその接続が塞ぐ）。
 
 ---
 
@@ -2079,9 +2091,14 @@ export class LocalSaver {
     return {
       ok: false,
       error: { kind, message, httpStatus, at: performance.now() },
-      retryable: RETRYABLE.has(kind) && !isNonRetryableClientError(httpStatus),
+      retryable: isRetryableError({ kind, httpStatus }),
     };
   }
+}
+
+/** 同じリクエストを送り直せば結果が変わりうる失敗か。LocalSaver.fail と Scheduler の再投入判定（resumeAll）で共有する。 */
+export function isRetryableError(error: Pick<LocalSaveError, "kind" | "httpStatus">): boolean {
+  return RETRYABLE.has(error.kind) && !isNonRetryableClientError(error.httpStatus);
 }
 
 /** 408 / 429 を除く 4xx は同じリクエストを送り直しても結果が変わらない（kind が UNKNOWN でも再試行しない）。 */
@@ -2103,7 +2120,7 @@ function isApiErrorBody(value: unknown): value is ApiErrorBody {
 
 ```typescript
 // src/recording/local-save-scheduler.ts
-import type { LocalSaver } from "../api/local-saver";
+import { isRetryableError, type LocalSaver } from "../api/local-saver";
 import type { ChunkStore } from "../storage/idb";
 import type { AudioChunkRecord, LocalBackendHealth, RecordingHealth } from "../types/recording";
 import { backoffMs, MAX_SAVE_ATTEMPTS } from "./backoff";
@@ -2146,15 +2163,14 @@ export class LocalSaveScheduler {
     void this.pump();
   }
 
-  /** backend が HEALTHY に戻ったとき、BACKEND_UNAVAILABLE / 上限到達 LOCAL_SAVE_FAILED を一括再投入する。 */
+  /** backend が HEALTHY に戻ったとき、BACKEND_UNAVAILABLE / 上限到達 LOCAL_SAVE_FAILED（retryable のみ）を一括再投入する。 */
   async resumeAll(): Promise<void> {
     const unfinished = await this.deps.chunkStore.listUnfinished();
     for (const r of unfinished) {
-      const s = r.save.status;
-      if (isResumable(s) && !this.pending.includes(r.chunkKey) && !this.inFlight.has(r.chunkKey)) {
+      if (isResumable(r) && !this.pending.includes(r.chunkKey) && !this.inFlight.has(r.chunkKey)) {
         await this.deps.chunkStore.updateSaveState(r.chunkKey, (x) => {
           // 一覧取得後に別経路で保存が進んでいたら書き戻さない
-          if (!isResumable(x.save.status)) return;
+          if (!isResumable(x)) return;
           x.save.status = "LOCAL_SAVE_PENDING";
           x.save.nextRetryAt = null;
         });
@@ -2336,8 +2352,11 @@ export class LocalSaveScheduler {
   }
 }
 
-function isResumable(status: AudioChunkRecord["save"]["status"]): boolean {
-  return status === "BACKEND_UNAVAILABLE" || status === "LOCAL_SAVE_FAILED" || status === "RETRYING" || status === "LOCAL_SAVE_PENDING" || status === "IDB_STORED";
+function isResumable(record: AudioChunkRecord): boolean {
+  const { status, lastError } = record.save;
+  // non-retryable（VALIDATION / CONFLICT / 408・429 以外の 4xx）は送り直しても結果が変わらないため、手動再試行のみ（§17）
+  if (status === "LOCAL_SAVE_FAILED") return lastError === null || isRetryableError(lastError);
+  return status === "BACKEND_UNAVAILABLE" || status === "RETRYING" || status === "LOCAL_SAVE_PENDING" || status === "IDB_STORED";
 }
 
 function errorMessage(error: unknown): string {
@@ -2821,20 +2840,26 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
   if (list.meetingId !== meetingId) return { ok: false, stage: "verify", detail: `list meetingId mismatch: ${list.meetingId}` };
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
+  // 不一致を 1 件ずつ直すと Barrier の再試行が件数分かかるため、すべて洗い出してから一度に再投入する
+  const mismatched: number[] = [];
   for (const c of chunks) {
     const s = serverByKey.get(`${c.meta.source}:${c.meta.sequenceNo}`);
     if (s === undefined || s.sha256 !== c.meta.sha256 || !s.registered) {
       await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
         r.save.status = "LOCAL_SAVE_PENDING";
       });
-      await deps.scheduler.resumeAll();
-      return { ok: false, stage: "verify", detail: `server mismatch at seq ${c.meta.sequenceNo}` };
+      mismatched.push(c.meta.sequenceNo);
+      continue;
     }
     if (c.save.status === "SAVED") {
       await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
         r.save.status = "DB_REGISTERED";
       });
     }
+  }
+  if (mismatched.length > 0) {
+    await deps.scheduler.resumeAll();
+    return { ok: false, stage: "verify", detail: `server mismatch at seq ${mismatched.join(", ")}` };
   }
 
   meeting.status = "finalizing";
@@ -2887,6 +2912,8 @@ function errorMessage(error: unknown): string {
 
 `SAVED`（サーバーがファイル書き込みだけ成功し `registered: false` を返した Chunk）は Scheduler の再開対象ではない。PUT を再送しても `registered: false` が続きうるため、`notRegistered` からは除外してサーバー一覧の照合へ進める。一覧で `registered: true` かつ sha256 一致が確認できたら `DB_REGISTERED` に更新する。確認できなければ他の不一致と同様に `LOCAL_SAVE_PENDING` に戻して再投入する。
 
+サーバー一覧との照合は、最初の不一致で打ち切らずに全 Chunk を確かめる。不一致の Chunk はすべて `LOCAL_SAVE_PENDING` に戻し、`resumeAll()` を 1 回だけ呼んでから、不一致の `sequenceNo` をすべて `detail` に並べて `verify` の失敗を返す（例: `server mismatch at seq 0, 2`）。1 件ずつ直すと、不一致の件数だけ Barrier の再試行が必要になるためである。
+
 `finalizeMeeting` は失敗を例外ではなく `FinalizeResult` で返す。`GET /chunks` の応答は外部入力なので `isChunkListResponse` で検証し、契約に合わなければ `verify` の失敗とする。応答の `meetingId` が要求した会議と異なる場合も `verify` の失敗とし、ローカルの Chunk を `DB_REGISTERED` にしない（無音など同一内容の Chunk は別会議でも SHA-256 が一致しうるため）。`GET /chunks` と `POST /finalize` にはそれぞれ `timeoutMs`（既定 30 秒）の `AbortController` を付ける。応答しないサーバーに対しても、接続失敗と同じ経路で失敗結果を返す。`POST /finalize` が失敗した場合（HTTP エラー、接続失敗、タイムアウトのいずれも）は会議を `stop_requested` に戻し、`finalizing` のまま残さない。
 
 ---
@@ -2909,6 +2936,7 @@ export interface RecoveryReport {
  * - status が recording / stop_requested / finalizing の会議を「中断された会議」として列挙
  * - DB_REGISTERED 以外の Chunk を Scheduler に再投入（SAVING で止まっていたものも含む。冪等 PUT なので安全）
  * - recording のまま残っていた会議は stop_requested に落とす（音声はもう来ない）
+ *   audioFrameCount は stop() でしか永続化されないため、保存済み Chunk の最大 endFrame から復元する
  */
 export async function recoverOnStartup(meetingStore: MeetingStore, chunkStore: ChunkStore, scheduler: LocalSaveScheduler): Promise<RecoveryReport> {
   const interrupted: Array<{ meetingId: string; status: MeetingRecord["status"]; chunkCount: number }> = [];
@@ -2920,6 +2948,9 @@ export async function recoverOnStartup(meetingStore: MeetingStore, chunkStore: C
       seen.add(m.meetingId);
       const chunks = await chunkStore.listByMeeting(m.meetingId, "mic");
       if (m.status === "recording") {
+        // Finalizer が totalAudioFrames として送る値。既に大きい値があれば維持する
+        const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
+        m.sessionClock.audioFrameCount = Math.max(m.sessionClock.audioFrameCount, lastEndFrame);
         m.status = "stop_requested";
         m.updatedAt = Date.now();
         await meetingStore.put(m);
@@ -2940,6 +2971,8 @@ export async function recoverOnStartup(meetingStore: MeetingStore, chunkStore: C
   return { interruptedMeetings: interrupted, requeuedChunks: unfinished.length };
 }
 ```
+
+`recording` のまま残っていた会議は、`stop_requested` に落とす前に `sessionClock.audioFrameCount` を保存済み Chunk の最大 `endFrame` から復元する。この値は `stop()` でしか永続化されないため、録音中のクラッシュでは初期値のまま残り、Finalizer が誤った `totalAudioFrames` を送ることになる。すでに大きい値が保存されていれば維持する。
 
 復旧の前提は「IndexedDB の `put` が `complete` した Chunk は、ブラウザプロセスの異常終了後も残る」ことである。これは IndexedDB の永続性保証に依存しており、OS のクラッシュやディスク障害までは保証しない。`navigator.storage.persist()` はブラウザによる自動削除（ストレージ逼迫時の LRU eviction）を防ぐためのもので、これも保証ではなく要求である（§5）。
 

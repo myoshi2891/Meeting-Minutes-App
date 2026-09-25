@@ -1079,12 +1079,23 @@ export interface FinalizerDeps {
   readonly unpersistedChunkCount: () => number;
 }
 
-/** AbortController でタイムアウトさせる。fetch 自身にタイムアウトはない。 */
-async function fetchWithTimeout(fetchImpl: typeof fetch, url: URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+/**
+ * AbortController でタイムアウトさせる。fetch 自身にタイムアウトはない。
+ * 本文の読み取り（readBody）もタイムアウトの内側で行う。ヘッダだけ返して本文が止まったサーバーを無期限に待たないため。
+ */
+async function fetchWithTimeout<T>(
+  fetchImpl: typeof fetch,
+  url: URL,
+  init: RequestInit,
+  timeoutMs: number,
+  readBody: (res: Response) => Promise<T>,
+): Promise<{ readonly res: Response; readonly body: T }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetchImpl(url, { ...init, signal: controller.signal });
+    const res = await fetchImpl(url, { ...init, signal: controller.signal });
+    const body = await readBody(res);
+    return { res, body };
   } finally {
     clearTimeout(timer);
   }
@@ -1141,18 +1152,26 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
   assertLocalHost(listUrl);
   let listRes: Response;
+  let list: unknown;
   try {
-    listRes = await fetchWithTimeout(fetchImpl, listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit" }, timeoutMs);
+    // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す、Phase 1 §22）
+    ({ res: listRes, body: list } = await fetchWithTimeout(
+      fetchImpl,
+      listUrl,
+      { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit" },
+      timeoutMs,
+      (res): Promise<unknown> => (res.ok ? res.json().catch(() => null) : Promise.resolve(null)),
+    ));
   } catch (error) {
     return { ok: false, stage: "verify", detail: `list failed: ${describeFetchError(error, timeoutMs)}` };
   }
   if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
-  // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す、Phase 1 §22）
-  const list: unknown = await listRes.json().catch(() => null);
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
   // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
   if (list.meetingId !== meetingId) return { ok: false, stage: "verify", detail: `list meetingId mismatch: ${list.meetingId}` };
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
+  // 不一致を 1 件ずつ直すと Barrier の再試行が件数分かかるため、すべて洗い出してから一度に再投入する（Phase 1 §22）
+  const mismatched: string[] = [];
   for (const source of SOURCES) {
     for (const c of bySource[source]) {
       const s = serverByKey.get(`${c.meta.source}:${c.meta.sequenceNo}`);
@@ -1160,8 +1179,8 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
         await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
           r.save.status = "LOCAL_SAVE_PENDING";
         });
-        await deps.scheduler.resumeAll();
-        return { ok: false, stage: "verify", detail: `server mismatch at ${source}/${c.meta.sequenceNo}` };
+        mismatched.push(`${source}/${c.meta.sequenceNo}`);
+        continue;
       }
       if (c.save.status === "SAVED") {
         await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
@@ -1169,6 +1188,10 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
         });
       }
     }
+  }
+  if (mismatched.length > 0) {
+    await deps.scheduler.resumeAll();
+    return { ok: false, stage: "verify", detail: `server mismatch at ${mismatched.join(", ")}` };
   }
 
   const counts: Record<AudioSource, number> = { mic: bySource.mic.length, system: bySource.system.length };
@@ -1197,12 +1220,13 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   assertLocalHost(finUrl);
   let finRes: Response;
   try {
-    finRes = await fetchWithTimeout(fetchImpl, finUrl, {
+    // finalize の応答本文は使わないので読まない
+    ({ res: finRes } = await fetchWithTimeout(fetchImpl, finUrl, {
       method: "POST",
       headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
       credentials: "omit",
-    }, timeoutMs);
+    }, timeoutMs, async () => null));
   } catch (error) {
     await restore();
     return { ok: false, stage: "finalize", detail: `finalize failed: ${describeFetchError(error, timeoutMs)}` };
