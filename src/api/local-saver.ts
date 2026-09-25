@@ -107,9 +107,14 @@ export class LocalSaver {
     return {
       ok: false,
       error: { kind, message, httpStatus, at: performance.now() },
-      retryable: RETRYABLE.has(kind) && !isNonRetryableClientError(httpStatus),
+      retryable: isRetryableError({ kind, httpStatus }),
     };
   }
+}
+
+/** 同じリクエストを送り直せば結果が変わりうる失敗か。LocalSaver.fail と Scheduler の再投入判定（resumeAll）で共有する。 */
+export function isRetryableError(error: Pick<LocalSaveError, "kind" | "httpStatus">): boolean {
+  return RETRYABLE.has(error.kind) && !isNonRetryableClientError(error.httpStatus);
 }
 
 /** 408 / 429 を除く 4xx は同じリクエストを送り直しても結果が変わらない（kind が UNKNOWN でも再試行しない）。 */

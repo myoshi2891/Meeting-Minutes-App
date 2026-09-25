@@ -13,6 +13,7 @@ export interface RecoveryReport {
  * - status が recording / stop_requested / finalizing の会議を「中断された会議」として列挙
  * - DB_REGISTERED 以外の Chunk を Scheduler に再投入（SAVING で止まっていたものも含む。冪等 PUT なので安全）
  * - recording のまま残っていた会議は stop_requested に落とす（音声はもう来ない）
+ *   audioFrameCount は stop() でしか永続化されないため、保存済み Chunk の最大 endFrame から復元する
  */
 export async function recoverOnStartup(meetingStore: MeetingStore, chunkStore: ChunkStore, scheduler: LocalSaveScheduler): Promise<RecoveryReport> {
   const interrupted: Array<{ meetingId: string; status: MeetingRecord["status"]; chunkCount: number }> = [];
@@ -24,6 +25,9 @@ export async function recoverOnStartup(meetingStore: MeetingStore, chunkStore: C
       seen.add(m.meetingId);
       const chunks = await chunkStore.listByMeeting(m.meetingId, "mic");
       if (m.status === "recording") {
+        // Finalizer が totalAudioFrames として送る値。既に大きい値があれば維持する
+        const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
+        m.sessionClock.audioFrameCount = Math.max(m.sessionClock.audioFrameCount, lastEndFrame);
         m.status = "stop_requested";
         m.updatedAt = Date.now();
         await meetingStore.put(m);

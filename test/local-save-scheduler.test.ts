@@ -115,6 +115,29 @@ describe("LocalSaveScheduler", () => {
     expect(s.timers).toHaveLength(0);
   });
 
+  it("resumeAll は non-retryable の LOCAL_SAVE_FAILED を再投入せず、上限到達の retryable な LOCAL_SAVE_FAILED は再投入する", async () => {
+    // Arrange：seq 0 は 422（non-retryable）、seq 1 は 5xx を上限まで繰り返して LOCAL_SAVE_FAILED にする
+    let serverDown = true;
+    const s = await setup((r) => {
+      if (r.meta.sequenceNo === 0) return new Response("{}", { status: 422 });
+      return serverDown ? new Response("{}", { status: 500 }) : okResponse(r);
+    });
+    await s.add(0);
+    await s.add(1);
+    for (let i = 0; i < 20; i++) await s.advance(600_000);
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+    expect((await s.status(1))?.status).toBe("LOCAL_SAVE_FAILED");
+    const putsBefore = s.stats().putCount;
+    // Act
+    serverDown = false;
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    // Assert：non-retryable は手動再試行のみ。retryable は上限到達でも再開する
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+    expect((await s.status(1))?.status).toBe("DB_REGISTERED");
+    expect(s.stats().putCount).toBe(putsBefore + 1);
+  });
+
   it("DEGRADED（遅いが応答あり）の backend には PUT を試みる（§18）", async () => {
     const s = await setup((r) => okResponse(r), "DEGRADED");
     await s.add(0);

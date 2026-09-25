@@ -85,20 +85,26 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
   if (list.meetingId !== meetingId) return { ok: false, stage: "verify", detail: `list meetingId mismatch: ${list.meetingId}` };
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
+  // 不一致を 1 件ずつ直すと Barrier の再試行が件数分かかるため、すべて洗い出してから一度に再投入する
+  const mismatched: number[] = [];
   for (const c of chunks) {
     const s = serverByKey.get(`${c.meta.source}:${c.meta.sequenceNo}`);
     if (s === undefined || s.sha256 !== c.meta.sha256 || !s.registered) {
       await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
         r.save.status = "LOCAL_SAVE_PENDING";
       });
-      await deps.scheduler.resumeAll();
-      return { ok: false, stage: "verify", detail: `server mismatch at seq ${c.meta.sequenceNo}` };
+      mismatched.push(c.meta.sequenceNo);
+      continue;
     }
     if (c.save.status === "SAVED") {
       await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
         r.save.status = "DB_REGISTERED";
       });
     }
+  }
+  if (mismatched.length > 0) {
+    await deps.scheduler.resumeAll();
+    return { ok: false, stage: "verify", detail: `server mismatch at seq ${mismatched.join(", ")}` };
   }
 
   meeting.status = "finalizing";

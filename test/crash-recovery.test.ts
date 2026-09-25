@@ -54,6 +54,54 @@ describe("ブラウザクラッシュ後の復旧", () => {
     expect((await after.meetingStore.get(meetingId))?.status).toBe("stop_requested");
   });
 
+  it("recording 中に落ちた会議は、保存済み Chunk の最大 endFrame から audioFrameCount を復元する", async () => {
+    // Arrange：audioFrameCount は stop() でしか永続化されないため、録音中のクラッシュでは初期値のまま残る
+    const h = await createHarness();
+    const meetingId = "m-crash-frames";
+    const stale: MeetingRecord = {
+      meetingId,
+      title: "frames",
+      status: "recording",
+      sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 0 },
+      consentConfirmedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      endedAt: null,
+      finalChunkCount: null,
+    };
+    await h.meetingStore.put(stale);
+    for (let seq = 0; seq < 2; seq++) {
+      const r = await makeChunkRecord(meetingId, seq, 1600);
+      r.save.status = "DB_REGISTERED";
+      await h.chunkStore.putChunk(r);
+    }
+    // Act
+    await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler);
+    // Assert：seq 1 の endFrame = 480000 + 1600
+    expect((await h.meetingStore.get(meetingId))?.sessionClock.audioFrameCount).toBe(481600);
+  });
+
+  it("保存済みの audioFrameCount が Chunk の最大 endFrame より大きければ維持する", async () => {
+    const h = await createHarness();
+    const meetingId = "m-crash-frames-keep";
+    await h.meetingStore.put({
+      meetingId,
+      title: "frames",
+      status: "recording",
+      sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 999_999 },
+      consentConfirmedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      endedAt: null,
+      finalChunkCount: null,
+    });
+    const r = await makeChunkRecord(meetingId, 0, 1600);
+    r.save.status = "DB_REGISTERED";
+    await h.chunkStore.putChunk(r);
+    await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler);
+    expect((await h.meetingStore.get(meetingId))?.sessionClock.audioFrameCount).toBe(999_999);
+  });
+
   it("finalizing の会議は中断扱いで列挙し、created / finalized は対象外", async () => {
     const h = await createHarness();
     const base = (meetingId: string, status: MeetingRecord["status"]): MeetingRecord => ({

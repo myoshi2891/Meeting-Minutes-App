@@ -37,6 +37,8 @@ const MIGRATIONS: ReadonlyArray<{ readonly toVersion: number; readonly run: Migr
 export function openDatabase(indexedDbFactory: IDBFactory = indexedDB): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDbFactory.open(DB_NAME, DB_VERSION);
+    // blocked で reject した後に別タブが閉じると onsuccess が来る。その接続は呼び出し元に渡らないので閉じる
+    let blockedRejected = false;
 
     request.onupgradeneeded = (event) => {
       const db = request.result;
@@ -55,11 +57,17 @@ export function openDatabase(indexedDbFactory: IDBFactory = indexedDB): Promise<
 
     request.onblocked = () => {
       // 別タブが旧バージョンを開いたまま。閉じるまで待つ（UI で通知）。
+      blockedRejected = true;
       reject(new Error("IndexedDB upgrade blocked by another tab"));
     };
 
     request.onsuccess = () => {
       const db = request.result;
+      if (blockedRejected) {
+        // 開いたままだと、次の openDatabase のアップグレードをこの接続が塞ぐ
+        db.close();
+        return;
+      }
       db.onversionchange = () => {
         // 別タブがアップグレードを要求した。自タブは接続を閉じて再読み込みを促す。
         db.close();
@@ -134,8 +142,12 @@ export class ChunkStore {
   async listUnfinished(): Promise<AudioChunkRecord[]> {
     const tx = this.db.transaction(STORE_CHUNKS, "readonly");
     const index = tx.objectStore(STORE_CHUNKS).index("by_status");
-    const all = await requestToPromise(index.getAll());
-    return all.filter(isAudioChunkRecord).filter((r) => r.save.status !== "DB_REGISTERED");
+    // 完了済み（DB_REGISTERED）の WAV まで読み込まないよう、索引の範囲でその前後だけを取る
+    const [before, after] = await Promise.all([
+      requestToPromise(index.getAll(IDBKeyRange.upperBound("DB_REGISTERED", true))),
+      requestToPromise(index.getAll(IDBKeyRange.lowerBound("DB_REGISTERED", true))),
+    ]);
+    return [...before, ...after].filter(isAudioChunkRecord).filter((r) => r.save.status !== "DB_REGISTERED");
   }
 
   /** クォータ縮退（§3.4 段階1）：DB_REGISTERED の Chunk だけ Blob 本体を削除しメタデータのみ残す。未検証の Chunk は再送のため残す。 */

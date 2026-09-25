@@ -103,6 +103,22 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     expect(await finalizeMeeting(deps(h), MEETING_ID)).toEqual({ ok: true });
   });
 
+  it("サーバー側で複数の Chunk が不一致なら、1 回の照合ですべてを再投入し、不一致の seq をすべて返す", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 3);
+    h.server.stored.delete(`${MEETING_ID}:mic:0`);
+    h.server.stored.delete(`${MEETING_ID}:mic:2`);
+    // Act
+    const first = await finalizeMeeting(deps(h), MEETING_ID);
+    await h.advance(100);
+    // Assert
+    expect(first).toMatchObject({ ok: false, stage: "verify", detail: "server mismatch at seq 0, 2" });
+    expect(h.server.stored.has(`${MEETING_ID}:mic:0`)).toBe(true);
+    expect(h.server.stored.has(`${MEETING_ID}:mic:2`)).toBe(true);
+    expect(await finalizeMeeting(deps(h), MEETING_ID)).toEqual({ ok: true });
+  });
+
   it("POST /finalize が 409 なら stop_requested に戻して finalize ステージの失敗を返す", async () => {
     const h = await createHarness();
     await recordAndSave(h, 1);

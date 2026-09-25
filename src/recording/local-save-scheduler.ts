@@ -1,5 +1,5 @@
 // src/recording/local-save-scheduler.ts
-import type { LocalSaver } from "../api/local-saver";
+import { isRetryableError, type LocalSaver } from "../api/local-saver";
 import type { ChunkStore } from "../storage/idb";
 import type { AudioChunkRecord, LocalBackendHealth, RecordingHealth } from "../types/recording";
 import { backoffMs, MAX_SAVE_ATTEMPTS } from "./backoff";
@@ -42,15 +42,14 @@ export class LocalSaveScheduler {
     void this.pump();
   }
 
-  /** backend が HEALTHY に戻ったとき、BACKEND_UNAVAILABLE / 上限到達 LOCAL_SAVE_FAILED を一括再投入する。 */
+  /** backend が HEALTHY に戻ったとき、BACKEND_UNAVAILABLE / 上限到達 LOCAL_SAVE_FAILED（retryable のみ）を一括再投入する。 */
   async resumeAll(): Promise<void> {
     const unfinished = await this.deps.chunkStore.listUnfinished();
     for (const r of unfinished) {
-      const s = r.save.status;
-      if (isResumable(s) && !this.pending.includes(r.chunkKey) && !this.inFlight.has(r.chunkKey)) {
+      if (isResumable(r) && !this.pending.includes(r.chunkKey) && !this.inFlight.has(r.chunkKey)) {
         await this.deps.chunkStore.updateSaveState(r.chunkKey, (x) => {
           // 一覧取得後に別経路で保存が進んでいたら書き戻さない
-          if (!isResumable(x.save.status)) return;
+          if (!isResumable(x)) return;
           x.save.status = "LOCAL_SAVE_PENDING";
           x.save.nextRetryAt = null;
         });
@@ -232,8 +231,11 @@ export class LocalSaveScheduler {
   }
 }
 
-function isResumable(status: AudioChunkRecord["save"]["status"]): boolean {
-  return status === "BACKEND_UNAVAILABLE" || status === "LOCAL_SAVE_FAILED" || status === "RETRYING" || status === "LOCAL_SAVE_PENDING" || status === "IDB_STORED";
+function isResumable(record: AudioChunkRecord): boolean {
+  const { status, lastError } = record.save;
+  // non-retryable（VALIDATION / CONFLICT / 408・429 以外の 4xx）は送り直しても結果が変わらないため、手動再試行のみ（§17）
+  if (status === "LOCAL_SAVE_FAILED") return lastError === null || isRetryableError(lastError);
+  return status === "BACKEND_UNAVAILABLE" || status === "RETRYING" || status === "LOCAL_SAVE_PENDING" || status === "IDB_STORED";
 }
 
 function errorMessage(error: unknown): string {

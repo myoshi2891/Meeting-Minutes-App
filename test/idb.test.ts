@@ -51,6 +51,41 @@ describe("openDatabase", () => {
   });
 });
 
+describe("openDatabase（別タブによるブロック）", () => {
+  it("blocked で reject した後に open が成功したら、その接続を閉じる", async () => {
+    // Arrange：onblocked → onsuccess の順に発火する open 要求を模倣する
+    let closed = false;
+    const request = {
+      result: { onversionchange: null, close: () => { closed = true; } },
+      transaction: null,
+      error: null,
+      onupgradeneeded: null as (() => void) | null,
+      onblocked: null as (() => void) | null,
+      onsuccess: null as (() => void) | null,
+      onerror: null as (() => void) | null,
+    };
+    const factory = { open: () => request } as unknown as IDBFactory;
+    // Act
+    const opened = openDatabase(factory);
+    request.onblocked?.();
+    request.onsuccess?.();
+    // Assert
+    await expect(opened).rejects.toThrow("blocked");
+    expect(closed).toBe(true);
+  });
+
+  it("blocked を経ずに成功した接続は閉じずに返す", async () => {
+    let closed = false;
+    const db = { onversionchange: null, close: () => { closed = true; } };
+    const request = { result: db, onsuccess: null as (() => void) | null };
+    const factory = { open: () => request } as unknown as IDBFactory;
+    const opened = openDatabase(factory);
+    request.onsuccess?.();
+    expect(await opened).toBe(db);
+    expect(closed).toBe(false);
+  });
+});
+
 describe("ChunkStore", () => {
   it("put した Chunk を get で取り出せる", async () => {
     const store = new ChunkStore(await freshDb());
