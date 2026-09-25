@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-09-25（ブランチ `dev`）
+最終更新: 2026-09-26（ブランチ `dev`）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -20,11 +20,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 198 件がすべて通過。`npm run typecheck` もエラーなし。
+- 自動テスト: 17 ファイル / 200 件がすべて通過。`npm run typecheck` もエラーなし。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-25・6〜9 回目のレビュー対応）
+### 未コミットの変更（2026-09-25〜26・6〜10 回目のレビュー対応）
 
 4・5 回目の変更はコミット済み。
 
@@ -38,7 +38,10 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | `.claude/skills/design-doc-sync/scripts/check_design_sync.py`、`CLAUDE.md` | 照合スクリプト: 閉じフェンスを「行頭・同じ記号・開き以上の長さ」に限定、開きフェンス行末の空白を許容、`--diff` で末尾改行の差を表示。CLAUDE.md: `flushed` は FIFO ではなく `requestId` で対応付けると記載を修正 | `chore(claude): ...` |
 | `src/recording/meeting-lock.ts`（新規）、`src/recording/recording-controller.ts`、`src/recording/recovery.ts`、`test/harness.ts`、`test/recording-controller.test.ts`、`test/crash-recovery.test.ts`（9 回目） | 会議ごとの Web Lock。`start()` が recording を書く前に取得し `stop()` の finally で解放、`recoverOnStartup` はロック保持中（別タブで録音中）の会議と Chunk に触らない。`RecordingControllerDeps.locks` と `recoverOnStartup` の第 4 引数 `locks` を追加（必須）。ハーネスに `FakeLockManager`。回帰テスト 3 件（修正前 Red を確認）+ 失敗時解放 1 件 | `fix(recording): ...` |
 | `src/types/recording.ts`、`src/recording/recording-controller.ts`、`test/recording-controller.test.ts`（9 回目） | 非クォータの IDB 書き込み失敗で `IDB_WRITE_FAILED` を degradedReasons に記録（修正前 Red を確認） | `fix(recording): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（9 回目: phase1 §3.4・§15（meeting-lock ブロック追加）・§23・§24、phase2-client の Controller と DegradedReason）（8 回目: phase1 に finalizer の `restore()`、phase1・phase2-client に新しい `isWorkletEvent`）。phase2-client は失敗時の復元対象から `endedAt` を外し、Finalizer の重複呼び出しを束ね、`RecordingControllerDeps.scheduler` を `ChunkEnqueuer` にした | `docs(phase1): ...` |
+| `src/worklet/pcm-chunker.worklet.ts`、`test/pcm-chunker.test.ts`（10 回目） | 1 回の `process()` が 480,000 サンプル境界をまたぐとき、VAD にも境界で分けて渡す（境界後の音声が前の Chunk の `hasVoice` に入らない）。回帰テスト 1 件（修正前 Red を確認） | `fix(worklet): ...` |
+| `src/api/local-saver.ts`、`test/local-saver.test.ts`（10 回目） | PUT を `redirect: "error"` で送る（リダイレクトで録音データを外部へ再送しない、§4.4）。既存テストに検証を追加（修正前 Red を確認） | `fix(api): ...` |
+| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts`（10 回目） | `start()` が recording 保存後に失敗したら `rollBackStart()` で Worklet を切り離し、会議を `created` に戻す（次回起動の復旧が空の会議を finalize しないように）。回帰テスト 1 件（修正前 Red を確認） | `fix(recording): ...` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（10 回目: phase1 §4.4・§14.1 図・§14.4・§15 の本文とコード、§24.1 ハーネスに待機ヘルパー、§24.2 / §24.4 のテストブロックを実装と一致させ §24.7 のテスト数を 17 に。phase2-client の Controller に `rollBackStart()`）（9 回目: phase1 §3.4・§15（meeting-lock ブロック追加）・§23・§24、phase2-client の Controller と DegradedReason）（8 回目: phase1 に finalizer の `restore()`、phase1・phase2-client に新しい `isWorkletEvent`）。phase2-client は失敗時の復元対象から `endedAt` を外し、Finalizer の重複呼び出しを束ね、`RecordingControllerDeps.scheduler` を `ChunkEnqueuer` にした | `docs(phase1): ...` |
 
 ---
 
@@ -121,6 +124,12 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-26（10 回目）
+
+- 指摘 4 件を検証し、すべて修正した（Worklet の VAD 境界、LocalSaver の redirect、`start()` 失敗時の巻き戻し、設計書 §24.2 / §24.4）。回帰テスト 3 件は修正前に Red を確認した。
+- 方針変更: 設計書の更新指摘は必ず対応する。7 回目に見送ったテストブロックの同期もここで対応した。
+- PROGRESS の T5 を完了表記にし、T1-f の「degradedReasons に出ない」という古い記述を直した。
 
 ### 2026-09-25（9 回目）
 
