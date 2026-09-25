@@ -93,6 +93,30 @@ describe("PcmChunkerProcessor", () => {
     expect(chunks[1].vad.hasVoice).toBe(false);
   });
 
+  it("1 回の process() が Chunk 境界をまたいでも、境界後の音声は次の Chunk の VAD に数える", async () => {
+    // Arrange: 境界直前まで無音を流し、最後の 1 quantum を「無音 1000 + 音声 8000」にして境界をまたがせる
+    const { processor, nodePort, received } = await loadWorkletProcessor(16000);
+    await startProcessor(processor.port, nodePort);
+    const firstChunk = nthChunk(nodePort, 1);
+    const silence = new Float32Array(479000);
+    for (let i = 0; i < silence.length; i += 1000) processor.process([[silence.subarray(i, i + 1000)]]);
+    const straddling = new Float32Array(9000);
+    straddling.set(makeSine(440, 16000, 8000, 0.3), 1000);
+
+    // Act
+    processor.process([[straddling]]);
+    await firstChunk;
+    const flushed = nextFlushed(nodePort, 1);
+    nodePort.postMessage({ type: "flush", requestId: 1 });
+    await flushed;
+
+    // Assert
+    const chunks = received.filter(isChunk);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0].vad.hasVoice).toBe(false);
+    expect(chunks[1].vad.hasVoice).toBe(true);
+  });
+
   it("configure で VAD しきい値を変更できる（しきい値は設定値であり固定仕様ではない）", async () => {
     const { processor, nodePort, received } = await loadWorkletProcessor(16000);
     nodePort.postMessage({ type: "configure", vad: { threshold: 0.99, minSpeechMs: 200, hangoverMs: 300, floorDbfs: -60 } });

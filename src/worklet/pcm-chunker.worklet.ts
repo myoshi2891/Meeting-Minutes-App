@@ -276,12 +276,18 @@ class PcmChunkerProcessor extends AudioWorkletProcessor implements AudioWorkletP
     }
 
     const resampled = this.resampler.push(mono);
-    this.vad.feed(resampled);
 
-    for (let i = 0; i < resampled.length; i++) {
-      const s = Math.max(-1, Math.min(1, resampled[i]));
-      this.buffer[this.writePos++] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
-      this.audioFrameCount++;
+    // VAD は Chunk 境界で区切って渡す。quantum ごとまとめて渡すと、境界後のサンプルの VAD 結果が前の Chunk に入る
+    let offset = 0;
+    while (offset < resampled.length) {
+      const count = Math.min(resampled.length - offset, SAMPLES_PER_CHUNK - this.writePos);
+      this.vad.feed(resampled.subarray(offset, offset + count));
+      for (let i = offset; i < offset + count; i++) {
+        const s = Math.max(-1, Math.min(1, resampled[i]));
+        this.buffer[this.writePos++] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
+      }
+      this.audioFrameCount += count;
+      offset += count;
       if (this.writePos === SAMPLES_PER_CHUNK) {
         this.emitChunk(false);
       }
