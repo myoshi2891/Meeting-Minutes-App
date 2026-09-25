@@ -20,11 +20,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 182 件がすべて通過。`npm run typecheck` もエラーなし。
+- 自動テスト: 17 ファイル / 193 件がすべて通過。`npm run typecheck` もエラーなし。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-25・6〜7 回目のレビュー対応）
+### 未コミットの変更（2026-09-25・6〜8 回目のレビュー対応）
 
 4・5 回目の変更はコミット済み。
 
@@ -32,8 +32,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | --- | --- | --- |
 | `src/recording/finalizer.ts`、`test/finalizer.test.ts` | 6 回目: POST /finalize の失敗後に再試行しても `endedAt` を書き換えない（`??=`）。7 回目: 同じ会議への `finalizeMeeting` の重複呼び出しを実行中 Promise の共有で 1 本にする（本体は `finalizeMeetingOnce`）。回帰テスト 2 件 | `fix(recording): ...` |
 | `src/storage/idb.ts`、`test/idb.test.ts` | `isMeetingRecord` が `sessionClock` の null と非数値の `audioFrameCount` を拒否。回帰テスト 1 件 | `fix(storage): ...` |
+| `src/recording/finalizer.ts`、`test/finalizer.test.ts`（8 回目） | POST /finalize 失敗時に `status` と一緒に `finalChunkCount` も POST 前の値へ戻す（`restore()`）。既存 2 テストに検証を追加（修正前 Red を確認） | `fix(recording): ...` |
+| `src/types/recording.ts`、`test/recording-types.test.ts`（8 回目） | `isWorkletEvent` が type だけでなく各バリアントの必須フィールド（chunk の `pcm`・`vad` 含む）を検証。type のみ・フィールド不正のケースを false に（修正前 Red を確認） | `fix(worklet): ...` |
+| `.claude/skills/design-doc-sync/SKILL.md`（8 回目） | 手順 4 の `grep -n` に対象 `design-local-phase*.md` を明記（標準入力待ちにならないように） | `chore(claude): ...` |
 | `.claude/skills/design-doc-sync/scripts/check_design_sync.py`、`CLAUDE.md` | 照合スクリプト: 閉じフェンスを「行頭・同じ記号・開き以上の長さ」に限定、開きフェンス行末の空白を許容、`--diff` で末尾改行の差を表示。CLAUDE.md: `flushed` は FIFO ではなく `requestId` で対応付けると記載を修正 | `chore(claude): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映。phase2-client は失敗時の復元対象から `endedAt` を外し、Finalizer の重複呼び出しを束ね、`RecordingControllerDeps.scheduler` を `ChunkEnqueuer` にした | `docs(phase1): ...` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（8 回目: phase1 に finalizer の `restore()`、phase1・phase2-client に新しい `isWorkletEvent`）。phase2-client は失敗時の復元対象から `endedAt` を外し、Finalizer の重複呼び出しを束ね、`RecordingControllerDeps.scheduler` を `ChunkEnqueuer` にした | `docs(phase1): ...` |
 
 ---
 
@@ -56,6 +59,10 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | T1-b | LocalSaveScheduler | backend 停止中に N 回 `enqueue` しても、各キーへの `BACKEND_UNAVAILABLE` 書き込みは 1 回だけ。復帰 → 再停止したら再び書く | `test/local-save-scheduler.test.ts` |
 | T1-c | RecordingController | ~~`flush()` と `stop()` が重なっても、`stop()` は自分の `flushed` まで解決しない~~ → requestId 化の回帰テストで対応済み（2026-09-25） | — |
 | T1-d | RecordingController | `meetingStore.put` が reject しても、トラック停止と `onmessage` の解除が行われる | `test/recording-controller.test.ts`（T1-c と同じファイルなので直列） |
+
+### T1-f. IDB 書き込みの非クォータ失敗と versionchange からの回復【要判断・利用者に確認】
+
+8 回目のレビュー指摘（見送り）。`persistChunk` の非クォータ失敗（別タブの versionchange で接続が閉じた後の `InvalidStateError` など）は degradedReasons に出ず、`drainMemoryBacklog` も同じ例外で進まないため、Finalizer が `waiting_local_save` のまま止まる。現設計（§10 `openDatabase`）は「接続を閉じて再読み込みを促す」方針で、ChunkStore の再オープンは設計にない。`DegradedReason` の追加（例: `IDB_WRITE_FAILED`）と再オープン経路の要否を決めてから、設計書 → テスト → 実装の順で進める。
 
 ### T1-e. stop タイムアウト時の扱い【要判断・利用者に確認】
 
