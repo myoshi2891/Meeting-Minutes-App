@@ -668,22 +668,25 @@ export class RecordingController {
 
   async stop(): Promise<void> {
     if (this.node === null || this.meetingId === null) return;
-    if (this.source === "mic") {
-      const meeting = await this.deps.meetingStore.get(this.meetingId);
-      if (meeting !== undefined) {
-        meeting.status = "stop_requested";
-        await this.deps.meetingStore.put(meeting);
+    try {
+      if (this.source === "mic") {
+        const meeting = await this.deps.meetingStore.get(this.meetingId);
+        if (meeting !== undefined) {
+          meeting.status = "stop_requested";
+          await this.deps.meetingStore.put(meeting);
+        }
       }
+      const flushed = new Promise<void>((resolve) => this.flushWaiters.push(resolve));
+      this.post({ type: "stop" });
+      await flushed;
+      await this.chunkQueue;
+    } finally {
+      // 途中で reject してもマイク／画面共有トラックと Worklet を解放する（Phase 1 §15 と同じ）
+      this.sourceNode?.disconnect();
+      if (this.node !== null) this.node.port.onmessage = null;
+      this.node = null;
+      for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
     }
-    const flushed = new Promise<void>((resolve) => this.flushWaiters.push(resolve));
-    this.post({ type: "stop" });
-    await flushed;
-    await this.chunkQueue;
-
-    this.sourceNode?.disconnect();
-    this.node.port.onmessage = null;
-    this.node = null;
-    for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
   }
 
   async drainMemoryBacklog(): Promise<number> {
@@ -733,10 +736,9 @@ export class RecordingController {
         break;
       case "flushed":
         if (this.clock !== null) this.clock.audioFrameCount = event.audioFrameCount;
+        // flush / stop 1 回につき flushed 1 回。最古の待機だけを解放する（Phase 1 §15 と同じ）
         this.chunkQueue = this.chunkQueue.then(() => {
-          const waiters = this.flushWaiters;
-          this.flushWaiters = [];
-          for (const resolve of waiters) resolve();
+          this.flushWaiters.shift()?.();
         });
         break;
     }
@@ -1041,6 +1043,8 @@ export interface FinalizerDeps {
   /** 既定 10000。ローカルサーバー相手でも無期限には待たない（Phase 1 §17.1 と同じ方針）。 */
   readonly timeoutMs?: number;
   readonly fetchImpl?: typeof fetch;
+  /** mic / system 両 Controller の memoryBacklogCount の合計。0 でない限り Barrier を通さない（Phase 1 §22）。 */
+  readonly unpersistedChunkCount: () => number;
 }
 
 /** AbortController でタイムアウトさせる。fetch 自身にタイムアウトはない。 */
@@ -1071,10 +1075,17 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   const meeting = await deps.meetingStore.get(meetingId);
   if (meeting === undefined) return { ok: false, stage: "verify", detail: "meeting not found" };
 
+  // 末尾の Chunk がメモリ待機中だと IDB 上は欠番なしに見えるため、先に弾く
+  const unpersisted = deps.unpersistedChunkCount();
+  if (unpersisted > 0) {
+    return { ok: false, stage: "waiting_local_save", detail: `${unpersisted} chunks not persisted to IDB` };
+  }
+
   const bySource: Record<AudioSource, Awaited<ReturnType<ChunkStore["listByMeeting"]>>> = { mic: [], system: [] };
   for (const source of SOURCES) {
     bySource[source] = await deps.chunkStore.listByMeeting(meetingId, source);
-    const notRegistered = bySource[source].filter((c) => c.save.status !== "DB_REGISTERED");
+    // SAVED はサーバー一覧で登録確認する（再送しても registered: false が続きうる）
+    const notRegistered = bySource[source].filter((c) => c.save.status !== "DB_REGISTERED" && c.save.status !== "SAVED");
     if (notRegistered.length > 0) {
       await deps.scheduler.resumeAll();
       return { ok: false, stage: "waiting_local_save", detail: `${source}: ${notRegistered.length} chunks not registered` };
@@ -1106,6 +1117,11 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
         });
         await deps.scheduler.resumeAll();
         return { ok: false, stage: "verify", detail: `server mismatch at ${source}/${c.meta.sequenceNo}` };
+      }
+      if (c.save.status === "SAVED") {
+        await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
+          r.save.status = "DB_REGISTERED";
+        });
       }
     }
   }
@@ -2091,7 +2107,7 @@ describe("finalize（mic + system）", () => {
       if (url.endsWith("/finalize") && init?.body) finalizeBody = JSON.parse(String(init.body));
       return h.server.fetch(input, init);
     };
-    const result = await finalizeMeeting({ chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchSpy }, meetingId);
+    const result = await finalizeMeeting({ chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchSpy, unpersistedChunkCount: () => 0 }, meetingId);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.counts).toEqual({ mic: 2, system: 1 });
     expect((finalizeBody as { expectedChunkCounts: unknown }).expectedChunkCounts).toEqual({ mic: 2, system: 1 });
@@ -2115,7 +2131,7 @@ describe("finalize（mic + system）", () => {
     await h.chunkStore.putChunk(sys);
     await h.scheduler.enqueue(sys.chunkKey);
     await h.advance(100);
-    const result = await finalizeMeeting({ chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl: h.server.fetch }, meetingId);
+    const result = await finalizeMeeting({ chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl: h.server.fetch, unpersistedChunkCount: () => 0 }, meetingId);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.stage).toBe("waiting_local_save");
   });
@@ -2143,7 +2159,7 @@ describe("finalize（mic + system）", () => {
     };
 
     const result = await finalizeMeeting(
-      { chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, timeoutMs: 20, fetchImpl: hangingFetch },
+      { chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, timeoutMs: 20, fetchImpl: hangingFetch, unpersistedChunkCount: () => 0 },
       meetingId,
     );
     expect(result.ok).toBe(false);

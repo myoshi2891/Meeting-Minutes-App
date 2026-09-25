@@ -1633,21 +1633,25 @@ export class RecordingController {
   /** stop_requested → 最終 Chunk 生成 → IDB 書き込み完了まで待つ。Finalization Barrier は §22。 */
   async stop(): Promise<void> {
     if (this.node === null || this.meeting === null) return;
-    this.meeting.status = "stop_requested";
-    await this.deps.meetingStore.put(this.meeting);
+    const meeting = this.meeting;
+    try {
+      meeting.status = "stop_requested";
+      await this.deps.meetingStore.put(meeting);
 
-    const flushed = new Promise<void>((resolve) => this.flushWaiters.push(resolve));
-    this.post({ type: "stop" });
-    await flushed;
-    await this.chunkQueue;
-    // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
-    this.meeting.updatedAt = Date.now();
-    await this.deps.meetingStore.put(this.meeting);
-
-    this.sourceNode?.disconnect();
-    this.node.port.onmessage = null;
-    this.node = null;
-    for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
+      const flushed = new Promise<void>((resolve) => this.flushWaiters.push(resolve));
+      this.post({ type: "stop" });
+      await flushed;
+      await this.chunkQueue;
+      // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
+      meeting.updatedAt = Date.now();
+      await this.deps.meetingStore.put(meeting);
+    } finally {
+      // 途中で reject してもマイクと Worklet を解放する
+      this.sourceNode?.disconnect();
+      if (this.node !== null) this.node.port.onmessage = null;
+      this.node = null;
+      for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
+    }
   }
 
   /** IDB クォータが回復したときに UI / QuotaMonitor から呼ぶ。 */
@@ -1700,10 +1704,9 @@ export class RecordingController {
       case "flushed":
         if (this.clock !== null) this.clock.audioFrameCount = event.audioFrameCount;
         // chunk イベントは flushed より先に届く（同一 MessagePort は順序保証）。
+        // flush / stop コマンド 1 回につき flushed 1 回。最古の待機だけを解放し、後続コマンドの待機は自分の flushed まで残す。
         this.chunkQueue = this.chunkQueue.then(() => {
-          const waiters = this.flushWaiters;
-          this.flushWaiters = [];
-          for (const resolve of waiters) resolve();
+          this.flushWaiters.shift()?.();
         });
         break;
     }
@@ -1781,9 +1784,11 @@ export class RecordingController {
 
 `sequenceNo` の採番はメインスレッドで行う。Worklet 側で採番すると flush で生じる部分 Chunk との整合を Worklet が知る必要が出るためである。Worklet からの `chunk` イベントは同一 `MessagePort` 上で順序が保証されるので、`chunkQueue` による直列化と合わせて `sequenceNo` と `startFrame` の単調増加が保たれる。
 
-IndexedDB への書き込みに失敗した Chunk は、失敗の理由を問わずメモリ待機キュー（`memoryBacklog`）に残す。`sequenceNo` は採番済みなので、捨てると欠番になり、Finalization Barrier（§22）の連続性検査を永久に通過できなくなるためである。`QuotaExceededError` は §3.4 段階3として `IDB_QUOTA_EXHAUSTED` を記録し、録音を継続する。それ以外のエラーは `onError` に通知したうえで同じく待機キューに残し、`drainMemoryBacklog()` で再書き込みする。
+IndexedDB への書き込みに失敗した Chunk は、失敗の理由を問わずメモリ待機キュー（`memoryBacklog`）に残す。`sequenceNo` は採番済みなので、捨てると欠番になり、Finalization Barrier（§22）の連続性検査を永久に通過できなくなるためである。`QuotaExceededError` は §3.4 段階3として `IDB_QUOTA_EXHAUSTED` を記録し、録音を継続する。それ以外のエラーは `onError` に通知したうえで同じく待機キューに残し、`drainMemoryBacklog()` で再書き込みする。なお、待機キューに残ったのが末尾の Chunk だけだと、IndexedDB 上は欠番なしに見えて連続性検査では検出できない。そのため Finalizer は `memoryBacklogCount` が 0 になるまで Barrier を通さない（§22）。
 
-`stop()` は `stop_requested` を先に永続化し、最終 Chunk の書き込み完了を待ってから会議レコードをもう一度保存する。最終 flush で確定した `sessionClock.audioFrameCount` を IndexedDB に残すためで、Finalizer はこの値を `totalAudioFrames` として送る。
+`stop()` は `stop_requested` を先に永続化し、最終 Chunk の書き込み完了を待ってから会議レコードをもう一度保存する。最終 flush で確定した `sessionClock.audioFrameCount` を IndexedDB に残すためで、Finalizer はこの値を `totalAudioFrames` として送る。これらの処理全体を try/finally で包み、途中で IndexedDB 書き込みなどが reject しても、ソースノードの切断・`onmessage` の解除・マイクトラックの停止は必ず行う。
+
+Worklet は `flush` / `stop` コマンド 1 回につき `flushed` を 1 回返す。`flushWaiters` は FIFO として扱い、`flushed` 1 回につき最も古い待機だけを解放する。pagehide の `flush()` と `stop()` が重なった場合に、先の `flushed` で `stop()` の待機まで解放され、最終 Chunk の書き込みを待たずに進むのを防ぐためである。
 
 Scheduler への依存は `enqueue()` だけを持つ `ChunkEnqueuer` インターフェースに絞っている。`LocalSaveScheduler` はこのインターフェースを構造的に満たすため、呼び出し側の配線は変わらない。
 
@@ -2093,6 +2098,8 @@ export class LocalSaveScheduler {
   private pumping = false;
   /** pump 実行中に再度 pump が要求されたら true。実行終了後にもう一度回す。 */
   private pumpRequested = false;
+  /** BACKEND_UNAVAILABLE を書き込み済みの pending キー。backend 停止中の enqueue ごとに全件を書き直さないために使う。 */
+  private readonly markedUnavailable = new Set<string>();
 
   constructor(private readonly deps: SchedulerDeps) {}
 
@@ -2100,6 +2107,8 @@ export class LocalSaveScheduler {
     await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
       r.save.status = "LOCAL_SAVE_PENDING";
     });
+    // 状態を LOCAL_SAVE_PENDING に書き戻したので、停止中なら再度 BACKEND_UNAVAILABLE を書く必要がある
+    this.markedUnavailable.delete(chunkKey);
     this.insertSorted(chunkKey);
     this.deps.health.pendingChunkCount = this.pendingCount;
     void this.pump();
@@ -2159,6 +2168,7 @@ export class LocalSaveScheduler {
         const index = this.pending.findIndex((k) => !this.inFlight.has(k));
         if (index === -1) return;
         const [chunkKey] = this.pending.splice(index, 1);
+        this.markedUnavailable.delete(chunkKey);
         this.inFlight.add(chunkKey);
         void this.runOne(chunkKey, saver).finally(() => {
           this.inFlight.delete(chunkKey);
@@ -2177,6 +2187,8 @@ export class LocalSaveScheduler {
 
   private async markAllPendingUnavailable(): Promise<void> {
     for (const key of this.pending) {
+      if (this.markedUnavailable.has(key)) continue;
+      this.markedUnavailable.add(key);
       await this.deps.chunkStore.updateSaveState(key, (r) => {
         r.save.status = "BACKEND_UNAVAILABLE";
       });
@@ -2271,6 +2283,8 @@ export function isTerminal(record: AudioChunkRecord): boolean {
 
 同じ Chunk の二重送信は 3 段で防ぐ。`enqueue()` / `resumeAll()` / リトライタイマーは同時に同じ Chunk を投入しうるため、第一に `insertSorted()` が `pending` 内の重複を排除する。第二に、PUT 実行中の `chunkKey` を `inFlight`（`Set`）で持ち、`pump()` は実行中のキーを取り出さない。`runOne()` が自分自身を再投入した場合も、完了後の `pump()` で拾われる。第三に、`runOne()` は送信直前に IndexedDB の状態を読み、`DB_REGISTERED` または `SAVING` なら送らない。これにより、`resumeAll()` で保存が完了した後に遅れて発火したリトライタイマーが再送することはない。`resumeAll()` は一覧取得後に別経路で状態が進んでいた Chunk を `LOCAL_SAVE_PENDING` に書き戻さない。
 
+backend が利用できない間、`pump()` は `enqueue()` のたびに `markAllPendingUnavailable()` を呼ぶ。`pending` 全件を毎回書き直すと、停止中の滞留 Chunk 数に比例した IndexedDB 書き込みが Chunk ごとに発生する。そこで `BACKEND_UNAVAILABLE` を書き込み済みのキーを `markedUnavailable` に記録し、2 回目以降は書き込まない。`pump()` がキーを `pending` から取り出したとき、および `enqueue()` が状態を `LOCAL_SAVE_PENDING` に書き戻したときは記録を消し、再び滞留したら改めて書き込む。
+
 ---
 
 # 18. BackendHealthMonitor
@@ -2303,6 +2317,8 @@ export class BackendHealthMonitor {
   private timer: ReturnType<typeof setTimeout> | null = null;
   /** start() 〜 stop() の間だけ true。実行中のチェックが stop() 後にポーリングを再開しないための判定に使う。 */
   private polling = false;
+  /** start()/stop() ごとに進める世代番号。stop() → start() を挟んだ古いチェックが 2 本目のループを作らないために使う。 */
+  private generation = 0;
   /** 最後に onChange で通知した (status, unauthorized)。どちらかが変わったら通知する。 */
   private notified: { status: LocalBackendHealth["status"]; unauthorized: boolean } = { status: "UNKNOWN", unauthorized: false };
   private readonly listeners = new Set<(state: LocalBackendHealth) => void>();
@@ -2325,11 +2341,13 @@ export class BackendHealthMonitor {
   start(): void {
     if (this.polling) return;
     this.polling = true;
-    void this.checkAndSchedule();
+    this.generation++;
+    void this.checkAndSchedule(this.generation);
   }
 
   stop(): void {
     this.polling = false;
+    this.generation++;
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
   }
@@ -2411,12 +2429,12 @@ export class BackendHealthMonitor {
     this.recordingHealth.degradedReasons = reasons;
   }
 
-  private async checkAndSchedule(): Promise<void> {
+  private async checkAndSchedule(generation: number): Promise<void> {
     await this.checkOnce();
-    if (!this.polling) return;
+    if (!this.polling || generation !== this.generation) return;
     const interval = this.state.status === "UNREACHABLE" ? this.config.unreachableIntervalMs : this.config.healthyIntervalMs;
     // バックグラウンドタブで throttle されても可用性「表示」が遅れるだけで、録音には影響しない（Invariant 8 と同じ構造）。
-    this.timer = setTimeout(() => void this.checkAndSchedule(), interval);
+    this.timer = setTimeout(() => void this.checkAndSchedule(generation), interval);
   }
 }
 ```
@@ -2427,7 +2445,7 @@ export class BackendHealthMonitor {
 
 認証エラーも同じ構造で配線する。Scheduler の `onBackendUnauthorized` に `() => monitor.reportUnauthorized()` を渡すと、PUT が 401 / 403 を受けた時点で `unauthorized` が立ち、Scheduler は PUT を止める。`/v1/health` は認証なしでも `status` と `service` だけを返す（§12）ため、`capabilities` を含まない応答ではトークンの正しさを判断できない。そのため `unauthorized` は、`capabilities` を含む認証済みの応答でだけ解除する。解除は `status` が `HEALTHY` のまま起こりうるので、`onChange` は `status` と `unauthorized` のどちらかが変わったときに通知する。これにより、トークン修正後の最初のポーリングで `resumeAll()` が呼ばれる。
 
-`start()` は多重に呼んでもポーリングを 1 系統しか作らない。`stop()` はポーリング中フラグを下ろしてタイマーを解除する。実行中の `checkOnce()` は、完了後にこのフラグを確認してから次のタイマーを仕掛けるので、`stop()` 後にポーリングが再開することはない。
+`start()` は多重に呼んでもポーリングを 1 系統しか作らない。`stop()` はポーリング中フラグを下ろしてタイマーを解除する。フラグだけでは、`checkOnce()` の実行中に `stop()` → `start()` が挟まると、古いチェックが完了後に再びフラグが立っているのを見て 2 系統目のループを作ってしまう。そこで `start()` / `stop()` のたびに世代番号 `generation` を進め、各ループは開始時の世代を持ち回る。`checkOnce()` の完了後、ポーリング中かつ世代が一致するときだけ次のタイマーを仕掛ける。
 
 ---
 
@@ -2631,7 +2649,7 @@ stateDiagram-v2
     STOP_REQUESTED --> LAST_CHUNK_STORED : Worklet stop → 最終 Chunk IDB 書き込み完了
     LAST_CHUNK_STORED --> WAITING_LOCAL_SAVE : 全 Chunk を Scheduler へ投入済み
     WAITING_LOCAL_SAVE --> WAITING_LOCAL_SAVE : backend UNREACHABLE（無期限待機。UI に滞留数を表示）
-    WAITING_LOCAL_SAVE --> VERIFYING : 全 Chunk が DB_REGISTERED
+    WAITING_LOCAL_SAVE --> VERIFYING : メモリ待機 Chunk なし かつ 全 Chunk が DB_REGISTERED または SAVED
     VERIFYING --> FINALIZING : GET /chunks の件数・sha256 が IDB と一致
     VERIFYING --> WAITING_LOCAL_SAVE : 不一致 Chunk を再投入
     FINALIZING --> FINALIZED : POST /finalize 200
@@ -2655,6 +2673,8 @@ export interface FinalizerDeps {
   readonly fetchImpl?: typeof fetch;
   /** GET /chunks と POST /finalize それぞれのタイムアウト。既定 30000ms */
   readonly timeoutMs?: number;
+  /** IDB に書けずメモリ待機中の Chunk 数（RecordingController.memoryBacklogCount）。0 でない限り Barrier を通さない。 */
+  readonly unpersistedChunkCount: () => number;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -2665,8 +2685,8 @@ export type FinalizeResult =
 
 /**
  * Finalization Barrier：
- *   1. 最終 Chunk が IDB にある（呼び出し前提：RecordingController.stop() 完了）
- *   2. IDB 上の全 Chunk が DB_REGISTERED
+ *   1. 最終 Chunk が IDB にある（呼び出し前提：RecordingController.stop() 完了）かつメモリ待機中の Chunk がない
+ *   2. IDB 上の全 Chunk が DB_REGISTERED（SAVED はサーバー一覧で登録確認できれば DB_REGISTERED に進める）
  *   3. サーバーの一覧と件数・sha256 が一致
  *   4. POST /finalize
  * 1〜3 を満たさない限り finalizing へ遷移しない。
@@ -2677,8 +2697,15 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   const meeting = await deps.meetingStore.get(meetingId);
   if (meeting === undefined) return { ok: false, stage: "verify", detail: "meeting not found" };
 
+  // 末尾の Chunk がメモリ待機中だと IDB 上は欠番なしに見えるため、件数不足のまま finalize しないよう先に弾く
+  const unpersisted = deps.unpersistedChunkCount();
+  if (unpersisted > 0) {
+    return { ok: false, stage: "waiting_local_save", detail: `${unpersisted} chunks not persisted to IDB` };
+  }
+
   const chunks = await deps.chunkStore.listByMeeting(meetingId, "mic");
-  const notRegistered = chunks.filter((c) => c.save.status !== "DB_REGISTERED");
+  // SAVED（ファイル保存済み・DB 未登録）は再送しても registered: false が続きうるため、サーバー一覧で確認する
+  const notRegistered = chunks.filter((c) => c.save.status !== "DB_REGISTERED" && c.save.status !== "SAVED");
   if (notRegistered.length > 0) {
     await deps.scheduler.resumeAll();
     return { ok: false, stage: "waiting_local_save", detail: `${notRegistered.length} chunks not registered` };
@@ -2718,6 +2745,11 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
       });
       await deps.scheduler.resumeAll();
       return { ok: false, stage: "verify", detail: `server mismatch at seq ${c.meta.sequenceNo}` };
+    }
+    if (c.save.status === "SAVED") {
+      await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
+        r.save.status = "DB_REGISTERED";
+      });
     }
   }
 
@@ -2767,7 +2799,9 @@ function errorMessage(error: unknown): string {
 }
 ```
 
-サーバー未起動のまま利用者が停止した場合、Meeting は `stop_requested` で IndexedDB に残り、次回起動時の復旧（§23）でサーバーが `HEALTHY` になった時点から自動的に Barrier を再試行する。「最後の Chunk を保存する前に finalizing へ遷移してはいけない」（v4.0 §43）は、`finalizeMeeting` が `RecordingController.stop()` の完了後にしか呼ばれない呼び出し規約と、`notRegistered.length > 0` の早期リターンで担保する。
+サーバー未起動のまま利用者が停止した場合、Meeting は `stop_requested` で IndexedDB に残り、次回起動時の復旧（§23）でサーバーが `HEALTHY` になった時点から自動的に Barrier を再試行する。「最後の Chunk を保存する前に finalizing へ遷移してはいけない」（v4.0 §43）は、`finalizeMeeting` が `RecordingController.stop()` の完了後にしか呼ばれない呼び出し規約と、`unpersistedChunkCount() > 0` および `notRegistered.length > 0` の早期リターンで担保する。`unpersistedChunkCount` には `() => controller.memoryBacklogCount` を渡す。IndexedDB に書けずメモリ待機中の末尾 Chunk は IndexedDB の一覧に現れず、連続性検査をすり抜けるためである。
+
+`SAVED`（サーバーがファイル書き込みだけ成功し `registered: false` を返した Chunk）は Scheduler の再開対象ではない。PUT を再送しても `registered: false` が続きうるため、`notRegistered` からは除外してサーバー一覧の照合へ進める。一覧で `registered: true` かつ sha256 一致が確認できたら `DB_REGISTERED` に更新する。確認できなければ他の不一致と同様に `LOCAL_SAVE_PENDING` に戻して再投入する。
 
 `finalizeMeeting` は失敗を例外ではなく `FinalizeResult` で返す。`GET /chunks` の応答は外部入力なので `isChunkListResponse` で検証し、契約に合わなければ `verify` の失敗とする。`GET /chunks` と `POST /finalize` にはそれぞれ `timeoutMs`（既定 30 秒）の `AbortController` を付ける。応答しないサーバーに対しても、接続失敗と同じ経路で失敗結果を返す。`POST /finalize` が失敗した場合（HTTP エラー、接続失敗、タイムアウトのいずれも）は会議を `stop_requested` に戻し、`finalizing` のまま残さない。
 
