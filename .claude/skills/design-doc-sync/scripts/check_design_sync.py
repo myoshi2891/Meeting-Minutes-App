@@ -10,7 +10,13 @@ import os
 import re
 import sys
 
-BLOCK = re.compile(r"```typescript\n(// ((?:src|test)/\S+)\n.*?)```", re.S)
+# 閉じフェンスは「行頭・開きと同じ記号・開き以上の長さ・行末まで空白のみ」のときだけ認める（CommonMark と同じ）
+BLOCK = re.compile(
+    r"^(?P<fence>(?P<ch>[`~])(?P=ch){2,})typescript\n"
+    r"(?P<body>// (?P<path>(?:src|test)/\S+)\n.*?)"
+    r"^(?P=fence)(?P=ch)*[ \t]*$",
+    re.S | re.M,
+)
 
 
 def main() -> int:
@@ -23,7 +29,7 @@ def main() -> int:
         text = open(doc, encoding="utf-8").read()
         for m in BLOCK.finditer(text):
             # 閉じフェンス直前の改行はファイル末尾の改行に当たるので、前後を削らずにそのまま比べる
-            body, path = m.group(1), m.group(2)
+            body, path = m.group("body"), m.group("path")
             if not os.path.exists(path):
                 print(f"MISSING  {path}（未実装）")
                 continue
@@ -37,6 +43,9 @@ def main() -> int:
             if show_diff:
                 diff = difflib.unified_diff(body.splitlines(), actual.splitlines(), "doc", "file", n=1, lineterm="")
                 print("\n".join(diff))
+                # splitlines() は末尾改行の有無を捨てるため、その差だけは別に表示する
+                if body.endswith("\n") != actual.endswith("\n"):
+                    print(f"  末尾改行: doc={body.endswith(chr(10))} file={actual.endswith(chr(10))}")
     return 1 if src_mismatch else 0
 
 
