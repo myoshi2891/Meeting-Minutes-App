@@ -31,7 +31,20 @@ export type FinalizeResult =
  *   4. POST /finalize
  * 1〜3 を満たさない限り finalizing へ遷移しない。
  */
-export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
+export function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
+  // 同じ会議への呼び出しが重なると、両方が stop_requested を読んで二重に POST し、
+  // 後から失敗した側が finalized を stop_requested で上書きしうる。実行中の Promise を共有して 1 本にする
+  const running = inProgress.get(meetingId);
+  if (running !== undefined) return running;
+  const promise = finalizeMeetingOnce(deps, meetingId).finally(() => inProgress.delete(meetingId));
+  inProgress.set(meetingId, promise);
+  return promise;
+}
+
+/** meetingId → 実行中の finalize。同じタブ内の重複呼び出しだけを束ねる */
+const inProgress = new Map<string, Promise<FinalizeResult>>();
+
+async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const meeting = await deps.meetingStore.get(meetingId);

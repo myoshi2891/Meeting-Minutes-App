@@ -128,6 +128,25 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
   });
 
+  it("同じ会議への finalize が重なっても POST は 1 回だけで、両方の呼び出しが同じ結果を受け取る", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    let posts = 0;
+    const spy: typeof fetch = async (input, init) => {
+      // 2 回目以降の POST は、サーバー側では確定済みとして 409 を返す想定
+      if (init?.method === "POST" && ++posts > 1) return new Response(JSON.stringify({ error: "done", code: "CONFLICT_CHUNKS_MISSING" }), { status: 409 });
+      return h.server.fetch(input, init);
+    };
+    // Act
+    const [a, b] = await Promise.all([finalizeMeeting(deps(h, spy), MEETING_ID), finalizeMeeting(deps(h, spy), MEETING_ID)]);
+    // Assert
+    expect(posts).toBe(1);
+    expect(a).toEqual({ ok: true });
+    expect(b).toEqual({ ok: true });
+    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("finalized");
+  });
+
   it("存在しない会議は verify の失敗", async () => {
     const h = await createHarness();
     expect(await finalizeMeeting(deps(h), "nope")).toMatchObject({ ok: false, stage: "verify", detail: "meeting not found" });
