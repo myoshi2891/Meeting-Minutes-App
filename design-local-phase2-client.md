@@ -556,14 +556,18 @@ import {
 import { computeFrameClockDriftMs, createSessionClock, frameToOffsetMs } from "./session-clock";
 import { buildStandaloneWav } from "../audio/wav";
 import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
-import type { LocalSaveScheduler } from "./local-save-scheduler";
+
+/** Chunk を保存 State Machine に投入する口。LocalSaveScheduler が構造的に満たす（テストでは差し替える）。Phase 1 §15 と同じ */
+export interface ChunkEnqueuer {
+  enqueue(chunkKey: string): Promise<void>;
+}
 
 export interface RecordingControllerDeps {
   readonly audioContext: AudioContext;
   readonly mediaStream: MediaStream;
   readonly chunkStore: ChunkStore;
   readonly meetingStore: MeetingStore;
-  readonly scheduler: LocalSaveScheduler;
+  readonly scheduler: ChunkEnqueuer;
   readonly health: RecordingHealth;
   readonly workletModuleUrl: string;
   readonly onError: (error: Error) => void;
@@ -1112,7 +1116,20 @@ export type FinalizeResult =
 
 const SOURCES: ReadonlyArray<AudioSource> = ["mic", "system"];
 
-export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
+export function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
+  // 同じ会議への呼び出しが重なると、両方が stop_requested を読んで二重に POST し、
+  // 後から失敗した側が finalized を stop_requested で上書きしうる。実行中の Promise を共有して 1 本にする（Phase 1 §22）
+  const running = inProgress.get(meetingId);
+  if (running !== undefined) return running;
+  const promise = finalizeMeetingOnce(deps, meetingId).finally(() => inProgress.delete(meetingId));
+  inProgress.set(meetingId, promise);
+  return promise;
+}
+
+/** meetingId → 実行中の finalize。同じタブ内の重複呼び出しだけを束ねる */
+const inProgress = new Map<string, Promise<FinalizeResult>>();
+
+async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const timeoutMs = deps.timeoutMs ?? 10_000;
   const meeting = await deps.meetingStore.get(meetingId);
