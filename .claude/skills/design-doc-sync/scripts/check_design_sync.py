@@ -22,11 +22,12 @@ def main() -> int:
         print(f"== {doc}")
         text = open(doc, encoding="utf-8").read()
         for m in BLOCK.finditer(text):
-            body, path = m.group(1).strip(), m.group(2)
+            # 閉じフェンス直前の改行はファイル末尾の改行に当たるので、前後を削らずにそのまま比べる
+            body, path = m.group(1), m.group(2)
             if not os.path.exists(path):
                 print(f"MISSING  {path}（未実装）")
                 continue
-            actual = open(path, encoding="utf-8").read().strip()
+            actual = open(path, encoding="utf-8").read()
             if actual == body:
                 print(f"MATCH    {path}")
                 continue
