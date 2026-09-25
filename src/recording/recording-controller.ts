@@ -29,7 +29,12 @@ export interface RecordingControllerDeps {
   readonly health: RecordingHealth;
   readonly workletModuleUrl: string;
   readonly onError: (error: Error) => void;
+  /** flush / stop の応答待ちタイムアウト用。既定は setTimeout（テストでは差し替える） */
+  readonly setTimer?: (fn: () => void, ms: number) => unknown;
 }
+
+/** Worklet が flush / stop に応答しない（AudioContext が閉じられた等）ときに待機を打ち切るまでの時間 */
+const FLUSH_TIMEOUT_MS = 5_000;
 
 export function makeChunkKey(meetingId: string, source: "mic" | "system", sequenceNo: number): string {
   return `${meetingId}:${source}:${sequenceNo.toString().padStart(6, "0")}`;
@@ -50,7 +55,9 @@ export class RecordingController {
   private readonly memoryBacklog: AudioChunkRecord[] = [];
   /** Chunk 処理の直列化。Worklet からの chunk イベントは順序どおりに IDB へ書く。 */
   private chunkQueue: Promise<void> = Promise.resolve();
-  private flushWaiters: Array<() => void> = [];
+  /** requestId → flushed 待機。応答は要求 ID で対応付ける（タイムアウト後の遅れた応答が別の要求を解放しないように） */
+  private readonly flushWaiters = new Map<number, () => void>();
+  private nextRequestId = 0;
 
   constructor(private readonly deps: RecordingControllerDeps) {}
 
@@ -106,9 +113,7 @@ export class RecordingController {
   /** pagehide 用。Worklet に flush を要求し、部分 Chunk の IDB 書き込みまで待つ。 */
   async flush(): Promise<void> {
     if (this.node === null) return;
-    const flushed = new Promise<void>((resolve) => this.flushWaiters.push(resolve));
-    this.post({ type: "flush" });
-    await flushed;
+    await this.requestFlush("flush");
     await this.chunkQueue;
   }
 
@@ -120,9 +125,7 @@ export class RecordingController {
       meeting.status = "stop_requested";
       await this.deps.meetingStore.put(meeting);
 
-      const flushed = new Promise<void>((resolve) => this.flushWaiters.push(resolve));
-      this.post({ type: "stop" });
-      await flushed;
+      await this.requestFlush("stop");
       await this.chunkQueue;
       // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
       meeting.updatedAt = Date.now();
@@ -159,6 +162,22 @@ export class RecordingController {
     return this.memoryBacklog.length;
   }
 
+  /** flush / stop を送り、同じ requestId の flushed を待つ。応答がなければタイムアウトで onError を通知して待機を打ち切る。 */
+  private requestFlush(type: "flush" | "stop"): Promise<void> {
+    const requestId = ++this.nextRequestId;
+    const setTimer = this.deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+    return new Promise<void>((resolve) => {
+      this.flushWaiters.set(requestId, resolve);
+      setTimer(() => {
+        // 応答済みなら何もしない。自分の待機だけを外し、遅れて届いた flushed は対応する待機がないので無視される
+        if (!this.flushWaiters.delete(requestId)) return;
+        this.deps.onError(new Error(`worklet did not respond to ${type} within ${FLUSH_TIMEOUT_MS}ms`));
+        resolve();
+      }, FLUSH_TIMEOUT_MS);
+      this.post({ type, requestId });
+    });
+  }
+
   private post(cmd: WorkletCommand): void {
     this.node?.port.postMessage(cmd);
   }
@@ -186,9 +205,11 @@ export class RecordingController {
       case "flushed":
         if (this.clock !== null) this.clock.audioFrameCount = event.audioFrameCount;
         // chunk イベントは flushed より先に届く（同一 MessagePort は順序保証）。
-        // flush / stop コマンド 1 回につき flushed 1 回。最古の待機だけを解放し、後続コマンドの待機は自分の flushed まで残す。
+        // 要求した requestId の待機だけを解放する。後続コマンドの待機は自分の flushed まで残す。
         this.chunkQueue = this.chunkQueue.then(() => {
-          this.flushWaiters.shift()?.();
+          const resolve = this.flushWaiters.get(event.requestId);
+          this.flushWaiters.delete(event.requestId);
+          resolve?.();
         });
         break;
     }

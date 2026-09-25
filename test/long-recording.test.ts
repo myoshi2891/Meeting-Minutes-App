@@ -60,7 +60,7 @@ describe("60 分連続録音（48kHz ネイティブ → 16kHz、120 Chunk）", 
       processor.process([[signal]]);
       fed += quantum;
     }
-    nodePort.postMessage({ type: "flush" });
+    nodePort.postMessage({ type: "flush", requestId: 1 });
     await flushMessages();
     const total = received.filter(isChunkEvent).reduce((acc, c) => acc + c.sampleCount, 0);
     const expected = Math.floor((fed / native) * 16000);

@@ -36,6 +36,12 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const meeting = await deps.meetingStore.get(meetingId);
   if (meeting === undefined) return { ok: false, stage: "verify", detail: "meeting not found" };
+  // 二重に POST /finalize して endedAt を書き換えない
+  if (meeting.status === "finalized") return { ok: true };
+  // recording 中は最終 Chunk が IDB にある前提（stop() 完了）を満たさない。finalizing は POST 中に中断された会議の再試行
+  if (meeting.status !== "stop_requested" && meeting.status !== "finalizing") {
+    return { ok: false, stage: "verify", detail: `meeting status is ${meeting.status}` };
+  }
 
   // 末尾の Chunk がメモリ待機中だと IDB 上は欠番なしに見えるため、件数不足のまま finalize しないよう先に弾く
   const unpersisted = deps.unpersistedChunkCount();

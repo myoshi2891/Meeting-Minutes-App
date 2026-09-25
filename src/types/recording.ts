@@ -247,8 +247,9 @@ export interface AudioChunkRecord {
 export type WorkletCommand =
   | { readonly type: "configure"; readonly vad: VADConfig }
   | { readonly type: "start" }
-  | { readonly type: "flush" }
-  | { readonly type: "stop" };
+  /** requestId は flushed で同じ値が返る。応答と要求を対応付け、タイムアウトした要求への遅れた応答を捨てるために使う。 */
+  | { readonly type: "flush"; readonly requestId: number }
+  | { readonly type: "stop"; readonly requestId: number };
 
 /** Worklet → Main */
 export type WorkletEvent =
@@ -274,7 +275,7 @@ export type WorkletEvent =
       readonly audioFrameCount: number;
       readonly currentTime: number;
     }
-  | { readonly type: "flushed"; readonly audioFrameCount: number };
+  | { readonly type: "flushed"; readonly requestId: number; readonly audioFrameCount: number };
 
 export function isWorkletEvent(value: unknown): value is WorkletEvent {
   if (typeof value !== "object" || value === null) return false;

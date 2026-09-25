@@ -36,7 +36,7 @@ describe("PcmChunkerProcessor", () => {
   it("start 前の process() は PCM を蓄積しない", async () => {
     const { processor, nodePort, received } = await loadWorkletProcessor(16000);
     feed(processor, makeSine(440, 16000, 16000));
-    nodePort.postMessage({ type: "flush" });
+    nodePort.postMessage({ type: "flush", requestId: 1 });
     await flushMessages();
     expect(received.filter(isChunk)).toHaveLength(0);
   });
@@ -54,7 +54,7 @@ describe("PcmChunkerProcessor", () => {
     nodePort.postMessage({ type: "start" });
     await flushMessages();
     feed(processor, makeSine(440, 16000, 16000 * 5));
-    nodePort.postMessage({ type: "flush" });
+    nodePort.postMessage({ type: "flush", requestId: 1 });
     await flushMessages();
     feed(processor, makeSine(440, 16000, 16000 * 31));
     await flushMessages();
@@ -66,7 +66,8 @@ describe("PcmChunkerProcessor", () => {
     expect(chunks[1].partial).toBe(false);
     expect(chunks[1].sampleCount).toBe(480000);
     expect(chunks[1].startFrame).toBe(chunks[0].endFrame);
-    expect(received.some(isEvent<{ type: "flushed" }>("flushed"))).toBe(true);
+    // flushed は要求の requestId をそのまま返す（Controller が応答と要求を対応付ける）
+    expect(received.filter(isEvent<{ type: "flushed"; requestId: number }>("flushed")).map((e) => e.requestId)).toEqual([1]);
   });
 
   it("stop 後の process() は false を返し Processor が破棄される", async () => {
@@ -74,7 +75,7 @@ describe("PcmChunkerProcessor", () => {
     nodePort.postMessage({ type: "start" });
     await flushMessages();
     feed(processor, makeSine(440, 16000, 16000));
-    nodePort.postMessage({ type: "stop" });
+    nodePort.postMessage({ type: "stop", requestId: 1 });
     await flushMessages();
     expect(processor.process([[new Float32Array(128)]])).toBe(false);
     expect(received.filter(isChunk)).toHaveLength(1);
@@ -101,7 +102,7 @@ describe("PcmChunkerProcessor", () => {
     nodePort.postMessage({ type: "start" });
     await flushMessages();
     feed(processor, makeSine(440, 16000, 16000 * 2, 0.3));
-    nodePort.postMessage({ type: "flush" });
+    nodePort.postMessage({ type: "flush", requestId: 1 });
     await flushMessages();
     const chunk = received.find(isChunk);
     expect(chunk?.vad.hasVoice).toBe(false);

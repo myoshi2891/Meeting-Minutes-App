@@ -98,11 +98,13 @@ export class LocalSaveScheduler {
         const [chunkKey] = this.pending.splice(index, 1);
         this.markedUnavailable.delete(chunkKey);
         this.inFlight.add(chunkKey);
-        void this.runOne(chunkKey, saver).finally(() => {
-          this.inFlight.delete(chunkKey);
-          this.deps.health.pendingChunkCount = this.pendingCount;
-          void this.pump();
-        });
+        void this.runOne(chunkKey, saver)
+          .catch((error: unknown) => this.recoverFailedRun(chunkKey, error))
+          .finally(() => {
+            this.inFlight.delete(chunkKey);
+            this.deps.health.pendingChunkCount = this.pendingCount;
+            void this.pump();
+          });
       }
     } finally {
       this.pumping = false;
@@ -122,6 +124,38 @@ export class LocalSaveScheduler {
       });
     }
     // pending 配列は保持する。resumeAll() または backend 復帰時の pump() で再開する。
+  }
+
+  /**
+   * runOne が例外（IDB の書き込み失敗など）で終わった Chunk を再開可能な状態に戻す。
+   * SAVING のまま残すと runOne が「送信中」とみなして永久に送らないため、RETRYING に戻してバックオフ後に再投入する。
+   */
+  private async recoverFailedRun(chunkKey: string, error: unknown): Promise<void> {
+    const at = this.deps.now();
+    // nextRetryAt より前にタイマーが発火すると runOne が再投入だけして空回りするため、遅延は 1 回だけ決める
+    let delay = backoffMs(1);
+    let exhausted = false;
+    try {
+      await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+        const attempts = Math.max(r.save.attempts, 1);
+        delay = backoffMs(attempts);
+        // 例外より前に保存が終わっていた・別経路で状態が進んでいた場合は書き戻さない
+        if (r.save.status !== "SAVING") return;
+        exhausted = attempts >= MAX_SAVE_ATTEMPTS;
+        r.save.status = exhausted ? "LOCAL_SAVE_FAILED" : "RETRYING";
+        r.save.lastError = { kind: "UNKNOWN", message: errorMessage(error), httpStatus: null, at };
+        r.save.nextRetryAt = exhausted ? null : at + delay;
+      });
+    } catch (restoreError: unknown) {
+      // 状態も書き戻せない（IDB が使えない）。バックオフ後に復旧処理ごとやり直す
+      this.deps.setTimer(() => void this.recoverFailedRun(chunkKey, restoreError), delay);
+      return;
+    }
+    if (exhausted) return;
+    this.deps.setTimer(() => {
+      this.insertSorted(chunkKey);
+      void this.pump();
+    }, delay);
   }
 
   private async runOne(chunkKey: string, saver: LocalSaver): Promise<void> {
@@ -200,6 +234,10 @@ export class LocalSaveScheduler {
 
 function isResumable(status: AudioChunkRecord["save"]["status"]): boolean {
   return status === "BACKEND_UNAVAILABLE" || status === "LOCAL_SAVE_FAILED" || status === "RETRYING" || status === "LOCAL_SAVE_PENDING" || status === "IDB_STORED";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function isTerminal(record: AudioChunkRecord): boolean {

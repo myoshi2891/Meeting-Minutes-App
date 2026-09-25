@@ -204,4 +204,30 @@ describe("LocalSaveScheduler", () => {
     await s.advance(0);
     expect(s.stats().putCount).toBe(1);
   });
+
+  it("保存状態の書き込みが例外で失敗しても SAVING に取り残さず、バックオフ後に再送して保存を終える", async () => {
+    // Arrange：PUT 成功後の DB_REGISTERED 書き込みだけを 1 回失敗させる（IDB の一時的な失敗）
+    const s = await setup((r) => okResponse(r));
+    const original = s.chunkStore.updateSaveState.bind(s.chunkStore);
+    let failOnce = true;
+    s.chunkStore.updateSaveState = (key, mutate) =>
+      original(key, (r) => {
+        mutate(r);
+        if (failOnce && r.save.status === "DB_REGISTERED") {
+          failOnce = false;
+          throw new Error("idb write failed");
+        }
+      });
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert：SAVING ではなく再開可能な RETRYING に戻り、即時の再送はしない
+    const retrying = await s.status(0);
+    expect(retrying?.status).toBe("RETRYING");
+    expect(retrying?.lastError?.kind).toBe("UNKNOWN");
+    expect(s.stats().putCount).toBe(1);
+    await s.advance(3_000);
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    expect(s.stats().putCount).toBe(2);
+  });
 });

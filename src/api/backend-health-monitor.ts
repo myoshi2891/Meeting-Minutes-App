@@ -110,10 +110,12 @@ export class BackendHealthMonitor {
   }
 
   private transition(status: LocalBackendHealth["status"], latency: number | null, caps: LocalBackendHealth["capabilities"]): void {
+    const reachable = status === "HEALTHY" || status === "DEGRADED";
     this.state.status = status;
-    this.state.latencyMs = latency;
-    this.state.capabilities = caps ?? this.state.capabilities;
-    if (status === "HEALTHY" || status === "DEGRADED") {
+    // UNREACHABLE では応答時間・能力を持たない（LocalBackendHealth の契約）。401 応答の latency も残さない
+    this.state.latencyMs = reachable ? latency : null;
+    this.state.capabilities = reachable ? caps ?? this.state.capabilities : null;
+    if (reachable) {
       this.state.lastHealthyAt = performance.now();
       this.state.consecutiveFailures = 0;
     } else {

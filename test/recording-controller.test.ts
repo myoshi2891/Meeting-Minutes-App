@@ -25,18 +25,25 @@ async function flushMessages(): Promise<void> {
   for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 0));
 }
 
-/** Worklet 側の端。受け取ったコマンドを記録し、stop / flush には部分 Chunk + flushed で応答する。 */
+/** Worklet 側の端。受け取ったコマンドを記録し、stop / flush には部分 Chunk + flushed（同じ requestId）で応答する。 */
 class FakeWorkletSide {
   readonly commands: WorkletCommand[] = [];
+  /** true の間は flush / stop に応答しない（AudioContext が閉じられた Worklet を模す） */
+  silent = false;
   private frame = 0;
   constructor(readonly port: MessagePort) {
     port.onmessage = (e: MessageEvent<WorkletCommand>) => {
       this.commands.push(e.data);
+      if (this.silent) return;
       if (e.data.type === "stop" || e.data.type === "flush") {
         this.sendChunk(1600, true);
-        port.postMessage({ type: "flushed", audioFrameCount: this.frame });
+        this.sendFlushed(e.data.requestId);
       }
     };
+  }
+
+  sendFlushed(requestId: number): void {
+    this.port.postMessage({ type: "flushed", requestId, audioFrameCount: this.frame });
   }
 
   sendChunk(sampleCount: number, partial = false): void {
@@ -59,6 +66,8 @@ interface Setup {
   health: RecordingHealth;
   errors: Error[];
   track: EventTarget & { stop: ReturnType<typeof vi.fn> };
+  /** 注入したタイマー。fireTimers() で期限を待たずに発火させる */
+  fireTimers: () => void;
 }
 
 async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Promise<Setup> {
@@ -84,6 +93,7 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Prom
   const enqueued: string[] = [];
   const health = createHealth();
   const errors: Error[] = [];
+  const timers: Array<() => void> = [];
   const controller = new RecordingController({
     audioContext,
     mediaStream,
@@ -93,8 +103,12 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Prom
     health,
     workletModuleUrl: "/worklet.js",
     onError: (e) => errors.push(e),
+    setTimer: (fn) => timers.push(fn),
   });
-  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, track };
+  const fireTimers = () => {
+    for (const fn of timers.splice(0)) fn();
+  };
+  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, track, fireTimers };
 }
 
 describe("makeChunkKey / sha256Hex", () => {
@@ -163,6 +177,48 @@ describe("RecordingController", () => {
     expect(s.track.stop).toHaveBeenCalled();
     // flush 後の最終フレーム数が IDB の会議レコードに反映されている（Finalizer の totalAudioFrames の元）
     expect((await s.meetingStore.get("m1"))?.sessionClock.audioFrameCount).toBe(481600);
+  });
+
+  it("Worklet が stop に応答しなくてもタイムアウトで onError を通知し、トラックを解放して stop が終わる", async () => {
+    // Arrange
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.silent = true;
+    // Act
+    const stopped = s.controller.stop().then(() => "done");
+    await flushMessages();
+    s.fireTimers();
+    // Assert
+    expect(await Promise.race([stopped, flushMessages().then(() => "pending")])).toBe("done");
+    expect(s.errors.map((e) => e.message)).toEqual([expect.stringContaining("stop")]);
+    expect(s.track.stop).toHaveBeenCalled();
+  });
+
+  it("タイムアウトした flush への遅れた flushed で、後続の stop の待機を解放しない", async () => {
+    // Arrange：flush がタイムアウトした後で Worklet が応答を再開する
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.silent = true;
+    const flushed = s.controller.flush();
+    await flushMessages();
+    s.fireTimers();
+    await flushed;
+    const flushCmd = s.worklet.commands.find((c) => c.type === "flush");
+    // Act：stop を送った直後に、flush への遅れた応答だけが届く
+    const stopped = s.controller.stop().then(() => "done");
+    await flushMessages();
+    if (flushCmd?.type !== "flush") throw new Error("flush command not sent");
+    s.worklet.sendFlushed(flushCmd.requestId);
+    // Assert：stop はまだ自分の flushed を待っている
+    expect(await Promise.race([stopped, flushMessages().then(() => "pending")])).toBe("pending");
+    expect(s.track.stop).not.toHaveBeenCalled();
+    // stop への応答（最終 Chunk + flushed）で完了する
+    const stopCmd = s.worklet.commands.find((c) => c.type === "stop");
+    if (stopCmd?.type !== "stop") throw new Error("stop command not sent");
+    s.worklet.sendChunk(1600, true);
+    s.worklet.sendFlushed(stopCmd.requestId);
+    expect(await stopped).toBe("done");
+    expect(s.enqueued).toEqual(["m1:mic:000000"]);
   });
 
   it("flush は録音を継続したまま部分 Chunk の IDB 書き込みまで待つ", async () => {

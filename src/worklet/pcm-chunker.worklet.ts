@@ -32,8 +32,8 @@ interface VADResult {
 type WorkletCommand =
   | { readonly type: "configure"; readonly vad: VADConfig }
   | { readonly type: "start" }
-  | { readonly type: "flush" }
-  | { readonly type: "stop" };
+  | { readonly type: "flush"; readonly requestId: number }
+  | { readonly type: "stop"; readonly requestId: number };
 
 const TARGET_RATE = 16000;
 const SAMPLES_PER_CHUNK = 480000;
@@ -239,13 +239,13 @@ class PcmChunkerProcessor extends AudioWorkletProcessor implements AudioWorkletP
           break;
         case "flush":
           this.emitChunk(true);
-          this.port.postMessage({ type: "flushed", audioFrameCount: this.audioFrameCount });
+          this.port.postMessage({ type: "flushed", requestId: cmd.requestId, audioFrameCount: this.audioFrameCount });
           break;
         case "stop":
           this.emitChunk(true);
           this.running = false;
           this.stopped = true;
-          this.port.postMessage({ type: "flushed", audioFrameCount: this.audioFrameCount });
+          this.port.postMessage({ type: "flushed", requestId: cmd.requestId, audioFrameCount: this.audioFrameCount });
           break;
       }
     };
@@ -320,7 +320,8 @@ class PcmChunkerProcessor extends AudioWorkletProcessor implements AudioWorkletP
 function isWorkletCommand(value: unknown): value is WorkletCommand {
   if (typeof value !== "object" || value === null) return false;
   const t = (value as { type?: unknown }).type;
-  return t === "configure" || t === "start" || t === "flush" || t === "stop";
+  if (t === "flush" || t === "stop") return typeof (value as { requestId?: unknown }).requestId === "number";
+  return t === "configure" || t === "start";
 }
 
 registerProcessor("pcm-chunker", PcmChunkerProcessor);

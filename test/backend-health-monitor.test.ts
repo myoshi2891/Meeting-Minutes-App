@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BackendHealthMonitor, type BackendHealthMonitorConfig } from "../src/api/backend-health-monitor";
 import { createInitialHealth } from "../src/recording/recording-health-monitor";
 import type { LocalBackendCapabilities, LocalBackendStatus } from "../src/types/recording";
@@ -99,6 +99,36 @@ describe("BackendHealthMonitor.checkOnce", () => {
     expect(health.degradedReasons).toEqual([]);
   });
 
+  it("401 応答で UNREACHABLE になったときは latencyMs と capabilities を持たない", async () => {
+    // Arrange：認証済みで HEALTHY（capabilities あり）にしてから 401 を返す
+    let authorized = true;
+    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async () =>
+      authorized ? json({ status: "ok", service: "minutes-local", capabilities: CAPS }) : json({ error: "x", code: "UNAUTHORIZED" }, 401),
+    );
+    await m.checkOnce();
+    expect(m.state.capabilities).toEqual(CAPS);
+    authorized = false;
+    // Act
+    const s = await m.checkOnce();
+    // Assert
+    expect(s.status).toBe("UNREACHABLE");
+    expect(s.latencyMs).toBeNull();
+    expect(s.capabilities).toBeNull();
+  });
+
+  it("接続不能で UNREACHABLE になったら、直前の capabilities を残さない", async () => {
+    let up = true;
+    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async () => {
+      if (!up) throw new TypeError("x");
+      return json({ status: "ok", service: "minutes-local", capabilities: CAPS });
+    });
+    await m.checkOnce();
+    up = false;
+    const s = await m.checkOnce();
+    expect(s.capabilities).toBeNull();
+    expect(s.latencyMs).toBeNull();
+  });
+
   it("backend 以外の degradedReasons は保持される", async () => {
     const health = createInitialHealth("running");
     health.degradedReasons = ["MIC_TRACK_ENDED"];
@@ -160,6 +190,14 @@ describe("BackendHealthMonitor.checkOnce", () => {
 });
 
 describe("BackendHealthMonitor の定期ポーリング", () => {
+  // 実時間を待たず、ポーリング間隔をフェイクタイマーで決定的に進める
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("実行中のチェックがある間に stop() しても、完了後にポーリングを再開しない", async () => {
     // Arrange
     let calls = 0;
@@ -175,7 +213,7 @@ describe("BackendHealthMonitor の定期ポーリング", () => {
     m.start();
     m.stop();
     release();
-    await new Promise((r) => setTimeout(r, 40));
+    await vi.advanceTimersByTimeAsync(40);
     // Assert
     expect(calls).toBe(1);
   });
@@ -188,7 +226,7 @@ describe("BackendHealthMonitor の定期ポーリング", () => {
     });
     m.start();
     m.start();
-    await new Promise((r) => setTimeout(r, 20));
+    await vi.advanceTimersByTimeAsync(20);
     m.stop();
     expect(calls).toBe(1);
   });

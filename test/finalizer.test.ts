@@ -195,3 +195,56 @@ describe("finalizeMeeting（Barrier の追加条件）", () => {
     expect((await h.chunkStore.getChunk(first.chunkKey))?.save.status).toBe("DB_REGISTERED");
   });
 });
+
+describe("finalizeMeeting（会議の状態による前提条件）", () => {
+  it("recording 中の会議は stop の前提を満たさないため verify で失敗し、サーバーへ問い合わせない", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    const m = await h.meetingStore.get(MEETING_ID);
+    await h.meetingStore.put({ ...(m as MeetingRecord), status: "recording" });
+    let calls = 0;
+    const spy: typeof fetch = async (input, init) => {
+      calls++;
+      return h.server.fetch(input, init);
+    };
+    // Act
+    const result = await finalizeMeeting(deps(h, spy), MEETING_ID);
+    // Assert
+    expect(result).toMatchObject({ ok: false, stage: "verify" });
+    expect(calls).toBe(0);
+    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("recording");
+  });
+
+  it("finalized 済みの会議は再度 POST /finalize せず成功を返し、endedAt を書き換えない", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    expect(await finalizeMeeting(deps(h), MEETING_ID)).toEqual({ ok: true });
+    const endedAt = (await h.meetingStore.get(MEETING_ID))?.endedAt;
+    let posts = 0;
+    const spy: typeof fetch = async (input, init) => {
+      if (init?.method === "POST") posts++;
+      return h.server.fetch(input, init);
+    };
+    // Act
+    const result = await finalizeMeeting(deps(h, spy), MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: true });
+    expect(posts).toBe(0);
+    expect((await h.meetingStore.get(MEETING_ID))?.endedAt).toBe(endedAt);
+  });
+
+  it("finalizing のまま中断された会議（POST 中のクラッシュ）は再試行で finalized になる", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    const m = await h.meetingStore.get(MEETING_ID);
+    await h.meetingStore.put({ ...(m as MeetingRecord), status: "finalizing" });
+    // Act
+    const result = await finalizeMeeting(deps(h), MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: true });
+    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("finalized");
+  });
+});
