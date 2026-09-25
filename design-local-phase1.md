@@ -91,7 +91,7 @@ AudioContext のネイティブ sample rate は 44.1kHz / 48kHz / 96kHz など�
 1. **監視**：録音開始時に `navigator.storage.persist()` を要求し、Chunk 保存ごとに `navigator.storage.estimate()` で `usage / quota` を確認する（§21）。
 2. **段階1（使用率 ≥ 80%）**：状態が `DB_REGISTERED`（サーバー側で SHA-256 が検証済み）の Chunk から、`sequenceNo` 昇順に WAV Blob 本体を IndexedDB から削除し、メタデータのみ残す。サーバー側ファイルが Source of Truth の座を引き継いでいるため、録音データは失われない。
 3. **段階2（使用率 ≥ 95% かつ削除対象なし＝サーバー未起動で全 Chunk が滞留）**：File System Access API による緊急エクスポート（§4.5）を UI で促す。エクスポート成功後、当該 Chunk は `SAVED`（保存先 = `fsa`）として扱い、段階1 と同様に Blob 本体を削除できる。
-4. **段階3（それでも `put` が `QuotaExceededError` で失敗）**：Chunk はメモリ上の待機キューに保持し、UI に「保存領域が不足しています。サーバーを起動するかエクスポートしてください」と表示する。録音は継続する。メモリ待機キューはブラウザクラッシュで失われるため、この状態は `RecordingHealth.degradedReasons` に `IDB_QUOTA_EXHAUSTED` として記録し、UI が最上位警告として表示する。
+4. **段階3（それでも `put` が `QuotaExceededError` で失敗）**：Chunk はメモリ上の待機キューに保持し、UI に「保存領域が不足しています。サーバーを起動するかエクスポートしてください」と表示する。録音は継続する。メモリ待機キューはブラウザクラッシュで失われるため、この状態は `RecordingHealth.degradedReasons` に `IDB_QUOTA_EXHAUSTED` として記録し、UI が最上位警告として表示する。クォータ以外の理由で `put` が失敗した場合も同じくメモリ待機に回し、`IDB_WRITE_FAILED` として記録する（§15）。
 
 `persist()` の結果が `false` でも録音を止めない。永続化許可はブラウザのヒューリスティクスに依存し、断定できない事項である（§5）。
 
@@ -425,6 +425,7 @@ export type DegradedReason =
   | "BACKEND_UNAUTHORIZED"
   | "IDB_QUOTA_WARNING"
   | "IDB_QUOTA_EXHAUSTED"
+  | "IDB_WRITE_FAILED"
   | "STORAGE_NOT_PERSISTED"
   | "MIC_TRACK_ENDED";
 
@@ -1587,6 +1588,7 @@ import {
 import { createSessionClock, frameToOffsetMs } from "./session-clock";
 import { buildStandaloneWav } from "../audio/wav";
 import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
+import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
 
 /** Chunk を保存 State Machine に投入する口。LocalSaveScheduler が構造的に満たす（テストでは差し替える）。 */
 export interface ChunkEnqueuer {
@@ -1604,6 +1606,8 @@ export interface RecordingControllerDeps {
   readonly onError: (error: Error) => void;
   /** flush / stop の応答待ちタイムアウト用。既定は setTimeout（テストでは差し替える） */
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
+  /** 録音中の会議ロック（本番は navigator.locks）。§23 の復旧はロック保持中の会議に触らない */
+  readonly locks: MeetingLockManager;
 }
 
 /** Worklet が flush / stop に応答しない（AudioContext が閉じられた等）ときに待機を打ち切るまでの時間 */
@@ -1631,6 +1635,8 @@ export class RecordingController {
   /** requestId → flushed 待機。応答は要求 ID で対応付ける（タイムアウト後の遅れた応答が別の要求を解放しないように） */
   private readonly flushWaiters = new Map<number, () => void>();
   private nextRequestId = 0;
+  /** 会議ロックの解放。start で取得し、stop の完了で解放する */
+  private releaseLock: (() => void) | null = null;
 
   constructor(private readonly deps: RecordingControllerDeps) {}
 
@@ -1639,6 +1645,21 @@ export class RecordingController {
   }
 
   async start(meetingId: string, title: string, consentConfirmedAt: number): Promise<void> {
+    const { audioContext, mediaStream, workletModuleUrl } = this.deps;
+
+    // recording を書く前にロックを取る。先に書くと、別タブの復旧がロックのない recording を中断扱いにできてしまう
+    const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
+    if (release === null) throw new Error(`meeting ${meetingId} is already being recorded`);
+    this.releaseLock = release;
+    try {
+      await this.setUp(meetingId, title, consentConfirmedAt);
+    } catch (error) {
+      this.unlock();
+      throw error;
+    }
+  }
+
+  private async setUp(meetingId: string, title: string, consentConfirmedAt: number): Promise<void> {
     const { audioContext, mediaStream, workletModuleUrl } = this.deps;
 
     // AudioContext は sampleRate を指定せずに生成されている前提。実際の値はここで取得する。
@@ -1709,7 +1730,13 @@ export class RecordingController {
       if (this.node !== null) this.node.port.onmessage = null;
       this.node = null;
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
+      this.unlock();
     }
+  }
+
+  private unlock(): void {
+    this.releaseLock?.();
+    this.releaseLock = null;
   }
 
   /** IDB クォータが回復したときに UI / QuotaMonitor から呼ぶ。 */
@@ -1838,13 +1865,12 @@ export class RecordingController {
     } catch (error) {
       // 失敗理由を問わずメモリ待機に残す。sequenceNo は採番済みなので、捨てると欠番になり Finalizer が進めなくなる
       this.memoryBacklog.push(record);
-      if (isQuotaExceeded(error)) {
-        // §3.4 段階3：メモリ待機。録音は止めない。
-        if (!this.deps.health.degradedReasons.includes("IDB_QUOTA_EXHAUSTED")) {
-          this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "IDB_QUOTA_EXHAUSTED"];
-        }
-        return;
+      // §3.4 段階3：メモリ待機。録音は止めない。メモリ待機はクラッシュで失われるため、理由を問わず UI に出す
+      const reason = isQuotaExceeded(error) ? "IDB_QUOTA_EXHAUSTED" : "IDB_WRITE_FAILED";
+      if (!this.deps.health.degradedReasons.includes(reason)) {
+        this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, reason];
       }
+      if (reason === "IDB_QUOTA_EXHAUSTED") return;
       throw error;
     }
 
@@ -1860,7 +1886,7 @@ export class RecordingController {
 
 `sequenceNo` の採番はメインスレッドで行う。Worklet 側で採番すると flush で生じる部分 Chunk との整合を Worklet が知る必要が出るためである。Worklet からの `chunk` イベントは同一 `MessagePort` 上で順序が保証されるので、`chunkQueue` による直列化と合わせて `sequenceNo` と `startFrame` の単調増加が保たれる。
 
-IndexedDB への書き込みに失敗した Chunk は、失敗の理由を問わずメモリ待機キュー（`memoryBacklog`）に残す。`sequenceNo` は採番済みなので、捨てると欠番になり、Finalization Barrier（§22）の連続性検査を永久に通過できなくなるためである。`QuotaExceededError` は §3.4 段階3として `IDB_QUOTA_EXHAUSTED` を記録し、録音を継続する。それ以外のエラーは `onError` に通知したうえで同じく待機キューに残し、`drainMemoryBacklog()` で再書き込みする。なお、待機キューに残ったのが末尾の Chunk だけだと、IndexedDB 上は欠番なしに見えて連続性検査では検出できない。そのため Finalizer は `memoryBacklogCount` が 0 になるまで Barrier を通さない（§22）。
+IndexedDB への書き込みに失敗した Chunk は、失敗の理由を問わずメモリ待機キュー（`memoryBacklog`）に残す。`sequenceNo` は採番済みなので、捨てると欠番になり、Finalization Barrier（§22）の連続性検査を永久に通過できなくなるためである。`QuotaExceededError` は §3.4 段階3として `IDB_QUOTA_EXHAUSTED` を記録し、録音を継続する。それ以外のエラー（別タブのアップグレードで接続が閉じられた後の `InvalidStateError` など）は `IDB_WRITE_FAILED` を記録し、`onError` に通知したうえで同じく待機キューに残し、`drainMemoryBacklog()` で再書き込みする。なお、待機キューに残ったのが末尾の Chunk だけだと、IndexedDB 上は欠番なしに見えて連続性検査では検出できない。そのため Finalizer は `memoryBacklogCount` が 0 になるまで Barrier を通さない（§22）。
 
 `stop()` は `stop_requested` を先に永続化し、最終 Chunk の書き込み完了を待ってから会議レコードをもう一度保存する。最終 flush で確定した `sessionClock.audioFrameCount` を IndexedDB に残すためで、Finalizer はこの値を `totalAudioFrames` として送る。これらの処理全体を try/finally で包み、途中で IndexedDB 書き込みなどが reject しても、ソースノードの切断・`onmessage` の解除・マイクトラックの停止は必ず行う。
 
@@ -1869,6 +1895,41 @@ IndexedDB への書き込みに失敗した Chunk は、失敗の理由を問わ
 Worklet が応答しない場合（AudioContext が閉じられた、Processor が破棄された等）に備え、待機には `FLUSH_TIMEOUT_MS`（5 秒）のタイムアウトを付ける。タイムアウトしたら自分の待機だけを `Map` から外し、`onError` に通知して待機を打ち切る。`stop()` はそのまま進んで finally でマイクと Worklet を解放する。遅れて届いた `flushed` は対応する待機がないので無視され、後続の要求を誤って解放しない。応答を順番（FIFO）で対応付けると、タイムアウトで外した待機の分だけ対応がずれるため、`requestId` で対応付けている。タイマーは `setTimer` で依存注入できる（既定は `setTimeout`）。
 
 Scheduler への依存は `enqueue()` だけを持つ `ChunkEnqueuer` インターフェースに絞っている。`LocalSaveScheduler` はこのインターフェースを構造的に満たすため、呼び出し側の配線は変わらない。
+
+録音中の会議は、会議ごとの Web Lock（会議ロック）で示す。Phase 1 は複数タブでの同時録音を許すため、あとから開いたタブの起動時復旧（§23）が、別タブで録音中の `recording` を中断と誤認して `stop_requested` に落とさないようにするためである。`start()` は `recording` を書く**前**にロックを取り（先に書くと、ロックのない `recording` を他タブの復旧が拾える）、取れなければ失敗する。ロックは `stop()` の finally、または `start()` が途中で失敗したときに解放する。タブが閉じたり落ちたりした場合はブラウザが自動で解放するので、クラッシュした会議は従来どおり復旧の対象になる。ロックマネージャは `locks` で依存注入する（本番は `navigator.locks`。`LockManager` は `MeetingLockManager` を構造的に満たす）。
+
+```typescript
+// src/recording/meeting-lock.ts
+
+/** navigator.locks のうち、会議ロックで使う部分。LockManager が構造的に満たす（テストでは差し替える）。 */
+export interface MeetingLockManager {
+  request(name: string, options: { ifAvailable: true }, callback: (lock: Lock | null) => Promise<void>): Promise<void>;
+}
+
+/** 録音中の会議を示す Web Lock の名前。保持しているタブが閉じる・落ちるとブラウザが自動で解放する。 */
+export function meetingLockName(meetingId: string): string {
+  return `minutes:recording:${meetingId}`;
+}
+
+/**
+ * 会議ロックを待たずに取りにいく。取れたら解放関数を、他（別タブの録音など）が保持中なら null を返す。
+ * 解放関数を呼ぶまでロックを保持し続ける。
+ */
+export function tryAcquireMeetingLock(locks: MeetingLockManager, meetingId: string): Promise<(() => void) | null> {
+  return new Promise((resolve, reject) => {
+    locks
+      .request(meetingLockName(meetingId), { ifAvailable: true }, (lock) => {
+        if (lock === null) {
+          resolve(null);
+          return Promise.resolve();
+        }
+        // コールバックの Promise が解決するまでロックは保持される
+        return new Promise<void>((release) => resolve(() => release()));
+      })
+      .catch(reject);
+  });
+}
+```
 
 ---
 
@@ -2979,6 +3040,7 @@ function errorMessage(error: unknown): string {
 // src/recording/recovery.ts
 import type { ChunkStore, MeetingStore } from "../storage/idb";
 import { isResumable, type LocalSaveScheduler } from "./local-save-scheduler";
+import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
 import type { AudioChunkRecord, MeetingRecord } from "../types/recording";
 
 export interface RecoveryReport {
@@ -2993,31 +3055,50 @@ export interface RecoveryReport {
  *   non-retryable の LOCAL_SAVE_FAILED は resumeAll の判定に任せ、SAVED は Finalizer のサーバー一覧照合に任せる
  * - recording のまま残っていた会議は stop_requested に落とす（音声はもう来ない）
  *   audioFrameCount は stop() でしか永続化されないため、保存済み Chunk の最大 endFrame から復元する
+ * - 会議ロック（§15）が保持中の会議は別タブで録音中なので、会議も Chunk も触らない
  */
-export async function recoverOnStartup(meetingStore: MeetingStore, chunkStore: ChunkStore, scheduler: LocalSaveScheduler): Promise<RecoveryReport> {
+export async function recoverOnStartup(
+  meetingStore: MeetingStore,
+  chunkStore: ChunkStore,
+  scheduler: LocalSaveScheduler,
+  locks: MeetingLockManager,
+): Promise<RecoveryReport> {
   const interrupted: Array<{ meetingId: string; status: MeetingRecord["status"]; chunkCount: number }> = [];
   const seen = new Set<string>();
+  const active = new Set<string>();
   for (const status of ["recording", "stop_requested", "finalizing"] as const) {
     for (const m of await meetingStore.listByStatus(status)) {
       // recording → stop_requested に更新した会議を次の status で二重に拾わない
       if (seen.has(m.meetingId)) continue;
       seen.add(m.meetingId);
-      const chunks = await chunkStore.listByMeeting(m.meetingId, "mic");
-      if (m.status === "recording") {
-        // Finalizer が totalAudioFrames として送る値。既に大きい値があれば維持する
-        const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
-        m.sessionClock.audioFrameCount = Math.max(m.sessionClock.audioFrameCount, lastEndFrame);
-        m.status = "stop_requested";
-        m.updatedAt = Date.now();
-        await meetingStore.put(m);
+      // 復旧中もロックを持ち、録音タブと同時に会議を書き換えない
+      const release = await tryAcquireMeetingLock(locks, m.meetingId);
+      if (release === null) {
+        active.add(m.meetingId);
+        continue;
       }
-      interrupted.push({ meetingId: m.meetingId, status: m.status, chunkCount: chunks.length });
+      try {
+        const chunks = await chunkStore.listByMeeting(m.meetingId, "mic");
+        if (m.status === "recording") {
+          // Finalizer が totalAudioFrames として送る値。既に大きい値があれば維持する
+          const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
+          m.sessionClock.audioFrameCount = Math.max(m.sessionClock.audioFrameCount, lastEndFrame);
+          m.status = "stop_requested";
+          m.updatedAt = Date.now();
+          await meetingStore.put(m);
+        }
+        interrupted.push({ meetingId: m.meetingId, status: m.status, chunkCount: chunks.length });
+      } finally {
+        release();
+      }
     }
   }
 
   const unfinished = await chunkStore.listUnfinished();
   let requeued = 0;
   for (const c of unfinished) {
+    // 録音中のタブが PUT している最中の Chunk。書き戻すと SAVING が PENDING に巻き戻る
+    if (active.has(c.meta.meetingId)) continue;
     if (isInterrupted(c)) {
       // SAVING のまま落ちた Chunk はサーバー側に届いているかもしれない。冪等 PUT で再送し、200/201 どちらでも SAVED にする。
       await chunkStore.updateSaveState(c.chunkKey, (r) => {
@@ -3039,6 +3120,8 @@ function isInterrupted(record: AudioChunkRecord): boolean {
   return record.save.status === "GENERATED" || record.save.status === "SAVING";
 }
 ```
+
+会議ロック（§15）が保持されている会議は、別タブで録音中なので中断とみなさず、会議レコードも Chunk も書き換えない（`SAVING` を書き戻すと、そのタブの PUT 中に状態が巻き戻る）。ロックが取れた会議は、処理のあいだロックを保持してから解放する。
 
 `recording` のまま残っていた会議は、`stop_requested` に落とす前に `sessionClock.audioFrameCount` を保存済み Chunk の最大 `endFrame` から復元する。この値は `stop()` でしか永続化されないため、録音中のクラッシュでは初期値のまま残り、Finalizer が誤った `totalAudioFrames` を送ることになる。すでに大きい値が保存されていれば維持する。
 
@@ -3074,6 +3157,7 @@ import { LocalSaver } from "../src/api/local-saver";
 import { createInitialHealth } from "../src/recording/recording-health-monitor";
 import { buildStandaloneWav } from "../src/audio/wav";
 import { makeChunkKey, sha256Hex } from "../src/recording/recording-controller";
+import type { MeetingLockManager } from "../src/recording/meeting-lock";
 
 export const BASE_URL = "http://127.0.0.1:43117";
 export const TOKEN = "test-token";
@@ -3140,6 +3224,21 @@ export class FakeLocalServer {
   };
 }
 
+/** navigator.locks の ifAvailable 付き排他ロックだけを模倣する。インスタンスごとに別ブラウザ（クラッシュ後の再起動）とみなす。 */
+export class FakeLockManager implements MeetingLockManager {
+  readonly held = new Set<string>();
+
+  async request(name: string, _options: { ifAvailable: true }, callback: (lock: Lock | null) => Promise<void>): Promise<void> {
+    if (this.held.has(name)) return callback(null);
+    this.held.add(name);
+    try {
+      await callback({ name, mode: "exclusive" });
+    } finally {
+      this.held.delete(name);
+    }
+  }
+}
+
 export interface Harness {
   readonly db: IDBDatabase;
   readonly chunkStore: ChunkStore;
@@ -3148,6 +3247,7 @@ export interface Harness {
   readonly backend: LocalBackendHealth;
   readonly health: RecordingHealth;
   readonly scheduler: LocalSaveScheduler;
+  readonly locks: FakeLockManager;
   readonly timers: Array<{ fn: () => void; at: number }>;
   now: number;
   readonly advance: (ms: number) => Promise<void>;
@@ -3166,6 +3266,7 @@ export async function createHarness(): Promise<Harness> {
     server,
     backend,
     health,
+    locks: new FakeLockManager(),
     timers,
     now: 0,
     scheduler: new LocalSaveScheduler({
@@ -3464,7 +3565,7 @@ describe("ブラウザクラッシュ後の復旧", () => {
     const after = await createHarness();
     after.server.stored.clear();
     for (const [k, v] of before.server.stored) after.server.stored.set(k, v);
-    const report = await recoverOnStartup(after.meetingStore, after.chunkStore, after.scheduler);
+    const report = await recoverOnStartup(after.meetingStore, after.chunkStore, after.scheduler, after.locks);
     expect(report.interruptedMeetings).toEqual([{ meetingId, status: "stop_requested", chunkCount: 3 }]);
     expect(report.requeuedChunks).toBe(2); // SAVING と IDB_STORED
 
@@ -3613,7 +3714,7 @@ describe("リサンプラのアンチエイリアシング", () => {
 | --- | --- | --- |
 | 60 分連続録音 | `long-recording.test.ts` | 120 Chunk の連番・フレーム連続・960,044 バイト・ヘッダ整合。44.1kHz での累積誤差 |
 | ローカル常駐サーバー停止 5 分からの復旧 | `backend-outage.test.ts` | 停止中の滞留、PUT 未到達、復旧後の順序保証と全件 `DB_REGISTERED`、401 経路 |
-| ブラウザクラッシュ後の IndexedDB 復旧 | `crash-recovery.test.ts` | `recording` → `stop_requested`、`SAVING` 中断 Chunk の冪等再送 |
+| ブラウザクラッシュ後の IndexedDB 復旧 | `crash-recovery.test.ts` | `recording` → `stop_requested`、`SAVING` 中断 Chunk の冪等再送、会議ロック保持中（別タブで録音中）の会議は触らない |
 | Chunk 単体再生可能性 | `chunk-standalone.test.ts` | 44 バイトヘッダの全フィールド、IDB 読み戻しのラウンドトリップ、部分 Chunk、壊れたヘッダの拒否 |
 | （追加）DSP 品質 | `resampler-aliasing.test.ts` | 折り返し成分 -40dB 以下、通過帯域 -1dB 以内 |
 

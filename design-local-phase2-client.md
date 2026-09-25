@@ -136,6 +136,7 @@ export type DegradedReason =
   | "BACKEND_UNAUTHORIZED"
   | "IDB_QUOTA_WARNING"
   | "IDB_QUOTA_EXHAUSTED"
+  | "IDB_WRITE_FAILED"
   | "STORAGE_NOT_PERSISTED"
   | "MIC_TRACK_ENDED"
   /** Phase 2: System Audio 系統の終了・取得不可。録音（Mic）は継続する。 */
@@ -587,6 +588,7 @@ import {
 import { computeFrameClockDriftMs, createSessionClock, frameToOffsetMs } from "./session-clock";
 import { buildStandaloneWav } from "../audio/wav";
 import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
+import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
 
 /** Chunk を保存 State Machine に投入する口。LocalSaveScheduler が構造的に満たす（テストでは差し替える）。Phase 1 §15 と同じ */
 export interface ChunkEnqueuer {
@@ -604,6 +606,8 @@ export interface RecordingControllerDeps {
   readonly onError: (error: Error) => void;
   /** flush / stop の応答待ちタイムアウト用。既定は setTimeout（Phase 1 §15 と同じ） */
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
+  /** 録音中の会議ロック（本番は navigator.locks、Phase 1 §15 と同じ）。会議レコードを作る側（Mic）だけが取る */
+  readonly locks: MeetingLockManager;
 }
 
 /** Worklet が flush / stop に応答しないときに待機を打ち切るまでの時間（Phase 1 §15 と同じ） */
@@ -641,6 +645,8 @@ export class RecordingController {
   /** requestId → flushed 待機（Phase 1 §15 と同じ） */
   private readonly flushWaiters = new Map<number, () => void>();
   private nextRequestId = 0;
+  /** 会議ロックの解放。registerMeeting の start で取得し、stop の完了で解放する（Phase 1 §15 と同じ） */
+  private releaseLock: (() => void) | null = null;
 
   constructor(private readonly deps: RecordingControllerDeps, readonly source: AudioSource = "mic") {}
 
@@ -653,6 +659,21 @@ export class RecordingController {
   }
 
   async start(meetingId: string, title: string, consentConfirmedAt: number, options: StartOptions = {}): Promise<void> {
+    if (options.registerMeeting !== false) {
+      // recording を書く前にロックを取る（Phase 1 §15）。System 側は Mic のロックに乗る
+      const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
+      if (release === null) throw new Error(`meeting ${meetingId} is already being recorded`);
+      this.releaseLock = release;
+    }
+    try {
+      await this.setUp(meetingId, title, consentConfirmedAt, options);
+    } catch (error) {
+      this.unlock();
+      throw error;
+    }
+  }
+
+  private async setUp(meetingId: string, title: string, consentConfirmedAt: number, options: StartOptions): Promise<void> {
     const { audioContext, mediaStream, workletModuleUrl } = this.deps;
     await audioContext.audioWorklet.addModule(workletModuleUrl);
     this.clock = createSessionClock(audioContext);
@@ -735,7 +756,13 @@ export class RecordingController {
       if (this.node !== null) this.node.port.onmessage = null;
       this.node = null;
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
+      this.unlock();
     }
+  }
+
+  private unlock(): void {
+    this.releaseLock?.();
+    this.releaseLock = null;
   }
 
   async drainMemoryBacklog(): Promise<number> {
@@ -856,12 +883,12 @@ export class RecordingController {
     } catch (error) {
       // 失敗理由を問わずメモリ待機に残す。sequenceNo は採番済みなので、捨てると欠番になる（Phase 1 §15）
       this.memoryBacklog.push(record);
-      if (isQuotaExceeded(error)) {
-        if (!this.deps.health.degradedReasons.includes("IDB_QUOTA_EXHAUSTED")) {
-          this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "IDB_QUOTA_EXHAUSTED"];
-        }
-        return;
+      // メモリ待機はクラッシュで失われるため、理由を問わず UI に出す（Phase 1 §15）
+      const reason = isQuotaExceeded(error) ? "IDB_QUOTA_EXHAUSTED" : "IDB_WRITE_FAILED";
+      if (!this.deps.health.degradedReasons.includes(reason)) {
+        this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, reason];
       }
+      if (reason === "IDB_QUOTA_EXHAUSTED") return;
       throw error;
     }
 
