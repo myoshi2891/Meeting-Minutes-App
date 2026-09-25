@@ -123,4 +123,25 @@ describe("ブラウザクラッシュ後の復旧", () => {
     expect(report.interruptedMeetings.map((m) => m.meetingId).filter((id) => id.startsWith("r-"))).toEqual(["r-fin"]);
     expect(report.requeuedChunks).toBe(0);
   });
+
+  it("中断状態（GENERATED / SAVING）だけを書き戻し、non-retryable の LOCAL_SAVE_FAILED と SAVED は再送しない", async () => {
+    // Arrange
+    const h = await createHarness();
+    const meetingId = "m-crash-terminal";
+    const statuses = ["LOCAL_SAVE_FAILED", "SAVED", "GENERATED", "SAVING"] as const;
+    for (let seq = 0; seq < statuses.length; seq++) {
+      const r = await makeChunkRecord(meetingId, seq, 160);
+      r.save.status = statuses[seq];
+      if (statuses[seq] === "LOCAL_SAVE_FAILED") r.save.lastError = { kind: "VALIDATION", message: "422", httpStatus: 422, at: 0 };
+      await h.chunkStore.putChunk(r);
+    }
+    // Act
+    const report = await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler);
+    for (let i = 0; i < 20; i++) await h.advance(100);
+    // Assert：再投入は GENERATED と SAVING の 2 件だけ
+    expect(report.requeuedChunks).toBe(2);
+    expect(h.server.putCount).toBe(2);
+    const chunks = await h.chunkStore.listByMeeting(meetingId, "mic");
+    expect(chunks.map((c) => c.save.status)).toEqual(["LOCAL_SAVE_FAILED", "SAVED", "DB_REGISTERED", "DB_REGISTERED"]);
+  });
 });

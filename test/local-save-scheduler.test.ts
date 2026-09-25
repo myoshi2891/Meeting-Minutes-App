@@ -214,6 +214,21 @@ describe("LocalSaveScheduler", () => {
     expect(s.health.pendingChunkCount).toBe(0);
   });
 
+  it("resumeAll で SAVED になった Chunk を、後から発火したリトライタイマーが再送しない", async () => {
+    // Arrange：1 回目は 5xx でリトライタイマーが残り、resumeAll による 2 回目で SAVED（DB 未登録）になる
+    const s = await setup((r, attempt) => (attempt === 1 ? new Response("{}", { status: 500 }) : okResponse(r, false)));
+    await s.add(0);
+    await s.advance(0);
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("SAVED");
+    // Act：リトライタイマー発火
+    await s.advance(3_000);
+    // Assert：SAVED の登録確認は Finalizer のサーバー一覧照合に任せ、再送しない
+    expect(s.stats().putCount).toBe(2);
+    expect((await s.status(0))?.status).toBe("SAVED");
+  });
+
   it("同じ Chunk を二重に enqueue しても PUT は 1 回", async () => {
     const s = await setup((r) => okResponse(r));
     const r = await makeChunkRecord("m", 0, 160);

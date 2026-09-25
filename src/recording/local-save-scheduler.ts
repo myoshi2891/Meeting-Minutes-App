@@ -161,7 +161,8 @@ export class LocalSaveScheduler {
     const record = await this.deps.chunkStore.getChunk(chunkKey);
     if (record === undefined) return;
     // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
-    if (record.save.status === "DB_REGISTERED" || record.save.status === "SAVING") return;
+    // SAVED（ファイル保存済み・DB 未登録）の登録確認は Finalizer のサーバー一覧照合に任せる
+    if (record.save.status === "DB_REGISTERED" || record.save.status === "SAVED" || record.save.status === "SAVING") return;
     if (record.save.status === "RETRYING" && record.save.nextRetryAt !== null && record.save.nextRetryAt > this.deps.now()) {
       this.insertSorted(chunkKey);
       return;
@@ -231,7 +232,7 @@ export class LocalSaveScheduler {
   }
 }
 
-function isResumable(record: AudioChunkRecord): boolean {
+export function isResumable(record: AudioChunkRecord): boolean {
   const { status, lastError } = record.save;
   // non-retryable（VALIDATION / CONFLICT / 408・429 以外の 4xx）は送り直しても結果が変わらないため、手動再試行のみ（§17）
   if (status === "LOCAL_SAVE_FAILED") return lastError === null || isRetryableError(lastError);
