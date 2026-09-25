@@ -22,7 +22,7 @@ description: Keep the design docs (design-local-phase*.md) in sync with src/ aft
    - コード直後の説明段落（「〜で担保する」「〜ことはない」など、保証を言い切っている文）
    - Mermaid の状態遷移図（遷移条件）
    - §27 Invariant 担保箇所、§28 Definition of Done の表
-4. 後続フェーズに波及させる。`design-local-phase2-client.md` などは Phase 1 のコードを元に拡張している。同じ不具合や同じ引数追加が必要かを `grep -n "<関数名>"` で確認し、フェーズ固有の差分（mic/system の 2 系統など）を保ったまま同じ修正を当てる。後続フェーズのブロックは Phase 1 の src と一致しないのが正常で、チェッカーの対象外。
+4. 後続フェーズに波及させる。`design-local-phase2-client.md` などは Phase 1 のコードを元に拡張している。同じ不具合や同じ引数追加が必要かを `grep -n "<関数名>" design-local-phase*.md` で確認し、フェーズ固有の差分（mic/system の 2 系統など）を保ったまま同じ修正を当てる。後続フェーズのブロックは Phase 1 の src と一致しないのが正常で、チェッカーの対象外。
 5. 手順 1 を再実行し、`DIFF` がゼロであることを確認する。
 
 ## 報告
