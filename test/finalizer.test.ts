@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { finalizeMeeting, type FinalizerDeps } from "../src/recording/finalizer";
 import type { MeetingRecord } from "../src/types/recording";
 import { BASE_URL, createHarness, makeChunkRecord, TOKEN, type Harness } from "./harness";
@@ -149,6 +149,31 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     };
     expect(await finalizeMeeting(deps(h, dropsOnPost), MEETING_ID)).toMatchObject({ ok: false, stage: "finalize" });
     expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
+  });
+
+  it("POST /finalize の失敗後に再試行しても、最初に記録した endedAt を送り直して書き換えない", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    const dropsOnPost: typeof fetch = async (input, init) => {
+      if (init?.method === "POST") throw new TypeError("Failed to fetch");
+      return h.server.fetch(input, init);
+    };
+    expect(await finalizeMeeting(deps(h, dropsOnPost), MEETING_ID)).toMatchObject({ ok: false, stage: "finalize" });
+    const firstEndedAt = (await h.meetingStore.get(MEETING_ID))?.endedAt;
+    const posted: unknown[] = [];
+    const spy: typeof fetch = async (input, init) => {
+      if (init?.method === "POST") posted.push(JSON.parse(String(init.body)));
+      return h.server.fetch(input, init);
+    };
+    const now = vi.spyOn(Date, "now").mockReturnValue((firstEndedAt ?? 0) + 60_000);
+    // Act
+    const result = await finalizeMeeting(deps(h, spy), MEETING_ID);
+    now.mockRestore();
+    // Assert
+    expect(result).toEqual({ ok: true });
+    expect((await h.meetingStore.get(MEETING_ID))?.endedAt).toBe(firstEndedAt);
+    expect(posted).toMatchObject([{ endedAtEpochMs: firstEndedAt }]);
   });
 
   it("一覧取得時に接続できなければ verify の失敗 Result を返す", async () => {

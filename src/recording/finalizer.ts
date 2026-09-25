@@ -109,7 +109,8 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
 
   meeting.status = "finalizing";
   meeting.finalChunkCount = chunks.length;
-  meeting.endedAt = Date.now();
+  // 再試行で終了時刻を書き換えない（前回の POST がサーバーに届いていた場合と値を揃える）
+  meeting.endedAt ??= Date.now();
   await deps.meetingStore.put(meeting);
 
   const body: FinalizeRequest = {
