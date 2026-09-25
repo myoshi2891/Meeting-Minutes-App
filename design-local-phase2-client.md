@@ -1199,17 +1199,17 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   // finalizing へ進める前の値を控える。POST が失敗・タイムアウトしたらここへ戻す。
   // 戻さないと、IndexedDB に finalizing のまま取り残された会議ができ、再開経路がなくなる。
   // finalizing から再試行した場合も含め、status は常に stop_requested へ戻す（Phase 1 §22）
-  const before = { endedAt: meeting.endedAt, finalChunkCount: meeting.finalChunkCount };
+  // endedAt は戻さない。前回の POST がサーバーに届いていた場合と、再試行で送る値を揃える
+  const before = { finalChunkCount: meeting.finalChunkCount };
   const restore = async (): Promise<void> => {
     meeting.status = "stop_requested";
-    meeting.endedAt = before.endedAt;
     meeting.finalChunkCount = before.finalChunkCount;
     await deps.meetingStore.put(meeting);
   };
 
   meeting.status = "finalizing";
   meeting.finalChunkCount = counts.mic + counts.system;
-  meeting.endedAt = Date.now();
+  meeting.endedAt ??= Date.now();
   await deps.meetingStore.put(meeting);
 
   const body: FinalizeRequest = {
@@ -2238,10 +2238,10 @@ describe("finalize（mic + system）", () => {
       expect(result.detail).toMatch(/TIMEOUT/);
     }
 
-    // finalizing 前の値へ戻っており、復帰後に再度 finalize を呼べる
+    // finalizing 前の値へ戻っており、復帰後に再度 finalize を呼べる。endedAt は再試行で同じ値を送るため残す
     const after = await h.meetingStore.get(meetingId);
     expect(after?.status).toBe("stop_requested");
-    expect(after?.endedAt).toBeNull();
+    expect(after?.endedAt).not.toBeNull();
     expect(after?.finalChunkCount).toBeNull();
   });
 });
