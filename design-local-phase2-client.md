@@ -1056,7 +1056,7 @@ export class MultiSourceRecorder {
 
 # 7. `src/recording/finalizer.ts` の変更
 
-mic / system の両方を検証する。System なしの会議は `expectedChunkCounts.system = 0`。会議の状態の検査（`finalized` なら POST せず成功を返す、`stop_requested` / `finalizing` 以外は `verify` で失敗させる）と、`GET /chunks` の応答を `isChunkListResponse` に通す検査は Phase 1 §22 と同じ。
+mic / system の両方を検証する。System なしの会議は `expectedChunkCounts.system = 0`。会議の状態の検査（`finalized` なら POST せず成功を返す、`stop_requested` / `finalizing` 以外は `verify` で失敗させる）と、`GET /chunks` の応答を `isChunkListResponse` に通し `meetingId` の一致を確かめる検査は Phase 1 §22 と同じ。
 
 ```typescript
 // src/recording/finalizer.ts
@@ -1150,6 +1150,8 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す、Phase 1 §22）
   const list: unknown = await listRes.json().catch(() => null);
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
+  // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
+  if (list.meetingId !== meetingId) return { ok: false, stage: "verify", detail: `list meetingId mismatch: ${list.meetingId}` };
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
   for (const source of SOURCES) {
     for (const c of bySource[source]) {

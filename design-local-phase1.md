@@ -900,9 +900,10 @@ export class ChunkStore {
     return all.filter(isAudioChunkRecord).filter((r) => r.save.status !== "DB_REGISTERED");
   }
 
-  /** クォータ縮退：Blob 本体を削除しメタデータのみ残す。 */
+  /** クォータ縮退（§3.4 段階1）：DB_REGISTERED の Chunk だけ Blob 本体を削除しメタデータのみ残す。未検証の Chunk は再送のため残す。 */
   async dropBlob(chunkKey: string): Promise<void> {
     await this.updateSaveState(chunkKey, (record) => {
+      if (record.save.status !== "DB_REGISTERED") return;
       record.wav = null;
     });
   }
@@ -1087,7 +1088,9 @@ export function isChunkResponse(value: unknown): value is ChunkResponse {
 export function isHealthResponse(value: unknown): value is HealthResponse {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return (v.status === "ok" || v.status === "degraded") && v.service === "minutes-local";
+  // capabilities は認証済みのときだけ含まれる（省略可）。null などを通すと unauthorized の解除判定を誤る
+  const capsOk = v.capabilities === undefined || (typeof v.capabilities === "object" && v.capabilities !== null);
+  return (v.status === "ok" || v.status === "degraded") && v.service === "minutes-local" && capsOk;
 }
 
 /** ChunkTimingMetadata を X-Chunk-Meta ヘッダ用に Base64URL 化する（ヘッダに非 ASCII を載せない）。 */
@@ -1102,8 +1105,8 @@ export function encodeChunkMetaHeader(meta: ChunkTimingMetadata): string {
 /** GET /v1/meetings/{id}/chunks の応答。各要素は isChunkResponse の 3 フィールドに加え、照合キー（source / sequenceNo）を必須にする。 */
 export function isChunkListResponse(value: unknown): value is ChunkListResponse {
   if (typeof value !== "object" || value === null) return false;
-  const chunks = (value as { chunks?: unknown }).chunks;
-  if (!Array.isArray(chunks)) return false;
+  const { meetingId, chunks } = value as { meetingId?: unknown; chunks?: unknown };
+  if (typeof meetingId !== "string" || !Array.isArray(chunks)) return false;
   return chunks.every((c: unknown) => {
     if (!isChunkResponse(c)) return false;
     const v = c as unknown as Record<string, unknown>;
@@ -1222,6 +1225,7 @@ class SincResampler {
   private history: Float32Array;           // 直近入力（タップ幅 + 未消費分）
   private historyLen = 0;
   private position = 0;                    // 次の出力サンプルに対応する history 内の実数インデックス
+  private out = new Float32Array(0);       // 出力バッファ（オーディオスレッドで毎回確保しないよう再利用）
 
   constructor(inputRate: number, outputRate: number) {
     if (inputRate <= 0 || outputRate <= 0) throw new Error("invalid sample rate");
@@ -1254,7 +1258,7 @@ class SincResampler {
     this.position = this.halfTaps;
   }
 
-  /** 入力を追加し、生成できる出力サンプルをすべて返す。 */
+  /** 入力を追加し、生成できる出力サンプルをすべて返す。戻り値は内部バッファのビューで、次の push まで有効。 */
   push(input: Float32Array): Float32Array {
     // history に追記（必要なら拡張）
     if (this.historyLen + input.length > this.history.length) {
@@ -1267,7 +1271,8 @@ class SincResampler {
 
     const taps = this.halfTaps * 2;
     const maxOutputs = Math.floor((this.historyLen - this.halfTaps - this.position) / this.ratio) + 1;
-    const out = new Float32Array(Math.max(0, maxOutputs));
+    if (maxOutputs > this.out.length) this.out = new Float32Array(maxOutputs);
+    const out = this.out;
     let produced = 0;
 
     while (this.position + this.halfTaps <= this.historyLen - 1) {
@@ -1296,7 +1301,7 @@ class SincResampler {
       this.historyLen -= keepFrom;
       this.position -= keepFrom;
     }
-    return produced === out.length ? out : out.subarray(0, produced);
+    return out.subarray(0, produced);
   }
 }
 
@@ -2813,6 +2818,8 @@ export async function finalizeMeeting(deps: FinalizerDeps, meetingId: string): P
   }
   if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
+  // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
+  if (list.meetingId !== meetingId) return { ok: false, stage: "verify", detail: `list meetingId mismatch: ${list.meetingId}` };
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
   for (const c of chunks) {
     const s = serverByKey.get(`${c.meta.source}:${c.meta.sequenceNo}`);
@@ -2880,7 +2887,7 @@ function errorMessage(error: unknown): string {
 
 `SAVED`（サーバーがファイル書き込みだけ成功し `registered: false` を返した Chunk）は Scheduler の再開対象ではない。PUT を再送しても `registered: false` が続きうるため、`notRegistered` からは除外してサーバー一覧の照合へ進める。一覧で `registered: true` かつ sha256 一致が確認できたら `DB_REGISTERED` に更新する。確認できなければ他の不一致と同様に `LOCAL_SAVE_PENDING` に戻して再投入する。
 
-`finalizeMeeting` は失敗を例外ではなく `FinalizeResult` で返す。`GET /chunks` の応答は外部入力なので `isChunkListResponse` で検証し、契約に合わなければ `verify` の失敗とする。`GET /chunks` と `POST /finalize` にはそれぞれ `timeoutMs`（既定 30 秒）の `AbortController` を付ける。応答しないサーバーに対しても、接続失敗と同じ経路で失敗結果を返す。`POST /finalize` が失敗した場合（HTTP エラー、接続失敗、タイムアウトのいずれも）は会議を `stop_requested` に戻し、`finalizing` のまま残さない。
+`finalizeMeeting` は失敗を例外ではなく `FinalizeResult` で返す。`GET /chunks` の応答は外部入力なので `isChunkListResponse` で検証し、契約に合わなければ `verify` の失敗とする。応答の `meetingId` が要求した会議と異なる場合も `verify` の失敗とし、ローカルの Chunk を `DB_REGISTERED` にしない（無音など同一内容の Chunk は別会議でも SHA-256 が一致しうるため）。`GET /chunks` と `POST /finalize` にはそれぞれ `timeoutMs`（既定 30 秒）の `AbortController` を付ける。応答しないサーバーに対しても、接続失敗と同じ経路で失敗結果を返す。`POST /finalize` が失敗した場合（HTTP エラー、接続失敗、タイムアウトのいずれも）は会議を `stop_requested` に戻し、`finalizing` のまま残さない。
 
 ---
 
