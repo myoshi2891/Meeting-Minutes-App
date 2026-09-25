@@ -580,10 +580,41 @@ export type WorkletEvent =
     }
   | { readonly type: "flushed"; readonly requestId: number; readonly audioFrameCount: number };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isVADResult(value: unknown): value is VADResult {
+  return (
+    isRecord(value) &&
+    typeof value.score === "number" &&
+    typeof value.hasVoice === "boolean" &&
+    typeof value.voicedSamples === "number"
+  );
+}
+
+/** type だけでなく各バリアントの必須フィールドまで確かめる。欠けたイベントを通すと handler 側で例外になる。 */
 export function isWorkletEvent(value: unknown): value is WorkletEvent {
-  if (typeof value !== "object" || value === null) return false;
-  const t = (value as { type?: unknown }).type;
-  return t === "ready" || t === "chunk" || t === "heartbeat" || t === "flushed";
+  if (!isRecord(value)) return false;
+  switch (value.type) {
+    case "ready":
+      return typeof value.nativeSampleRate === "number" && typeof value.renderQuantum === "number";
+    case "chunk":
+      return (
+        value.pcm instanceof ArrayBuffer &&
+        typeof value.sampleCount === "number" &&
+        typeof value.startFrame === "number" &&
+        typeof value.endFrame === "number" &&
+        isVADResult(value.vad) &&
+        typeof value.partial === "boolean"
+      );
+    case "heartbeat":
+      return typeof value.audioFrameCount === "number" && typeof value.currentTime === "number";
+    case "flushed":
+      return typeof value.requestId === "number" && typeof value.audioFrameCount === "number";
+    default:
+      return false;
+  }
 }
 ```
 
@@ -2879,6 +2910,14 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     return { ok: false, stage: "verify", detail: `server mismatch at seq ${mismatched.join(", ")}` };
   }
 
+  // finalizing へ進める前の値を控える。POST が失敗・タイムアウトしたら status と一緒にここへ戻す
+  const before = { finalChunkCount: meeting.finalChunkCount };
+  const restore = async (): Promise<void> => {
+    meeting.status = "stop_requested";
+    meeting.finalChunkCount = before.finalChunkCount;
+    await deps.meetingStore.put(meeting);
+  };
+
   meeting.status = "finalizing";
   meeting.finalChunkCount = chunks.length;
   // 再試行で終了時刻を書き換えない（前回の POST がサーバーに届いていた場合と値を揃える）
@@ -2905,15 +2944,13 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     });
   } catch (error) {
     // finalizing のまま残さない。次回の Barrier 再試行は stop_requested から行う
-    meeting.status = "stop_requested";
-    await deps.meetingStore.put(meeting);
+    await restore();
     return { ok: false, stage: "finalize", detail: `finalize request failed: ${errorMessage(error)}` };
   } finally {
     clearTimeout(finTimer);
   }
   if (!finRes.ok) {
-    meeting.status = "stop_requested";
-    await deps.meetingStore.put(meeting);
+    await restore();
     return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}` };
   }
   meeting.status = "finalized";
@@ -2932,7 +2969,7 @@ function errorMessage(error: unknown): string {
 
 サーバー一覧との照合は、最初の不一致で打ち切らずに全 Chunk を確かめる。不一致の Chunk はすべて `LOCAL_SAVE_PENDING` に戻し、`resumeAll()` を 1 回だけ呼んでから、不一致の `sequenceNo` をすべて `detail` に並べて `verify` の失敗を返す（例: `server mismatch at seq 0, 2`）。1 件ずつ直すと、不一致の件数だけ Barrier の再試行が必要になるためである。
 
-`finalizeMeeting` は失敗を例外ではなく `FinalizeResult` で返す。`GET /chunks` の応答は外部入力なので `isChunkListResponse` で検証し、契約に合わなければ `verify` の失敗とする。応答の `meetingId` が要求した会議と異なる場合も `verify` の失敗とし、ローカルの Chunk を `DB_REGISTERED` にしない（無音など同一内容の Chunk は別会議でも SHA-256 が一致しうるため）。`GET /chunks` と `POST /finalize` にはそれぞれ `timeoutMs`（既定 30 秒）の `AbortController` を付ける。応答しないサーバーに対しても、接続失敗と同じ経路で失敗結果を返す。`POST /finalize` が失敗した場合（HTTP エラー、接続失敗、タイムアウトのいずれも）は会議を `stop_requested` に戻し、`finalizing` のまま残さない。
+`finalizeMeeting` は失敗を例外ではなく `FinalizeResult` で返す。`GET /chunks` の応答は外部入力なので `isChunkListResponse` で検証し、契約に合わなければ `verify` の失敗とする。応答の `meetingId` が要求した会議と異なる場合も `verify` の失敗とし、ローカルの Chunk を `DB_REGISTERED` にしない（無音など同一内容の Chunk は別会議でも SHA-256 が一致しうるため）。`GET /chunks` と `POST /finalize` にはそれぞれ `timeoutMs`（既定 30 秒）の `AbortController` を付ける。応答しないサーバーに対しても、接続失敗と同じ経路で失敗結果を返す。`POST /finalize` が失敗した場合（HTTP エラー、接続失敗、タイムアウトのいずれも）は会議を `stop_requested` に戻し、`finalizing` のまま残さない。`finalChunkCount` も POST 前の値へ戻す（失敗した POST の件数を記録として残さない）。
 
 ---
 

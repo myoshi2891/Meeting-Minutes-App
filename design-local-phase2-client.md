@@ -258,10 +258,41 @@ export type WorkletEvent =
   | { readonly type: "heartbeat"; readonly audioFrameCount: number; readonly currentTime: number }
   | { readonly type: "flushed"; readonly requestId: number; readonly audioFrameCount: number };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isVADResult(value: unknown): value is VADResult {
+  return (
+    isRecord(value) &&
+    typeof value.score === "number" &&
+    typeof value.hasVoice === "boolean" &&
+    typeof value.voicedSamples === "number"
+  );
+}
+
+/** type だけでなく各バリアントの必須フィールドまで確かめる。欠けたイベントを通すと handler 側で例外になる。 */
 export function isWorkletEvent(value: unknown): value is WorkletEvent {
-  if (typeof value !== "object" || value === null) return false;
-  const t = (value as { type?: unknown }).type;
-  return t === "ready" || t === "chunk" || t === "heartbeat" || t === "flushed";
+  if (!isRecord(value)) return false;
+  switch (value.type) {
+    case "ready":
+      return typeof value.nativeSampleRate === "number" && typeof value.renderQuantum === "number";
+    case "chunk":
+      return (
+        value.pcm instanceof ArrayBuffer &&
+        typeof value.sampleCount === "number" &&
+        typeof value.startFrame === "number" &&
+        typeof value.endFrame === "number" &&
+        isVADResult(value.vad) &&
+        typeof value.partial === "boolean"
+      );
+    case "heartbeat":
+      return typeof value.audioFrameCount === "number" && typeof value.currentTime === "number";
+    case "flushed":
+      return typeof value.requestId === "number" && typeof value.audioFrameCount === "number";
+    default:
+      return false;
+  }
 }
 ```
 
