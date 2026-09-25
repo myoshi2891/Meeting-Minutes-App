@@ -61,5 +61,5 @@
 - **タイマーは依存注入する。** Scheduler の `setTimer`、テストハーネスの `h.advance(ms)` を使う。実時間の `setTimeout` を待つテストは書かない（遅く不安定になる）。
 - **サーバー応答は外部入力。** `as` でキャストせず、`src/api/contracts.ts` の型ガード（`isChunkListResponse` など）を通す。
 - **ローカル以外へ通信しない。** URL を組み立てたら `assertLocalHost()` を通す（Zero External Data Egress、設計書 §4.4）。
-- **非同期の完了通知は、どの要求への応答かを対応付ける。** 例: `flushed` は FIFO で 1 件ずつ解放する。ポーリングは世代番号で古いループを捨てる。フラグ 1 つで判定すると、stop → start の競合で壊れる。
+- **非同期の完了通知は、どの要求への応答かを対応付ける。** 例: `flushed` は `requestId` で対応する要求だけを解放する（FIFO だとタイムアウト後に遅れて届いた応答が別の要求を解放する）。ポーリングは世代番号で古いループを捨てる。フラグ 1 つで判定すると、stop → start の競合で壊れる。
 - **Finalization Barrier は IDB の中身だけを見ると不十分。** メモリ待機中の末尾 Chunk は連番チェックをすり抜けるので、`unpersistedChunkCount` を必ず配線する（§22）。

@@ -12,7 +12,7 @@ import sys
 
 # 閉じフェンスは「行頭・開きと同じ記号・開き以上の長さ・行末まで空白のみ」のときだけ認める（CommonMark と同じ）
 BLOCK = re.compile(
-    r"^(?P<fence>(?P<ch>[`~])(?P=ch){2,})typescript\n"
+    r"^(?P<fence>(?P<ch>[`~])(?P=ch){2,})typescript[ \t]*\n"
     r"(?P<body>// (?P<path>(?:src|test)/\S+)\n.*?)"
     r"^(?P=fence)(?P=ch)*[ \t]*$",
     re.S | re.M,
