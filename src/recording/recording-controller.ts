@@ -106,28 +106,54 @@ export class RecordingController {
     await this.deps.meetingStore.put(meeting);
     this.meeting = meeting;
 
-    const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
-      numberOfInputs: 1,
-      numberOfOutputs: 0,
-      channelCount: 1,
-      channelCountMode: "explicit",
-    });
-    node.port.onmessage = (event: MessageEvent<unknown>) => {
-      if (!isWorkletEvent(event.data)) return;
-      this.handleWorkletEvent(event.data);
-    };
-    this.sourceNode = audioContext.createMediaStreamSource(mediaStream);
-    this.sourceNode.connect(node);
-    this.node = node;
+    try {
+      const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        channelCount: 1,
+        channelCountMode: "explicit",
+      });
+      node.port.onmessage = (event: MessageEvent<unknown>) => {
+        if (!isWorkletEvent(event.data)) return;
+        this.handleWorkletEvent(event.data);
+      };
+      this.node = node;
+      this.sourceNode = audioContext.createMediaStreamSource(mediaStream);
+      this.sourceNode.connect(node);
+
+      this.post({ type: "configure", vad: DEFAULT_VAD_CONFIG });
+      this.post({ type: "start" });
+    } catch (error) {
+      await this.rollBackStart(meeting);
+      throw error;
+    }
 
     for (const track of mediaStream.getAudioTracks()) {
       track.addEventListener("ended", () => {
         this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "MIC_TRACK_ENDED"];
       });
     }
+  }
 
-    this.post({ type: "configure", vad: DEFAULT_VAD_CONFIG });
-    this.post({ type: "start" });
+  /**
+   * recording を保存した後の start 失敗を巻き戻す。Worklet を切り離し、会議を created に戻す。
+   * recording のまま残すと、次回起動の復旧が stop_requested に落として Chunk のない会議を finalize しうる。
+   * 巻き戻しの保存失敗は onError に通知し、呼び出し元には元の例外を返す。
+   */
+  private async rollBackStart(meeting: MeetingRecord): Promise<void> {
+    this.sourceNode?.disconnect();
+    this.sourceNode = null;
+    if (this.node !== null) this.node.port.onmessage = null;
+    this.node = null;
+    this.meeting = null;
+    this.clock = null;
+    meeting.status = "created";
+    meeting.updatedAt = Date.now();
+    try {
+      await this.deps.meetingStore.put(meeting);
+    } catch (rollbackError) {
+      this.deps.onError(rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)));
+    }
   }
 
   /** pagehide 用。Worklet に flush を要求し、部分 Chunk の IDB 書き込みまで待つ。 */

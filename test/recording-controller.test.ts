@@ -232,6 +232,25 @@ describe("RecordingController", () => {
     expect(s.locks.held.size).toBe(0);
   });
 
+  it("会議を recording で保存した後に start が失敗したら、会議を created に戻して起動時復旧の対象から外す", async () => {
+    // Arrange：会議の保存後に Worklet ノードの生成が失敗する
+    const s = await setup();
+    vi.stubGlobal(
+      "AudioWorkletNode",
+      class {
+        constructor() {
+          throw new Error("node failed");
+        }
+      },
+    );
+    // Act
+    await expect(s.controller.start("m1", "定例", 1)).rejects.toThrow("node failed");
+    // Assert：recording のまま残すと、次回起動の復旧が stop_requested に落として空の会議を finalize しうる
+    const meeting = await s.meetingStore.get("m1");
+    expect(meeting?.status).toBe("created");
+    expect(s.controller.sessionClock).toBeNull();
+  });
+
   it("stop は stop_requested を記録し、最終の部分 Chunk の保存完了まで待ってからトラックを止める", async () => {
     const s = await setup();
     await s.controller.start("m1", "定例", 1);
