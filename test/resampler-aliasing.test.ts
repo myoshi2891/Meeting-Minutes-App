@@ -1,6 +1,6 @@
 // test/resampler-aliasing.test.ts
 import { describe, expect, it } from "vitest";
-import { loadWorkletProcessor, makeSine } from "./harness";
+import { loadWorkletProcessor, makeSine, nextMessage, startProcessor } from "./harness";
 
 interface ChunkEvent {
   type: "chunk";
@@ -10,25 +10,6 @@ interface ChunkEvent {
 
 function isChunkEvent(v: unknown): v is ChunkEvent {
   return typeof v === "object" && v !== null && (v as { type?: unknown }).type === "chunk";
-}
-
-/** port に条件を満たすメッセージが届くまで待つ（タイマーに頼らずメッセージ順序で同期する）。 */
-function nextMessage<T>(port: MessagePort, match: (data: unknown) => data is T): Promise<T> {
-  return new Promise((resolve) => {
-    const onMessage = (e: MessageEvent): void => {
-      if (!match(e.data)) return;
-      port.removeEventListener("message", onMessage);
-      resolve(e.data);
-    };
-    port.addEventListener("message", onMessage);
-  });
-}
-
-/** start を送り、Processor 側の onmessage が処理し終えるまで待つ。Processor は ack を返さないため、後から登録したリスナーの発火で完了を知る。 */
-async function startProcessor(processorPort: MessagePort, nodePort: MessagePort): Promise<void> {
-  const handled = nextMessage(processorPort, (d): d is { type: "start" } => typeof d === "object" && d !== null && (d as { type?: unknown }).type === "start");
-  nodePort.postMessage({ type: "start" });
-  await handled;
 }
 
 /** 単一周波数の振幅を Goertzel で求める（dBFS）。 */

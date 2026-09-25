@@ -201,3 +201,35 @@ export async function loadWorkletProcessor(nativeSampleRate: number): Promise<{
   const processor = new holder.ctor();
   return { processor, nodePort: channel.port2, received };
 }
+
+/** port に条件を満たすメッセージが届くまで待つ（タイマーに頼らずメッセージ順序で同期する）。 */
+export function nextMessage<T>(port: MessagePort, match: (data: unknown) => data is T): Promise<T> {
+  return new Promise((resolve) => {
+    const onMessage = (e: MessageEvent): void => {
+      if (!match(e.data)) return;
+      port.removeEventListener("message", onMessage);
+      resolve(e.data);
+    };
+    port.addEventListener("message", onMessage);
+  });
+}
+
+/** start を送り、Processor 側の onmessage が処理し終えるまで待つ。Processor は ack を返さないため、後から登録したリスナーの発火で完了を知る。 */
+export async function startProcessor(processorPort: MessagePort, nodePort: MessagePort): Promise<void> {
+  const handled = nextMessage(processorPort, (d): d is { type: "start" } => typeof d === "object" && d !== null && (d as { type?: unknown }).type === "start");
+  nodePort.postMessage({ type: "start" });
+  await handled;
+}
+
+/** 指定 requestId の flushed を待つ。同一 port は順序保証なので、これより前に送られた chunk はすべて届いている。 */
+export function nextFlushed(nodePort: MessagePort, requestId: number): Promise<{ type: "flushed"; requestId: number }> {
+  return nextMessage(nodePort, (d): d is { type: "flushed"; requestId: number } =>
+    typeof d === "object" && d !== null && (d as { type?: unknown }).type === "flushed" && (d as { requestId?: unknown }).requestId === requestId,
+  );
+}
+
+/** n 個目の chunk が届くまで待つ。 */
+export function nthChunk(nodePort: MessagePort, n: number): Promise<unknown> {
+  let seen = 0;
+  return nextMessage(nodePort, (d): d is unknown => typeof d === "object" && d !== null && (d as { type?: unknown }).type === "chunk" && ++seen === n);
+}

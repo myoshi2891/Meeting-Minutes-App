@@ -53,11 +53,33 @@ describe("BackendHealthMonitor.checkOnce", () => {
   });
 
   it("応答が degradedLatencyMs を超えると DEGRADED", async () => {
+    // Arrange：実時間を待たず、performance.now() の進みで応答時間を決める
+    let clock = 1_000;
+    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => clock);
     const m = new BackendHealthMonitor({ ...CONFIG, degradedLatencyMs: 5 }, createInitialHealth("running"), async () => {
-      await new Promise((r) => setTimeout(r, 15));
+      clock += 6;
       return json({ status: "ok", service: "minutes-local" });
     });
-    expect((await m.checkOnce()).status).toBe("DEGRADED");
+    try {
+      // Act / Assert
+      expect((await m.checkOnce()).status).toBe("DEGRADED");
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("応答が degradedLatencyMs ちょうどなら DEGRADED にしない", async () => {
+    let clock = 1_000;
+    const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => clock);
+    const m = new BackendHealthMonitor({ ...CONFIG, degradedLatencyMs: 5 }, createInitialHealth("running"), async () => {
+      clock += 5;
+      return json({ status: "ok", service: "minutes-local" });
+    });
+    try {
+      expect((await m.checkOnce()).status).toBe("HEALTHY");
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it("同じポートの別サービス（service 不一致）は UNREACHABLE", async () => {
@@ -78,10 +100,20 @@ describe("BackendHealthMonitor.checkOnce", () => {
   });
 
   it("timeoutMs 以内に応答しなければ UNREACHABLE", async () => {
-    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), (_i, init) =>
-      new Promise((_r, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason))),
-    );
-    expect((await m.checkOnce()).status).toBe("UNREACHABLE");
+    // Arrange：タイムアウトはフェイクタイマーで進める
+    vi.useFakeTimers();
+    try {
+      const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), (_i, init) =>
+        new Promise((_r, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason))),
+      );
+      // Act
+      const result = m.checkOnce();
+      await vi.advanceTimersByTimeAsync(CONFIG.timeoutMs);
+      // Assert
+      expect((await result).status).toBe("UNREACHABLE");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("401 は unauthorized=true で BACKEND_UNAUTHORIZED、正しい応答で解除される", async () => {

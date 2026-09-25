@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { loadWorkletProcessor, makeSine } from "./harness";
+import { loadWorkletProcessor, makeSine, nextFlushed, nextMessage, nthChunk, startProcessor } from "./harness";
 
 interface ChunkEvent {
   type: "chunk";
@@ -15,10 +15,6 @@ function isEvent<T extends { type: string }>(type: T["type"]) {
 }
 const isChunk = isEvent<ChunkEvent>("chunk");
 
-async function flushMessages(): Promise<void> {
-  for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 0));
-}
-
 /** native=16kHz で seconds 秒分の信号を 128 フレームずつ流す */
 function feed(processor: { process(inputs: Float32Array[][]): boolean }, signal: Float32Array): void {
   for (let i = 0; i + 128 <= signal.length; i += 128) processor.process([[signal.subarray(i, i + 128)]]);
@@ -27,37 +23,38 @@ function feed(processor: { process(inputs: Float32Array[][]): boolean }, signal:
 describe("PcmChunkerProcessor", () => {
   it("起動時に ready で実行時のネイティブレートを通知する", async () => {
     // Arrange / Act
-    const { received } = await loadWorkletProcessor(44100);
-    await flushMessages();
+    const { nodePort } = await loadWorkletProcessor(44100);
+    const ready = await nextMessage(nodePort, isEvent<{ type: "ready"; nativeSampleRate: number }>("ready"));
     // Assert
-    expect(received[0]).toMatchObject({ type: "ready", nativeSampleRate: 44100 });
+    expect(ready).toMatchObject({ type: "ready", nativeSampleRate: 44100 });
   });
 
   it("start 前の process() は PCM を蓄積しない", async () => {
     const { processor, nodePort, received } = await loadWorkletProcessor(16000);
     feed(processor, makeSine(440, 16000, 16000));
+    const flushed = nextFlushed(nodePort, 1);
     nodePort.postMessage({ type: "flush", requestId: 1 });
-    await flushMessages();
+    await flushed;
     expect(received.filter(isChunk)).toHaveLength(0);
   });
 
   it("入力が空（Mic 切断）でも Processor は維持される", async () => {
     const { processor, nodePort } = await loadWorkletProcessor(16000);
-    nodePort.postMessage({ type: "start" });
-    await flushMessages();
+    await startProcessor(processor.port, nodePort);
     expect(processor.process([[]])).toBe(true);
     expect(processor.process([])).toBe(true);
   });
 
   it("flush は録音を継続したまま部分 Chunk を吐き、次 Chunk のフレームが連続する", async () => {
     const { processor, nodePort, received } = await loadWorkletProcessor(16000);
-    nodePort.postMessage({ type: "start" });
-    await flushMessages();
+    await startProcessor(processor.port, nodePort);
     feed(processor, makeSine(440, 16000, 16000 * 5));
+    const flushed = nextFlushed(nodePort, 1);
     nodePort.postMessage({ type: "flush", requestId: 1 });
-    await flushMessages();
+    await flushed;
+    const fullChunk = nthChunk(nodePort, 1);
     feed(processor, makeSine(440, 16000, 16000 * 31));
-    await flushMessages();
+    await fullChunk;
 
     const chunks = received.filter(isChunk);
     expect(chunks.length).toBeGreaterThanOrEqual(2);
@@ -72,22 +69,22 @@ describe("PcmChunkerProcessor", () => {
 
   it("stop 後の process() は false を返し Processor が破棄される", async () => {
     const { processor, nodePort, received } = await loadWorkletProcessor(16000);
-    nodePort.postMessage({ type: "start" });
-    await flushMessages();
+    await startProcessor(processor.port, nodePort);
     feed(processor, makeSine(440, 16000, 16000));
+    const stopped = nextFlushed(nodePort, 1);
     nodePort.postMessage({ type: "stop", requestId: 1 });
-    await flushMessages();
+    await stopped;
     expect(processor.process([[new Float32Array(128)]])).toBe(false);
     expect(received.filter(isChunk)).toHaveLength(1);
   });
 
   it("音声 Chunk は hasVoice=true、直後の無音 Chunk は hangover を持ち越さず hasVoice=false", async () => {
     const { processor, nodePort, received } = await loadWorkletProcessor(16000);
-    nodePort.postMessage({ type: "start" });
-    await flushMessages();
+    await startProcessor(processor.port, nodePort);
+    const secondChunk = nthChunk(nodePort, 2);
     feed(processor, makeSine(440, 16000, 480000, 0.3)); // 30 秒の音声（Chunk 境界ちょうどで終わる）
     feed(processor, new Float32Array(480000 + 16000)); // 無音
-    await flushMessages();
+    await secondChunk;
 
     const chunks = received.filter(isChunk);
     expect(chunks.length).toBeGreaterThanOrEqual(2);
@@ -99,11 +96,12 @@ describe("PcmChunkerProcessor", () => {
   it("configure で VAD しきい値を変更できる（しきい値は設定値であり固定仕様ではない）", async () => {
     const { processor, nodePort, received } = await loadWorkletProcessor(16000);
     nodePort.postMessage({ type: "configure", vad: { threshold: 0.99, minSpeechMs: 200, hangoverMs: 300, floorDbfs: -60 } });
-    nodePort.postMessage({ type: "start" });
-    await flushMessages();
+    // 同一 port は順序保証なので、start の処理完了を待てば configure も適用済み
+    await startProcessor(processor.port, nodePort);
     feed(processor, makeSine(440, 16000, 16000 * 2, 0.3));
+    const flushed = nextFlushed(nodePort, 1);
     nodePort.postMessage({ type: "flush", requestId: 1 });
-    await flushMessages();
+    await flushed;
     const chunk = received.find(isChunk);
     expect(chunk?.vad.hasVoice).toBe(false);
   });
