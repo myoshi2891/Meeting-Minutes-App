@@ -20,18 +20,17 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 156 件がすべて通過。`npm run typecheck` もエラーなし。
+- 自動テスト: 17 ファイル / 164 件がすべて通過。`npm run typecheck` もエラーなし。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-25 時点）
+### 未コミットの変更（2026-09-25 時点・2 回目のレビュー対応）
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/**`、`test/finalizer.test.ts` | レビュー指摘 6 件の修正（ヘルスモニタの世代番号、Finalizer の backlog / SAVED 対応、Scheduler の重複書き込み抑止、flushed FIFO、stop の finally） | `fix(recording): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を設計書に反映 | `docs(phase1): ...` |
-| `CLAUDE.md`、`PROGRESS.md`、`.claude/skills/**` | 開発ルール・進捗・スキル | `chore(claude): ...` |
-| `design-local.md` 削除 / `archive/design-local.md` 追加 | 利用者自身の作業（今回のセッション外） | **要確認**：どのコミットに含めるか |
+| `src/**`、`test/**` | レビュー指摘の修正（Finalizer の状態の前提条件、Scheduler の runOne 例外からの復旧、HealthMonitor の UNREACHABLE 時の null 化、flush/stop の requestId＋タイムアウト）と回帰テスト。HealthMonitor のポーリングテストをフェイクタイマー化 | `fix(recording): ...` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を設計書に反映。phase2-client は stop の最終フレーム数の永続化、persistChunk の全エラーでのメモリ待機、Finalizer の型ガードも修正 | `docs(phase1): ...` |
+| `.gitignore` | `.env`、`*.wav`、`recordings/` を除外 | `chore(setup): ...` |
 
 ---
 
@@ -52,7 +51,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | --- | --- | --- | --- |
 | T1-a | BackendHealthMonitor | `checkOnce` の応答待ち中に `stop()` → `start()` しても、ポーリングが 1 系統だけになる | `test/backend-health-monitor.test.ts` |
 | T1-b | LocalSaveScheduler | backend 停止中に N 回 `enqueue` しても、各キーへの `BACKEND_UNAVAILABLE` 書き込みは 1 回だけ。復帰 → 再停止したら再び書く | `test/local-save-scheduler.test.ts` |
-| T1-c | RecordingController | `flush()` と `stop()` が重なっても、`stop()` は自分の `flushed` まで解決しない | `test/recording-controller.test.ts` |
+| T1-c | RecordingController | ~~`flush()` と `stop()` が重なっても、`stop()` は自分の `flushed` まで解決しない~~ → requestId 化の回帰テストで対応済み（2026-09-25） | — |
 | T1-d | RecordingController | `meetingStore.put` が reject しても、トラック停止と `onmessage` の解除が行われる | `test/recording-controller.test.ts`（T1-c と同じファイルなので直列） |
 
 ### T2. Step 1-f: §20 / §21 の実装【T0 の後／T2-a と T2-b は並行可】
@@ -88,6 +87,12 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-25（2 回目）
+
+- CodeRabbit の指摘 9 件（インライン 6・範囲外 2・nitpick 1）を検証し、すべて有効と判定して修正した。回帰テスト 8 件は、修正前のコードで Red になることを確認した。
+- Worklet プロトコルを変更した: `flush` / `stop` / `flushed` に `requestId` が必須になった。`RecordingControllerDeps.setTimer` を省略可能な引数として追加した。
+- Finalizer は `stop_requested` / `finalizing` の会議だけを進める（`finalizing` は POST 中のクラッシュからの再試行のため許可）。
 
 ### 2026-09-25
 
