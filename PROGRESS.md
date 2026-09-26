@@ -17,11 +17,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-c | §10 IndexedDB + §15 RecordingController | 🟡 コード・自動テストのみ | **未**：実マイクで 5 分録音 → IDB に 10 Chunk、`<audio>` で再生 |
 | 1-d | §17 LocalSaver / Scheduler + §18 BackendHealthMonitor | 🟡 コード・自動テストのみ | **未**：実サーバー（最小スタブ）へ PUT が届く |
 | 1-e | §22 Finalizer + §23 Recovery | 🟡 コード・自動テストのみ | **未**：タブ強制終了 → 再起動で再送 |
-| 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
+| 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19〜§21 はコード・自動テストのみ | UI・配線が未着手（T3）。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 222 件がすべて通過。`npm run typecheck` もエラーなし。
-- 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
+- 自動テスト: 19 ファイル / 239 件がすべて通過。`npm run typecheck` もエラーなし。
+- 設計書と src の同期: `src/` の埋め込みコードはすべて一致（MISSING なし）。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
 ### 未コミットの変更
@@ -58,14 +58,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 状態は増やさない。Finalizer が確定時に `totalAudioFrames` と最後の Chunk の `endFrame` を比べ、欠けがあれば `{ ok: true, missingTailMs }` を返す（`measureMissingTailMs()` を export）。警告表示は T3。
 - phase2-client §22 の「finalizing から再試行して失敗しても stop_requested に戻る」テストは、Phase 2 実装時に追加する。
 
-### T2. Step 1-f: §20 / §21 の実装【次に着手／T2-a と T2-b は並行可】
+### T2. Step 1-f: §20 / §21 の実装 ✅ 完了（2026-09-26・20 回目）
 
-設計書にコードがあるので、それを正として TDD で実装する（テストは設計書 §24 にないため新規に書く）。
-
-| ID | 内容 | 触るファイル | 備考 |
-| --- | --- | --- | --- |
-| T2-a | §20 `src/recording/page-lifecycle.ts` | 新規 + `test/page-lifecycle.test.ts` | §24.1 のとおり、このファイルだけ DOM が必要。`// @vitest-environment` か EventTarget の Fake で済むか先に判断する |
-| T2-b | §21 `src/storage/quota-monitor.ts` | 新規 + `test/quota-monitor.test.ts` | `drainMemoryBacklog()` との連携（§15）を含める |
+- 設計書のコードをそのまま配置し、テストを新規に書いた（`test/page-lifecycle.test.ts` 6 件、`test/quota-monitor.test.ts` 11 件）。
+- DOM ライブラリは追加していない。`window` / `document` / `navigator` は `vi.stubGlobal` で差し替える（§24.1 に追記）。Node の `Event.returnValue` は旧仕様のアクセサなので、beforeunload の Fake はデータプロパティで上書きしている。
+- `drainMemoryBacklog()` との連携は、§21 のコードが `QuotaAction` を返すだけで呼び出し側の責務なので、T3 の配線に移した。
 
 ### T3. アプリの配線と最小 UI【T2 の後／外部依存の追加を伴うため要確認】
 
@@ -76,6 +73,8 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
   - 起動時の `recoverOnStartup`（§23）
   - `RecordingController` の `directSaver: LocalSaver`、`IDB_WRITE_FAILED` のときの `drainMemoryBacklog()` 呼び出し、失敗時に `exportMemoryBacklog()` のダウンロードを促す表示（§15）
   - `finalizeMeeting` の `missingTailMs` を「末尾 約◯秒が保存されていません」と警告表示（§22）
+  - 録音開始時の `requestPersistence`、Chunk 保存ごとの `enforceQuota`（`export_required` ならエクスポートを促す）、クォータ回復時の `drainMemoryBacklog()`（§21 / §15）
+  - `attachPageLifecycle`（`onHidden` で Health の監視間隔を詰める）と、録音停止時の `detach()`（§20）。UI ヘルプの「直近最大 30 秒が失われる可能性」の文言
 - Worklet を配信するには開発サーバー / バンドラ（例: Vite）が要る。**依存の追加になるので、着手前に利用者に確認する。**
 
 ### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-g）【T3 の後】
@@ -114,6 +113,12 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-26（20 回目）
+
+- T2-a（§20 `page-lifecycle.ts`）と T2-b（§21 `quota-monitor.ts`）を TDD で実装。テスト 17 件追加、設計書の MISSING が 0 件に。
+- `design-local-phase1.md` §24.1 にテスト環境（DOM ライブラリなしで globals を差し替える）を追記。
+- 次は T3（配線と最小 UI。Vite など依存の追加は要確認）。
 
 ### 2026-09-26（19 回目）
 
