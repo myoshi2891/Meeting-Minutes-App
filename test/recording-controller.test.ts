@@ -2,7 +2,7 @@ import "fake-indexeddb/auto";
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseWavHeader } from "../src/audio/wav";
-import { makeChunkKey, RecordingController, sha256Hex } from "../src/recording/recording-controller";
+import { makeChunkKey, RecordingController, sha256Hex, type DirectChunkSaver } from "../src/recording/recording-controller";
 import { ChunkStore, MeetingStore, openDatabase } from "../src/storage/idb";
 import type { AudioChunkRecord, RecordingHealth, WorkletCommand } from "../src/types/recording";
 import { meetingLockName, tryAcquireMeetingLock } from "../src/recording/meeting-lock";
@@ -89,7 +89,7 @@ interface Setup {
   untilCommand: (type: WorkletCommand["type"]) => Promise<void>;
 }
 
-async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Promise<Setup> {
+async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, directSaver?: DirectChunkSaver): Promise<Setup> {
   const db = await openDatabase(new IDBFactory());
   const chunkStore = chunkStoreOverride?.(db) ?? new ChunkStore(db);
   const meetingStore = new MeetingStore(db);
@@ -134,6 +134,7 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Prom
     },
     setTimer: (fn) => timers.push(fn),
     locks,
+    directSaver,
   });
   const fireTimers = () => {
     for (const fn of timers.splice(0)) fn();
@@ -403,6 +404,62 @@ describe("RecordingController", () => {
 
     expect(await s.controller.drainMemoryBacklog()).toBe(1);
     expect((await s.chunkStore.getChunk("m1:mic:000000"))?.meta.sequenceNo).toBe(0);
+  });
+
+  /** IDB への書き込みが常に失敗する ChunkStore（別タブの versionchange で接続が閉じた状態） */
+  const closedStore = (db: IDBDatabase): ChunkStore =>
+    new (class extends ChunkStore {
+      override async putChunk(): Promise<void> {
+        throw new DOMException("The database connection is closing.", "InvalidStateError");
+      }
+    })(db);
+
+  it("IDB に書けない Chunk は drain でサーバーへ直接送り、メモリ待機から外す", async () => {
+    // Arrange
+    const sent: string[] = [];
+    const s = await setup(closedStore, {
+      put: async (r) => {
+        sent.push(r.chunkKey);
+        return { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false };
+      },
+    });
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.sendChunk(1600);
+    await s.until(() => s.errors.length >= 1);
+    // Act
+    const drained = await s.controller.drainMemoryBacklog();
+    // Assert：再オープンしても直らない（VersionError）ので IDB を待たずにサーバーへ逃がす
+    expect(drained).toBe(1);
+    expect(sent).toEqual(["m1:mic:000000"]);
+    expect(s.controller.memoryBacklogCount).toBe(0);
+  });
+
+  it("サーバーへの直接送信も失敗したら IDB の例外を投げ、メモリ待機に残す", async () => {
+    // Arrange
+    const s = await setup(closedStore, {
+      put: async () => ({ ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } }),
+    });
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.sendChunk(1600);
+    await s.until(() => s.errors.length >= 1);
+    // Act / Assert
+    await expect(s.controller.drainMemoryBacklog()).rejects.toThrow("The database connection is closing.");
+    expect(s.controller.memoryBacklogCount).toBe(1);
+  });
+
+  it("メモリ待機中の Chunk を WAV として書き出せる（書き出してもメモリ待機からは外さない）", async () => {
+    // Arrange
+    const s = await setup(closedStore);
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.sendChunk(1600);
+    await s.until(() => s.errors.length >= 1);
+    // Act
+    const files = s.controller.exportMemoryBacklog();
+    // Assert：ファイル名に使えない ":" を含む chunkKey ではなく、会議・source・連番から名前を作る
+    expect(files.map((f) => f.fileName)).toEqual(["m1_mic_000000.wav"]);
+    expect(files[0]?.meta.sequenceNo).toBe(0);
+    expect(files[0]?.wav.type).toBe("audio/wav");
+    expect(s.controller.memoryBacklogCount).toBe(1);
   });
 
   it("Worklet の ready が報告するレートと AudioContext のレートが異なれば onError", async () => {

@@ -15,10 +15,23 @@ import { createSessionClock, frameToOffsetMs } from "./session-clock";
 import { buildStandaloneWav } from "../audio/wav";
 import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
+import type { SaveOutcome } from "../api/local-saver";
 
 /** Chunk を保存 State Machine に投入する口。LocalSaveScheduler が構造的に満たす（テストでは差し替える）。 */
 export interface ChunkEnqueuer {
   enqueue(chunkKey: string): Promise<void>;
+}
+
+/** IDB を経由せずサーバーへ Chunk を送る口。LocalSaver が構造的に満たす（テストでは差し替える）。 */
+export interface DirectChunkSaver {
+  put(record: AudioChunkRecord): Promise<SaveOutcome>;
+}
+
+/** メモリ待機中の Chunk を利用者の手元へ書き出すためのファイル（exportMemoryBacklog）。 */
+export interface MemoryBacklogFile {
+  readonly fileName: string;
+  readonly wav: Blob;
+  readonly meta: ChunkTimingMetadata;
 }
 
 export interface RecordingControllerDeps {
@@ -34,6 +47,8 @@ export interface RecordingControllerDeps {
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
   /** 録音中の会議ロック（本番は navigator.locks）。§23 の復旧はロック保持中の会議に触らない */
   readonly locks: MeetingLockManager;
+  /** IDB に書けない Chunk をサーバーへ直接送る（drainMemoryBacklog）。省略時は直接送らない */
+  readonly directSaver?: DirectChunkSaver;
 }
 
 /** Worklet が flush / stop に応答しない（AudioContext が閉じられた等）ときに待機を打ち切るまでの時間 */
@@ -204,7 +219,12 @@ export class RecordingController {
     this.releaseLock = null;
   }
 
-  /** IDB クォータが回復したときに UI / QuotaMonitor から呼ぶ。 */
+  /**
+   * IDB クォータが回復したとき、または IDB_WRITE_FAILED のときに UI / QuotaMonitor から呼ぶ。
+   * クォータ以外の失敗（別タブの versionchange で接続が閉じた等）は再オープンしても直らないため、
+   * サーバーへ直接送る。直接送った Chunk は IDB に残らないが、Finalizer はサーバーの登録で連番を埋める（§22）。
+   * 直接送信も失敗したら元の例外を投げ、Chunk はメモリ待機に残す（exportMemoryBacklog で書き出せる）。
+   */
   async drainMemoryBacklog(): Promise<number> {
     let drained = 0;
     while (this.memoryBacklog.length > 0) {
@@ -213,7 +233,10 @@ export class RecordingController {
         await this.deps.chunkStore.putChunk(record);
       } catch (error) {
         if (isQuotaExceeded(error)) break;
-        throw error;
+        if (!(await this.sendDirect(record))) throw error;
+        this.memoryBacklog.shift();
+        drained++;
+        continue;
       }
       this.memoryBacklog.shift();
       record.save.status = "IDB_STORED";
@@ -225,6 +248,27 @@ export class RecordingController {
 
   get memoryBacklogCount(): number {
     return this.memoryBacklog.length;
+  }
+
+  /**
+   * メモリ待機中の Chunk を WAV として書き出す（ダウンロードは UI が行う）。IDB にもサーバーにも保存できないとき、
+   * 再読み込みやタブを閉じる前に利用者の手元へ残すための経路。書き出してもメモリ待機からは外さない（後で drain できる）。
+   */
+  exportMemoryBacklog(): MemoryBacklogFile[] {
+    const files: MemoryBacklogFile[] = [];
+    for (const record of this.memoryBacklog) {
+      if (record.wav === null) continue;
+      const { meetingId, source, sequenceNo } = record.meta;
+      // chunkKey の ":" はファイル名に使えない OS があるため、"_" で区切る
+      files.push({ fileName: `${meetingId}_${source}_${sequenceNo.toString().padStart(6, "0")}.wav`, wav: record.wav, meta: record.meta });
+    }
+    return files;
+  }
+
+  private async sendDirect(record: AudioChunkRecord): Promise<boolean> {
+    if (this.deps.directSaver === undefined) return false;
+    const outcome = await this.deps.directSaver.put(record);
+    return outcome.ok;
   }
 
   /** flush / stop を送り、同じ requestId の flushed を待つ。応答がなければタイムアウトで onError を通知して待機を打ち切る。 */
