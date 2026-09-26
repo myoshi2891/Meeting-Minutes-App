@@ -24,15 +24,14 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-26・13 回目：T1-e / T1-f）
+### 未コミットの変更（2026-09-26・14 回目：連番のリセット）
 
-12 回目までの変更はコミット済み。
+13 回目までの変更はコミット済み。
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/recording/finalizer.ts`、`test/finalizer.test.ts` | T1-e：確定時に末尾の欠けを `missingTailMs` で返す（`measureMissingTailMs()` を export）。T1-f：連続性検査をサーバー一覧の取得後に移し、IDB にない連番もサーバーに登録済みなら数える。テスト 4 件（3 件は修正前 Red を確認、欠けなしの 1 件は既存挙動の維持）。会議フィクスチャの `audioFrameCount` を最後の Chunk の終わりに揃えた | `feat(recording): ...` |
-| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | T1-f：`directSaver` 依存（省略可）、`drainMemoryBacklog()` の直接送信、`exportMemoryBacklog()`。テスト 3 件（2 件は修正前 Red を確認、直接送信も失敗する 1 件は既存挙動の維持） | `feat(recording): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §3.4・§15・§22 の本文とコード。phase2-client §4 Controller と §7 Finalizer の本文とコード） | `docs(phase1): ...` |
+| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | `setUp` で会議を確定したときに `nextSequenceNo` を 0 に戻す（同じインスタンスで stop → 別会議の start をすると前の会議の続きから採番され、Finalizer の連番チェックが通らなかった）。テスト 1 件（修正前 Red を確認） | `fix(recording): reset chunk sequence number per meeting` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §15 のコードと採番の本文。phase2-client §4 Controller にも同じ欠陥があったため同じ形で修正） | `docs(phase1): reset chunk sequence number per meeting` |
 
 ---
 
