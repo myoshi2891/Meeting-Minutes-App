@@ -1711,6 +1711,9 @@ export class RecordingController {
 
     for (const track of mediaStream.getAudioTracks()) {
       track.addEventListener("ended", () => {
+        // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する
+        if (this.node === null) return;
+        if (this.deps.health.degradedReasons.includes("MIC_TRACK_ENDED")) return;
         this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "MIC_TRACK_ENDED"];
       });
     }
@@ -1720,12 +1723,14 @@ export class RecordingController {
    * recording を保存した後の start 失敗を巻き戻す。Worklet を切り離し、会議を created に戻す。
    * recording のまま残すと、次回起動の復旧が stop_requested に落として Chunk のない会議を finalize しうる。
    * 巻き戻しの保存失敗は onError に通知し、呼び出し元には元の例外を返す。
+   * stop() は Worklet がないと何もしないため、マイクのトラックもここで止める。
    */
   private async rollBackStart(meeting: MeetingRecord): Promise<void> {
     this.sourceNode?.disconnect();
     this.sourceNode = null;
     if (this.node !== null) this.node.port.onmessage = null;
     this.node = null;
+    for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
     this.meeting = null;
     this.clock = null;
     meeting.status = "created";
@@ -1929,7 +1934,7 @@ Worklet が応答しない場合（AudioContext が閉じられた、Processor �
 
 Scheduler への依存は `enqueue()` だけを持つ `ChunkEnqueuer` インターフェースに絞っている。`LocalSaveScheduler` はこのインターフェースを構造的に満たすため、呼び出し側の配線は変わらない。
 
-録音中の会議は、会議ごとの Web Lock（会議ロック）で示す。Phase 1 は複数タブでの同時録音を許すため、あとから開いたタブの起動時復旧（§23）が、別タブで録音中の `recording` を中断と誤認して `stop_requested` に落とさないようにするためである。`start()` は `recording` を書く**前**にロックを取り（先に書くと、ロックのない `recording` を他タブの復旧が拾える）、取れなければ失敗する。ロックは `stop()` の finally、または `start()` が途中で失敗したときに解放する。`recording` を保存した後に失敗した場合（Worklet ノードの生成失敗など）は、`rollBackStart()` が Worklet を切り離し、会議を `created` に戻してから例外を返す。`recording` のまま残すと、ロックの解放後に次回起動の復旧（§23）が `stop_requested` に落とし、Chunk のない会議を finalize しうるためである。`created` は復旧の対象外である。タブが閉じたり落ちたりした場合はブラウザが自動で解放するので、クラッシュした会議は従来どおり復旧の対象になる。ロックマネージャは `locks` で依存注入する（本番は `navigator.locks`。`LockManager` は `MeetingLockManager` を構造的に満たす）。
+録音中の会議は、会議ごとの Web Lock（会議ロック）で示す。Phase 1 は複数タブでの同時録音を許すため、あとから開いたタブの起動時復旧（§23）が、別タブで録音中の `recording` を中断と誤認して `stop_requested` に落とさないようにするためである。`start()` は `recording` を書く**前**にロックを取り（先に書くと、ロックのない `recording` を他タブの復旧が拾える）、取れなければ失敗する。ロックは `stop()` の finally、または `start()` が途中で失敗したときに解放する。`recording` を保存した後に失敗した場合（Worklet ノードの生成失敗など）は、`rollBackStart()` が Worklet を切り離してマイクのトラックを止め、会議を `created` に戻してから例外を返す。`stop()` は Worklet がなければ何もしないため、ここで止めないとマイクを取得したままになる。`recording` のまま残すと、ロックの解放後に次回起動の復旧（§23）が `stop_requested` に落とし、Chunk のない会議を finalize しうるためである。`created` は復旧の対象外である。タブが閉じたり落ちたりした場合はブラウザが自動で解放するので、クラッシュした会議は従来どおり復旧の対象になる。ロックマネージャは `locks` で依存注入する（本番は `navigator.locks`。`LockManager` は `MeetingLockManager` を構造的に満たす）。
 
 ```typescript
 // src/recording/meeting-lock.ts
@@ -2293,10 +2298,14 @@ export class LocalSaveScheduler {
     void this.pump();
   }
 
-  /** backend が HEALTHY に戻ったとき、BACKEND_UNAVAILABLE / 上限到達 LOCAL_SAVE_FAILED（retryable のみ）を一括再投入する。 */
-  async resumeAll(): Promise<void> {
+  /**
+   * backend が HEALTHY に戻ったとき、BACKEND_UNAVAILABLE / 上限到達 LOCAL_SAVE_FAILED（retryable のみ）を一括再投入する。
+   * skipMeetingIds の会議（別タブで録音中）の Chunk は、そのタブのスケジューラに任せて触らない。
+   */
+  async resumeAll(skipMeetingIds: ReadonlySet<string> = new Set()): Promise<void> {
     const unfinished = await this.deps.chunkStore.listUnfinished();
     for (const r of unfinished) {
+      if (skipMeetingIds.has(r.meta.meetingId)) continue;
       if (isResumable(r) && !this.pending.includes(r.chunkKey) && !this.inFlight.has(r.chunkKey)) {
         await this.deps.chunkStore.updateSaveState(r.chunkKey, (x) => {
           // 一覧取得後に別経路で保存が進んでいたら書き戻さない
@@ -2366,13 +2375,23 @@ export class LocalSaveScheduler {
   }
 
   private async markAllPendingUnavailable(): Promise<void> {
-    for (const key of this.pending) {
+    // 保存済みのキーを pending から外すため、コピーを走査する
+    for (const key of [...this.pending]) {
       if (this.markedUnavailable.has(key)) continue;
-      this.markedUnavailable.add(key);
+      let settled = false;
       await this.deps.chunkStore.updateSaveState(key, (r) => {
+        // リトライタイマーが resumeAll 後に遅れて再投入したキーなど、別経路で保存済み・送信中なら書き戻さない
+        settled = r.save.status === "DB_REGISTERED" || r.save.status === "SAVED" || r.save.status === "SAVING";
+        if (settled) return;
         r.save.status = "BACKEND_UNAVAILABLE";
       });
+      if (settled) {
+        this.pending.splice(this.pending.indexOf(key), 1);
+        continue;
+      }
+      this.markedUnavailable.add(key);
     }
+    this.deps.health.pendingChunkCount = this.pendingCount;
     // pending 配列は保持する。resumeAll() または backend 復帰時の pump() で再開する。
   }
 
@@ -2501,7 +2520,7 @@ export function isTerminal(record: AudioChunkRecord): boolean {
 
 `setTimer` を依存注入しているのは、テストで仮想時間を使うためと、バックグラウンドタブでの `setTimeout` throttle が「リトライが遅れる」以上の影響を持たないことを明示するためである。リトライが遅れても Chunk は IndexedDB にあり、録音は継続する。
 
-同じ Chunk の二重送信は 3 段で防ぐ。`enqueue()` / `resumeAll()` / リトライタイマーは同時に同じ Chunk を投入しうるため、第一に `insertSorted()` が `pending` 内の重複を排除する。第二に、PUT 実行中の `chunkKey` を `inFlight`（`Set`）で持ち、`pump()` は実行中のキーを取り出さない。`runOne()` が自分自身を再投入した場合も、完了後の `pump()` で拾われる。第三に、`runOne()` は送信直前に IndexedDB の状態を読み、`DB_REGISTERED` または `SAVING` なら送らない。これにより、`resumeAll()` で保存が完了した後に遅れて発火したリトライタイマーが再送することはない。`resumeAll()` は一覧取得後に別経路で状態が進んでいた Chunk を `LOCAL_SAVE_PENDING` に書き戻さない。
+同じ Chunk の二重送信は 3 段で防ぐ。`enqueue()` / `resumeAll()` / リトライタイマーは同時に同じ Chunk を投入しうるため、第一に `insertSorted()` が `pending` 内の重複を排除する。第二に、PUT 実行中の `chunkKey` を `inFlight`（`Set`）で持ち、`pump()` は実行中のキーを取り出さない。`runOne()` が自分自身を再投入した場合も、完了後の `pump()` で拾われる。第三に、`runOne()` は送信直前に IndexedDB の状態を読み、`DB_REGISTERED` または `SAVING` なら送らない。これにより、`resumeAll()` で保存が完了した後に遅れて発火したリトライタイマーが再送することはない。backend 停止中にそのタイマーが発火した場合も、`markAllPendingUnavailable()` が同じ状態（`DB_REGISTERED` / `SAVED` / `SAVING`）を確かめ、`BACKEND_UNAVAILABLE` に書き戻さずに `pending` から外す。`resumeAll()` は一覧取得後に別経路で状態が進んでいた Chunk を `LOCAL_SAVE_PENDING` に書き戻さない。
 
 backend が利用できない間、`pump()` は `enqueue()` のたびに `markAllPendingUnavailable()` を呼ぶ。`pending` 全件を毎回書き直すと、停止中の滞留 Chunk 数に比例した IndexedDB 書き込みが Chunk ごとに発生する。そこで `BACKEND_UNAVAILABLE` を書き込み済みのキーを `markedUnavailable` に記録し、2 回目以降は書き込まない。`pump()` がキーを `pending` から取り出したとき、および `enqueue()` が状態を `LOCAL_SAVE_PENDING` に書き戻したときは記録を消し、再び滞留したら改めて書き込む。
 
@@ -3146,7 +3165,8 @@ export async function recoverOnStartup(
     }
     requeued++;
   }
-  await scheduler.resumeAll();
+  // 録音中の会議の Chunk は録音タブのスケジューラが送る。ここで再投入すると二重に PUT する
+  await scheduler.resumeAll(active);
   return { interruptedMeetings: interrupted, requeuedChunks: requeued };
 }
 
@@ -3156,7 +3176,7 @@ function isInterrupted(record: AudioChunkRecord): boolean {
 }
 ```
 
-会議ロック（§15）が保持されている会議は、別タブで録音中なので中断とみなさず、会議レコードも Chunk も書き換えない（`SAVING` を書き戻すと、そのタブの PUT 中に状態が巻き戻る）。ロックが取れた会議は、処理のあいだロックを保持してから解放する。
+会議ロック（§15）が保持されている会議は、別タブで録音中なので中断とみなさず、会議レコードも Chunk も書き換えない（`SAVING` を書き戻すと、そのタブの PUT 中に状態が巻き戻る）。最後の `resumeAll()` にもこれらの会議 ID を渡し、そのタブのスケジューラが待機させている `BACKEND_UNAVAILABLE` などの Chunk を再投入しない（二重に PUT するため）。ロックが取れた会議は、処理のあいだロックを保持してから解放する。
 
 `recording` のまま残っていた会議は、`stop_requested` に落とす前に `sessionClock.audioFrameCount` を保存済み Chunk の最大 `endFrame` から復元する。この値は `stop()` でしか永続化されないため、録音中のクラッシュでは初期値のまま残り、Finalizer が誤った `totalAudioFrames` を送ることになる。すでに大きい値が保存されていれば維持する。
 
