@@ -20,20 +20,19 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 207 件がすべて通過。`npm run typecheck` もエラーなし。
+- 自動テスト: 17 ファイル / 214 件がすべて通過。`npm run typecheck` もエラーなし。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-26・12 回目のレビュー対応）
+### 未コミットの変更（2026-09-26・13 回目：T1-e / T1-f）
 
-11 回目までの変更はコミット済み。
+12 回目までの変更はコミット済み。
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | `setUp()` の `addModule()` / `meetingStore.put()` が失敗したときもマイクのトラックを止め、`sessionClock` を戻す（ロックは従来どおり `start()` の catch が解放）。回帰テスト 2 件（修正前 Red を確認） | `fix(recording): ...` |
-| `src/recording/finalizer.ts`、`src/api/backend-health-monitor.ts`、`test/finalizer.test.ts`、`test/backend-health-monitor.test.ts` | Finalizer の `GET /chunks`・`POST /finalize` と `GET /health` に `redirect: "error"`（§4.4、LocalSaver と揃える）。回帰テスト 2 件（修正前 Red を確認） | `fix(save): ...` |
-| `test/local-saver.test.ts`、`test/finalizer.test.ts` | タイムアウトのテスト 3 件を実時間待ちから fake timers（`setTimeout` のみ偽装）へ。Finalizer はハングする fetch への到達を待ってから時間を進める | `test(save): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §4.4 本文、§15 本文とコード、§18・§22 のコード。phase2-client の Controller `setUp()`、Finalizer、SSE クライアント、`Phase2Client.request()` の `redirect: "error"`） | `docs(phase1): ...` |
+| `src/recording/finalizer.ts`、`test/finalizer.test.ts` | T1-e：確定時に末尾の欠けを `missingTailMs` で返す（`measureMissingTailMs()` を export）。T1-f：連続性検査をサーバー一覧の取得後に移し、IDB にない連番もサーバーに登録済みなら数える。テスト 4 件（3 件は修正前 Red を確認、欠けなしの 1 件は既存挙動の維持）。会議フィクスチャの `audioFrameCount` を最後の Chunk の終わりに揃えた | `feat(recording): ...` |
+| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | T1-f：`directSaver` 依存（省略可）、`drainMemoryBacklog()` の直接送信、`exportMemoryBacklog()`。テスト 3 件（2 件は修正前 Red を確認、直接送信も失敗する 1 件は既存挙動の維持） | `feat(recording): ...` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §3.4・§15・§22 の本文とコード。phase2-client §4 Controller と §7 Finalizer の本文とコード） | `docs(phase1): ...` |
 
 ---
 
@@ -57,15 +56,15 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | T1-c | RecordingController | ~~`flush()` と `stop()` が重なっても、`stop()` は自分の `flushed` まで解決しない~~ → requestId 化の回帰テストで対応済み（2026-09-25） | — |
 | T1-d | RecordingController | `meetingStore.put` が reject しても、トラック停止と `onmessage` の解除が行われる | `test/recording-controller.test.ts`（T1-c と同じファイルなので直列） |
 
-### T1-f. IDB 書き込みの非クォータ失敗と versionchange からの回復【要判断・利用者に確認】
+### T1-f. IDB 書き込みの非クォータ失敗と versionchange からの回復 ✅ 完了（2026-09-26・利用者判断：直接送信＋書き出し）
 
-8・9 回目のレビュー指摘。9 回目で `IDB_WRITE_FAILED` の記録は対応済み。残りは再オープン経路で、`persistChunk` の非クォータ失敗（別タブの versionchange で接続が閉じた後の `InvalidStateError` など）は `IDB_WRITE_FAILED` として表示されるが、`drainMemoryBacklog` が同じ例外で止まりメモリ待機分を救済する経路がないため、Finalizer が `waiting_local_save` のまま止まる。現設計（§10 `openDatabase`）は「接続を閉じて再読み込みを促す」方針で、ChunkStore の再オープンは設計にない。ただし別タブが新しい `DB_VERSION` へアップグレードした後は、旧コードの `open(DB_NAME, 旧版)` が `VersionError` になるため再オープンでは直らない。メモリ待機を失わずに済む経路（例: 待機分をサーバーへ直接 PUT、または UI でエクスポートを促してから再読み込み）を決めてから、設計書 → テスト → 実装の順で進める。
+- `drainMemoryBacklog()` はクォータ以外の失敗で `directSaver`（`LocalSaver`）からサーバーへ直接 PUT し、失敗したら例外を投げてメモリ待機に残す。`exportMemoryBacklog()` で WAV を書き出せる。
+- Finalizer は IDB にない連番でもサーバーに登録済みなら揃っているとみなす。
+- 残り：UI 配線は T3、書き出した WAV をサーバーへ取り込む経路は保留・メモへ。
 
-### T1-e. stop タイムアウト時の扱い【要判断・利用者に確認】
+### T1-e. stop タイムアウト時の扱い ✅ 完了（2026-09-26・利用者判断：検出して警告）
 
-- Worklet が 5 秒以内に `stop` に応答しないと、最終の部分 Chunk がないまま `stop_requested` が確定し、Finalizer は欠けた末尾に気づけない。
-- レビューでは「stop 未完了」状態の追加が提案されたが、`MeetingStatus` の変更（Phase 2 / 3 設計書と復旧・UI に波及）になり、Worklet は既に切断済みで失われた音声を取り戻す経路がない。状態を足すか、`totalAudioFrames` と Chunk の `endFrame` の差で検出して UI に警告するかを決める。
-- 9 回目のレビューで再び「stop 未完了状態を足し、末尾 Chunk が回復するまで finalize を拒否」と指摘されたが見送り。Worklet 切断後に末尾を回復する経路がないため、その状態は finalize できないまま抜けられなくなる。
+- 状態は増やさない。Finalizer が確定時に `totalAudioFrames` と最後の Chunk の `endFrame` を比べ、欠けがあれば `{ ok: true, missingTailMs }` を返す（`measureMissingTailMs()` を export）。警告表示は T3。
 - phase2-client §22 の「finalizing から再試行して失敗しても stop_requested に戻る」テストは、Phase 2 実装時に追加する。
 
 ### T2. Step 1-f: §20 / §21 の実装【T0 の後／T2-a と T2-b は並行可】
@@ -84,6 +83,8 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
   - Scheduler の `onBackendUnreachable` / `onBackendUnauthorized` → Monitor（§18）
   - `finalizeMeeting` の `unpersistedChunkCount: () => controller.memoryBacklogCount`（§22）
   - 起動時の `recoverOnStartup`（§23）
+  - `RecordingController` の `directSaver: LocalSaver`、`IDB_WRITE_FAILED` のときの `drainMemoryBacklog()` 呼び出し、失敗時に `exportMemoryBacklog()` のダウンロードを促す表示（§15）
+  - `finalizeMeeting` の `missingTailMs` を「末尾 約◯秒が保存されていません」と警告表示（§22）
 - Worklet を配信するには開発サーバー / バンドラ（例: Vite）が要る。**依存の追加になるので、着手前に利用者に確認する。**
 
 ### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-g）【T3 の後】
@@ -96,11 +97,9 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 2026-09-25 のレビュー指摘（3 回目）。別タブで録音中に新しいタブが開くと、`recoverOnStartup` がその会議を `stop_requested` に落とし、Barrier の自動再試行で録音中に finalize されうる（§3.1 で複数タブの同時録音を許している）。
 - 対応: 会議ごとの Web Lock（`src/recording/meeting-lock.ts`）。`start()` が recording を書く前に取得し `stop()` の finally で解放、`recoverOnStartup` はロック保持中の会議と Chunk に触らない。`RecordingControllerDeps.locks` と `recoverOnStartup` の第 4 引数 `locks` を追加し、テストはハーネスの `FakeLockManager` を使う。
 
-### T6. stop() の Worklet 無応答をどう扱うか【方針決定が必要】
+### T6. stop() の Worklet 無応答をどう扱うか ✅ 完了（T1-e で対応）
 
-- 2026-09-25 のレビュー指摘（4 回目）で有効と判定したが見送った。`stop()` の `requestFlush` がタイムアウトすると、最終の部分 Chunk が届かないまま会議が `stop_requested` になり、Barrier は末尾が欠けたまま finalize できてしまう（`onError` の通知だけ）。
-- 指摘の案は「専用の失敗状態（例: `stop_failed`）を追加し、Finalizer と復旧で進めない」。ただし `MeetingStatus` の追加は Phase 2 以降の設計とサーバー契約にも影響し、その会議を利用者が確定させる手段（手動 finalize）も要るため、着手前に利用者に確認する。
-- 6 回目のレビューでも同系統の指摘があった（`stop()` の flush 完了後に `finalChunkCount` を確定・永続化し、Finalizer は未確定や件数不一致を拒否する）。クラッシュ復旧した会議は `stop()` を通らず確定値を持たないため、復旧経路の扱いと合わせて本タスクで決める。
+- 専用の失敗状態は足さず、Finalizer の `missingTailMs` で検出・警告する方針に決定。クラッシュ復旧した会議は §23 が `audioFrameCount` を最大 `endFrame` から復元するので欠けとは判定されない。
 
 ### T7. 起動時復旧が non-retryable の Chunk も再送する ✅ 完了（5 回目のレビュー対応）
 
@@ -108,6 +107,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### 保留・メモ
 
+- T1-f で書き出した WAV（`exportMemoryBacklog()`）をサーバーへ取り込む経路は未設計。必要になったら Phase 2 以降で API を検討する。
 - `package.json` に lint スクリプトがない。コミット前の確認は現状 `typecheck` + `test` のみ。
 - 設計書のテストコード（`test/harness.ts`、`test/crash-recovery.test.ts`、`test/chunk-standalone.test.ts`）は、実装側にテストを足したため設計書と一致しない。設計書側は「最低限のテスト集合」という扱いで許容している。
 
@@ -116,6 +116,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-26（13 回目）
+
+- 利用者判断により T1-e（末尾の欠けを検出して警告）と T1-f（IDB に書けない Chunk をサーバーへ直接送り、だめなら WAV 書き出し）を実装した。T6 は T1-e で解消。
+- インターフェース変更: `FinalizeResult` の成功に `missingTailMs?`、`RecordingControllerDeps.directSaver?`、`RecordingController.exportMemoryBacklog()`、`measureMissingTailMs()` を export（すべて追加のみ）。
 
 ### 2026-09-26（12 回目）
 
