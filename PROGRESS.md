@@ -17,17 +17,19 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-c | §10 IndexedDB + §15 RecordingController | 🟡 コード・自動テストのみ | **未**：実マイクで 5 分録音 → IDB に 10 Chunk、`<audio>` で再生 |
 | 1-d | §17 LocalSaver / Scheduler + §18 BackendHealthMonitor | 🟡 コード・自動テストのみ | **未**：実サーバー（最小スタブ）へ PUT が届く |
 | 1-e | §22 Finalizer + §23 Recovery | 🟡 コード・自動テストのみ | **未**：タブ強制終了 → 再起動で再送 |
-| 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 §19〜§21・§31 はコード・自動テストのみ | UI が未着手（T3-c）。§28.3 の手動項目 |
+| 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 コード・自動テスト・最小 UI あり | **未**：§28.3 の手動項目（実マイク・実サーバー、T4） |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 20 ファイル / 256 件がすべて通過。`npm run typecheck` もエラーなし。`npm run build` も通る。
+- 自動テスト: 21 ファイル / 287 件がすべて通過。`npm run typecheck` もエラーなし。`npm run build` も通る。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致（MISSING なし）。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
 ### 未コミットの変更
 
-- `fix(app)`: 録音中に `setToken` しても `directSaver` が開始時の LocalSaver（未設定・失効トークン）を使い続ける不具合を修正（`src/app/app.ts`、回帰テスト 2 件 `test/app.test.ts`）
-- `docs(phase1)`: §31 のコードと本文を同期
+- `feat(app)`: `listPendingFinalize` / `retryFinalize`（`src/app/app.ts`、テスト 3 件 `test/app.test.ts`）
+- `feat(ui)`: `src/ui/recording-view.ts`、`test/recording-view.test.ts`
+- `feat(ui)`: 最小 UI（`src/main.ts`、`index.html`）
+- `docs(phase1)`: §31.4 最小 UI の追加と §31 の同期
 - `chore(progress)`: 本ファイル
 
 ---
@@ -66,26 +68,25 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - DOM ライブラリは追加していない。`window` / `document` / `navigator` は `vi.stubGlobal` で差し替える（§24.1 に追記）。Node の `Event.returnValue` は旧仕様のアクセサなので、beforeunload の Fake はデータプロパティで上書きしている。
 - `drainMemoryBacklog()` との連携は、§21 のコードが `QuotaAction` を返すだけで呼び出し側の責務なので、T3 の配線に移した。
 
-### T3. アプリの配線と最小 UI（T3-a・T3-b 完了／T3-c が次）
+### T3. アプリの配線と最小 UI ✅ 完了（2026-09-27）
 
 設計は [design-local-phase1.md](design-local-phase1.md) §31（アプリの組み立て）。利用者判断（2026-09-26）：Vite を追加し、配線は設計書に節を足してから実装する。
 
 | ID | 内容 | 状態 |
 | --- | --- | --- |
 | T3-a | Vite 7.3.6（devDependency）、`vite.config.ts`（127.0.0.1・strictPort・worker は ES）、`index.html`（§4.4 の CSP を meta で）、`src/main.ts`（Worklet を `?worker&url` で解決） | ✅ `npm run build` で Worklet が独立した JS として出る。dev サーバーで配信を確認 |
-| T3-b | `src/app/app.ts`（`createApp` / `App` / `RecordingSession`）。§31.2 の配線表どおりに、Monitor↔Scheduler、起動時復旧、backend 復帰時の resumeAll と finalize 再試行、`setToken`、クォータ、drain、ページライフサイクル、stop → finalize をつないだ | ✅ `test/app.test.ts` 17 件。配線を 1 本ずつ外すと Red になることを確認済み |
-| T3-c | 最小 DOM UI（`src/main.ts` から `createApp` を呼ぶ） | ⬜ 次に着手 |
+| T3-b | `src/app/app.ts`（`createApp` / `App` / `RecordingSession`）。§31.2 の配線表どおりに、Monitor↔Scheduler、起動時復旧、backend 復帰時の resumeAll と finalize 再試行、`setToken`、クォータ、drain、ページライフサイクル、stop → finalize をつないだ | ✅ `test/app.test.ts` 20 件。配線を 1 本ずつ外すと Red になることを確認済み |
+| T3-c | 最小 DOM UI（§31.4） | ✅ 表示文言は Vitest、画面は Playwright で確認 |
 
-T3-c でやること:
-- トークン入力（`app.setToken`）、録音開始（getUserMedia・同意確認）/ 停止ボタン
-- 状態表示：backend の状態、`pendingChunkCount`、`degradedReasons`
-- `AppEvent` の表示：`finalized` の `missingTailMs` →「末尾 約◯秒が保存されていません」、`export_required`、`memory_backlog_export_required` → `session.controller.exportMemoryBacklog()` の WAV ダウンロード
-- `onHidden` で `assessHealth` の監視間隔を詰める（§19 / §20）
-- §20 のヘルプ文言（直近最大 30 秒が失われる可能性）
-- `waiting_local_save` で終わった会議を「確定待ち」と表示し、手動で再試行できるようにする（§31.2 の既知の制約）
+T3-c の内容（§31.4）:
+- `src/ui/recording-view.ts`（表示文言を作る純関数。28 件）と `src/main.ts`（DOM の薄い層）、`index.html`（画面と最小スタイル）
+- `app.ts` に `listPendingFinalize()` / `retryFinalize()` を追加（「確定待ち」の手動再試行。backend 復帰時の自動再試行も同じ経路）
+- Playwright で dev サーバーの画面を確認済み：サーバー未接続のバナー、ヘルプ文言が出る。コンソールのエラーなし（favicon は `data:,`）、通信先は 127.0.0.1 のみ
+- 実マイクでの録音・同意ダイアログ・getUserMedia 拒否・タブの切り替えは未確認（T4）
 
-### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-g）【T3 の後】
+### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-f / 1-g）【次に着手】
 
+- 起動は `npm run dev` → http://127.0.0.1:5173/ 。1-c（実マイク → IDB）はサーバーなしでも確認できる（DevTools の Application → IndexedDB `minutes-local`）。
 - 1-d・1-e には実サーバーが要る。Phase 2 サーバー設計（[design-local-phase2-server.md](design-local-phase2-server.md)、Python）から、`/v1/health`・`PUT chunk`・`GET chunks`・`POST finalize` だけの最小スタブを作るかを判断する。
 - 結果は [design-local-phase1.md](design-local-phase1.md) §28 の「状況」列に反映する。
 
@@ -121,6 +122,12 @@ T3-c でやること:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-27（22 回目）
+
+- T3-c：設計書 §31.4 を追加し、表示文言の純関数 `recording-view.ts`（28 件）と DOM 層 `main.ts`・`index.html` を実装。`app.ts` に確定待ちの一覧と手動再試行を追加（3 件）。
+- `recovered` が `createApp` の中で届くため、そのときまだない `app` を参照して起動が失敗する不具合を、実装中に見つけて回避した。
+- Playwright で画面・コンソール・通信先を確認。次は T4（実マイク・実サーバーでの手動確認）。
 
 ### 2026-09-27（21 回目）
 
