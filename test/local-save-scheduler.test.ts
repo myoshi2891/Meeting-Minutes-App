@@ -284,4 +284,42 @@ describe("LocalSaveScheduler", () => {
     expect((await s.status(0))?.status).toBe("DB_REGISTERED");
     expect(s.stats().putCount).toBe(2);
   });
+
+  it("backend 停止中に何度 enqueue しても、各 Chunk への BACKEND_UNAVAILABLE の書き込みは 1 回だけ", async () => {
+    // Arrange：BACKEND_UNAVAILABLE を書いた回数を chunkKey ごとに数える
+    const s = await setup((r) => okResponse(r), "UNREACHABLE");
+    const original = s.chunkStore.updateSaveState.bind(s.chunkStore);
+    const unavailableWrites = new Map<string, number>();
+    s.chunkStore.updateSaveState = (key, mutate) =>
+      original(key, (r) => {
+        mutate(r);
+        if (r.save.status === "BACKEND_UNAVAILABLE") unavailableWrites.set(key, (unavailableWrites.get(key) ?? 0) + 1);
+      });
+    // Act
+    for (let i = 0; i < 5; i++) await s.add(i);
+    await s.advance(0);
+    // Assert
+    for (let i = 0; i < 5; i++) expect((await s.status(i))?.status).toBe("BACKEND_UNAVAILABLE");
+    expect(unavailableWrites.get("m:mic:000000")).toBe(1);
+    expect([...unavailableWrites.values()].every((n) => n === 1)).toBe(true);
+    expect(s.stats().putCount).toBe(0);
+  });
+
+  it("backend が復帰して送信を試みた Chunk は、再停止したら再び BACKEND_UNAVAILABLE を書く", async () => {
+    // Arrange：停止中に BACKEND_UNAVAILABLE を書き、復帰後の 1 回目の PUT は 5xx で RETRYING になる
+    const s = await setup((r, attempt) => (attempt === 1 ? new Response("{}", { status: 500 }) : okResponse(r)), "UNREACHABLE");
+    await s.add(0);
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("BACKEND_UNAVAILABLE");
+    s.backend.status = "HEALTHY";
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("RETRYING");
+    // Act：再停止した後にリトライタイマーが発火する
+    s.backend.status = "UNREACHABLE";
+    await s.advance(3_000);
+    // Assert：RETRYING のまま放置せず、停止中の待機状態を書き直す
+    expect((await s.status(0))?.status).toBe("BACKEND_UNAVAILABLE");
+    expect(s.stats().putCount).toBe(1);
+  });
 });
