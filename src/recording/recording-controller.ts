@@ -1,0 +1,402 @@
+// src/recording/recording-controller.ts
+import {
+  AUDIO_PIPELINE_CONFIG,
+  DEFAULT_VAD_CONFIG,
+  isWorkletEvent,
+  type AudioChunkRecord,
+  type ChunkTimingMetadata,
+  type MeetingRecord,
+  type RecordingHealth,
+  type SessionClock,
+  type WorkletCommand,
+  type WorkletEvent,
+} from "../types/recording";
+import { createSessionClock, frameToOffsetMs } from "./session-clock";
+import { buildStandaloneWav } from "../audio/wav";
+import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
+import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
+import type { SaveOutcome } from "../api/local-saver";
+
+/** Chunk を保存 State Machine に投入する口。LocalSaveScheduler が構造的に満たす（テストでは差し替える）。 */
+export interface ChunkEnqueuer {
+  enqueue(chunkKey: string): Promise<void>;
+}
+
+/** IDB を経由せずサーバーへ Chunk を送る口。LocalSaver が構造的に満たす（テストでは差し替える）。 */
+export interface DirectChunkSaver {
+  put(record: AudioChunkRecord): Promise<SaveOutcome>;
+}
+
+/** メモリ待機中の Chunk を利用者の手元へ書き出すためのファイル（exportMemoryBacklog）。 */
+export interface MemoryBacklogFile {
+  readonly fileName: string;
+  readonly wav: Blob;
+  readonly meta: ChunkTimingMetadata;
+}
+
+export interface RecordingControllerDeps {
+  readonly audioContext: AudioContext;
+  readonly mediaStream: MediaStream;
+  readonly chunkStore: ChunkStore;
+  readonly meetingStore: MeetingStore;
+  readonly scheduler: ChunkEnqueuer;
+  readonly health: RecordingHealth;
+  readonly workletModuleUrl: string;
+  readonly onError: (error: Error) => void;
+  /** flush / stop の応答待ちタイムアウト用。既定は setTimeout（テストでは差し替える） */
+  readonly setTimer?: (fn: () => void, ms: number) => unknown;
+  /** 録音中の会議ロック（本番は navigator.locks）。§23 の復旧はロック保持中の会議に触らない */
+  readonly locks: MeetingLockManager;
+  /** IDB に書けない Chunk をサーバーへ直接送る（drainMemoryBacklog）。省略時は直接送らない */
+  readonly directSaver?: DirectChunkSaver;
+}
+
+/** Worklet が flush / stop に応答しない（AudioContext が閉じられた等）ときに待機を打ち切るまでの時間 */
+const FLUSH_TIMEOUT_MS = 5_000;
+
+export function makeChunkKey(meetingId: string, source: "mic" | "system", sequenceNo: number): string {
+  return `${meetingId}:${source}:${sequenceNo.toString().padStart(6, "0")}`;
+}
+
+export async function sha256Hex(data: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export class RecordingController {
+  private node: AudioWorkletNode | null = null;
+  private sourceNode: MediaStreamAudioSourceNode | null = null;
+  private clock: SessionClock | null = null;
+  private meeting: MeetingRecord | null = null;
+  private nextSequenceNo = 0;
+  /** QuotaExceededError で IDB に書けなかった Chunk（§3.4 段階3） */
+  private readonly memoryBacklog: AudioChunkRecord[] = [];
+  /** Chunk 処理の直列化。Worklet からの chunk イベントは順序どおりに IDB へ書く。 */
+  private chunkQueue: Promise<void> = Promise.resolve();
+  /** requestId → flushed 待機。応答は要求 ID で対応付ける（タイムアウト後の遅れた応答が別の要求を解放しないように） */
+  private readonly flushWaiters = new Map<number, () => void>();
+  private nextRequestId = 0;
+  /** 会議ロックの解放。start で取得し、stop の完了で解放する */
+  private releaseLock: (() => void) | null = null;
+
+  constructor(private readonly deps: RecordingControllerDeps) {}
+
+  get sessionClock(): SessionClock | null {
+    return this.clock;
+  }
+
+  async start(meetingId: string, title: string, consentConfirmedAt: number): Promise<void> {
+    const { audioContext, mediaStream, workletModuleUrl } = this.deps;
+
+    // recording を書く前にロックを取る。先に書くと、別タブの復旧がロックのない recording を中断扱いにできてしまう
+    const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
+    if (release === null) throw new Error(`meeting ${meetingId} is already being recorded`);
+    this.releaseLock = release;
+    try {
+      await this.setUp(meetingId, title, consentConfirmedAt);
+    } catch (error) {
+      this.unlock();
+      throw error;
+    }
+  }
+
+  private async setUp(meetingId: string, title: string, consentConfirmedAt: number): Promise<void> {
+    const { audioContext, mediaStream, workletModuleUrl } = this.deps;
+
+    let meeting: MeetingRecord;
+    try {
+      // AudioContext は sampleRate を指定せずに生成されている前提。実際の値はここで取得する。
+      await audioContext.audioWorklet.addModule(workletModuleUrl);
+      this.clock = createSessionClock(audioContext);
+
+      meeting = {
+        meetingId,
+        title,
+        status: "recording",
+        sessionClock: this.clock,
+        consentConfirmedAt,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        endedAt: null,
+        finalChunkCount: null,
+      };
+      await this.deps.meetingStore.put(meeting);
+    } catch (error) {
+      // recording はまだ保存されていないので会議は巻き戻さない。stop() は Worklet がないと何もしないため、マイクだけここで止める
+      for (const track of mediaStream.getAudioTracks()) track.stop();
+      this.clock = null;
+      throw error;
+    }
+    this.meeting = meeting;
+    // 連番は会議ごと。同じインスタンスで次の会議を録ると前の会議の続きから採番され、Finalizer の連番チェックが通らなくなる
+    this.nextSequenceNo = 0;
+
+    try {
+      const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        channelCount: 1,
+        channelCountMode: "explicit",
+      });
+      node.port.onmessage = (event: MessageEvent<unknown>) => {
+        if (!isWorkletEvent(event.data)) return;
+        this.handleWorkletEvent(event.data);
+      };
+      this.node = node;
+      this.sourceNode = audioContext.createMediaStreamSource(mediaStream);
+      this.sourceNode.connect(node);
+
+      this.post({ type: "configure", vad: DEFAULT_VAD_CONFIG });
+      this.post({ type: "start" });
+    } catch (error) {
+      await this.rollBackStart(meeting);
+      throw error;
+    }
+
+    for (const track of mediaStream.getAudioTracks()) {
+      track.addEventListener("ended", () => {
+        // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する
+        if (this.node === null) return;
+        if (this.deps.health.degradedReasons.includes("MIC_TRACK_ENDED")) return;
+        this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "MIC_TRACK_ENDED"];
+      });
+    }
+  }
+
+  /**
+   * recording を保存した後の start 失敗を巻き戻す。Worklet を切り離し、会議を created に戻す。
+   * recording のまま残すと、次回起動の復旧が stop_requested に落として Chunk のない会議を finalize しうる。
+   * 巻き戻しの保存失敗は onError に通知し、呼び出し元には元の例外を返す。
+   * stop() は Worklet がないと何もしないため、マイクのトラックもここで止める。
+   */
+  private async rollBackStart(meeting: MeetingRecord): Promise<void> {
+    this.sourceNode?.disconnect();
+    this.sourceNode = null;
+    if (this.node !== null) this.node.port.onmessage = null;
+    this.node = null;
+    for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
+    this.meeting = null;
+    this.clock = null;
+    meeting.status = "created";
+    meeting.updatedAt = Date.now();
+    try {
+      await this.deps.meetingStore.put(meeting);
+    } catch (rollbackError) {
+      this.deps.onError(rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)));
+    }
+  }
+
+  /** pagehide 用。Worklet に flush を要求し、部分 Chunk の IDB 書き込みまで待つ。 */
+  async flush(): Promise<void> {
+    if (this.node === null) return;
+    await this.requestFlush("flush");
+    await this.chunkQueue;
+  }
+
+  /** stop_requested → 最終 Chunk 生成 → IDB 書き込み完了まで待つ。Finalization Barrier は §22。 */
+  async stop(): Promise<void> {
+    if (this.node === null || this.meeting === null) return;
+    const meeting = this.meeting;
+    try {
+      meeting.status = "stop_requested";
+      await this.deps.meetingStore.put(meeting);
+
+      await this.requestFlush("stop");
+      await this.chunkQueue;
+      // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
+      meeting.updatedAt = Date.now();
+      await this.deps.meetingStore.put(meeting);
+    } finally {
+      // 途中で reject してもマイクと Worklet を解放する
+      this.sourceNode?.disconnect();
+      if (this.node !== null) this.node.port.onmessage = null;
+      this.node = null;
+      for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
+      this.unlock();
+    }
+  }
+
+  private unlock(): void {
+    this.releaseLock?.();
+    this.releaseLock = null;
+  }
+
+  /**
+   * IDB クォータが回復したとき、または IDB_WRITE_FAILED のときに UI / QuotaMonitor から呼ぶ。
+   * クォータ以外の失敗（別タブの versionchange で接続が閉じた等）は再オープンしても直らないため、
+   * サーバーへ直接送る。直接送った Chunk は IDB に残らないが、Finalizer はサーバーの登録で連番を埋める（§22）。
+   * 直接送信も失敗したら元の例外を投げ、Chunk はメモリ待機に残す（exportMemoryBacklog で書き出せる）。
+   */
+  async drainMemoryBacklog(): Promise<number> {
+    let drained = 0;
+    while (this.memoryBacklog.length > 0) {
+      const record = this.memoryBacklog[0];
+      try {
+        await this.deps.chunkStore.putChunk(record);
+      } catch (error) {
+        if (isQuotaExceeded(error)) break;
+        if (!(await this.sendDirect(record))) throw error;
+        this.memoryBacklog.shift();
+        drained++;
+        continue;
+      }
+      this.memoryBacklog.shift();
+      record.save.status = "IDB_STORED";
+      await this.deps.scheduler.enqueue(record.chunkKey);
+      drained++;
+    }
+    if (this.memoryBacklog.length === 0) {
+      // IDB の劣化理由は「メモリ待機がクラッシュで失われうる」ことの警告。空になったら外す（次に書けなければ persistChunk が付け直す）
+      this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
+        (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
+      );
+    }
+    return drained;
+  }
+
+  get memoryBacklogCount(): number {
+    return this.memoryBacklog.length;
+  }
+
+  /**
+   * メモリ待機中の Chunk を WAV として書き出す（ダウンロードは UI が行う）。IDB にもサーバーにも保存できないとき、
+   * 再読み込みやタブを閉じる前に利用者の手元へ残すための経路。書き出してもメモリ待機からは外さない（後で drain できる）。
+   */
+  exportMemoryBacklog(): MemoryBacklogFile[] {
+    const files: MemoryBacklogFile[] = [];
+    for (const record of this.memoryBacklog) {
+      if (record.wav === null) continue;
+      const { meetingId, source, sequenceNo } = record.meta;
+      // chunkKey の ":" はファイル名に使えない OS があるため、"_" で区切る
+      files.push({ fileName: `${meetingId}_${source}_${sequenceNo.toString().padStart(6, "0")}.wav`, wav: record.wav, meta: record.meta });
+    }
+    return files;
+  }
+
+  private async sendDirect(record: AudioChunkRecord): Promise<boolean> {
+    if (this.deps.directSaver === undefined) return false;
+    const outcome = await this.deps.directSaver.put(record);
+    // DB 未登録（registered: false）は成功にしない。IDB にもないので外すと Finalizer が埋められない欠番になる
+    return outcome.ok && outcome.registered;
+  }
+
+  /** flush / stop を送り、同じ requestId の flushed を待つ。応答がなければタイムアウトで onError を通知して待機を打ち切る。 */
+  private requestFlush(type: "flush" | "stop"): Promise<void> {
+    const requestId = ++this.nextRequestId;
+    const setTimer = this.deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+    return new Promise<void>((resolve) => {
+      this.flushWaiters.set(requestId, resolve);
+      setTimer(() => {
+        // 応答済みなら何もしない。自分の待機だけを外し、遅れて届いた flushed は対応する待機がないので無視される
+        if (!this.flushWaiters.delete(requestId)) return;
+        this.deps.onError(new Error(`worklet did not respond to ${type} within ${FLUSH_TIMEOUT_MS}ms`));
+        resolve();
+      }, FLUSH_TIMEOUT_MS);
+      this.post({ type, requestId });
+    });
+  }
+
+  private post(cmd: WorkletCommand): void {
+    this.node?.port.postMessage(cmd);
+  }
+
+  private handleWorkletEvent(event: WorkletEvent): void {
+    const now = performance.now();
+    switch (event.type) {
+      case "ready":
+        // nativeSampleRate は createSessionClock で取得済み。ここでは一致確認のみ。
+        if (this.clock !== null && this.clock.nativeSampleRate !== event.nativeSampleRate) {
+          this.deps.onError(new Error(`sampleRate mismatch: main=${this.clock.nativeSampleRate} worklet=${event.nativeSampleRate}`));
+        }
+        break;
+      case "heartbeat":
+        this.deps.health.lastAudioFrameAt = now;
+        if (this.clock !== null) this.clock.audioFrameCount = event.audioFrameCount;
+        break;
+      case "chunk":
+        this.deps.health.lastAudioFrameAt = now;
+        if (this.clock !== null) this.clock.audioFrameCount = event.endFrame;
+        this.chunkQueue = this.chunkQueue
+          .then(() => this.persistChunk(event))
+          .catch((error: unknown) => this.deps.onError(error instanceof Error ? error : new Error(String(error))));
+        break;
+      case "flushed":
+        if (this.clock !== null) this.clock.audioFrameCount = event.audioFrameCount;
+        // chunk イベントは flushed より先に届く（同一 MessagePort は順序保証）。
+        // 要求した requestId の待機だけを解放する。後続コマンドの待機は自分の flushed まで残す。
+        this.chunkQueue = this.chunkQueue.then(() => {
+          const resolve = this.flushWaiters.get(event.requestId);
+          this.flushWaiters.delete(event.requestId);
+          resolve?.();
+        });
+        break;
+    }
+  }
+
+  private async persistChunk(event: Extract<WorkletEvent, { type: "chunk" }>): Promise<void> {
+    if (this.meeting === null || this.clock === null) throw new Error("recording not started");
+
+    const sequenceNo = this.nextSequenceNo++;
+    const pcm = new Int16Array(event.pcm, 0, event.sampleCount);
+    const wavBuffer = buildStandaloneWav(pcm);
+    const sha256 = await sha256Hex(wavBuffer);
+
+    const startOffsetMs = frameToOffsetMs(event.startFrame);
+    const endOffsetMs = frameToOffsetMs(event.endFrame);
+    const meta: ChunkTimingMetadata = {
+      meetingId: this.meeting.meetingId,
+      source: "mic",
+      sequenceNo,
+      startFrame: event.startFrame,
+      endFrame: event.endFrame,
+      startOffsetMs,
+      endOffsetMs,
+      wallClockStartEpochMs: this.clock.sessionStartEpochMs + startOffsetMs,
+      sampleRate: AUDIO_PIPELINE_CONFIG.targetSampleRate,
+      channels: AUDIO_PIPELINE_CONFIG.channels,
+      durationMs: endOffsetMs - startOffsetMs,
+      sampleCount: event.sampleCount,
+      vadScore: event.vad.score,
+      hasVoice: event.vad.hasVoice,
+      sha256,
+      sizeBytes: wavBuffer.byteLength,
+    };
+
+    const record: AudioChunkRecord = {
+      chunkKey: makeChunkKey(meta.meetingId, meta.source, sequenceNo),
+      meta,
+      save: {
+        status: "GENERATED",
+        savedVia: null,
+        attempts: 0,
+        nextRetryAt: null,
+        lastError: null,
+        serverPath: null,
+        updatedAt: performance.now(),
+      },
+      wav: new Blob([wavBuffer], { type: "audio/wav" }),
+      createdAt: Date.now(),
+    };
+
+    try {
+      await this.deps.chunkStore.putChunk(record);
+    } catch (error) {
+      // 失敗理由を問わずメモリ待機に残す。sequenceNo は採番済みなので、捨てると欠番になり Finalizer が進めなくなる
+      this.memoryBacklog.push(record);
+      // §3.4 段階3：メモリ待機。録音は止めない。メモリ待機はクラッシュで失われるため、理由を問わず UI に出す
+      const reason = isQuotaExceeded(error) ? "IDB_QUOTA_EXHAUSTED" : "IDB_WRITE_FAILED";
+      if (!this.deps.health.degradedReasons.includes(reason)) {
+        this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, reason];
+      }
+      if (reason === "IDB_QUOTA_EXHAUSTED") return;
+      throw error;
+    }
+
+    record.save.status = "IDB_STORED";
+    await this.deps.chunkStore.updateSaveState(record.chunkKey, (r) => {
+      r.save.status = "IDB_STORED";
+    });
+    this.deps.health.lastChunkAt = performance.now();
+    await this.deps.scheduler.enqueue(record.chunkKey);
+  }
+}
