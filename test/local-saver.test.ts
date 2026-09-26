@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { assertLocalHost, LocalSaver } from "../src/api/local-saver";
 import type { AudioChunkRecord } from "../src/types/recording";
 import { makeChunkRecord } from "./harness";
@@ -124,8 +124,15 @@ describe("LocalSaver.put", () => {
       new Promise((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
       });
-    const outcome = await saverWith(hanging, 20).put(r);
-    expect(outcome).toMatchObject({ ok: false, retryable: true, error: { kind: "TIMEOUT" } });
+    // 実時間を待たない。タイマーだけ偽装し、fetch の abort を requestTimeoutMs 経過で発火させる
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const pending = saverWith(hanging, 20).put(r);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(await pending).toMatchObject({ ok: false, retryable: true, error: { kind: "TIMEOUT" } });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("Blob がクォータ縮退で削除済みなら送信せず VALIDATION", async () => {

@@ -35,6 +35,36 @@ async function recordAndSave(h: Harness, n: number): Promise<void> {
   for (let i = 0; i < 5; i++) await h.advance(100);
 }
 
+/**
+ * 応答しない fetch。呼ばれたら reached が解決し、abort されるまで返らない。
+ * 実時間を待たずにタイムアウトさせるため、呼び出し側は reached を待ってからタイマーを進める。
+ */
+function hangingFetch(): { fetch: (init: RequestInit | undefined) => Promise<Response>; reached: Promise<void> } {
+  let markReached: () => void = () => undefined;
+  const reached = new Promise<void>((resolve) => {
+    markReached = resolve;
+  });
+  const fetch = (init: RequestInit | undefined): Promise<Response> =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      markReached();
+    });
+  return { fetch, reached };
+}
+
+/** fake-indexeddb が使う setImmediate は偽装せず、setTimeout だけを偽装して timeoutMs 進める */
+async function withFakeTimeout<T>(run: () => Promise<T>, reached: Promise<void>, timeoutMs: number): Promise<T> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const pending = run();
+    await reached;
+    await vi.advanceTimersByTimeAsync(timeoutMs);
+    return await pending;
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 function deps(h: Harness, fetchImpl: typeof fetch = h.server.fetch): FinalizerDeps {
   return { chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl, unpersistedChunkCount: () => 0 };
 }
@@ -227,22 +257,18 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
   it("GET /chunks が応答しなければ timeoutMs で verify の失敗 Result を返す", async () => {
     const h = await createHarness();
     await recordAndSave(h, 1);
-    const hangsOnList: typeof fetch = (input, init) =>
-      String(input).endsWith("/chunks")
-        ? new Promise((_r, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason)))
-        : h.server.fetch(input, init);
-    const result = await finalizeMeeting({ ...deps(h, hangsOnList), timeoutMs: 20 }, MEETING_ID);
+    const hang = hangingFetch();
+    const hangsOnList: typeof fetch = (input, init) => (String(input).endsWith("/chunks") ? hang.fetch(init) : h.server.fetch(input, init));
+    const result = await withFakeTimeout(() => finalizeMeeting({ ...deps(h, hangsOnList), timeoutMs: 20 }, MEETING_ID), hang.reached, 20);
     expect(result).toMatchObject({ ok: false, stage: "verify" });
   });
 
   it("POST /finalize が応答しなければ timeoutMs で finalize の失敗 Result を返し、stop_requested に戻る", async () => {
     const h = await createHarness();
     await recordAndSave(h, 1);
-    const hangsOnPost: typeof fetch = (input, init) =>
-      init?.method === "POST"
-        ? new Promise((_r, reject) => init.signal?.addEventListener("abort", () => reject(init.signal?.reason)))
-        : h.server.fetch(input, init);
-    const result = await finalizeMeeting({ ...deps(h, hangsOnPost), timeoutMs: 20 }, MEETING_ID);
+    const hang = hangingFetch();
+    const hangsOnPost: typeof fetch = (input, init) => (init?.method === "POST" ? hang.fetch(init) : h.server.fetch(input, init));
+    const result = await withFakeTimeout(() => finalizeMeeting({ ...deps(h, hangsOnPost), timeoutMs: 20 }, MEETING_ID), hang.reached, 20);
     expect(result).toMatchObject({ ok: false, stage: "finalize" });
     expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
   });
