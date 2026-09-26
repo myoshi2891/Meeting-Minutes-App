@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- §4.4 の CSP。frame-ancestors は meta では無視されるため、配信側ヘッダでのみ付ける -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self' http://127.0.0.1:43117 http://localhost:43117; worker-src 'self'; script-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+    />
+    <title>Minutes</title>
+    <!-- favicon を要求させない（404 をコンソールに出さない）。img-src 'self' data: の範囲 -->
+    <link rel="icon" href="data:," />
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.6; }
+      body { max-width: 720px; margin: 0 auto; padding: 16px; }
+      section { border: 1px solid #8884; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+      h1 { font-size: 1.4rem; margin: 0 0 8px; }
+      h2 { font-size: 1.05rem; margin: 0 0 8px; }
+      .banner { background: #fff3cd; color: #664d03; border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+      .warning { background: #f8d7da; color: #58151c; border-radius: 6px; padding: 8px 12px; margin: 4px 0; }
+      .help { font-size: 0.9rem; opacity: 0.8; }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+      .elapsed { font-size: 2rem; font-variant-numeric: tabular-nums; }
+      input[type="text"], input[type="password"] { flex: 1; min-width: 12rem; padding: 4px 8px; }
+      button { padding: 4px 12px; }
+      ul { padding-left: 1.2rem; margin: 4px 0; }
+      [hidden] { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <h1>Minutes</h1>
+    <div id="banner" class="banner" hidden></div>
+    <div id="warnings"></div>
+
+    <section>
+      <h2>録音</h2>
+      <div class="row">
+        <input id="title" type="text" placeholder="会議のタイトル" />
+        <button id="start" type="button">録音開始</button>
+        <button id="stop" type="button" hidden>録音停止</button>
+      </div>
+      <div class="row"><span id="elapsed" class="elapsed">00:00</span></div>
+      <div class="row help"><span id="storage"></span></div>
+      <div class="row" id="export-row" hidden>
+        <button id="export" type="button">WAV を書き出す</button>
+      </div>
+      <p class="help" id="tab-close-help"></p>
+    </section>
+
+    <section>
+      <h2>お知らせ</h2>
+      <ul id="notices"></ul>
+    </section>
+
+    <section>
+      <h2>確定待ちの会議</h2>
+      <ul id="pending"></ul>
+    </section>
+
+    <section>
+      <h2>設定</h2>
+      <form id="token-form" class="row">
+        <input id="token" type="password" autocomplete="off" placeholder="サーバーのトークン" />
+        <button type="submit">保存</button>
+      </form>
+      <p class="help" id="local-data-notice"></p>
+    </section>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

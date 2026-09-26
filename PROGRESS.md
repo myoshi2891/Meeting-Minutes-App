@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-09-26（ブランチ `dev`）
+最終更新: 2026-09-27（ブランチ `dev`）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -17,20 +17,20 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-c | §10 IndexedDB + §15 RecordingController | 🟡 コード・自動テストのみ | **未**：実マイクで 5 分録音 → IDB に 10 Chunk、`<audio>` で再生 |
 | 1-d | §17 LocalSaver / Scheduler + §18 BackendHealthMonitor | 🟡 コード・自動テストのみ | **未**：実サーバー（最小スタブ）へ PUT が届く |
 | 1-e | §22 Finalizer + §23 Recovery | 🟡 コード・自動テストのみ | **未**：タブ強制終了 → 再起動で再送 |
-| 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
+| 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 コード・自動テスト・最小 UI あり | **未**：§28.3 の手動項目（実マイク・実サーバー、T4） |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 214 件がすべて通過。`npm run typecheck` もエラーなし。
-- 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
+- 自動テスト: 21 ファイル / 287 件がすべて通過。`npm run typecheck` もエラーなし。`npm run build` も通る。
+- 設計書と src の同期: `src/` の埋め込みコードはすべて一致（MISSING なし）。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-26・17 回目：実装スキルの設計書参照をフェーズ別にする）
+### 未コミットの変更
 
-16 回目までの変更はコミット済み。
-
-| 変更 | 内容 | 推奨コミット |
-| --- | --- | --- |
-| `.claude/skills/implement-design-step/SKILL.md` | 手順 2 で `design-local-phase1.md` 固定だった設計書の参照を、タスクのフェーズを決めてから対応する `design-local-phase*.md` を選ぶ形に変更（Phase 2 以降のタスクで phase1 を引かないため） | `chore(claude): look up the design doc matching the task phase` |
+- `feat(app)`: `listPendingFinalize` / `retryFinalize`（`src/app/app.ts`、テスト 3 件 `test/app.test.ts`）
+- `feat(ui)`: `src/ui/recording-view.ts`、`test/recording-view.test.ts`
+- `feat(ui)`: 最小 UI（`src/main.ts`、`index.html`）
+- `docs(phase1)`: §31.4 最小 UI の追加と §31 の同期
+- `chore(progress)`: 本ファイル
 
 ---
 
@@ -38,21 +38,18 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 依存関係と並行実行の可否を明記する。「並行可」のタスクは、別エージェントや別セッションに分けても衝突しない（触るファイルが重ならない）。
 
-### T0. 未コミット変更のコミット【最優先・他タスクの前提】
+### T0. 未コミット変更のコミット ✅ 完了（2026-09-26 時点で作業ツリーは clean）
 
-- 上の表の単位でコミットを分ける。`design-local.md` の扱いは利用者に確認する。
-- 前提確認: `npm run typecheck && npm test`
+### T1. レビュー修正の回帰テスト追加 ✅ 完了（2026-09-26・19 回目）
 
-### T1. レビュー修正の回帰テスト追加【T0 の後／T1-a〜d は並行可】
-
-2026-09-25 のレビュー修正のうち、テストがないもの。どれも「修正前のコードで Red になる」ことを確認してから Green にする。
+2026-09-25 のレビュー修正のうち、テストがないもの。どれも修正箇所を一時的に外して Red になることを確認済み。src は無変更。
 
 | ID | 対象 | テストで再現する状況 | 触るファイル |
 | --- | --- | --- | --- |
-| T1-a | BackendHealthMonitor | `checkOnce` の応答待ち中に `stop()` → `start()` しても、ポーリングが 1 系統だけになる | `test/backend-health-monitor.test.ts` |
-| T1-b | LocalSaveScheduler | backend 停止中に N 回 `enqueue` しても、各キーへの `BACKEND_UNAVAILABLE` 書き込みは 1 回だけ。復帰 → 再停止したら再び書く | `test/local-save-scheduler.test.ts` |
+| T1-a | BackendHealthMonitor | ✅ `checkOnce` の応答待ち中に `stop()` → `start()` しても、ポーリングが 1 系統だけになる | `test/backend-health-monitor.test.ts` |
+| T1-b | LocalSaveScheduler | ✅ backend 停止中に N 回 `enqueue` しても、各キーへの `BACKEND_UNAVAILABLE` 書き込みは 1 回だけ。復帰 → 再停止したら再び書く | `test/local-save-scheduler.test.ts` |
 | T1-c | RecordingController | ~~`flush()` と `stop()` が重なっても、`stop()` は自分の `flushed` まで解決しない~~ → requestId 化の回帰テストで対応済み（2026-09-25） | — |
-| T1-d | RecordingController | `meetingStore.put` が reject しても、トラック停止と `onmessage` の解除が行われる | `test/recording-controller.test.ts`（T1-c と同じファイルなので直列） |
+| T1-d | RecordingController | ✅ `stop()` 中に `meetingStore.put` が reject しても、トラック停止・`onmessage` の解除・会議ロックの解放が行われる | `test/recording-controller.test.ts` |
 
 ### T1-f. IDB 書き込みの非クォータ失敗と versionchange からの回復 ✅ 完了（2026-09-26・利用者判断：直接送信＋書き出し）
 
@@ -65,28 +62,31 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 状態は増やさない。Finalizer が確定時に `totalAudioFrames` と最後の Chunk の `endFrame` を比べ、欠けがあれば `{ ok: true, missingTailMs }` を返す（`measureMissingTailMs()` を export）。警告表示は T3。
 - phase2-client §22 の「finalizing から再試行して失敗しても stop_requested に戻る」テストは、Phase 2 実装時に追加する。
 
-### T2. Step 1-f: §20 / §21 の実装【T0 の後／T2-a と T2-b は並行可】
+### T2. Step 1-f: §20 / §21 の実装 ✅ 完了（2026-09-26・20 回目）
 
-設計書にコードがあるので、それを正として TDD で実装する（テストは設計書 §24 にないため新規に書く）。
+- 設計書のコードをそのまま配置し、テストを新規に書いた（`test/page-lifecycle.test.ts` 6 件、`test/quota-monitor.test.ts` 11 件）。
+- DOM ライブラリは追加していない。`window` / `document` / `navigator` は `vi.stubGlobal` で差し替える（§24.1 に追記）。Node の `Event.returnValue` は旧仕様のアクセサなので、beforeunload の Fake はデータプロパティで上書きしている。
+- `drainMemoryBacklog()` との連携は、§21 のコードが `QuotaAction` を返すだけで呼び出し側の責務なので、T3 の配線に移した。
 
-| ID | 内容 | 触るファイル | 備考 |
-| --- | --- | --- | --- |
-| T2-a | §20 `src/recording/page-lifecycle.ts` | 新規 + `test/page-lifecycle.test.ts` | §24.1 のとおり、このファイルだけ DOM が必要。`// @vitest-environment` か EventTarget の Fake で済むか先に判断する |
-| T2-b | §21 `src/storage/quota-monitor.ts` | 新規 + `test/quota-monitor.test.ts` | `drainMemoryBacklog()` との連携（§15）を含める |
+### T3. アプリの配線と最小 UI ✅ 完了（2026-09-27）
 
-### T3. アプリの配線と最小 UI【T2 の後／外部依存の追加を伴うため要確認】
+設計は [design-local-phase1.md](design-local-phase1.md) §31（アプリの組み立て）。利用者判断（2026-09-26）：Vite を追加し、配線は設計書に節を足してから実装する。
 
-- まだエントリポイントがない。未配線なのは次のとおり。
-  - `monitor.onChange → scheduler.resumeAll`
-  - Scheduler の `onBackendUnreachable` / `onBackendUnauthorized` → Monitor（§18）
-  - `finalizeMeeting` の `unpersistedChunkCount: () => controller.memoryBacklogCount`（§22）
-  - 起動時の `recoverOnStartup`（§23）
-  - `RecordingController` の `directSaver: LocalSaver`、`IDB_WRITE_FAILED` のときの `drainMemoryBacklog()` 呼び出し、失敗時に `exportMemoryBacklog()` のダウンロードを促す表示（§15）
-  - `finalizeMeeting` の `missingTailMs` を「末尾 約◯秒が保存されていません」と警告表示（§22）
-- Worklet を配信するには開発サーバー / バンドラ（例: Vite）が要る。**依存の追加になるので、着手前に利用者に確認する。**
+| ID | 内容 | 状態 |
+| --- | --- | --- |
+| T3-a | Vite 7.3.6（devDependency）、`vite.config.ts`（127.0.0.1・strictPort・worker は ES）、`index.html`（§4.4 の CSP を meta で）、`src/main.ts`（Worklet を `?worker&url` で解決） | ✅ `npm run build` で Worklet が独立した JS として出る。dev サーバーで配信を確認 |
+| T3-b | `src/app/app.ts`（`createApp` / `App` / `RecordingSession`）。§31.2 の配線表どおりに、Monitor↔Scheduler、起動時復旧、backend 復帰時の resumeAll と finalize 再試行、`setToken`、クォータ、drain、ページライフサイクル、stop → finalize をつないだ | ✅ `test/app.test.ts` 20 件。配線を 1 本ずつ外すと Red になることを確認済み |
+| T3-c | 最小 DOM UI（§31.4） | ✅ 表示文言は Vitest、画面は Playwright で確認 |
 
-### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-g）【T3 の後】
+T3-c の内容（§31.4）:
+- `src/ui/recording-view.ts`（表示文言を作る純関数。28 件）と `src/main.ts`（DOM の薄い層）、`index.html`（画面と最小スタイル）
+- `app.ts` に `listPendingFinalize()` / `retryFinalize()` を追加（「確定待ち」の手動再試行。backend 復帰時の自動再試行も同じ経路）
+- Playwright で dev サーバーの画面を確認済み：サーバー未接続のバナー、ヘルプ文言が出る。コンソールのエラーなし（favicon は `data:,`）、通信先は 127.0.0.1 のみ
+- 実マイクでの録音・同意ダイアログ・getUserMedia 拒否・タブの切り替えは未確認（T4）
 
+### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-f / 1-g）【次に着手】
+
+- 起動は `npm run dev` → http://127.0.0.1:5173/ 。1-c（実マイク → IDB）はサーバーなしでも確認できる（DevTools の Application → IndexedDB `minutes-local`）。
 - 1-d・1-e には実サーバーが要る。Phase 2 サーバー設計（[design-local-phase2-server.md](design-local-phase2-server.md)、Python）から、`/v1/health`・`PUT chunk`・`GET chunks`・`POST finalize` だけの最小スタブを作るかを判断する。
 - 結果は [design-local-phase1.md](design-local-phase1.md) §28 の「状況」列に反映する。
 
@@ -113,14 +113,45 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ### 保留・メモ
 
 - T1-f で書き出した WAV（`exportMemoryBacklog()`）をサーバーへ取り込む経路は未設計。必要になったら Phase 2 以降で API を検討する。
+- `npm audit` で vitest 3 系（`@vitest/mocker`）に moderate 2 件。修正には vitest 5 への破壊的更新が要るため保留（vite 追加とは無関係）。
 - `package.json` に lint スクリプトがない。コミット前の確認は現状 `typecheck` + `test` のみ。
-- 設計書のテストコード（`test/harness.ts`、`test/crash-recovery.test.ts`、`test/chunk-standalone.test.ts`）は、実装側にテストを足したため設計書と一致しない。設計書側は「最低限のテスト集合」という扱いで許容している。
+- 設計書のテストコード（`test/harness.ts`、`test/crash-recovery.test.ts`、`test/chunk-standalone.test.ts`、`test/resampler-aliasing.test.ts`）は、実装側にテストを足したため設計書と一致しない。設計書側は「最低限のテスト集合」という扱いで許容している。
 
 ---
 
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-27（22 回目）
+
+- T3-c：設計書 §31.4 を追加し、表示文言の純関数 `recording-view.ts`（28 件）と DOM 層 `main.ts`・`index.html` を実装。`app.ts` に確定待ちの一覧と手動再試行を追加（3 件）。
+- `recovered` が `createApp` の中で届くため、そのときまだない `app` を参照して起動が失敗する不具合を、実装中に見つけて回避した。
+- Playwright で画面・コンソール・通信先を確認。次は T4（実マイク・実サーバーでの手動確認）。
+
+### 2026-09-27（21 回目）
+
+- T3-a：Vite を追加し、127.0.0.1 の開発サーバーと、Worklet を別エントリで出力するビルドを用意。§4.4 に「`frame-ancestors` は meta では無効」を追記。
+- T3-b：設計書 §31 を追加し、`src/app/app.ts` を TDD で実装（15 件）。`attachPageLifecycle` の引数を `Pick<RecordingController, "flush">` に絞った（§20）。
+- レビュー指摘 2 件を検証。有効 1 件：`directSaver` が録音開始時の LocalSaver を固定していた → 送るたびに現在の saver を引く口に変更（回帰テスト 2 件）。スキップ 1 件：`enforceQuota` の「削除後も 95% 以上」は次の Chunk の確認で `export_required` になり、停止後は守る IDB 書き込みがないため（§21 の API も変えない）。
+- 次は T3-c（最小 DOM UI）。
+
+### 2026-09-26（20 回目）
+
+- T2-a（§20 `page-lifecycle.ts`）と T2-b（§21 `quota-monitor.ts`）を TDD で実装。テスト 17 件追加、設計書の MISSING が 0 件に。
+- `design-local-phase1.md` §24.1 にテスト環境（DOM ライブラリなしで globals を差し替える）を追記。
+- 次は T3（配線と最小 UI。Vite など依存の追加は要確認）。
+
+### 2026-09-26（19 回目）
+
+- T1-a / T1-b / T1-d の回帰テストを 4 件追加（src 無変更）。各テストは修正箇所を一時的に外して Red を確認済み。
+- `test/recording-controller.test.ts` の `setup()` に `nodePort`（AudioWorkletNode 側のポート）を追加。
+- 次は T2（§20 / §21）。
+
+### 2026-09-26（18 回目）
+
+- トラックの `ended` リスナーを `AbortController` の signal 付きで登録し、`stop()` で解除するように修正（回帰テスト 1 件追加）。
+- `design-local-phase1.md` および `design-local-phase2-client.md` を実装と同期。
 
 ### 2026-09-26（17 回目）
 
