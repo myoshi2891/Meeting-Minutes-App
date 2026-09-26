@@ -4249,7 +4249,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 | `session.stop()` | `controller.stop()` → `detach()` → `finalizeMeeting`（`unpersistedChunkCount` はその会議の controller の `memoryBacklogCount`）→ 成功なら `AppEvent.finalized`（`missingTailMs` 付き） | §22 の呼び出し規約（stop 完了後にだけ Barrier を試みる） |
 
 - `unpersistedChunkCount` は、stop 後もこのタブで録音した会議の controller を引く。stop の後に会議ロックが外れた会議を、サーバー復帰の再試行が拾う可能性があるためである。`() => 0` を渡すと、メモリ待機中の末尾 Chunk を残したまま Barrier を通してしまう。
-- `directSaver`（§15）には録音開始時点の `LocalSaver` を渡す。トークン未設定で始めた録音では直接送信を行わない。
+- `directSaver`（§15）には、送るたびに現在の `LocalSaver` を引く口を渡す。録音開始時点の `LocalSaver` を渡すと、トークン未設定や失効したトークンで始めた録音は、途中で `setToken` しても直接送信が通らない。トークン未設定の間は、送らずに `UNAUTHORIZED` の失敗を返す（Chunk はメモリ待機に残る）。
 - 既知の制約：`finalizeMeeting` が `waiting_local_save` で終わった会議は、次に backend の状態が変わるか、`setToken` を呼ぶか、アプリを再起動するまで再試行されない。UI は会議一覧に「確定待ち」と表示し、手動の再試行を用意する（UI の範囲）。
 - Phase 2 のクライアント（`design-local-phase2-client.md`）は画面共有音声（system）の Controller を追加するため、この層を拡張して使う。
 
@@ -4445,7 +4445,12 @@ export class App {
       },
       setTimer: this.deps.setTimer,
       locks: this.deps.locks,
-      directSaver: this.saver ?? undefined,
+      // 送るたびに現在の saver を引く。録音中に setToken しても、開始時のトークン（未設定・失効）で送り続けない
+      directSaver: {
+        put: async (record) =>
+          this.saver?.put(record) ??
+          { ok: false, retryable: false, error: { kind: "UNAUTHORIZED", message: "backend token is not set", httpStatus: null, at: (this.deps.now ?? Date.now)() } },
+      },
     });
 
     await controller.start(meetingId, input.title, input.consentConfirmedAt);
