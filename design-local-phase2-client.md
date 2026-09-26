@@ -662,6 +662,8 @@ export class RecordingController {
   private nextRequestId = 0;
   /** 会議ロックの解放。registerMeeting の start で取得し、stop の完了で解放する（Phase 1 §15 と同じ） */
   private releaseLock: (() => void) | null = null;
+  /** トラックの ended リスナーの解除用。stop で abort する（Phase 1 §15 と同じ） */
+  private trackListeners: AbortController | null = null;
 
   constructor(private readonly deps: RecordingControllerDeps, readonly source: AudioSource = "mic") {}
 
@@ -746,14 +748,19 @@ export class RecordingController {
     }
 
     const endedReason = this.source === "mic" ? "MIC_TRACK_ENDED" : "SYSTEM_TRACK_ENDED";
+    this.trackListeners = new AbortController();
     for (const track of mediaStream.getAudioTracks()) {
-      track.addEventListener("ended", () => {
-        // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する（Phase 1 §15 と同じ）
-        if (this.node === null) return;
-        if (!this.deps.health.degradedReasons.includes(endedReason)) {
-          this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, endedReason];
-        }
-      });
+      track.addEventListener(
+        "ended",
+        () => {
+          // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する（Phase 1 §15 と同じ）
+          if (this.node === null) return;
+          if (!this.deps.health.degradedReasons.includes(endedReason)) {
+            this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, endedReason];
+          }
+        },
+        { signal: this.trackListeners.signal },
+      );
     }
   }
 
@@ -810,6 +817,8 @@ export class RecordingController {
       this.sourceNode?.disconnect();
       if (this.node !== null) this.node.port.onmessage = null;
       this.node = null;
+      this.trackListeners?.abort();
+      this.trackListeners = null;
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
       this.unlock();
     }
