@@ -861,7 +861,8 @@ export class RecordingController {
   private async sendDirect(record: AudioChunkRecord): Promise<boolean> {
     if (this.deps.directSaver === undefined) return false;
     const outcome = await this.deps.directSaver.put(record);
-    return outcome.ok;
+    // DB 未登録（registered: false）は成功にしない。IDB にもないので外すと Finalizer が埋められない欠番になる
+    return outcome.ok && outcome.registered;
   }
 
   /** flush / stop を送り、同じ requestId の flushed を待つ。応答がなければタイムアウトで onError を通知して打ち切る（Phase 1 §15 と同じ）。 */

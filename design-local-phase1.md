@@ -1851,7 +1851,8 @@ export class RecordingController {
   private async sendDirect(record: AudioChunkRecord): Promise<boolean> {
     if (this.deps.directSaver === undefined) return false;
     const outcome = await this.deps.directSaver.put(record);
-    return outcome.ok;
+    // DB 未登録（registered: false）は成功にしない。IDB にもないので外すと Finalizer が埋められない欠番になる
+    return outcome.ok && outcome.registered;
   }
 
   /** flush / stop を送り、同じ requestId の flushed を待つ。応答がなければタイムアウトで onError を通知して待機を打ち切る。 */
@@ -1980,7 +1981,7 @@ export class RecordingController {
 
 IndexedDB への書き込みに失敗した Chunk は、失敗の理由を問わずメモリ待機キュー（`memoryBacklog`）に残す。`sequenceNo` は採番済みなので、捨てると欠番になり、Finalization Barrier（§22）の連続性検査を永久に通過できなくなるためである。`QuotaExceededError` は §3.4 段階3として `IDB_QUOTA_EXHAUSTED` を記録し、録音を継続する。それ以外のエラー（別タブのアップグレードで接続が閉じられた後の `InvalidStateError` など）は `IDB_WRITE_FAILED` を記録し、`onError` に通知したうえで同じく待機キューに残し、`drainMemoryBacklog()` で再書き込みする。なお、待機キューに残ったのが末尾の Chunk だけだと、IndexedDB 上は欠番なしに見えて連続性検査では検出できない。そのため Finalizer は `memoryBacklogCount` が 0 になるまで Barrier を通さない（§22）。
 
-`drainMemoryBacklog()` は、クォータ以外の理由で再書き込みにも失敗した Chunk を、`directSaver`（本番は `LocalSaver`）でサーバーへ直接 PUT し、成功したらメモリ待機から外す。別タブが `DB_VERSION` を上げた後は、古いコードで開き直しても `VersionError` になり、このタブは二度と IndexedDB に書けないためである。直接送った Chunk は IndexedDB に残らないが、Finalizer はサーバーに登録済みの連番を「揃っている」とみなす（§22）。直接送信も失敗した場合（サーバー停止中など）は IndexedDB の例外をそのまま投げ、Chunk はメモリ待機に残す。このとき UI は `exportMemoryBacklog()` で WAV を書き出させ、再読み込みやタブを閉じる前に利用者の手元へ残す（ファイル名は `<meetingId>_<source>_<6 桁の sequenceNo>.wav`。書き出してもメモリ待機からは外さない）。書き出したファイルをサーバーへ取り込む経路は Phase 1 の範囲外である。`directSaver` を省略すると直接送信は行わない。
+`drainMemoryBacklog()` は、クォータ以外の理由で再書き込みにも失敗した Chunk を、`directSaver`（本番は `LocalSaver`）でサーバーへ直接 PUT し、DB 登録まで済んだ（`ok` かつ `registered`）ときだけメモリ待機から外す。ファイル保存だけで DB 未登録（`registered: false`）のときは外さない。IndexedDB にもない Chunk を外すと、Finalizer はサーバーに登録済みの連番しか数えないので欠番が埋まらず、再送も書き出しもできなくなるためである（この場合は直接送信の失敗と同じ扱いにする）。別タブが `DB_VERSION` を上げた後は、古いコードで開き直しても `VersionError` になり、このタブは二度と IndexedDB に書けないためである。直接送った Chunk は IndexedDB に残らないが、Finalizer はサーバーに登録済みの連番を「揃っている」とみなす（§22）。直接送信も失敗した場合（サーバー停止中など）は IndexedDB の例外をそのまま投げ、Chunk はメモリ待機に残す。このとき UI は `exportMemoryBacklog()` で WAV を書き出させ、再読み込みやタブを閉じる前に利用者の手元へ残す（ファイル名は `<meetingId>_<source>_<6 桁の sequenceNo>.wav`。書き出してもメモリ待機からは外さない）。書き出したファイルをサーバーへ取り込む経路は Phase 1 の範囲外である。`directSaver` を省略すると直接送信は行わない。
 
 `stop()` は `stop_requested` を先に永続化し、最終 Chunk の書き込み完了を待ってから会議レコードをもう一度保存する。最終 flush で確定した `sessionClock.audioFrameCount` を IndexedDB に残すためで、Finalizer はこの値を `totalAudioFrames` として送る。これらの処理全体を try/finally で包み、途中で IndexedDB 書き込みなどが reject しても、ソースノードの切断・`onmessage` の解除・マイクトラックの停止は必ず行う。
 
