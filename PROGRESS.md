@@ -24,14 +24,14 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-26・14 回目：連番のリセット）
+### 未コミットの変更（2026-09-26・15 回目：直接送信の DB 登録確認）
 
-13 回目までの変更はコミット済み。
+14 回目までの変更はコミット済み。
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | `setUp` で会議を確定したときに `nextSequenceNo` を 0 に戻す（同じインスタンスで stop → 別会議の start をすると前の会議の続きから採番され、Finalizer の連番チェックが通らなかった）。テスト 1 件（修正前 Red を確認） | `fix(recording): reset chunk sequence number per meeting` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §15 のコードと採番の本文。phase2-client §4 Controller にも同じ欠陥があったため同じ形で修正） | `docs(phase1): reset chunk sequence number per meeting` |
+| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | `sendDirect` は `ok && registered` のときだけ成功にする（`registered: false` で外すと IDB にもサーバー登録にもない欠番になり、再送も書き出しもできなかった）。テスト 1 件（修正前 Red を確認） | `fix(recording): keep unregistered direct-sent chunks in memory backlog` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §15 のコードと `drainMemoryBacklog()` の本文。phase2-client §4 Controller にも同じ欠陥があったため同じ形で修正） | `docs(phase1): keep unregistered direct-sent chunks in memory backlog` |
 
 ---
 
