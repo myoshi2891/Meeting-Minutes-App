@@ -187,7 +187,12 @@ export class App {
       },
       setTimer: this.deps.setTimer,
       locks: this.deps.locks,
-      directSaver: this.saver ?? undefined,
+      // 送るたびに現在の saver を引く。録音中に setToken しても、開始時のトークン（未設定・失効）で送り続けない
+      directSaver: {
+        put: async (record) =>
+          this.saver?.put(record) ??
+          { ok: false, retryable: false, error: { kind: "UNAUTHORIZED", message: "backend token is not set", httpStatus: null, at: (this.deps.now ?? Date.now)() } },
+      },
     });
 
     await controller.start(meetingId, input.title, input.consentConfirmedAt);

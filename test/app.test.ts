@@ -295,6 +295,20 @@ describe("startRecording（録音ごとの配線）", () => {
     expect(c.drainCount).toBe(1);
   });
 
+  it.each([null, "stale"])("録音中に setToken したら、直接送信（directSaver）も新しいトークンで送る（開始時のトークン: %s）", async (initial) => {
+    // Arrange：トークン未設定・古いトークンのまま録音を始める
+    stubPageGlobals();
+    const s = await setup({ token: initial });
+    const meetingId = nextMeetingId();
+    await s.app.startRecording(startInput(meetingId));
+    const r = await makeChunkRecord(meetingId, 0, 160);
+    // Act
+    await s.app.setToken(TOKEN);
+    const outcome = await s.controllers[0].deps.directSaver?.put(r);
+    // Assert
+    expect(outcome).toMatchObject({ ok: true, registered: true });
+  });
+
   it("IDB_WRITE_FAILED でない onError では drain しない", async () => {
     stubPageGlobals();
     const s = await setup();
