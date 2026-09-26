@@ -128,6 +128,8 @@ export class RecordingController {
       throw error;
     }
     this.meeting = meeting;
+    // 連番は会議ごと。同じインスタンスで次の会議を録ると前の会議の続きから採番され、Finalizer の連番チェックが通らなくなる
+    this.nextSequenceNo = 0;
 
     try {
       const node = new AudioWorkletNode(audioContext, "pcm-chunker", {

@@ -296,6 +296,18 @@ describe("RecordingController", () => {
     expect((await s.meetingStore.get("m1"))?.sessionClock.audioFrameCount).toBe(481600);
   });
 
+  it("同じインスタンスで stop 後に別の会議を start すると、Chunk の連番は 0 から始まる", async () => {
+    // Arrange：1 件目の会議で Chunk を 1 つ保存して止める
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    await s.controller.stop();
+    // Act
+    await s.controller.start("m2", "定例2", 2);
+    await s.controller.stop();
+    // Assert
+    expect(s.enqueued).toEqual(["m1:mic:000000", "m2:mic:000000"]);
+  });
+
   it("Worklet が stop に応答しなくてもタイムアウトで onError を通知し、トラックを解放して stop が終わる", async () => {
     // Arrange
     const s = await setup();
