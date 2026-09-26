@@ -20,13 +20,15 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 §19〜§21・§31 はコード・自動テストのみ | UI が未着手（T3-c）。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 20 ファイル / 254 件がすべて通過。`npm run typecheck` もエラーなし。`npm run build` も通る。
+- 自動テスト: 20 ファイル / 256 件がすべて通過。`npm run typecheck` もエラーなし。`npm run build` も通る。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致（MISSING なし）。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
 ### 未コミットの変更
 
-なし（すべてコミット済み）。
+- `fix(app)`: 録音中に `setToken` しても `directSaver` が開始時の LocalSaver（未設定・失効トークン）を使い続ける不具合を修正（`src/app/app.ts`、回帰テスト 2 件 `test/app.test.ts`）
+- `docs(phase1)`: §31 のコードと本文を同期
+- `chore(progress)`: 本ファイル
 
 ---
 
@@ -71,7 +73,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | ID | 内容 | 状態 |
 | --- | --- | --- |
 | T3-a | Vite 7.3.6（devDependency）、`vite.config.ts`（127.0.0.1・strictPort・worker は ES）、`index.html`（§4.4 の CSP を meta で）、`src/main.ts`（Worklet を `?worker&url` で解決） | ✅ `npm run build` で Worklet が独立した JS として出る。dev サーバーで配信を確認 |
-| T3-b | `src/app/app.ts`（`createApp` / `App` / `RecordingSession`）。§31.2 の配線表どおりに、Monitor↔Scheduler、起動時復旧、backend 復帰時の resumeAll と finalize 再試行、`setToken`、クォータ、drain、ページライフサイクル、stop → finalize をつないだ | ✅ `test/app.test.ts` 15 件。配線を 1 本ずつ外すと Red になることを確認済み |
+| T3-b | `src/app/app.ts`（`createApp` / `App` / `RecordingSession`）。§31.2 の配線表どおりに、Monitor↔Scheduler、起動時復旧、backend 復帰時の resumeAll と finalize 再試行、`setToken`、クォータ、drain、ページライフサイクル、stop → finalize をつないだ | ✅ `test/app.test.ts` 17 件。配線を 1 本ずつ外すと Red になることを確認済み |
 | T3-c | 最小 DOM UI（`src/main.ts` から `createApp` を呼ぶ） | ⬜ 次に着手 |
 
 T3-c でやること:
@@ -124,6 +126,7 @@ T3-c でやること:
 
 - T3-a：Vite を追加し、127.0.0.1 の開発サーバーと、Worklet を別エントリで出力するビルドを用意。§4.4 に「`frame-ancestors` は meta では無効」を追記。
 - T3-b：設計書 §31 を追加し、`src/app/app.ts` を TDD で実装（15 件）。`attachPageLifecycle` の引数を `Pick<RecordingController, "flush">` に絞った（§20）。
+- レビュー指摘 2 件を検証。有効 1 件：`directSaver` が録音開始時の LocalSaver を固定していた → 送るたびに現在の saver を引く口に変更（回帰テスト 2 件）。スキップ 1 件：`enforceQuota` の「削除後も 95% 以上」は次の Chunk の確認で `export_required` になり、停止後は守る IDB 書き込みがないため（§21 の API も変えない）。
 - 次は T3-c（最小 DOM UI）。
 
 ### 2026-09-26（20 回目）
