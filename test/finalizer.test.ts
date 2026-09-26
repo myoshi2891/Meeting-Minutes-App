@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { finalizeMeeting, type FinalizerDeps } from "../src/recording/finalizer";
 import type { MeetingRecord } from "../src/types/recording";
+import { LocalSaver } from "../src/api/local-saver";
 import { BASE_URL, createHarness, makeChunkRecord, TOKEN, type Harness } from "./harness";
 
 // createHarness() はグローバル IndexedDB を共有するため、テストごとに会議 ID を分ける
@@ -15,7 +16,7 @@ function meeting(): MeetingRecord {
     meetingId: MEETING_ID,
     title: "fin",
     status: "stop_requested",
-    sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 960000 },
+    sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 1600 },
     consentConfirmedAt: 1,
     createdAt: 1,
     updatedAt: 1,
@@ -24,9 +25,11 @@ function meeting(): MeetingRecord {
   };
 }
 
-/** seq 0..n-1 を保存し、Scheduler 経由でサーバーへ送り切る */
+/** seq 0..n-1 を保存し、Scheduler 経由でサーバーへ送り切る。録音した長さは stop() の flush 後と同じく最後の Chunk の終わりに揃える */
 async function recordAndSave(h: Harness, n: number): Promise<void> {
-  await h.meetingStore.put(meeting());
+  const m = meeting();
+  if (n > 0) m.sessionClock.audioFrameCount = (n - 1) * 480000 + 1600;
+  await h.meetingStore.put(m);
   for (let seq = 0; seq < n; seq++) {
     const r = await makeChunkRecord(MEETING_ID, seq, 1600);
     await h.chunkStore.putChunk(r);
@@ -86,7 +89,7 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     const m = await h.meetingStore.get(MEETING_ID);
     expect(m?.status).toBe("finalized");
     expect(m?.finalChunkCount).toBe(2);
-    expect(posted).toEqual([{ expectedChunkCounts: { mic: 2, system: 0 }, endedAtEpochMs: m?.endedAt, totalAudioFrames: 960000 }]);
+    expect(posted).toEqual([{ expectedChunkCounts: { mic: 2, system: 0 }, endedAtEpochMs: m?.endedAt, totalAudioFrames: 481600 }]);
   });
 
   it("未登録 Chunk が残っていれば finalizing に進まず waiting_local_save を返し、再投入する", async () => {
@@ -321,6 +324,78 @@ describe("finalizeMeeting（Barrier の追加条件）", () => {
     expect(result.ok).toBe(false);
     expect((await h.chunkStore.getChunk(first.chunkKey))?.save.status).toBe("SAVED");
     expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
+  });
+});
+
+describe("finalizeMeeting（末尾の欠けの検出、T1-e）", () => {
+  it("録音した長さが最後の Chunk の終わりより長ければ、finalize は成功しつつ欠けた長さを missingTailMs で返す", async () => {
+    // Arrange：stop() が Worklet の応答を待てず、最後の 5 秒分の Chunk が届かなかった
+    const h = await createHarness();
+    await recordAndSave(h, 2);
+    const m = await h.meetingStore.get(MEETING_ID);
+    if (m === undefined) throw new Error("meeting not found");
+    await h.meetingStore.put({ ...m, sessionClock: { ...m.sessionClock, audioFrameCount: 481600 + 5 * 16000 } });
+    // Act
+    const result = await finalizeMeeting(deps(h), MEETING_ID);
+    // Assert：取り戻せない欠けなので確定は止めない
+    expect(result).toEqual({ ok: true, missingTailMs: 5000 });
+    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("finalized");
+  });
+
+  it("録音した長さと最後の Chunk の終わりが一致すれば missingTailMs を返さない", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 2);
+    const m = await h.meetingStore.get(MEETING_ID);
+    if (m === undefined) throw new Error("meeting not found");
+    await h.meetingStore.put({ ...m, sessionClock: { ...m.sessionClock, audioFrameCount: 481600 } });
+    // Act / Assert
+    expect(await finalizeMeeting(deps(h), MEETING_ID)).toEqual({ ok: true });
+  });
+});
+
+describe("finalizeMeeting（IDB を経由せずサーバーへ直接送った Chunk、T1-f）", () => {
+  /** IDB に書けなかった Chunk を drainMemoryBacklog がサーバーへ直接 PUT した状態を作る */
+  async function putDirectly(h: Harness, seq: number): Promise<void> {
+    const r = await makeChunkRecord(MEETING_ID, seq, 1600);
+    const outcome = await new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, h.server.fetch).put(r);
+    if (!outcome.ok) throw new Error("direct put failed");
+  }
+
+  it("IDB にない連番でも、サーバーに登録済みなら揃っているとみなして全件数で finalize する", async () => {
+    // Arrange：seq 1 だけ IDB に書けず、サーバーへ直接送った
+    const h = await createHarness();
+    await h.meetingStore.put(meeting());
+    for (const seq of [0, 2]) {
+      const r = await makeChunkRecord(MEETING_ID, seq, 1600);
+      await h.chunkStore.putChunk(r);
+      await h.scheduler.enqueue(r.chunkKey);
+    }
+    await h.advance(100);
+    await putDirectly(h, 1);
+    const posted: unknown[] = [];
+    const spy: typeof fetch = async (input, init) => {
+      if (init?.method === "POST") posted.push(JSON.parse(String(init.body)));
+      return h.server.fetch(input, init);
+    };
+    // Act
+    const result = await finalizeMeeting(deps(h, spy), MEETING_ID);
+    // Assert：IDB の件数（2）で送ると、サーバーは件数不一致の 409 を返し続ける
+    expect(result).toMatchObject({ ok: true });
+    expect(posted).toMatchObject([{ expectedChunkCounts: { mic: 3, system: 0 } }]);
+    expect((await h.meetingStore.get(MEETING_ID))?.finalChunkCount).toBe(3);
+  });
+
+  it("末尾の Chunk がサーバーにだけあっても件数に含め、終わりの位置が分からないので missingTailMs は返さない", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    await putDirectly(h, 1);
+    // Act
+    const result = await finalizeMeeting(deps(h), MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: true });
+    expect((await h.meetingStore.get(MEETING_ID))?.finalChunkCount).toBe(2);
   });
 });
 

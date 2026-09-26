@@ -3,6 +3,8 @@ import type { ChunkStore, MeetingStore } from "../storage/idb";
 import type { LocalSaveScheduler } from "./local-save-scheduler";
 import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
+import type { AudioChunkRecord } from "../types/recording";
+import { frameToOffsetMs } from "./session-clock";
 
 export interface FinalizerDeps {
   readonly chunkStore: ChunkStore;
@@ -20,14 +22,15 @@ export interface FinalizerDeps {
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export type FinalizeResult =
-  | { readonly ok: true }
+  /** missingTailMs：末尾の Chunk が欠けたまま確定した長さ（ms）。欠けがなければ省く（T1-e） */
+  | { readonly ok: true; readonly missingTailMs?: number }
   | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string };
 
 /**
  * Finalization Barrier：
  *   1. 最終 Chunk が IDB にある（呼び出し前提：RecordingController.stop() 完了）かつメモリ待機中の Chunk がない
  *   2. IDB 上の全 Chunk が DB_REGISTERED（SAVED はサーバー一覧で登録確認できれば DB_REGISTERED に進める）
- *   3. サーバーの一覧と件数・sha256 が一致
+ *   3. サーバーの一覧と件数・sha256 が一致（IDB にない連番は、サーバーに登録済みなら揃っているとみなす）
  *   4. POST /finalize
  * 1〜3 を満たさない限り finalizing へ遷移しない。
  */
@@ -70,13 +73,6 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     return { ok: false, stage: "waiting_local_save", detail: `${notRegistered.length} chunks not registered` };
   }
 
-  // sequenceNo の連続性（欠番なし）
-  for (let i = 0; i < chunks.length; i++) {
-    if (chunks[i].meta.sequenceNo !== i) {
-      return { ok: false, stage: "verify", detail: `sequence gap at ${i}` };
-    }
-  }
-
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
   assertLocalHost(listUrl);
   // タイムアウトで abort すると fetch / json() が reject し、既存のエラー経路で Result になる
@@ -97,6 +93,20 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
   // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
   if (list.meetingId !== meetingId) return { ok: false, stage: "verify", detail: `list meetingId mismatch: ${list.meetingId}` };
+
+  // sequenceNo の連続性（欠番なし）。IDB に書けずサーバーへ直接送った Chunk（§15 drainMemoryBacklog）は IDB に残らないので、
+  // IDB にない連番はサーバーに登録済みなら揃っているとみなす。IDB の件数で送ると、サーバーは件数不一致の 409 を返し続ける
+  const localSeqs = new Set(chunks.map((c) => c.meta.sequenceNo));
+  const serverOnlySeqs = new Set(
+    list.chunks.filter((c) => c.source === "mic" && c.registered && !localSeqs.has(c.sequenceNo)).map((c) => c.sequenceNo),
+  );
+  const chunkCount = Math.max(-1, ...localSeqs, ...serverOnlySeqs) + 1;
+  for (let i = 0; i < chunkCount; i++) {
+    if (!localSeqs.has(i) && !serverOnlySeqs.has(i)) {
+      return { ok: false, stage: "verify", detail: `sequence gap at ${i}` };
+    }
+  }
+
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
   // 不一致を 1 件ずつ直すと Barrier の再試行が件数分かかるため、すべて洗い出してから一度に再投入する
   const mismatched: number[] = [];
@@ -129,13 +139,13 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   };
 
   meeting.status = "finalizing";
-  meeting.finalChunkCount = chunks.length;
+  meeting.finalChunkCount = chunkCount;
   // 再試行で終了時刻を書き換えない（前回の POST がサーバーに届いていた場合と値を揃える）
   meeting.endedAt ??= Date.now();
   await deps.meetingStore.put(meeting);
 
   const body: FinalizeRequest = {
-    expectedChunkCounts: { mic: chunks.length, system: 0 },
+    expectedChunkCounts: { mic: chunkCount, system: 0 },
     endedAtEpochMs: meeting.endedAt,
     totalAudioFrames: meeting.sessionClock.audioFrameCount,
   };
@@ -167,7 +177,21 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   }
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);
-  return { ok: true };
+  // 欠けた音声は取り戻せないので確定は止めず、UI が警告できるよう長さを返す（T1-e）
+  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, chunks, chunkCount);
+  return missingTailMs > 0 ? { ok: true, missingTailMs } : { ok: true };
+}
+
+/**
+ * 末尾の欠け（ms）。stop() が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま会議が確定する。
+ * audioFrameCount は heartbeat（1 秒ごと）でも進むので、最後の Chunk の endFrame より大きければ末尾が欠けている
+ * （最後の heartbeat より後の 1 秒未満の欠けは検出できない）。
+ * 最後の連番が IDB にない（サーバーへ直接送った）ときは endFrame が分からないので 0 を返す。
+ */
+export function measureMissingTailMs(audioFrameCount: number, chunks: ReadonlyArray<AudioChunkRecord>, chunkCount: number): number {
+  const last = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
+  if (last === undefined || last.meta.sequenceNo !== chunkCount - 1) return 0;
+  return frameToOffsetMs(Math.max(0, audioFrameCount - last.meta.endFrame));
 }
 
 function errorMessage(error: unknown): string {
