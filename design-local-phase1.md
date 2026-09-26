@@ -3295,7 +3295,7 @@ Chunk の状態を書き戻すのは、保存の途中で落ちた `GENERATED`�
 
 | 項目 | 選定 |
 | --- | --- |
-| ランナー | Vitest（`environment: "node"`。`page-lifecycle.ts` 以外は DOM 不要。`Blob` / `Response` / `MessageChannel` / `crypto.subtle` は Node 18 以降の組み込みを使う） |
+| ランナー | Vitest（`environment: "node"`。DOM ライブラリ（jsdom 等）は使わない。DOM に依存する `page-lifecycle.ts` は `window` / `document` を `vi.stubGlobal` で `EventTarget` に差し替えてテストし、`quota-monitor.ts` は `navigator.storage` を同様に差し替える。`Blob` / `Response` / `MessageChannel` / `crypto.subtle` は Node 18 以降の組み込みを使う） |
 | IndexedDB | `fake-indexeddb`（`import "fake-indexeddb/auto"`） |
 | fetch | 手書きの `FakeLocalServer`（下記）。実サーバー不要 |
 | AudioWorklet | `AudioWorkletGlobalScope` のグローバルをスタブし、Worklet モジュールを動的 import して Processor クラスを取り出す |
