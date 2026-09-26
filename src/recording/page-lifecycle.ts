@@ -10,7 +10,7 @@ export interface PageLifecycleHandles {
  * - pagehide: Worklet に flush を要求し、部分 Chunk を IndexedDB へ書き込む。完了は保証されない（損失上限 30 秒）
  * - visibilitychange: hidden になったら Health の監視間隔を詰める（判定はフレーム基準のまま）
  */
-export function attachPageLifecycle(controller: RecordingController, isRecording: () => boolean, onHidden: () => void): PageLifecycleHandles {
+export function attachPageLifecycle(controller: Pick<RecordingController, "flush">, isRecording: () => boolean, onHidden: () => void): PageLifecycleHandles {
   const onBeforeUnload = (event: BeforeUnloadEvent) => {
     if (!isRecording()) return;
     event.preventDefault();

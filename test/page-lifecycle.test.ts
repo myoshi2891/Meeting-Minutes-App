@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { attachPageLifecycle } from "../src/recording/page-lifecycle";
-import type { RecordingController } from "../src/recording/recording-controller";
 
 // DOM ライブラリは使わず、window / document を EventTarget で差し替える（§24.1）
 type FakeDocument = EventTarget & { visibilityState: DocumentVisibilityState };
@@ -24,7 +23,7 @@ describe("attachPageLifecycle", () => {
   let win: EventTarget;
   let doc: FakeDocument;
   let flush: ReturnType<typeof vi.fn>;
-  let controller: RecordingController;
+  let controller: { flush: () => Promise<void> };
   let recording: boolean;
   let onHidden: ReturnType<typeof vi.fn>;
 
@@ -34,7 +33,7 @@ describe("attachPageLifecycle", () => {
     vi.stubGlobal("window", win);
     vi.stubGlobal("document", doc);
     flush = vi.fn(async () => undefined);
-    controller = { flush } as unknown as RecordingController;
+    controller = { flush };
     recording = true;
     onHidden = vi.fn();
   });
