@@ -24,14 +24,13 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-26・16 回目：メモリ待機が空になったら IDB の劣化理由を外す）
+### 未コミットの変更（2026-09-26・17 回目：実装スキルの設計書参照をフェーズ別にする）
 
-15 回目までの変更はコミット済み。
+16 回目までの変更はコミット済み。
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | `drainMemoryBacklog()` の終了時にメモリ待機が空なら、`degradedReasons` から `IDB_QUOTA_EXHAUSTED` / `IDB_WRITE_FAILED` だけを外す（外す処理がどこにもなく、回復後も最上位警告が出続けていた）。テスト 1 件（修正前 Red を確認） | `fix(recording): clear idb degraded reasons once memory backlog is drained` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §3.4 段階3・§15 の本文とコード。phase2-client §4 Controller のコード） | `docs(phase1): clear idb degraded reasons once memory backlog is drained` |
+| `.claude/skills/implement-design-step/SKILL.md` | 手順 2 で `design-local-phase1.md` 固定だった設計書の参照を、タスクのフェーズを決めてから対応する `design-local-phase*.md` を選ぶ形に変更（Phase 2 以降のタスクで phase1 を引かないため） | `chore(claude): look up the design doc matching the task phase` |
 
 ---
 
@@ -122,6 +121,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-26（17 回目）
+
+- レビュー指摘 3 件を検証。有効は 1 件（implement-design-step の設計書参照が phase1 固定）で修正。
+- スキップ: §24.2/§24.4 のテストブロック（long-recording は MATCH、crash-recovery は 7 件すべて掲載済みで `flushMessages` もない。差分は許容範囲の DIFF(i) のみ）。`ended` リスナーの AbortController 化（`mediaStream` はインスタンス固定で同じトラックを指し、理由の重複も排除済みのため観測できる不具合がない）。
 
 ### 2026-09-26（13 回目）
 
