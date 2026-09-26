@@ -675,26 +675,35 @@ export class RecordingController {
 
   private async setUp(meetingId: string, title: string, consentConfirmedAt: number, options: StartOptions): Promise<void> {
     const { audioContext, mediaStream, workletModuleUrl } = this.deps;
-    await audioContext.audioWorklet.addModule(workletModuleUrl);
-    this.clock = createSessionClock(audioContext);
-    this.meetingId = meetingId;
-    // Mic は自身が原点。System は Mic の原点を受け取り、両 source の start_offset_ms を
-    // 同じ基準に揃える（§11.4 の start_ms 順マージが成立する前提、基本設計 §16.2）。
-    this.timelineOriginEpochMs = options.timelineOriginEpochMs ?? this.clock.sessionStartEpochMs;
+    try {
+      await audioContext.audioWorklet.addModule(workletModuleUrl);
+      this.clock = createSessionClock(audioContext);
+      this.meetingId = meetingId;
+      // Mic は自身が原点。System は Mic の原点を受け取り、両 source の start_offset_ms を
+      // 同じ基準に揃える（§11.4 の start_ms 順マージが成立する前提、基本設計 §16.2）。
+      this.timelineOriginEpochMs = options.timelineOriginEpochMs ?? this.clock.sessionStartEpochMs;
 
-    if (options.registerMeeting !== false) {
-      const meeting: MeetingRecord = {
-        meetingId,
-        title,
-        status: "recording",
-        sessionClock: this.clock,
-        consentConfirmedAt,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        endedAt: null,
-        finalChunkCount: null,
-      };
-      await this.deps.meetingStore.put(meeting);
+      if (options.registerMeeting !== false) {
+        const meeting: MeetingRecord = {
+          meetingId,
+          title,
+          status: "recording",
+          sessionClock: this.clock,
+          consentConfirmedAt,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          endedAt: null,
+          finalChunkCount: null,
+        };
+        await this.deps.meetingStore.put(meeting);
+      }
+    } catch (error) {
+      // recording はまだ保存されていないので会議は巻き戻さない。stop() は Worklet がないと何もしないため、
+      // マイク／画面共有トラックだけここで止める（Phase 1 §15 と同じ）。ロックは start() の catch が解放する
+      for (const track of mediaStream.getAudioTracks()) track.stop();
+      this.meetingId = null;
+      this.clock = null;
+      throw error;
     }
 
     try {
@@ -1262,7 +1271,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     ({ res: listRes, body: list } = await fetchWithTimeout(
       fetchImpl,
       listUrl,
-      { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit" },
+      { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", redirect: "error" },
       timeoutMs,
       (res): Promise<unknown> => (res.ok ? res.json().catch(() => null) : Promise.resolve(null)),
     ));
@@ -1331,6 +1340,8 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
       headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
       credentials: "omit",
+      // リダイレクト先は assertLocalHost を通らないため追従しない（Phase 1 §4.4）
+      redirect: "error",
     }, timeoutMs, async () => null));
   } catch (error) {
     await restore();
@@ -1506,6 +1517,7 @@ export class FetchEventSource implements EventSourceLike {
         const res = await this.fetchImpl(this.url, {
           headers: { Authorization: `Bearer ${this.token}`, Accept: "text/event-stream" },
           credentials: "omit",
+          redirect: "error",
           signal: controller.signal,
         });
         if (!res.ok || res.body === null) throw new Error(`SSE HTTP ${res.status}`);
@@ -1671,6 +1683,7 @@ export class Phase2Client {
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal,
         credentials: "omit",
+        redirect: "error",
       });
       const json: unknown = res.status === 204 ? null : await res.json().catch(() => null);
       if (res.ok) return { ok: true, value: json as T, status: res.status };

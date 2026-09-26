@@ -206,7 +206,7 @@ Content-Security-Policy:
 
    `connect-src` により、`fetch` / `XMLHttpRequest` / `WebSocket` / `EventSource` の接続先が列挙したホストに限定される。`worker-src 'self'` で AudioWorklet モジュールも同一オリジンに限定する。
 
-2. **アプリケーション側 allowlist（§17）**：`LocalSaver` は URL を組み立てる直前に `assertLocalHost(url)` を呼び、ホスト名が `127.0.0.1` / `localhost` / `[::1]` 以外なら例外を投げる。設定画面でサーバー URL を変更できる場合でも、この関数がゲートになる。`assertLocalHost()` が検証するのは最初の URL だけなので、`fetch` は `redirect: "error"` で送り、リダイレクト応答に従って音声本文や `Authorization` を別ホストへ再送しない（`fetch` は `TypeError` で reject し、`NETWORK` として扱う）。CSP が何らかの理由で効かない配信経路（ローカルファイルから開いた場合など）への二重防御である。
+2. **アプリケーション側 allowlist（§17）**：`LocalSaver` は URL を組み立てる直前に `assertLocalHost(url)` を呼び、ホスト名が `127.0.0.1` / `localhost` / `[::1]` 以外なら例外を投げる。設定画面でサーバー URL を変更できる場合でも、この関数がゲートになる。`assertLocalHost()` が検証するのは最初の URL だけなので、`fetch` は `redirect: "error"` で送り（`LocalSaver` の PUT に加え、Finalizer の `GET /chunks`・`POST /finalize`、`BackendHealthMonitor` の `GET /health` も同じ）、リダイレクト応答に従って音声本文や `Authorization` を別ホストへ再送しない（`fetch` は `TypeError` で reject し、`NETWORK` として扱う）。CSP が何らかの理由で効かない配信経路（ローカルファイルから開いた場合など）への二重防御である。
 
 3. **常駐サーバー側**：`127.0.0.1` にのみ bind し、`0.0.0.0` への bind はコマンドライン引数で明示した場合だけ許可する。サーバー自体が外部へ通信する経路（モデルの自動ダウンロード等）は Phase 2 の論点であり、本書では「モデルファイルは利用者が事前に配置する」前提に立つ（§25）。
 
@@ -1669,22 +1669,30 @@ export class RecordingController {
   private async setUp(meetingId: string, title: string, consentConfirmedAt: number): Promise<void> {
     const { audioContext, mediaStream, workletModuleUrl } = this.deps;
 
-    // AudioContext は sampleRate を指定せずに生成されている前提。実際の値はここで取得する。
-    await audioContext.audioWorklet.addModule(workletModuleUrl);
-    this.clock = createSessionClock(audioContext);
+    let meeting: MeetingRecord;
+    try {
+      // AudioContext は sampleRate を指定せずに生成されている前提。実際の値はここで取得する。
+      await audioContext.audioWorklet.addModule(workletModuleUrl);
+      this.clock = createSessionClock(audioContext);
 
-    const meeting: MeetingRecord = {
-      meetingId,
-      title,
-      status: "recording",
-      sessionClock: this.clock,
-      consentConfirmedAt,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      endedAt: null,
-      finalChunkCount: null,
-    };
-    await this.deps.meetingStore.put(meeting);
+      meeting = {
+        meetingId,
+        title,
+        status: "recording",
+        sessionClock: this.clock,
+        consentConfirmedAt,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        endedAt: null,
+        finalChunkCount: null,
+      };
+      await this.deps.meetingStore.put(meeting);
+    } catch (error) {
+      // recording はまだ保存されていないので会議は巻き戻さない。stop() は Worklet がないと何もしないため、マイクだけここで止める
+      for (const track of mediaStream.getAudioTracks()) track.stop();
+      this.clock = null;
+      throw error;
+    }
     this.meeting = meeting;
 
     try {
@@ -1934,7 +1942,7 @@ Worklet が応答しない場合（AudioContext が閉じられた、Processor �
 
 Scheduler への依存は `enqueue()` だけを持つ `ChunkEnqueuer` インターフェースに絞っている。`LocalSaveScheduler` はこのインターフェースを構造的に満たすため、呼び出し側の配線は変わらない。
 
-録音中の会議は、会議ごとの Web Lock（会議ロック）で示す。Phase 1 は複数タブでの同時録音を許すため、あとから開いたタブの起動時復旧（§23）が、別タブで録音中の `recording` を中断と誤認して `stop_requested` に落とさないようにするためである。`start()` は `recording` を書く**前**にロックを取り（先に書くと、ロックのない `recording` を他タブの復旧が拾える）、取れなければ失敗する。ロックは `stop()` の finally、または `start()` が途中で失敗したときに解放する。`recording` を保存した後に失敗した場合（Worklet ノードの生成失敗など）は、`rollBackStart()` が Worklet を切り離してマイクのトラックを止め、会議を `created` に戻してから例外を返す。`stop()` は Worklet がなければ何もしないため、ここで止めないとマイクを取得したままになる。`recording` のまま残すと、ロックの解放後に次回起動の復旧（§23）が `stop_requested` に落とし、Chunk のない会議を finalize しうるためである。`created` は復旧の対象外である。タブが閉じたり落ちたりした場合はブラウザが自動で解放するので、クラッシュした会議は従来どおり復旧の対象になる。ロックマネージャは `locks` で依存注入する（本番は `navigator.locks`。`LockManager` は `MeetingLockManager` を構造的に満たす）。
+録音中の会議は、会議ごとの Web Lock（会議ロック）で示す。Phase 1 は複数タブでの同時録音を許すため、あとから開いたタブの起動時復旧（§23）が、別タブで録音中の `recording` を中断と誤認して `stop_requested` に落とさないようにするためである。`start()` は `recording` を書く**前**にロックを取り（先に書くと、ロックのない `recording` を他タブの復旧が拾える）、取れなければ失敗する。ロックは `stop()` の finally、または `start()` が途中で失敗したときに解放する。`recording` を保存した後に失敗した場合（Worklet ノードの生成失敗など）は、`rollBackStart()` が Worklet を切り離してマイクのトラックを止め、会議を `created` に戻してから例外を返す。`stop()` は Worklet がなければ何もしないため、ここで止めないとマイクを取得したままになる。`recording` を保存する前に失敗した場合（`addModule()` や `meetingStore.put()` の失敗）も、同じ理由でマイクのトラックを止めてから例外を返す（会議は保存されていないので巻き戻しは不要）。`recording` のまま残すと、ロックの解放後に次回起動の復旧（§23）が `stop_requested` に落とし、Chunk のない会議を finalize しうるためである。`created` は復旧の対象外である。タブが閉じたり落ちたりした場合はブラウザが自動で解放するので、クラッシュした会議は従来どおり復旧の対象になる。ロックマネージャは `locks` で依存注入する（本番は `navigator.locks`。`LockManager` は `MeetingLockManager` を構造的に満たす）。
 
 ```typescript
 // src/recording/meeting-lock.ts
@@ -2612,7 +2620,7 @@ export class BackendHealthMonitor {
       const token = this.config.token();
       const headers: Record<string, string> = {};
       if (token !== null) headers.Authorization = `Bearer ${token}`;
-      const response = await this.fetchImpl(this.healthUrl, { method: "GET", headers, signal: controller.signal, credentials: "omit" });
+      const response = await this.fetchImpl(this.healthUrl, { method: "GET", headers, signal: controller.signal, credentials: "omit", redirect: "error" });
       const latency = performance.now() - started;
 
       if (response.status === 401 || response.status === 403) {
@@ -2990,7 +2998,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   let listRes: Response;
   let list: unknown;
   try {
-    listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", signal: listAbort.signal });
+    listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", redirect: "error", signal: listAbort.signal });
     // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
     list = listRes.ok ? await listRes.json().catch(() => null) : null;
   } catch (error) {
@@ -3055,6 +3063,8 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
       headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
       credentials: "omit",
+      // リダイレクト先は assertLocalHost を通らないため追従しない（§4.4）
+      redirect: "error",
       signal: finAbort.signal,
     });
   } catch (error) {
