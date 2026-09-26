@@ -459,6 +459,19 @@ describe("RecordingController", () => {
     expect(s.controller.memoryBacklogCount).toBe(1);
   });
 
+  it("直接送信が DB 未登録（registered: false）で終わったら IDB の例外を投げ、メモリ待機に残す", async () => {
+    // Arrange：ファイルは保存されたが DB 登録がまだ。IDB にもないので、外すと Finalizer が埋められない欠番になる
+    const s = await setup(closedStore, {
+      put: async () => ({ ok: true, registered: false, serverPath: "recordings/x.wav", idempotent: false }),
+    });
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.sendChunk(1600);
+    await s.until(() => s.errors.length >= 1);
+    // Act / Assert
+    await expect(s.controller.drainMemoryBacklog()).rejects.toThrow("The database connection is closing.");
+    expect(s.controller.memoryBacklogCount).toBe(1);
+  });
+
   it("メモリ待機中の Chunk を WAV として書き出せる（書き出してもメモリ待機からは外さない）", async () => {
     // Arrange
     const s = await setup(closedStore);
