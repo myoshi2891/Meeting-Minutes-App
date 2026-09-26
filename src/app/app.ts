@@ -10,7 +10,7 @@ import { createInitialHealth } from "../recording/recording-health-monitor";
 import { recoverOnStartup, type RecoveryReport } from "../recording/recovery";
 import { ChunkStore, MeetingStore, SettingsStore } from "../storage/idb";
 import { enforceQuota, requestPersistence } from "../storage/quota-monitor";
-import type { LocalBackendHealth, RecordingHealth } from "../types/recording";
+import type { LocalBackendHealth, MeetingRecord, RecordingHealth } from "../types/recording";
 
 /** settings ストアでトークンを保存するキー（§4.3） */
 export const BACKEND_TOKEN_KEY = "backendToken";
@@ -218,6 +218,24 @@ export class App {
     return session;
   }
 
+  /** 停止したが確定していない会議（§31.2 の既知の制約）。UI は「確定待ち」として表示し、手動で再試行させる */
+  async listPendingFinalize(): Promise<MeetingRecord[]> {
+    const stopped = await this.meetingStore.listByStatus("stop_requested");
+    const finalizing = await this.meetingStore.listByStatus("finalizing");
+    return [...stopped, ...finalizing];
+  }
+
+  /** 会議ロックを取って Barrier を再試行する。別タブが録音・確定中の会議には触らない（§23 と同じ） */
+  async retryFinalize(meetingId: string): Promise<FinalizeResult> {
+    const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
+    if (release === null) return { ok: false, stage: "verify", detail: "meeting is locked by another tab" };
+    try {
+      return await this.finalize(meetingId);
+    } finally {
+      release();
+    }
+  }
+
   private createSaver(token: string): LocalSaver {
     return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch);
   }
@@ -260,17 +278,7 @@ export class App {
       }
       await this.scheduler.resumeAll(lockedElsewhere);
 
-      for (const status of ["stop_requested", "finalizing"] as const) {
-        for (const m of await this.meetingStore.listByStatus(status)) {
-          const release = await tryAcquireMeetingLock(this.deps.locks, m.meetingId);
-          if (release === null) continue;
-          try {
-            await this.finalize(m.meetingId);
-          } finally {
-            release();
-          }
-        }
-      }
+      for (const m of await this.listPendingFinalize()) await this.retryFinalize(m.meetingId);
     } catch (error) {
       this.deps.onEvent({ type: "error", error });
     }

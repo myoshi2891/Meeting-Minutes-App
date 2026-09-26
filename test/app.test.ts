@@ -327,6 +327,65 @@ describe("startRecording（録音ごとの配線）", () => {
   });
 });
 
+describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () => {
+  it("stop_requested と finalizing の会議だけを確定待ちとして返す", async () => {
+    // Arrange
+    const [stopped, finalizing, done] = [nextMeetingId(), nextMeetingId(), nextMeetingId()];
+    const s = await setup({
+      serverUp: false,
+      seed: async (db) => {
+        await seedMeeting(db, makeMeeting(stopped, "stop_requested"));
+        await seedMeeting(db, makeMeeting(finalizing, "finalizing"));
+        await seedMeeting(db, makeMeeting(done, "finalized"));
+      },
+    });
+    // Act
+    const pending = await s.app.listPendingFinalize();
+    // Assert
+    expect(pending.map((m) => m.meetingId).sort()).toEqual([stopped, finalizing].sort());
+  });
+
+  it("retryFinalize はサーバーに揃っていれば会議を確定し、finalized を通知する", async () => {
+    // Arrange：サーバー停止中に止めた会議。後からサーバーが起動した
+    const meetingId = nextMeetingId();
+    const s = await setup({
+      serverUp: false,
+      seed: async (db, server) => {
+        const r = await seedChunk(db, meetingId, 0, "DB_REGISTERED");
+        registerOnServer(server, r);
+        await seedMeeting(db, makeMeeting(meetingId, "stop_requested", r.meta.endFrame));
+      },
+    });
+    s.server.up = true;
+    // Act
+    const result = await s.app.retryFinalize(meetingId);
+    // Assert
+    expect(result.ok).toBe(true);
+    expect((await s.app.meetingStore.get(meetingId))?.status).toBe("finalized");
+    expect(s.events).toContainEqual({ type: "finalized", meetingId });
+  });
+
+  it("retryFinalize は別タブがロックを持つ会議に触らない", async () => {
+    // Arrange
+    const meetingId = nextMeetingId();
+    const s = await setup({
+      serverUp: false,
+      seed: async (db, server, locks) => {
+        const r = await seedChunk(db, meetingId, 0, "DB_REGISTERED");
+        registerOnServer(server, r);
+        await seedMeeting(db, makeMeeting(meetingId, "stop_requested", r.meta.endFrame));
+        await tryAcquireMeetingLock(locks, meetingId);
+      },
+    });
+    s.server.up = true;
+    // Act
+    const result = await s.app.retryFinalize(meetingId);
+    // Assert
+    expect(result).toMatchObject({ ok: false, stage: "verify" });
+    expect((await s.app.meetingStore.get(meetingId))?.status).toBe("stop_requested");
+  });
+});
+
 describe("RecordingSession.stop", () => {
   it("stop → ページライフサイクルの解除 → finalize の順に進み、末尾の欠けを finalized で通知する", async () => {
     // Arrange：保存済みの Chunk より 2 秒ぶん長く録音していた（Worklet の stop 無応答など）
