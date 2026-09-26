@@ -42,10 +42,14 @@ export class LocalSaveScheduler {
     void this.pump();
   }
 
-  /** backend が HEALTHY に戻ったとき、BACKEND_UNAVAILABLE / 上限到達 LOCAL_SAVE_FAILED（retryable のみ）を一括再投入する。 */
-  async resumeAll(): Promise<void> {
+  /**
+   * backend が HEALTHY に戻ったとき、BACKEND_UNAVAILABLE / 上限到達 LOCAL_SAVE_FAILED（retryable のみ）を一括再投入する。
+   * skipMeetingIds の会議（別タブで録音中）の Chunk は、そのタブのスケジューラに任せて触らない。
+   */
+  async resumeAll(skipMeetingIds: ReadonlySet<string> = new Set()): Promise<void> {
     const unfinished = await this.deps.chunkStore.listUnfinished();
     for (const r of unfinished) {
+      if (skipMeetingIds.has(r.meta.meetingId)) continue;
       if (isResumable(r) && !this.pending.includes(r.chunkKey) && !this.inFlight.has(r.chunkKey)) {
         await this.deps.chunkStore.updateSaveState(r.chunkKey, (x) => {
           // 一覧取得後に別経路で保存が進んでいたら書き戻さない

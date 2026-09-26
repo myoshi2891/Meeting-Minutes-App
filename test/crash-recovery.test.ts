@@ -164,15 +164,22 @@ describe("ブラウザクラッシュ後の復旧", () => {
     const r = await makeChunkRecord(meetingId, 0, 160);
     r.save.status = "SAVING";
     await h.chunkStore.putChunk(r);
+    // 録音タブのスケジューラが backend 停止で待機させている Chunk（resumeAll の再投入対象になる状態）
+    const waiting = await makeChunkRecord(meetingId, 1, 160);
+    waiting.save.status = "BACKEND_UNAVAILABLE";
+    await h.chunkStore.putChunk(waiting);
     const release = await tryAcquireMeetingLock(h.locks, meetingId);
     // Act
     const report = await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    for (let i = 0; i < 5; i++) await h.advance(100);
     // Assert
     const meeting = await h.meetingStore.get(meetingId);
     expect(meeting?.status).toBe("recording");
     expect(meeting?.updatedAt).toBe(1);
     expect(report.interruptedMeetings.map((m) => m.meetingId)).not.toContain(meetingId);
     expect((await h.chunkStore.getChunk(r.chunkKey))?.save.status).toBe("SAVING");
+    expect((await h.chunkStore.getChunk(waiting.chunkKey))?.save.status).toBe("BACKEND_UNAVAILABLE");
+    expect(h.server.putCount).toBe(0);
     release?.();
   });
 

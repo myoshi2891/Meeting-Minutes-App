@@ -72,7 +72,8 @@ export async function recoverOnStartup(
     }
     requeued++;
   }
-  await scheduler.resumeAll();
+  // 録音中の会議の Chunk は録音タブのスケジューラが送る。ここで再投入すると二重に PUT する
+  await scheduler.resumeAll(active);
   return { interruptedMeetings: interrupted, requeuedChunks: requeued };
 }
 
