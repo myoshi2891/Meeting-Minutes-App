@@ -24,13 +24,9 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-26・17 回目：実装スキルの設計書参照をフェーズ別にする）
+### 未コミットの変更
 
-16 回目までの変更はコミット済み。
-
-| 変更 | 内容 | 推奨コミット |
-| --- | --- | --- |
-| `.claude/skills/implement-design-step/SKILL.md` | 手順 2 で `design-local-phase1.md` 固定だった設計書の参照を、タスクのフェーズを決めてから対応する `design-local-phase*.md` を選ぶ形に変更（Phase 2 以降のタスクで phase1 を引かないため） | `chore(claude): look up the design doc matching the task phase` |
+なし（すべてコミット済み）。
 
 ---
 
@@ -121,6 +117,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-26（18 回目）
+
+- トラックの `ended` リスナーを `AbortController` の signal 付きで登録し、`stop()` で解除するように修正（回帰テスト 1 件追加）。
+- `design-local-phase1.md` および `design-local-phase2-client.md` を実装と同期。
 
 ### 2026-09-26（17 回目）
 
