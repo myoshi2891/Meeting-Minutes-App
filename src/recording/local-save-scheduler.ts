@@ -115,13 +115,23 @@ export class LocalSaveScheduler {
   }
 
   private async markAllPendingUnavailable(): Promise<void> {
-    for (const key of this.pending) {
+    // 保存済みのキーを pending から外すため、コピーを走査する
+    for (const key of [...this.pending]) {
       if (this.markedUnavailable.has(key)) continue;
-      this.markedUnavailable.add(key);
+      let settled = false;
       await this.deps.chunkStore.updateSaveState(key, (r) => {
+        // リトライタイマーが resumeAll 後に遅れて再投入したキーなど、別経路で保存済み・送信中なら書き戻さない
+        settled = r.save.status === "DB_REGISTERED" || r.save.status === "SAVED" || r.save.status === "SAVING";
+        if (settled) return;
         r.save.status = "BACKEND_UNAVAILABLE";
       });
+      if (settled) {
+        this.pending.splice(this.pending.indexOf(key), 1);
+        continue;
+      }
+      this.markedUnavailable.add(key);
     }
+    this.deps.health.pendingChunkCount = this.pendingCount;
     // pending 配列は保持する。resumeAll() または backend 復帰時の pump() で再開する。
   }
 

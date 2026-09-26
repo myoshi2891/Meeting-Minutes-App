@@ -214,6 +214,22 @@ describe("LocalSaveScheduler", () => {
     expect(s.health.pendingChunkCount).toBe(0);
   });
 
+  it("resumeAll で保存済みになった Chunk を、backend 停止中に発火したリトライタイマーが BACKEND_UNAVAILABLE に書き戻さない", async () => {
+    // Arrange：1 回目は 5xx でリトライタイマーが残り、resumeAll による 2 回目で DB_REGISTERED になる
+    const s = await setup((r, attempt) => (attempt === 1 ? new Response("{}", { status: 500 }) : okResponse(r)));
+    await s.add(0);
+    await s.advance(0);
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    // Act：backend が停止した後にリトライタイマーが発火する
+    s.backend.status = "UNREACHABLE";
+    await s.advance(3_000);
+    // Assert：登録済みの状態を保ち、pending にも残さない
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    expect(s.health.pendingChunkCount).toBe(0);
+  });
+
   it("resumeAll で SAVED になった Chunk を、後から発火したリトライタイマーが再送しない", async () => {
     // Arrange：1 回目は 5xx でリトライタイマーが残り、resumeAll による 2 回目で SAVED（DB 未登録）になる
     const s = await setup((r, attempt) => (attempt === 1 ? new Response("{}", { status: 500 }) : okResponse(r, false)));
