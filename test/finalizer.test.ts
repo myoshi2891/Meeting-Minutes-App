@@ -199,6 +199,22 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     expect(posted).toMatchObject([{ endedAtEpochMs: firstEndedAt }]);
   });
 
+  it("GET /chunks と POST /finalize はリダイレクトを拒否する（ローカル外への転送を防ぐ）", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    const inits: Array<RequestInit | undefined> = [];
+    const spy: typeof fetch = async (input, init) => {
+      inits.push(init);
+      return h.server.fetch(input, init);
+    };
+    // Act
+    const result = await finalizeMeeting(deps(h, spy), MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: true });
+    expect(inits.map((i) => i?.redirect)).toEqual(["error", "error"]);
+  });
+
   it("一覧取得時に接続できなければ verify の失敗 Result を返す", async () => {
     const h = await createHarness();
     await recordAndSave(h, 1);

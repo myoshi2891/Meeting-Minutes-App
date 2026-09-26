@@ -85,7 +85,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   let listRes: Response;
   let list: unknown;
   try {
-    listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", signal: listAbort.signal });
+    listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", redirect: "error", signal: listAbort.signal });
     // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
     list = listRes.ok ? await listRes.json().catch(() => null) : null;
   } catch (error) {
@@ -150,6 +150,8 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
       headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
       credentials: "omit",
+      // リダイレクト先は assertLocalHost を通らないため追従しない（§4.4）
+      redirect: "error",
       signal: finAbort.signal,
     });
   } catch (error) {

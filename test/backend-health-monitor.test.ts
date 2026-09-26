@@ -45,6 +45,19 @@ describe("BackendHealthMonitor.checkOnce", () => {
     expect(health.degradedReasons).toEqual([]);
   });
 
+  it("ヘルスチェックはリダイレクトを拒否する（ローカル外への転送を防ぐ）", async () => {
+    // Arrange
+    let captured: RequestInit | undefined;
+    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async (_input, init) => {
+      captured = init;
+      return json({ status: "ok", service: "minutes-local" });
+    });
+    // Act
+    await m.checkOnce();
+    // Assert
+    expect(captured?.redirect).toBe("error");
+  });
+
   it("サーバー自己申告の degraded は DEGRADED", async () => {
     const health = createInitialHealth("running");
     const m = new BackendHealthMonitor(CONFIG, health, async () => json({ status: "degraded", service: "minutes-local" }));
