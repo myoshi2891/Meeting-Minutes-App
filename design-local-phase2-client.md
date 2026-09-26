@@ -694,6 +694,8 @@ export class RecordingController {
       await audioContext.audioWorklet.addModule(workletModuleUrl);
       this.clock = createSessionClock(audioContext);
       this.meetingId = meetingId;
+      // 連番は会議ごと（Phase 1 §15 と同じ）。chunkCount も会議ごとの数になる
+      this.nextSequenceNo = 0;
       // Mic は自身が原点。System は Mic の原点を受け取り、両 source の start_offset_ms を
       // 同じ基準に揃える（§11.4 の start_ms 順マージが成立する前提、基本設計 §16.2）。
       this.timelineOriginEpochMs = options.timelineOriginEpochMs ?? this.clock.sessionStartEpochMs;
