@@ -24,14 +24,14 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-26・15 回目：直接送信の DB 登録確認）
+### 未コミットの変更（2026-09-26・16 回目：メモリ待機が空になったら IDB の劣化理由を外す）
 
-14 回目までの変更はコミット済み。
+15 回目までの変更はコミット済み。
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | `sendDirect` は `ok && registered` のときだけ成功にする（`registered: false` で外すと IDB にもサーバー登録にもない欠番になり、再送も書き出しもできなかった）。テスト 1 件（修正前 Red を確認） | `fix(recording): keep unregistered direct-sent chunks in memory backlog` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §15 のコードと `drainMemoryBacklog()` の本文。phase2-client §4 Controller にも同じ欠陥があったため同じ形で修正） | `docs(phase1): keep unregistered direct-sent chunks in memory backlog` |
+| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | `drainMemoryBacklog()` の終了時にメモリ待機が空なら、`degradedReasons` から `IDB_QUOTA_EXHAUSTED` / `IDB_WRITE_FAILED` だけを外す（外す処理がどこにもなく、回復後も最上位警告が出続けていた）。テスト 1 件（修正前 Red を確認） | `fix(recording): clear idb degraded reasons once memory backlog is drained` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §3.4 段階3・§15 の本文とコード。phase2-client §4 Controller のコード） | `docs(phase1): clear idb degraded reasons once memory backlog is drained` |
 
 ---
 
@@ -103,6 +103,13 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ### T7. 起動時復旧が non-retryable の Chunk も再送する ✅ 完了（5 回目のレビュー対応）
 
 - `recoverOnStartup` は GENERATED / SAVING の Chunk だけを `LOCAL_SAVE_PENDING` に書き戻すようにした。non-retryable の `LOCAL_SAVE_FAILED` は `isResumable` で除外され、再送されない。
+
+### T8. テストハーネスの固定 tick 待ちを条件待ちにする【T0 の後／テストのみ・要方針確認】
+
+- 背景（16 回目のレビュー指摘、今回は見送り）: `test/harness.ts` の `advance()` は `setTimeout(0)` を 10 回、`test/local-save-scheduler.test.ts` の `advance` は 20 回回して非同期処理の完了を待つ。`FakeServer` の `sha256Hex`（crypto.subtle）と `Blob.arrayBuffer()` は libuv のスレッドプールで完了するため、負荷が高いと tick 数が足りずに不安定になりうる。
+- 見送った理由: 指摘の案（`advance()` から待ちを外し、最終状態を `vi.waitFor` でポーリングする）では、`for (…) await h.advance(600_000)` のように「1 回の advance で保存と再試行タイマーの登録まで済んでいる」ことを前提にしたループが崩れる（タイマー登録前に時計だけ進む）。`backend-outage.test.ts`（設計書と完全一致）も同じ前提に立っている。
+- 案: `advance()` の中で「待つ条件」を固定 tick 数から条件にする（例: Scheduler の `pendingCount` と送信中の数がともに 0 になり、FakeServer に処理中の要求がなくなるまで待つ。上限つき）。Scheduler に送信中の数を読むゲッターを足すかは要確認。
+- 対象: `test/harness.ts`、`test/local-save-scheduler.test.ts`、`test/crash-recovery.test.ts`、`test/finalizer.test.ts`、`test/backend-outage.test.ts`、および設計書の対応するテストのコードブロック。
 
 ### 保留・メモ
 
