@@ -20,20 +20,20 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + UI | 🟡 §19 のみ実装 | §20・§21・UI・配線が未着手。§28.3 の手動項目 |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 17 ファイル / 203 件がすべて通過。`npm run typecheck` もエラーなし。
+- 自動テスト: 17 ファイル / 207 件がすべて通過。`npm run typecheck` もエラーなし。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致。未実装の 2 ファイル（`page-lifecycle.ts`、`quota-monitor.ts`）だけが MISSING。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
-### 未コミットの変更（2026-09-26・11 回目のレビュー対応）
+### 未コミットの変更（2026-09-26・12 回目のレビュー対応）
 
-10 回目までの変更はコミット済み。
+11 回目までの変更はコミット済み。
 
 | 変更 | 内容 | 推奨コミット |
 | --- | --- | --- |
-| `src/recording/local-save-scheduler.ts`、`test/local-save-scheduler.test.ts` | `markAllPendingUnavailable()` が `DB_REGISTERED` / `SAVED` / `SAVING` を `BACKEND_UNAVAILABLE` に書き戻さず、`pending` から外す（5xx → resumeAll で保存済み → backend 停止中にリトライタイマー発火の順で起きていた）。回帰テスト 1 件（修正前 Red を確認） | `fix(save): ...` |
-| `src/recording/local-save-scheduler.ts`、`src/recording/recovery.ts`、`test/crash-recovery.test.ts` | `resumeAll(skipMeetingIds?)` を追加し、`recoverOnStartup` がロック保持中の会議を渡す（別タブが待機させている Chunk を再投入して二重 PUT しない）。既存のロックテストを拡張（修正前 Red を確認） | `fix(recording): ...` |
-| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | `rollBackStart()` でマイクのトラックを止める。ended リスナーは stop 後（`node === null`）を無視し、`MIC_TRACK_ENDED` を重複して入れない。回帰テスト 2 件 + 既存 1 件に検証追加（修正前 Red を確認） | `fix(recording): ...` |
-| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §15 本文とコード、§17 の二重送信防止の段落、§23 本文とコード。phase2-client の Controller の `rollBackStart()` と ended リスナー） | `docs(phase1): ...` |
+| `src/recording/recording-controller.ts`、`test/recording-controller.test.ts` | `setUp()` の `addModule()` / `meetingStore.put()` が失敗したときもマイクのトラックを止め、`sessionClock` を戻す（ロックは従来どおり `start()` の catch が解放）。回帰テスト 2 件（修正前 Red を確認） | `fix(recording): ...` |
+| `src/recording/finalizer.ts`、`src/api/backend-health-monitor.ts`、`test/finalizer.test.ts`、`test/backend-health-monitor.test.ts` | Finalizer の `GET /chunks`・`POST /finalize` と `GET /health` に `redirect: "error"`（§4.4、LocalSaver と揃える）。回帰テスト 2 件（修正前 Red を確認） | `fix(save): ...` |
+| `test/local-saver.test.ts`、`test/finalizer.test.ts` | タイムアウトのテスト 3 件を実時間待ちから fake timers（`setTimeout` のみ偽装）へ。Finalizer はハングする fetch への到達を待ってから時間を進める | `test(save): ...` |
+| `design-local-phase1.md`、`design-local-phase2-client.md` | 上記を反映（phase1 §4.4 本文、§15 本文とコード、§18・§22 のコード。phase2-client の Controller `setUp()`、Finalizer、SSE クライアント、`Phase2Client.request()` の `redirect: "error"`） | `docs(phase1): ...` |
 
 ---
 
@@ -116,6 +116,11 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-26（12 回目）
+
+- 指摘 4 件を検証し 3 件を修正（start 前半の失敗でのトラック解放、Finalizer / ヘルスチェックの `redirect: "error"`、タイムアウトテストの fake timers 化）。回帰テスト 4 件は修正前に Red を確認した。
+- ended リスナーの AbortController 化はスキップ（stop / rollBack でトラックを止めるため、止めたトラックは ended を発火せず挙動が変わらない）。
 
 ### 2026-09-26（11 回目）
 
