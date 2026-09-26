@@ -446,6 +446,21 @@ describe("RecordingController", () => {
     expect(s.controller.memoryBacklogCount).toBe(0);
   });
 
+  it("drain でメモリ待機が空になったら IDB の劣化理由だけを外し、他の劣化理由は残す", async () => {
+    // Arrange
+    const s = await setup(closedStore, {
+      put: async () => ({ ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false }),
+    });
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.sendChunk(1600);
+    await s.until(() => s.errors.length >= 1);
+    s.health.degradedReasons = ["IDB_QUOTA_EXHAUSTED", ...s.health.degradedReasons, "BACKEND_UNREACHABLE"];
+    // Act
+    await s.controller.drainMemoryBacklog();
+    // Assert：メモリ待機が失われる恐れはもうないので、最上位警告を出し続けない
+    expect(s.health.degradedReasons).toEqual(["BACKEND_UNREACHABLE"]);
+  });
+
   it("サーバーへの直接送信も失敗したら IDB の例外を投げ、メモリ待機に残す", async () => {
     // Arrange
     const s = await setup(closedStore, {

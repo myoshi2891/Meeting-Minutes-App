@@ -245,6 +245,12 @@ export class RecordingController {
       await this.deps.scheduler.enqueue(record.chunkKey);
       drained++;
     }
+    if (this.memoryBacklog.length === 0) {
+      // IDB の劣化理由は「メモリ待機がクラッシュで失われうる」ことの警告。空になったら外す（次に書けなければ persistChunk が付け直す）
+      this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
+        (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
+      );
+    }
     return drained;
   }
 
