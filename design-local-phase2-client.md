@@ -566,7 +566,7 @@ export function jobFromServerRow(row: Record<string, unknown>): JobSummary | nul
 
 # 4. `src/recording/recording-controller.ts` の変更
 
-変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機を含む）。
+変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出しを含む）。
 
 `stop()` の最後の会議レコード保存だけは Phase 1 と形が違う。Phase 1 は Controller が会議レコードを保持し、その `sessionClock` が Controller の時計と同じオブジェクトなので、保存し直すだけで最終 `audioFrameCount` が残る。Phase 2 は `registerMeeting` のため会議レコードを IndexedDB から読み直すので、別オブジェクトになる。そこで Mic 側は、最終 Chunk の書き込み完了後に会議レコードを読み直し、Controller の `SessionClock` を写した新しいオブジェクトとして保存する。`sessionClock` は `readonly` なので、書き換えずに置き換える。System 側は会議レコードを持たないので何もしない。
 
@@ -589,10 +589,23 @@ import { computeFrameClockDriftMs, createSessionClock, frameToOffsetMs } from ".
 import { buildStandaloneWav } from "../audio/wav";
 import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
+import type { SaveOutcome } from "../api/local-saver";
 
 /** Chunk を保存 State Machine に投入する口。LocalSaveScheduler が構造的に満たす（テストでは差し替える）。Phase 1 §15 と同じ */
 export interface ChunkEnqueuer {
   enqueue(chunkKey: string): Promise<void>;
+}
+
+/** IDB を経由せずサーバーへ Chunk を送る口。LocalSaver が構造的に満たす（Phase 1 §15 と同じ） */
+export interface DirectChunkSaver {
+  put(record: AudioChunkRecord): Promise<SaveOutcome>;
+}
+
+/** メモリ待機中の Chunk を利用者の手元へ書き出すためのファイル（Phase 1 §15 と同じ） */
+export interface MemoryBacklogFile {
+  readonly fileName: string;
+  readonly wav: Blob;
+  readonly meta: ChunkTimingMetadata;
 }
 
 export interface RecordingControllerDeps {
@@ -608,6 +621,8 @@ export interface RecordingControllerDeps {
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
   /** 録音中の会議ロック（本番は navigator.locks、Phase 1 §15 と同じ）。会議レコードを作る側（Mic）だけが取る */
   readonly locks: MeetingLockManager;
+  /** IDB に書けない Chunk をサーバーへ直接送る（Phase 1 §15 と同じ）。省略時は直接送らない */
+  readonly directSaver?: DirectChunkSaver;
 }
 
 /** Worklet が flush / stop に応答しないときに待機を打ち切るまでの時間（Phase 1 §15 と同じ） */
@@ -803,6 +818,7 @@ export class RecordingController {
     this.releaseLock = null;
   }
 
+  /** クォータ以外の失敗はサーバーへ直接送る。直接送信も失敗したら元の例外を投げ、メモリ待機に残す（Phase 1 §15 と同じ） */
   async drainMemoryBacklog(): Promise<number> {
     let drained = 0;
     while (this.memoryBacklog.length > 0) {
@@ -811,7 +827,10 @@ export class RecordingController {
         await this.deps.chunkStore.putChunk(record);
       } catch (error) {
         if (isQuotaExceeded(error)) break;
-        throw error;
+        if (!(await this.sendDirect(record))) throw error;
+        this.memoryBacklog.shift();
+        drained++;
+        continue;
       }
       this.memoryBacklog.shift();
       record.save.status = "IDB_STORED";
@@ -823,6 +842,24 @@ export class RecordingController {
 
   get memoryBacklogCount(): number {
     return this.memoryBacklog.length;
+  }
+
+  /** メモリ待機中の Chunk を WAV として書き出す。書き出してもメモリ待機からは外さない（Phase 1 §15 と同じ） */
+  exportMemoryBacklog(): MemoryBacklogFile[] {
+    const files: MemoryBacklogFile[] = [];
+    for (const record of this.memoryBacklog) {
+      if (record.wav === null) continue;
+      const { meetingId, source, sequenceNo } = record.meta;
+      // chunkKey の ":" はファイル名に使えない OS があるため、"_" で区切る
+      files.push({ fileName: `${meetingId}_${source}_${sequenceNo.toString().padStart(6, "0")}.wav`, wav: record.wav, meta: record.meta });
+    }
+    return files;
+  }
+
+  private async sendDirect(record: AudioChunkRecord): Promise<boolean> {
+    if (this.deps.directSaver === undefined) return false;
+    const outcome = await this.deps.directSaver.put(record);
+    return outcome.ok;
   }
 
   /** flush / stop を送り、同じ requestId の flushed を待つ。応答がなければタイムアウトで onError を通知して打ち切る（Phase 1 §15 と同じ）。 */
@@ -1156,7 +1193,7 @@ export class MultiSourceRecorder {
 
 # 7. `src/recording/finalizer.ts` の変更
 
-mic / system の両方を検証する。System なしの会議は `expectedChunkCounts.system = 0`。会議の状態の検査（`finalized` なら POST せず成功を返す、`stop_requested` / `finalizing` 以外は `verify` で失敗させる）と、`GET /chunks` の応答を `isChunkListResponse` に通し `meetingId` の一致を確かめる検査は Phase 1 §22 と同じ。
+mic / system の両方を検証する。System なしの会議は `expectedChunkCounts.system = 0`。会議の状態の検査（`finalized` なら POST せず成功を返す、`stop_requested` / `finalizing` 以外は `verify` で失敗させる）と、`GET /chunks` の応答を `isChunkListResponse` に通し `meetingId` の一致を確かめる検査は Phase 1 §22 と同じ。連続性検査をサーバー一覧の取得後に行い、IndexedDB にない連番でもサーバーに登録済みなら揃っているとみなす点（source ごとに判定）、確定に成功したら末尾の欠けを `missingTailMs` で返す点も Phase 1 §22 と同じ。末尾の欠けは Mic だけで判定する。`totalAudioFrames` は Mic の時計で、System の `audioFrameCount` は会議レコードに残らないためである。
 
 ```typescript
 // src/recording/finalizer.ts
@@ -1164,7 +1201,8 @@ import type { ChunkStore, MeetingStore } from "../storage/idb";
 import type { LocalSaveScheduler } from "./local-save-scheduler";
 import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
-import type { AudioSource } from "../types/recording";
+import type { AudioChunkRecord, AudioSource } from "../types/recording";
+import { frameToOffsetMs } from "./session-clock";
 
 export interface FinalizerDeps {
   readonly chunkStore: ChunkStore;
@@ -1207,7 +1245,8 @@ function describeFetchError(error: unknown, timeoutMs: number): string {
 }
 
 export type FinalizeResult =
-  | { readonly ok: true; readonly counts: Readonly<Record<AudioSource, number>> }
+  /** missingTailMs：Mic の末尾の Chunk が欠けたまま確定した長さ（ms）。欠けがなければ省く（Phase 1 §22） */
+  | { readonly ok: true; readonly counts: Readonly<Record<AudioSource, number>>; readonly missingTailMs?: number }
   | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string };
 
 const SOURCES: ReadonlyArray<AudioSource> = ["mic", "system"];
@@ -1255,11 +1294,6 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
       await deps.scheduler.resumeAll();
       return { ok: false, stage: "waiting_local_save", detail: `${source}: ${notRegistered.length} chunks not registered` };
     }
-    for (let i = 0; i < bySource[source].length; i++) {
-      if (bySource[source][i].meta.sequenceNo !== i) {
-        return { ok: false, stage: "verify", detail: `${source}: sequence gap at ${i}` };
-      }
-    }
   }
 
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
@@ -1282,6 +1316,23 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
   // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
   if (list.meetingId !== meetingId) return { ok: false, stage: "verify", detail: `list meetingId mismatch: ${list.meetingId}` };
+
+  // sequenceNo の連続性（欠番なし）。IDB にない連番は、サーバーに登録済みなら揃っているとみなす
+  // （IDB に書けずサーバーへ直接送った Chunk、Phase 1 §15 / §22）
+  const counts: Record<AudioSource, number> = { mic: 0, system: 0 };
+  for (const source of SOURCES) {
+    const localSeqs = new Set(bySource[source].map((c) => c.meta.sequenceNo));
+    const serverOnlySeqs = new Set(
+      list.chunks.filter((c) => c.source === source && c.registered && !localSeqs.has(c.sequenceNo)).map((c) => c.sequenceNo),
+    );
+    counts[source] = Math.max(-1, ...localSeqs, ...serverOnlySeqs) + 1;
+    for (let i = 0; i < counts[source]; i++) {
+      if (!localSeqs.has(i) && !serverOnlySeqs.has(i)) {
+        return { ok: false, stage: "verify", detail: `${source}: sequence gap at ${i}` };
+      }
+    }
+  }
+
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
   // 不一致を 1 件ずつ直すと Barrier の再試行が件数分かかるため、すべて洗い出してから一度に再投入する（Phase 1 §22）
   const mismatched: string[] = [];
@@ -1306,8 +1357,6 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     await deps.scheduler.resumeAll();
     return { ok: false, stage: "verify", detail: `server mismatch at ${mismatched.join(", ")}` };
   }
-
-  const counts: Record<AudioSource, number> = { mic: bySource.mic.length, system: bySource.system.length };
 
   // finalizing へ進める前の値を控える。POST が失敗・タイムアウトしたらここへ戻す。
   // 戻さないと、IndexedDB に finalizing のまま取り残された会議ができ、再開経路がなくなる。
@@ -1353,7 +1402,16 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   }
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);
-  return { ok: true, counts };
+  // 末尾の欠けは Mic だけで判定する。totalAudioFrames は Mic の時計で、System の audioFrameCount は会議レコードに残らない（Phase 1 §22）
+  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, bySource.mic, counts.mic);
+  return missingTailMs > 0 ? { ok: true, counts, missingTailMs } : { ok: true, counts };
+}
+
+/** 末尾の欠け（ms）。最後の連番が IDB にない（サーバーへ直接送った）ときは endFrame が分からないので 0（Phase 1 §22 と同じ） */
+export function measureMissingTailMs(audioFrameCount: number, chunks: ReadonlyArray<AudioChunkRecord>, chunkCount: number): number {
+  const last = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
+  if (last === undefined || last.meta.sequenceNo !== chunkCount - 1) return 0;
+  return frameToOffsetMs(Math.max(0, audioFrameCount - last.meta.endFrame));
 }
 ```
 

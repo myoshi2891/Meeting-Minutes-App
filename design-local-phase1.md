@@ -91,7 +91,7 @@ AudioContext のネイティブ sample rate は 44.1kHz / 48kHz / 96kHz など�
 1. **監視**：録音開始時に `navigator.storage.persist()` を要求し、Chunk 保存ごとに `navigator.storage.estimate()` で `usage / quota` を確認する（§21）。
 2. **段階1（使用率 ≥ 80%）**：状態が `DB_REGISTERED`（サーバー側で SHA-256 が検証済み）の Chunk から、`sequenceNo` 昇順に WAV Blob 本体を IndexedDB から削除し、メタデータのみ残す。サーバー側ファイルが Source of Truth の座を引き継いでいるため、録音データは失われない。
 3. **段階2（使用率 ≥ 95% かつ削除対象なし＝サーバー未起動で全 Chunk が滞留）**：File System Access API による緊急エクスポート（§4.5）を UI で促す。エクスポート成功後、当該 Chunk は `SAVED`（保存先 = `fsa`）として扱い、段階1 と同様に Blob 本体を削除できる。
-4. **段階3（それでも `put` が `QuotaExceededError` で失敗）**：Chunk はメモリ上の待機キューに保持し、UI に「保存領域が不足しています。サーバーを起動するかエクスポートしてください」と表示する。録音は継続する。メモリ待機キューはブラウザクラッシュで失われるため、この状態は `RecordingHealth.degradedReasons` に `IDB_QUOTA_EXHAUSTED` として記録し、UI が最上位警告として表示する。クォータ以外の理由で `put` が失敗した場合も同じくメモリ待機に回し、`IDB_WRITE_FAILED` として記録する（§15）。
+4. **段階3（それでも `put` が `QuotaExceededError` で失敗）**：Chunk はメモリ上の待機キューに保持し、UI に「保存領域が不足しています。サーバーを起動するかエクスポートしてください」と表示する。録音は継続する。メモリ待機キューはブラウザクラッシュで失われるため、この状態は `RecordingHealth.degradedReasons` に `IDB_QUOTA_EXHAUSTED` として記録し、UI が最上位警告として表示する。クォータ以外の理由で `put` が失敗した場合も同じくメモリ待機に回し、`IDB_WRITE_FAILED` として記録する（§15）。この場合は IndexedDB の回復を待たずにサーバーへ直接送り、サーバーにも届かなければ WAV として書き出せるようにする（§15 `drainMemoryBacklog()` / `exportMemoryBacklog()`）。
 
 `persist()` の結果が `false` でも録音を止めない。永続化許可はブラウザのヒューリスティクスに依存し、断定できない事項である（§5）。
 
@@ -1596,10 +1596,23 @@ import { createSessionClock, frameToOffsetMs } from "./session-clock";
 import { buildStandaloneWav } from "../audio/wav";
 import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
+import type { SaveOutcome } from "../api/local-saver";
 
 /** Chunk を保存 State Machine に投入する口。LocalSaveScheduler が構造的に満たす（テストでは差し替える）。 */
 export interface ChunkEnqueuer {
   enqueue(chunkKey: string): Promise<void>;
+}
+
+/** IDB を経由せずサーバーへ Chunk を送る口。LocalSaver が構造的に満たす（テストでは差し替える）。 */
+export interface DirectChunkSaver {
+  put(record: AudioChunkRecord): Promise<SaveOutcome>;
+}
+
+/** メモリ待機中の Chunk を利用者の手元へ書き出すためのファイル（exportMemoryBacklog）。 */
+export interface MemoryBacklogFile {
+  readonly fileName: string;
+  readonly wav: Blob;
+  readonly meta: ChunkTimingMetadata;
 }
 
 export interface RecordingControllerDeps {
@@ -1615,6 +1628,8 @@ export interface RecordingControllerDeps {
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
   /** 録音中の会議ロック（本番は navigator.locks）。§23 の復旧はロック保持中の会議に触らない */
   readonly locks: MeetingLockManager;
+  /** IDB に書けない Chunk をサーバーへ直接送る（drainMemoryBacklog）。省略時は直接送らない */
+  readonly directSaver?: DirectChunkSaver;
 }
 
 /** Worklet が flush / stop に応答しない（AudioContext が閉じられた等）ときに待機を打ち切るまでの時間 */
@@ -1785,7 +1800,12 @@ export class RecordingController {
     this.releaseLock = null;
   }
 
-  /** IDB クォータが回復したときに UI / QuotaMonitor から呼ぶ。 */
+  /**
+   * IDB クォータが回復したとき、または IDB_WRITE_FAILED のときに UI / QuotaMonitor から呼ぶ。
+   * クォータ以外の失敗（別タブの versionchange で接続が閉じた等）は再オープンしても直らないため、
+   * サーバーへ直接送る。直接送った Chunk は IDB に残らないが、Finalizer はサーバーの登録で連番を埋める（§22）。
+   * 直接送信も失敗したら元の例外を投げ、Chunk はメモリ待機に残す（exportMemoryBacklog で書き出せる）。
+   */
   async drainMemoryBacklog(): Promise<number> {
     let drained = 0;
     while (this.memoryBacklog.length > 0) {
@@ -1794,7 +1814,10 @@ export class RecordingController {
         await this.deps.chunkStore.putChunk(record);
       } catch (error) {
         if (isQuotaExceeded(error)) break;
-        throw error;
+        if (!(await this.sendDirect(record))) throw error;
+        this.memoryBacklog.shift();
+        drained++;
+        continue;
       }
       this.memoryBacklog.shift();
       record.save.status = "IDB_STORED";
@@ -1806,6 +1829,27 @@ export class RecordingController {
 
   get memoryBacklogCount(): number {
     return this.memoryBacklog.length;
+  }
+
+  /**
+   * メモリ待機中の Chunk を WAV として書き出す（ダウンロードは UI が行う）。IDB にもサーバーにも保存できないとき、
+   * 再読み込みやタブを閉じる前に利用者の手元へ残すための経路。書き出してもメモリ待機からは外さない（後で drain できる）。
+   */
+  exportMemoryBacklog(): MemoryBacklogFile[] {
+    const files: MemoryBacklogFile[] = [];
+    for (const record of this.memoryBacklog) {
+      if (record.wav === null) continue;
+      const { meetingId, source, sequenceNo } = record.meta;
+      // chunkKey の ":" はファイル名に使えない OS があるため、"_" で区切る
+      files.push({ fileName: `${meetingId}_${source}_${sequenceNo.toString().padStart(6, "0")}.wav`, wav: record.wav, meta: record.meta });
+    }
+    return files;
+  }
+
+  private async sendDirect(record: AudioChunkRecord): Promise<boolean> {
+    if (this.deps.directSaver === undefined) return false;
+    const outcome = await this.deps.directSaver.put(record);
+    return outcome.ok;
   }
 
   /** flush / stop を送り、同じ requestId の flushed を待つ。応答がなければタイムアウトで onError を通知して待機を打ち切る。 */
@@ -1934,11 +1978,13 @@ export class RecordingController {
 
 IndexedDB への書き込みに失敗した Chunk は、失敗の理由を問わずメモリ待機キュー（`memoryBacklog`）に残す。`sequenceNo` は採番済みなので、捨てると欠番になり、Finalization Barrier（§22）の連続性検査を永久に通過できなくなるためである。`QuotaExceededError` は §3.4 段階3として `IDB_QUOTA_EXHAUSTED` を記録し、録音を継続する。それ以外のエラー（別タブのアップグレードで接続が閉じられた後の `InvalidStateError` など）は `IDB_WRITE_FAILED` を記録し、`onError` に通知したうえで同じく待機キューに残し、`drainMemoryBacklog()` で再書き込みする。なお、待機キューに残ったのが末尾の Chunk だけだと、IndexedDB 上は欠番なしに見えて連続性検査では検出できない。そのため Finalizer は `memoryBacklogCount` が 0 になるまで Barrier を通さない（§22）。
 
+`drainMemoryBacklog()` は、クォータ以外の理由で再書き込みにも失敗した Chunk を、`directSaver`（本番は `LocalSaver`）でサーバーへ直接 PUT し、成功したらメモリ待機から外す。別タブが `DB_VERSION` を上げた後は、古いコードで開き直しても `VersionError` になり、このタブは二度と IndexedDB に書けないためである。直接送った Chunk は IndexedDB に残らないが、Finalizer はサーバーに登録済みの連番を「揃っている」とみなす（§22）。直接送信も失敗した場合（サーバー停止中など）は IndexedDB の例外をそのまま投げ、Chunk はメモリ待機に残す。このとき UI は `exportMemoryBacklog()` で WAV を書き出させ、再読み込みやタブを閉じる前に利用者の手元へ残す（ファイル名は `<meetingId>_<source>_<6 桁の sequenceNo>.wav`。書き出してもメモリ待機からは外さない）。書き出したファイルをサーバーへ取り込む経路は Phase 1 の範囲外である。`directSaver` を省略すると直接送信は行わない。
+
 `stop()` は `stop_requested` を先に永続化し、最終 Chunk の書き込み完了を待ってから会議レコードをもう一度保存する。最終 flush で確定した `sessionClock.audioFrameCount` を IndexedDB に残すためで、Finalizer はこの値を `totalAudioFrames` として送る。これらの処理全体を try/finally で包み、途中で IndexedDB 書き込みなどが reject しても、ソースノードの切断・`onmessage` の解除・マイクトラックの停止は必ず行う。
 
 `flush` / `stop` コマンドには要求ごとに一意の `requestId` を付け、Worklet は同じ `requestId` を `flushed` に載せて返す。`flushWaiters` は `requestId` をキーにした `Map` で、`flushed` を受けたらその `requestId` の待機だけを解放する。pagehide の `flush()` と `stop()` が重なった場合に、先の `flushed` で `stop()` の待機まで解放され、最終 Chunk の書き込みを待たずに進むのを防ぐためである。
 
-Worklet が応答しない場合（AudioContext が閉じられた、Processor が破棄された等）に備え、待機には `FLUSH_TIMEOUT_MS`（5 秒）のタイムアウトを付ける。タイムアウトしたら自分の待機だけを `Map` から外し、`onError` に通知して待機を打ち切る。`stop()` はそのまま進んで finally でマイクと Worklet を解放する。遅れて届いた `flushed` は対応する待機がないので無視され、後続の要求を誤って解放しない。応答を順番（FIFO）で対応付けると、タイムアウトで外した待機の分だけ対応がずれるため、`requestId` で対応付けている。タイマーは `setTimer` で依存注入できる（既定は `setTimeout`）。
+Worklet が応答しない場合（AudioContext が閉じられた、Processor が破棄された等）に備え、待機には `FLUSH_TIMEOUT_MS`（5 秒）のタイムアウトを付ける。タイムアウトしたら自分の待機だけを `Map` から外し、`onError` に通知して待機を打ち切る。`stop()` はそのまま進んで finally でマイクと Worklet を解放する。遅れて届いた `flushed` は対応する待機がないので無視され、後続の要求を誤って解放しない。応答を順番（FIFO）で対応付けると、タイムアウトで外した待機の分だけ対応がずれるため、`requestId` で対応付けている。タイマーは `setTimer` で依存注入できる（既定は `setTimeout`）。`stop()` がタイムアウトすると最終の部分 Chunk は失われ、Worklet は切り離されるので取り戻せない。会議の状態は増やさず、Finalizer が確定時に末尾の欠けを `missingTailMs` として返し、UI が警告する（§22）。
 
 Scheduler への依存は `enqueue()` だけを持つ `ChunkEnqueuer` インターフェースに絞っている。`LocalSaveScheduler` はこのインターフェースを構造的に満たすため、呼び出し側の配線は変わらない。
 
@@ -2916,6 +2962,8 @@ import type { ChunkStore, MeetingStore } from "../storage/idb";
 import type { LocalSaveScheduler } from "./local-save-scheduler";
 import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
+import type { AudioChunkRecord } from "../types/recording";
+import { frameToOffsetMs } from "./session-clock";
 
 export interface FinalizerDeps {
   readonly chunkStore: ChunkStore;
@@ -2933,14 +2981,15 @@ export interface FinalizerDeps {
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export type FinalizeResult =
-  | { readonly ok: true }
+  /** missingTailMs：末尾の Chunk が欠けたまま確定した長さ（ms）。欠けがなければ省く（T1-e） */
+  | { readonly ok: true; readonly missingTailMs?: number }
   | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string };
 
 /**
  * Finalization Barrier：
  *   1. 最終 Chunk が IDB にある（呼び出し前提：RecordingController.stop() 完了）かつメモリ待機中の Chunk がない
  *   2. IDB 上の全 Chunk が DB_REGISTERED（SAVED はサーバー一覧で登録確認できれば DB_REGISTERED に進める）
- *   3. サーバーの一覧と件数・sha256 が一致
+ *   3. サーバーの一覧と件数・sha256 が一致（IDB にない連番は、サーバーに登録済みなら揃っているとみなす）
  *   4. POST /finalize
  * 1〜3 を満たさない限り finalizing へ遷移しない。
  */
@@ -2983,13 +3032,6 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     return { ok: false, stage: "waiting_local_save", detail: `${notRegistered.length} chunks not registered` };
   }
 
-  // sequenceNo の連続性（欠番なし）
-  for (let i = 0; i < chunks.length; i++) {
-    if (chunks[i].meta.sequenceNo !== i) {
-      return { ok: false, stage: "verify", detail: `sequence gap at ${i}` };
-    }
-  }
-
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
   assertLocalHost(listUrl);
   // タイムアウトで abort すると fetch / json() が reject し、既存のエラー経路で Result になる
@@ -3010,6 +3052,20 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
   // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
   if (list.meetingId !== meetingId) return { ok: false, stage: "verify", detail: `list meetingId mismatch: ${list.meetingId}` };
+
+  // sequenceNo の連続性（欠番なし）。IDB に書けずサーバーへ直接送った Chunk（§15 drainMemoryBacklog）は IDB に残らないので、
+  // IDB にない連番はサーバーに登録済みなら揃っているとみなす。IDB の件数で送ると、サーバーは件数不一致の 409 を返し続ける
+  const localSeqs = new Set(chunks.map((c) => c.meta.sequenceNo));
+  const serverOnlySeqs = new Set(
+    list.chunks.filter((c) => c.source === "mic" && c.registered && !localSeqs.has(c.sequenceNo)).map((c) => c.sequenceNo),
+  );
+  const chunkCount = Math.max(-1, ...localSeqs, ...serverOnlySeqs) + 1;
+  for (let i = 0; i < chunkCount; i++) {
+    if (!localSeqs.has(i) && !serverOnlySeqs.has(i)) {
+      return { ok: false, stage: "verify", detail: `sequence gap at ${i}` };
+    }
+  }
+
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
   // 不一致を 1 件ずつ直すと Barrier の再試行が件数分かかるため、すべて洗い出してから一度に再投入する
   const mismatched: number[] = [];
@@ -3042,13 +3098,13 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   };
 
   meeting.status = "finalizing";
-  meeting.finalChunkCount = chunks.length;
+  meeting.finalChunkCount = chunkCount;
   // 再試行で終了時刻を書き換えない（前回の POST がサーバーに届いていた場合と値を揃える）
   meeting.endedAt ??= Date.now();
   await deps.meetingStore.put(meeting);
 
   const body: FinalizeRequest = {
-    expectedChunkCounts: { mic: chunks.length, system: 0 },
+    expectedChunkCounts: { mic: chunkCount, system: 0 },
     endedAtEpochMs: meeting.endedAt,
     totalAudioFrames: meeting.sessionClock.audioFrameCount,
   };
@@ -3080,7 +3136,21 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   }
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);
-  return { ok: true };
+  // 欠けた音声は取り戻せないので確定は止めず、UI が警告できるよう長さを返す（T1-e）
+  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, chunks, chunkCount);
+  return missingTailMs > 0 ? { ok: true, missingTailMs } : { ok: true };
+}
+
+/**
+ * 末尾の欠け（ms）。stop() が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま会議が確定する。
+ * audioFrameCount は heartbeat（1 秒ごと）でも進むので、最後の Chunk の endFrame より大きければ末尾が欠けている
+ * （最後の heartbeat より後の 1 秒未満の欠けは検出できない）。
+ * 最後の連番が IDB にない（サーバーへ直接送った）ときは endFrame が分からないので 0 を返す。
+ */
+export function measureMissingTailMs(audioFrameCount: number, chunks: ReadonlyArray<AudioChunkRecord>, chunkCount: number): number {
+  const last = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
+  if (last === undefined || last.meta.sequenceNo !== chunkCount - 1) return 0;
+  return frameToOffsetMs(Math.max(0, audioFrameCount - last.meta.endFrame));
 }
 
 function errorMessage(error: unknown): string {
@@ -3093,6 +3163,10 @@ function errorMessage(error: unknown): string {
 `SAVED`（サーバーがファイル書き込みだけ成功し `registered: false` を返した Chunk）は Scheduler の再開対象ではない（`resumeAll`・起動時の復旧・遅れて発火したリトライタイマーのいずれも送らない）。PUT を再送しても `registered: false` が続きうるため、`notRegistered` からは除外してサーバー一覧の照合へ進める。一覧で `registered: true` かつ sha256 一致が確認できたら `DB_REGISTERED` に更新する。確認できなければ他の不一致と同様に `LOCAL_SAVE_PENDING` に戻して再投入する。
 
 サーバー一覧との照合は、最初の不一致で打ち切らずに全 Chunk を確かめる。不一致の Chunk はすべて `LOCAL_SAVE_PENDING` に戻し、`resumeAll()` を 1 回だけ呼んでから、不一致の `sequenceNo` をすべて `detail` に並べて `verify` の失敗を返す（例: `server mismatch at seq 0, 2`）。1 件ずつ直すと、不一致の件数だけ Barrier の再試行が必要になるためである。
+
+連続性検査はサーバー一覧を取得した後に行う。IndexedDB にない `sequenceNo` でも、サーバー一覧に `registered: true` で載っていれば揃っているとみなし、送る件数（`expectedChunkCounts.mic` と `finalChunkCount`）は「IndexedDB とサーバーのどちらかにある最大の `sequenceNo` + 1」とする。IndexedDB に書けずサーバーへ直接送った Chunk（§15 `drainMemoryBacklog()`）は IndexedDB に残らないため、IndexedDB の件数で送るとサーバーが件数不一致の 409 を返し続けるからである。サーバーにだけある Chunk は手元にコピーがないので SHA-256 を照合できないが、サーバーが finalize 時にファイルの SHA-256 を検証する。
+
+確定に成功したら、会議の `sessionClock.audioFrameCount`（`totalAudioFrames`）と最後の Chunk の `endFrame` を比べ、差があれば `{ ok: true, missingTailMs }` を返す（`measureMissingTailMs()`）。`stop()` が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま確定するためである。失った音声は取り戻せないので確定は止めず、UI が「末尾 約◯秒が保存されていません」と警告する。`audioFrameCount` は heartbeat（1 秒ごと）でも進むので、最後の heartbeat より後の 1 秒未満の欠けは検出できない。最後の `sequenceNo` が IndexedDB になくサーバーにだけある場合は `endFrame` が分からないので、欠けなしとして扱う。クラッシュ復旧した会議は `audioFrameCount` を保存済み Chunk の最大 `endFrame` から復元する（§23）ため、欠けとは判定されない。
 
 `finalizeMeeting` は失敗を例外ではなく `FinalizeResult` で返す。`GET /chunks` の応答は外部入力なので `isChunkListResponse` で検証し、契約に合わなければ `verify` の失敗とする。応答の `meetingId` が要求した会議と異なる場合も `verify` の失敗とし、ローカルの Chunk を `DB_REGISTERED` にしない（無音など同一内容の Chunk は別会議でも SHA-256 が一致しうるため）。`GET /chunks` と `POST /finalize` にはそれぞれ `timeoutMs`（既定 30 秒）の `AbortController` を付ける。応答しないサーバーに対しても、接続失敗と同じ経路で失敗結果を返す。`POST /finalize` が失敗した場合（HTTP エラー、接続失敗、タイムアウトのいずれも）は会議を `stop_requested` に戻し、`finalizing` のまま残さない。`finalChunkCount` も POST 前の値へ戻す（失敗した POST の件数を記録として残さない）。
 
