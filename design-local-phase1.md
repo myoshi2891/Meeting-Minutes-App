@@ -4222,7 +4222,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 
 # 31. アプリの組み立て（配線）
 
-§15〜§23 の部品は互いを直接知らない。起動時に 1 回だけ部品を生成してつなぎ、録音ごとに `RecordingController` を包む層を `src/app/app.ts` に置く。UI はこの層の `AppEvent` を表示し、`setToken` / `startRecording` / `session.stop()` を呼ぶだけにする（UI 本体は §31 の範囲外）。
+§15〜§23 の部品は互いを直接知らない。起動時に 1 回だけ部品を生成してつなぎ、録音ごとに `RecordingController` を包む層を `src/app/app.ts` に置く。UI はこの層の `AppEvent` を表示し、`setToken` / `startRecording` / `session.stop()` / `retryFinalize` を呼ぶだけにする（最小 UI は §31.4）。
 
 ## 31.1 ビルドと配信
 
@@ -4250,7 +4250,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 
 - `unpersistedChunkCount` は、stop 後もこのタブで録音した会議の controller を引く。stop の後に会議ロックが外れた会議を、サーバー復帰の再試行が拾う可能性があるためである。`() => 0` を渡すと、メモリ待機中の末尾 Chunk を残したまま Barrier を通してしまう。
 - `directSaver`（§15）には、送るたびに現在の `LocalSaver` を引く口を渡す。録音開始時点の `LocalSaver` を渡すと、トークン未設定や失効したトークンで始めた録音は、途中で `setToken` しても直接送信が通らない。トークン未設定の間は、送らずに `UNAUTHORIZED` の失敗を返す（Chunk はメモリ待機に残る）。
-- 既知の制約：`finalizeMeeting` が `waiting_local_save` で終わった会議は、次に backend の状態が変わるか、`setToken` を呼ぶか、アプリを再起動するまで再試行されない。UI は会議一覧に「確定待ち」と表示し、手動の再試行を用意する（UI の範囲）。
+- 既知の制約：`finalizeMeeting` が `waiting_local_save` で終わった会議は、次に backend の状態が変わるか、`setToken` を呼ぶか、アプリを再起動するまで自動では再試行されない。UI は `listPendingFinalize()` で「確定待ち」の会議を表示し、`retryFinalize(meetingId)` で手動の再試行を用意する（§31.4）。`retryFinalize` は会議ロックを取ってから確定し、別タブがロックを持つ会議には触らない。backend 復帰時の自動再試行も同じ `retryFinalize` を通る。
 - Phase 2 のクライアント（`design-local-phase2-client.md`）は画面共有音声（system）の Controller を追加するため、この層を拡張して使う。
 
 ## 31.3 コード
@@ -4268,7 +4268,7 @@ import { createInitialHealth } from "../recording/recording-health-monitor";
 import { recoverOnStartup, type RecoveryReport } from "../recording/recovery";
 import { ChunkStore, MeetingStore, SettingsStore } from "../storage/idb";
 import { enforceQuota, requestPersistence } from "../storage/quota-monitor";
-import type { LocalBackendHealth, RecordingHealth } from "../types/recording";
+import type { LocalBackendHealth, MeetingRecord, RecordingHealth } from "../types/recording";
 
 /** settings ストアでトークンを保存するキー（§4.3） */
 export const BACKEND_TOKEN_KEY = "backendToken";
@@ -4476,6 +4476,24 @@ export class App {
     return session;
   }
 
+  /** 停止したが確定していない会議（§31.2 の既知の制約）。UI は「確定待ち」として表示し、手動で再試行させる */
+  async listPendingFinalize(): Promise<MeetingRecord[]> {
+    const stopped = await this.meetingStore.listByStatus("stop_requested");
+    const finalizing = await this.meetingStore.listByStatus("finalizing");
+    return [...stopped, ...finalizing];
+  }
+
+  /** 会議ロックを取って Barrier を再試行する。別タブが録音・確定中の会議には触らない（§23 と同じ） */
+  async retryFinalize(meetingId: string): Promise<FinalizeResult> {
+    const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
+    if (release === null) return { ok: false, stage: "verify", detail: "meeting is locked by another tab" };
+    try {
+      return await this.finalize(meetingId);
+    } finally {
+      release();
+    }
+  }
+
   private createSaver(token: string): LocalSaver {
     return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch);
   }
@@ -4518,17 +4536,7 @@ export class App {
       }
       await this.scheduler.resumeAll(lockedElsewhere);
 
-      for (const status of ["stop_requested", "finalizing"] as const) {
-        for (const m of await this.meetingStore.listByStatus(status)) {
-          const release = await tryAcquireMeetingLock(this.deps.locks, m.meetingId);
-          if (release === null) continue;
-          try {
-            await this.finalize(m.meetingId);
-          } finally {
-            release();
-          }
-        }
-      }
+      for (const m of await this.listPendingFinalize()) await this.retryFinalize(m.meetingId);
     } catch (error) {
       this.deps.onEvent({ type: "error", error });
     }
@@ -4537,6 +4545,125 @@ export class App {
 
 function isUsable(state: LocalBackendHealth): boolean {
   return (state.status === "HEALTHY" || state.status === "DEGRADED") && !state.unauthorized;
+}
+```
+
+## 31.4 最小 UI
+
+UI フレームワークは使わない（ブラウザ標準 API と TypeScript のみ）。表示文言を作る純関数 `src/ui/recording-view.ts` と、DOM を操作する薄い層 `src/main.ts` に分け、前者を Node の Vitest で検証する。後者はブラウザでの手動確認（§28.3）で担保する。ファイル名は Phase 2 の `src/ui/state.ts`（phase2-client §11）と衝突させない。
+
+### 画面要素と根拠
+
+| 要素 | 振る舞い | 根拠 |
+| --- | --- | --- |
+| バナー | `backendBanner`：unauthorized → トークン無効、UNREACHABLE → 「サーバー未接続 ── 録音は継続中。N 個の Chunk をブラウザ内に保持しています」（N = `pendingChunkCount`）、DEGRADED → 高負荷。文言は phase2-client §11 の `backendBanner` と揃える | §3.6、§18 |
+| 警告 | `warningsFor`：`assessHealth` の `reasons` を重大な順に並べる。先頭は `IDB_QUOTA_EXHAUSTED`（§3.4 段階3 の最上位警告）。backend の理由はバナーと重複するので出さない。録音していない間は録音の健全性（`NO_AUDIO_FRAMES` など）を評価せず、`degradedReasons` だけを出す | §3.4、§19 |
+| 経過時間・使用率 | `elapsedText`、`storageUsageText`（`storageUsageRatio` が null なら不明） | §3.6 |
+| 録音開始 | `confirm(CONSENT_QUESTION)` → `getUserMedia({ audio: true })` → `new AudioContext()`（sampleRate は指定しない）→ `attachAudioContextMonitor` → `app.startRecording`。同意をキャンセルしたら開始しない。`getUserMedia` の拒否は開始前のエラーとして表示する | §3.9、§6、§19、§28.3 |
+| 録音停止 | `session.stop()` の結果を `finalizeResultText` で表示し、AudioContext を閉じる | §22 |
+| 描画ループ | 表示中は `requestAnimationFrame` で状態を読む。hidden の間は rAF が止まるので、`onHidden` で 1 秒間隔のタイマーに切り替え、visible で戻す | §19、§20 |
+| お知らせ | `onEvent` → `noticeFor`。`finalized` の `missingTailMs` は「末尾 約◯秒が保存されていません」（1 秒未満でも約 1 秒）。`memory_backlog_export_required` で「WAV を書き出す」ボタンを出し、`exportMemoryBacklog()` を Blob URL と `<a download>` で保存する | §15、§22 |
+| 確定待ちの会議 | `listPendingFinalize()` の一覧に「再試行」ボタン（`retryFinalize`）。5 秒ごとと確定・停止のたびに更新する | §31.2 |
+| 設定 | トークン入力 → `app.setToken`。`LOCAL_DATA_NOTICE`（§3.9 の利用者責任の明示）と `TAB_CLOSE_HELP`（§20 の文言）を常に表示する | §3.9、§4.3、§20 |
+| 起動失敗 | `openDatabase()` が別タブのためにアップグレードできなければ「他のタブを閉じてください」と表示する | §10 |
+
+- 描画は `textContent` だけで行い、`innerHTML` は使わない。エラー文言などに外部由来の文字列が混ざりうるためである。`noticeFor` は `Error` と文字列以外のエラーの中身を出さない（トークンなどを含むオブジェクトを画面に出さない）。
+- `recovered` は `createApp` の中（起動時の復旧）で届くため、その時点ではまだ `App` がない。確定待ちの一覧は起動後に取得する。
+- `index.html` は favicon を `data:,` にして要求させない（CSP の `img-src 'self' data:` の範囲）。
+
+### コード
+
+```typescript
+// src/ui/recording-view.ts
+import type { AppEvent } from "../app/app";
+import type { FinalizeResult } from "../recording/finalizer";
+import type { HealthAssessment } from "../recording/recording-health-monitor";
+import type { DegradedReason, LocalBackendHealth, RecordingHealth } from "../types/recording";
+
+/** §3.9：録音開始ボタン押下時に確認する。スキップするオプションは設けない */
+export const CONSENT_QUESTION = "この会議の参加者に録音の同意を得ましたか？";
+
+/** §3.9：通信設計では防げない持ち出し経路を、利用者の責任範囲として明示する */
+export const LOCAL_DATA_NOTICE =
+  "録音はこのパソコンの中（ブラウザと、ローカルで動くサーバーのデータフォルダ）にだけ保存され、外部へは送信しません。" +
+  "ただし、パソコンの盗難・マルウェア・クラウドバックアップの同期などによって録音ファイルが外部に出る可能性があります。管理は利用者の責任で行ってください。";
+
+/** §20：設定画面と録音画面のヘルプに記載する */
+export const TAB_CLOSE_HELP = "タブを閉じる・リロードすると、直近最大 30 秒の音声が失われる可能性があります。録音停止ボタンで終了してください";
+
+/** backend の状態（§3.6 / §18）。文言は phase2-client §11 の backendBanner と揃える */
+export function backendBanner(backend: LocalBackendHealth, health: Pick<RecordingHealth, "pendingChunkCount">): string | null {
+  if (backend.unauthorized) return "サーバーのトークンが無効です。設定を確認してください。";
+  if (backend.status === "UNREACHABLE") return `サーバー未接続 ── 録音は継続中。${health.pendingChunkCount} 個の Chunk をブラウザ内に保持しています`;
+  if (backend.status === "DEGRADED") return "サーバーが高負荷です。保存は継続中";
+  return null;
+}
+
+/** 重大な順。backend の理由はバナーで出すのでここには含めない */
+const WARNING_TEXT: ReadonlyArray<readonly [DegradedReason, string]> = [
+  // §3.4 段階3：メモリ待機はクラッシュで失われるため最上位
+  ["IDB_QUOTA_EXHAUSTED", "保存領域が不足しています。サーバーを起動するかエクスポートしてください"],
+  ["IDB_WRITE_FAILED", "ブラウザ内に保存できない音声があります。サーバーを起動するか、WAV を書き出してください"],
+  ["MIC_TRACK_ENDED", "マイクが切断されました。録音を止めて、マイクを確認してください"],
+  ["NO_AUDIO_FRAMES", "音声が届いていません（5 秒以上）"],
+  ["AUDIO_CONTEXT_CLOSED", "音声処理が停止しました。録音を止めてやり直してください"],
+  ["AUDIO_CONTEXT_SUSPENDED", "音声処理が一時停止しています（画面ロックなど）"],
+  ["IDB_QUOTA_WARNING", "ブラウザ内の保存領域が残り少なくなっています"],
+  ["STORAGE_NOT_PERSISTED", "ブラウザが保存領域の永続化を許可していません。容量が逼迫すると録音データが消える可能性があります"],
+];
+
+/** 録音の健全性（§19 assessHealth の reasons）を利用者向けの文言にする */
+export function warningsFor(assessment: Pick<HealthAssessment, "reasons">): string[] {
+  return WARNING_TEXT.filter(([reason]) => assessment.reasons.includes(reason)).map(([, text]) => text);
+}
+
+export function storageUsageText(ratio: number | null): string {
+  return `ブラウザ内の保存領域 使用率 ${ratio === null ? "不明" : `${Math.round(ratio * 100)}%`}`;
+}
+
+/** §22：stop が Worklet の応答を待てずに打ち切った場合の欠け。1 秒未満でも欠けはあるので 0 秒とは言わない */
+export function missingTailText(missingTailMs: number): string {
+  return `末尾 約${Math.max(1, Math.round(missingTailMs / 1000))}秒が保存されていません`;
+}
+
+export function noticeFor(event: AppEvent): string | null {
+  switch (event.type) {
+    case "recovered": {
+      const count = event.report.interruptedMeetings.length;
+      return count === 0 ? null : `前回中断された会議が ${count} 件あります。サーバーへの保存と確定を再開します`;
+    }
+    case "finalized":
+      return event.missingTailMs === undefined ? "録音を確定しました" : `録音を確定しました。${missingTailText(event.missingTailMs)}`;
+    case "export_required":
+      return "ブラウザ内の保存領域がほぼ一杯です。サーバーを起動するか、録音をエクスポートしてください";
+    case "memory_backlog_export_required":
+      return "保存できていない音声があります。「WAV を書き出す」で手元に保存してください";
+    case "error":
+      return `エラー: ${errorMessage(event.error)}`;
+  }
+}
+
+export function finalizeResultText(result: FinalizeResult): string {
+  if (result.ok) return result.missingTailMs === undefined ? "録音を確定しました" : `録音を確定しました。${missingTailText(result.missingTailMs)}`;
+  if (result.stage === "waiting_local_save") return "確定待ち（サーバーへの保存が終わると自動で確定します）";
+  if (result.stage === "finalize") return `確定できませんでした。再試行してください（${result.detail}）`;
+  return `確定できませんでした（${result.detail}）`;
+}
+
+/** 録音の経過時間。1 時間未満は mm:ss、以上は h:mm:ss */
+export function elapsedText(ms: number): string {
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const mm = String(Math.floor((total % 3600) / 60)).padStart(2, "0");
+  const ss = String(total % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+/** error は unknown。任意のオブジェクトの中身（トークンなど）を画面に出さない */
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return "不明なエラー";
 }
 ```
 
