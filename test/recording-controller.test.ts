@@ -528,6 +528,23 @@ describe("RecordingController", () => {
     expect(s.health.degradedReasons).toEqual([]);
   });
 
+  it("stop で ended リスナーを解除し、同じトラックで録り直してもリスナーが蓄積しない", async () => {
+    // Arrange：トラックに登録されたリスナーの signal を記録する
+    const s = await setup();
+    const signals: Array<AbortSignal | undefined> = [];
+    const original = s.track.addEventListener.bind(s.track);
+    s.track.addEventListener = (type, listener, options) => {
+      signals.push(typeof options === "object" ? options.signal : undefined);
+      original(type, listener, options);
+    };
+    await s.controller.start("m1", "定例", 1);
+    // Act
+    await s.controller.stop();
+    // Assert
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
   it("ended が複数回届いても MIC_TRACK_ENDED は 1 件だけ", async () => {
     const s = await setup();
     await s.controller.start("m1", "定例", 1);
