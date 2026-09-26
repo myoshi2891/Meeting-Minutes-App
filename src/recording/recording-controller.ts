@@ -130,6 +130,9 @@ export class RecordingController {
 
     for (const track of mediaStream.getAudioTracks()) {
       track.addEventListener("ended", () => {
+        // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する
+        if (this.node === null) return;
+        if (this.deps.health.degradedReasons.includes("MIC_TRACK_ENDED")) return;
         this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "MIC_TRACK_ENDED"];
       });
     }
@@ -139,12 +142,14 @@ export class RecordingController {
    * recording を保存した後の start 失敗を巻き戻す。Worklet を切り離し、会議を created に戻す。
    * recording のまま残すと、次回起動の復旧が stop_requested に落として Chunk のない会議を finalize しうる。
    * 巻き戻しの保存失敗は onError に通知し、呼び出し元には元の例外を返す。
+   * stop() は Worklet がないと何もしないため、マイクのトラックもここで止める。
    */
   private async rollBackStart(meeting: MeetingRecord): Promise<void> {
     this.sourceNode?.disconnect();
     this.sourceNode = null;
     if (this.node !== null) this.node.port.onmessage = null;
     this.node = null;
+    for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
     this.meeting = null;
     this.clock = null;
     meeting.status = "created";

@@ -249,6 +249,8 @@ describe("RecordingController", () => {
     const meeting = await s.meetingStore.get("m1");
     expect(meeting?.status).toBe("created");
     expect(s.controller.sessionClock).toBeNull();
+    // stop() は Worklet がないと何もしないため、ここでマイクを解放しないと取得したままになる
+    expect(s.track.stop).toHaveBeenCalled();
   });
 
   it("stop は stop_requested を記録し、最終の部分 Chunk の保存完了まで待ってからトラックを止める", async () => {
@@ -390,5 +392,24 @@ describe("RecordingController", () => {
     await s.controller.start("m1", "定例", 1);
     s.track.dispatchEvent(new Event("ended"));
     expect(s.health.degradedReasons).toContain("MIC_TRACK_ENDED");
+  });
+
+  it("stop 後に届いた ended は MIC_TRACK_ENDED を入れない", async () => {
+    // Arrange：停止済みの会議。health は次の録音に引き継がれうる
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    await s.controller.stop();
+    // Act
+    s.track.dispatchEvent(new Event("ended"));
+    // Assert
+    expect(s.health.degradedReasons).toEqual([]);
+  });
+
+  it("ended が複数回届いても MIC_TRACK_ENDED は 1 件だけ", async () => {
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    s.track.dispatchEvent(new Event("ended"));
+    s.track.dispatchEvent(new Event("ended"));
+    expect(s.health.degradedReasons).toEqual(["MIC_TRACK_ENDED"]);
   });
 });
