@@ -80,6 +80,7 @@ interface Setup {
   errors: Error[];
   locks: FakeLockManager;
   track: EventTarget & { stop: ReturnType<typeof vi.fn> };
+  audioContext: AudioContext;
   /** 注入したタイマー。fireTimers() で期限を待たずに発火させる */
   fireTimers: () => void;
   /** Worklet へのコマンド・enqueue・onError のいずれかで condition が真になるまで待つ */
@@ -139,7 +140,7 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore): Prom
   };
   const until = (condition: () => boolean) => signal.until(condition);
   const untilCommand = (type: WorkletCommand["type"]) => until(() => worklet.commands.some((c) => c.type === type));
-  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, locks, track, fireTimers, until, untilCommand };
+  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, locks, track, audioContext, fireTimers, until, untilCommand };
 }
 
 describe("makeChunkKey / sha256Hex", () => {
@@ -251,6 +252,31 @@ describe("RecordingController", () => {
     expect(s.controller.sessionClock).toBeNull();
     // stop() は Worklet がないと何もしないため、ここでマイクを解放しないと取得したままになる
     expect(s.track.stop).toHaveBeenCalled();
+  });
+
+  it("Worklet モジュールの読み込みに失敗したら、マイクを解放して会議ロックも解放する", async () => {
+    // Arrange
+    const s = await setup();
+    vi.mocked(s.audioContext.audioWorklet.addModule).mockRejectedValueOnce(new Error("addModule failed"));
+    // Act
+    await expect(s.controller.start("m1", "定例", 1)).rejects.toThrow("addModule failed");
+    // Assert：stop() は Worklet がないと何もしないため、ここで止めないとマイクを取得したままになる
+    expect(s.track.stop).toHaveBeenCalled();
+    expect(s.controller.sessionClock).toBeNull();
+    expect(s.locks.held.size).toBe(0);
+    expect(await s.meetingStore.get("m1")).toBeUndefined();
+  });
+
+  it("会議の保存に失敗したら、マイクを解放して会議ロックも解放する", async () => {
+    // Arrange
+    const s = await setup();
+    vi.spyOn(s.meetingStore, "put").mockRejectedValueOnce(new Error("put failed"));
+    // Act
+    await expect(s.controller.start("m1", "定例", 1)).rejects.toThrow("put failed");
+    // Assert
+    expect(s.track.stop).toHaveBeenCalled();
+    expect(s.controller.sessionClock).toBeNull();
+    expect(s.locks.held.size).toBe(0);
   });
 
   it("stop は stop_requested を記録し、最終の部分 Chunk の保存完了まで待ってからトラックを止める", async () => {

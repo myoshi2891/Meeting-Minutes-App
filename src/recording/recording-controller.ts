@@ -88,22 +88,30 @@ export class RecordingController {
   private async setUp(meetingId: string, title: string, consentConfirmedAt: number): Promise<void> {
     const { audioContext, mediaStream, workletModuleUrl } = this.deps;
 
-    // AudioContext は sampleRate を指定せずに生成されている前提。実際の値はここで取得する。
-    await audioContext.audioWorklet.addModule(workletModuleUrl);
-    this.clock = createSessionClock(audioContext);
+    let meeting: MeetingRecord;
+    try {
+      // AudioContext は sampleRate を指定せずに生成されている前提。実際の値はここで取得する。
+      await audioContext.audioWorklet.addModule(workletModuleUrl);
+      this.clock = createSessionClock(audioContext);
 
-    const meeting: MeetingRecord = {
-      meetingId,
-      title,
-      status: "recording",
-      sessionClock: this.clock,
-      consentConfirmedAt,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      endedAt: null,
-      finalChunkCount: null,
-    };
-    await this.deps.meetingStore.put(meeting);
+      meeting = {
+        meetingId,
+        title,
+        status: "recording",
+        sessionClock: this.clock,
+        consentConfirmedAt,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        endedAt: null,
+        finalChunkCount: null,
+      };
+      await this.deps.meetingStore.put(meeting);
+    } catch (error) {
+      // recording はまだ保存されていないので会議は巻き戻さない。stop() は Worklet がないと何もしないため、マイクだけここで止める
+      for (const track of mediaStream.getAudioTracks()) track.stop();
+      this.clock = null;
+      throw error;
+    }
     this.meeting = meeting;
 
     try {
