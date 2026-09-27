@@ -26,9 +26,9 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### 未コミットの変更
 
-- `fix(main)`: 停止後もメモリ待機が残る controller を `stoppedWithBacklog` に保持し、「WAV を書き出す」で書き出せるようにする（停止で `recording = null` になり書き出せなかった）。`memoryBacklogCount` が 0 になったら外す（`src/main.ts`）
-- `docs(phase1)`: §31 配線表「お知らせ」行に停止後の書き出し対象を追記
-- 残課題: `src/main.ts` は Node の Vitest 対象外のため回帰テストなし。§28.3 の手動確認で「サーバー停止＋IDB 書き込み失敗 → 停止 → 書き出し」を確認する
+- `fix(storage)`: `enforceQuota` の段階1 で、削除後の見積もりごとに `storageUsageRatio` を更新し、80% を下回ったら `IDB_QUOTA_WARNING` を外す（最後の Chunk だと警告と古い使用率が残り続けた）（`src/storage/quota-monitor.ts`、テスト 2 件追加・既存 1 件の誤った期待値を削除 `test/quota-monitor.test.ts`）
+- `docs(phase1)`: §21 の quota-monitor.ts 埋め込みコードと §3.4 段階1 の本文を同期
+- 残課題（1201352 から継続）: `src/main.ts` の停止後書き出しは Node の Vitest 対象外のため回帰テストなし。§28.3 の手動確認で「サーバー停止＋IDB 書き込み失敗 → 停止 → 書き出し」を確認する
 - 残課題（前回から継続）: `enforceQuota` の `meetingId` 引数は未使用（API 維持のため残置）／Scheduler が saver を掴んだ後の `setToken` 競合の app レベルテストは未追加
 
 ---
