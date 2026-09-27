@@ -2217,10 +2217,17 @@ const RETRYABLE: ReadonlySet<LocalSaveErrorKind> = new Set(["NETWORK", "TIMEOUT"
 
 export class LocalSaver {
   private readonly base: URL;
+  private token: string;
 
   constructor(private readonly config: LocalSaverConfig, private readonly fetchImpl: typeof fetch = fetch) {
     this.base = new URL(config.baseUrl);
     assertLocalHost(this.base);
+    this.token = config.token;
+  }
+
+  /** トークンを差し替える。Scheduler が送信前に掴んだ saver でも、次の put から新しいトークンで送る */
+  setToken(token: string): void {
+    this.token = token;
   }
 
   async put(record: AudioChunkRecord): Promise<SaveOutcome> {
@@ -2237,7 +2244,7 @@ export class LocalSaver {
       const response = await this.fetchImpl(url, {
         method: "PUT",
         headers: {
-          Authorization: `Bearer ${this.config.token}`,
+          Authorization: `Bearer ${this.token}`,
           "Content-Type": "audio/wav",
           "X-Chunk-SHA256": record.meta.sha256,
           "X-Chunk-Meta": encodeChunkMetaHeader(record.meta),
@@ -4242,7 +4249,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 | PUT が NETWORK / TIMEOUT | `monitor.reportUnreachable()` | §18 |
 | PUT が 401 / 403 | `monitor.reportUnauthorized()` | §18 |
 | `monitor.onChange` で HEALTHY / DEGRADED かつ unauthorized でない | `scheduler.resumeAll(別タブが録音中の会議)` → `stop_requested` / `finalizing` の会議ごとに会議ロックを取って `finalizeMeeting` | §17 / §22（サーバー復帰時に Barrier を自動で再試行する） |
-| `setToken` | settings の `backendToken` に保存 → `monitor.checkOnce()` → 使える状態なら上と同じ再開処理 | §4.3。トークンを入れてもヘルス状態は変わらないことがある（認証なしのヘルス応答）ため、`onChange` を待たない |
+| `setToken` | settings の `backendToken` に保存 → 既存の `LocalSaver` のトークンを更新（未生成なら生成）→ `monitor.checkOnce()` → 使える状態なら上と同じ再開処理 | §4.3。トークンを入れてもヘルス状態は変わらないことがある（認証なしのヘルス応答）ため、`onChange` を待たない |
 | 録音開始 | `requestPersistence` → `RecordingController.start` → `attachPageLifecycle` | §21 / §15 / §20 |
 | Chunk の enqueue | `scheduler.enqueue` の後に `enforceQuota` を直列で実行。`export_required` なら `AppEvent.export_required`。`dropped_registered_blobs` でメモリ待機があれば `drainMemoryBacklog()` | §21 / §15。`enforceQuota` の失敗が `persistChunk` の失敗に混ざらないよう、enqueue の Promise には含めない |
 | `onError` で `IDB_WRITE_FAILED` | `drainMemoryBacklog()`。失敗したら `AppEvent.memory_backlog_export_required`（UI が `exportMemoryBacklog()` を促す） | §15 |
@@ -4250,6 +4257,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 
 - `unpersistedChunkCount` は、stop 後もこのタブで録音した会議の controller を引く。stop の後に会議ロックが外れた会議を、サーバー復帰の再試行が拾う可能性があるためである。`() => 0` を渡すと、メモリ待機中の末尾 Chunk を残したまま Barrier を通してしまう。
 - `directSaver`（§15）には、送るたびに現在の `LocalSaver` を引く口を渡す。録音開始時点の `LocalSaver` を渡すと、トークン未設定や失効したトークンで始めた録音は、途中で `setToken` しても直接送信が通らない。トークン未設定の間は、送らずに `UNAUTHORIZED` の失敗を返す（Chunk はメモリ待機に残る）。
+- `setToken` は `LocalSaver` を作り直さず、同じインスタンスのトークンを更新する。Scheduler は送信前に saver を掴んでから IDB を読むため、作り直すとその間に差し替わった古いトークンで PUT し、401 で Monitor が unauthorized に戻ってしまう。
 - 既知の制約：`finalizeMeeting` が `waiting_local_save` で終わった会議は、次に backend の状態が変わるか、`setToken` を呼ぶか、アプリを再起動するまで自動では再試行されない。UI は `listPendingFinalize()` で「確定待ち」の会議を表示し、`retryFinalize(meetingId)` で手動の再試行を用意する（§31.4）。`retryFinalize` は会議ロックを取ってから確定し、別タブがロックを持つ会議には触らない。backend 復帰時の自動再試行も同じ `retryFinalize` を通る。
 - Phase 2 のクライアント（`design-local-phase2-client.md`）は画面共有音声（system）の Controller を追加するため、この層を拡張して使う。
 
@@ -4389,7 +4397,9 @@ export class App {
     if (token === "") throw new Error("token is empty");
     await this.settings.set(BACKEND_TOKEN_KEY, token);
     this.token = token;
-    this.saver = this.createSaver(token);
+    // 差し替えずに更新する。Scheduler が IDB 読み込み中に掴んでいる saver も新しいトークンで送る
+    if (this.saver === null) this.saver = this.createSaver(token);
+    else this.saver.setToken(token);
     const state = await this.monitor.checkOnce();
     if (isUsable(state)) await this.onBackendAvailable();
   }

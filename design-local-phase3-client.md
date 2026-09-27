@@ -970,10 +970,17 @@ const RETRYABLE: ReadonlySet<LocalSaveErrorKind> = new Set(["NETWORK", "TIMEOUT"
 
 export class LocalSaver {
   private readonly base: URL;
+  private token: string;
 
   constructor(private readonly config: LocalSaverConfig, private readonly fetchImpl: typeof fetch = fetch) {
     this.base = new URL(config.baseUrl);
     assertLocalHost(this.base);
+    this.token = config.token;
+  }
+
+  /** トークンを差し替える。Scheduler が送信前に掴んだ saver でも、次の put から新しいトークンで送る */
+  setToken(token: string): void {
+    this.token = token;
   }
 
   async put(record: AudioChunkRecord): Promise<SaveOutcome> {
@@ -990,7 +997,7 @@ export class LocalSaver {
       const response = await this.fetchImpl(url, {
         method: "PUT",
         headers: {
-          Authorization: `Bearer ${this.config.token}`,
+          Authorization: `Bearer ${this.token}`,
           "Content-Type": "audio/wav",
           "X-Chunk-SHA256": record.meta.sha256,
           "X-Chunk-Meta": encodeChunkMetaHeader(record.meta),
