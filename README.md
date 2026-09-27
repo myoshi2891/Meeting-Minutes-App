@@ -70,15 +70,18 @@ await (async () => {
   window.addEventListener('pagehide', cleanup, { once: true });
   document.body.append(panel);
   console.table(rows);
+  const partialChunks = rows.filter(r => r.samples > 0 && r.samples < 480000).length;
+  const allValid = rows.length > 0 && rows.every(r => r.valid);
+  const complete = rows.length >= 11 && partialChunks >= 1;
   console.log({ meetingId: meeting.meetingId, title: meeting.title,
     createdAt: new Date(meeting.createdAt).toLocaleString(), total: rows.length,
     fullChunks: rows.filter(r => r.samples === 480000).length,
-    partialChunks: rows.filter(r => r.samples > 0 && r.samples < 480000).length,
-    allValid: rows.length > 0 && rows.every(r => r.valid) });
+    partialChunks, allValid, complete,
+    result: !complete ? 'incomplete' : allValid ? 'pass' : 'fail' });
 })();
 ```
 
-5. `fullChunks: 10`、`allValid: true`、連番が0から続くことを確認します。停止操作でできた30秒未満の末尾は `partialChunks` として別に数えます。完全Chunkが10個でなければ、録音時間と警告を記録して原因を確認します。
+5. `result: 'pass'`（`complete: true` かつ `allValid: true`）、`fullChunks: 10`、連番が0から続くことを確認します。停止操作でできた30秒未満の末尾は `partialChunks` として別に数えます。`complete` は端数の末尾を含めて11件以上あるときだけ `true` で、そうでなければ `result: 'incomplete'` です。この場合 `allValid: true` でも合格とせず、録音時間と警告を記録して原因を確認します。完全Chunkが10個でない場合も同様です。
 6. 画面末尾の各リンクからWAVを保存し、ファイルをChromeの別タブで開いて各Chunk単独で再生できるか確認します。アプリのCSPはBlob URLのページ内メディア再生を許可していないため、ダウンロードしたWAVをブラウザの音声プレーヤーで再生します。
 7. DevToolsのNetworkで送信先を確認します。`127.0.0.1:43117` の接続失敗は想定内です。外部ホストへの要求や録音中の警告があれば記録します。
 
