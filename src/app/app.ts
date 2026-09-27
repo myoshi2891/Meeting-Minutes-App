@@ -79,6 +79,8 @@ export class App {
   private readonly settings: SettingsStore;
   private saver: LocalSaver | null = null;
   private session: RecordingSession | null = null;
+  /** startRecording の開始処理中（session が入る前）か */
+  private starting = false;
   /** このタブで録音した会議の controller。stop 後もメモリ待機が残りうるため、Barrier の unpersistedChunkCount に使う（§22） */
   private readonly controllers = new Map<string, SessionController>();
   private unsubscribeMonitor: () => void = () => undefined;
@@ -139,7 +141,17 @@ export class App {
   }
 
   async startRecording(input: StartRecordingInput): Promise<RecordingSession> {
-    if (this.session !== null) throw new Error("already recording");
+    // session は開始処理の await 後に入るため、開始中フラグでも弾く（別会議 ID の同時開始を含む）
+    if (this.session !== null || this.starting) throw new Error("already recording");
+    this.starting = true;
+    try {
+      return await this.startSession(input);
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  private async startSession(input: StartRecordingInput): Promise<RecordingSession> {
     const { meetingId } = input;
     // 永続化は録音開始のついでに要求する。拒否・失敗しても録音は止めない（§3.4）
     await requestPersistence(this.health).catch((error: unknown) => this.deps.onEvent({ type: "error", error }));

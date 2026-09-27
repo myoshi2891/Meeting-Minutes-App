@@ -155,6 +155,7 @@ afterEach(() => {
   for (const app of apps) app.dispose();
   apps = [];
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("createApp（起動時の配線）", () => {
@@ -324,6 +325,31 @@ describe("startRecording（録音ごとの配線）", () => {
     const s = await setup();
     await s.app.startRecording(startInput(nextMeetingId()));
     await expect(s.app.startRecording(startInput(nextMeetingId()))).rejects.toThrow("already recording");
+  });
+
+  it("開始処理の完了前に別会議の録音を始めようとしたら拒否する", async () => {
+    // Arrange
+    stubPageGlobals();
+    const s = await setup();
+    // Act：1 本目の await 中に 2 本目を呼ぶ
+    const first = s.app.startRecording(startInput(nextMeetingId()));
+    const second = s.app.startRecording(startInput(nextMeetingId()));
+    // Assert
+    await expect(second).rejects.toThrow("already recording");
+    await expect(first).resolves.toBeDefined();
+    expect(s.controllers).toHaveLength(1);
+  });
+
+  it("開始に失敗しても、次の録音は始められる", async () => {
+    // Arrange
+    stubPageGlobals();
+    const s = await setup();
+    vi.spyOn(FakeController.prototype, "start").mockRejectedValueOnce(new Error("mic denied"));
+    await expect(s.app.startRecording(startInput(nextMeetingId()))).rejects.toThrow("mic denied");
+    // Act
+    const session = await s.app.startRecording(startInput(nextMeetingId()));
+    // Assert
+    expect(s.app.currentSession).toBe(session);
   });
 });
 
