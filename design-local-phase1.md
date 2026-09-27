@@ -89,7 +89,7 @@ AudioContext のネイティブ sample rate は 44.1kHz / 48kHz / 96kHz など�
 **結論：三段階の縮退を設計し、いずれの段階でも録音を停止しない。**
 
 1. **監視**：録音開始時に `navigator.storage.persist()` を要求し、Chunk 保存ごとに `navigator.storage.estimate()` で `usage / quota` を確認する（§21）。
-2. **段階1（使用率 ≥ 80%）**：状態が `DB_REGISTERED`（サーバー側で SHA-256 が検証済み）の Chunk から、`sequenceNo` 昇順に WAV Blob 本体を IndexedDB から削除し、メタデータのみ残す。サーバー側ファイルが Source of Truth の座を引き継いでいるため、録音データは失われない。
+2. **段階1（使用率 ≥ 80%）**：状態が `DB_REGISTERED`（サーバー側で SHA-256 が検証済み）の Chunk から、会議・トラックを問わず作成の古い順（`createdAt` 昇順）に、使用率が 80% を下回るまで WAV Blob 本体を IndexedDB から削除し、メタデータのみ残す。サーバー側ファイルが Source of Truth の座を引き継いでいるため、録音データは失われない。
 3. **段階2（使用率 ≥ 95% かつ削除対象なし＝サーバー未起動で全 Chunk が滞留）**：File System Access API による緊急エクスポート（§4.5）を UI で促す。エクスポート成功後、当該 Chunk は `SAVED`（保存先 = `fsa`）として扱い、段階1 と同様に Blob 本体を削除できる。
 4. **段階3（それでも `put` が `QuotaExceededError` で失敗）**：Chunk はメモリ上の待機キューに保持し、UI に「保存領域が不足しています。サーバーを起動するかエクスポートしてください」と表示する。録音は継続する。メモリ待機キューはブラウザクラッシュで失われるため、この状態は `RecordingHealth.degradedReasons` に `IDB_QUOTA_EXHAUSTED` として記録し、UI が最上位警告として表示する。クォータ以外の理由で `put` が失敗した場合も同じくメモリ待機に回し、`IDB_WRITE_FAILED` として記録する（§15）。この場合は IndexedDB の回復を待たずにサーバーへ直接送り、サーバーにも届かなければ WAV として書き出せるようにする（§15 `drainMemoryBacklog()` / `exportMemoryBacklog()`）。`drainMemoryBacklog()` でメモリ待機が空になれば、この 2 つの理由は外す。
 
@@ -942,6 +942,17 @@ export class ChunkStore {
       requestToPromise(index.getAll(IDBKeyRange.lowerBound("DB_REGISTERED", true))),
     ]);
     return [...before, ...after].filter(isAudioChunkRecord).filter((r) => r.save.status !== "DB_REGISTERED");
+  }
+
+  /** クォータ縮退用：Blob が残っている DB_REGISTERED の Chunk を、会議・トラックを問わず作成の古い順に返す。 */
+  async listDroppable(): Promise<AudioChunkRecord[]> {
+    const tx = this.db.transaction(STORE_CHUNKS, "readonly");
+    const index = tx.objectStore(STORE_CHUNKS).index("by_status");
+    const results = await requestToPromise(index.getAll(IDBKeyRange.only("DB_REGISTERED")));
+    return results
+      .filter(isAudioChunkRecord)
+      .filter((r) => r.save.status === "DB_REGISTERED" && r.wav !== null)
+      .sort((a, b) => a.createdAt - b.createdAt || (a.chunkKey < b.chunkKey ? -1 : a.chunkKey > b.chunkKey ? 1 : 0));
   }
 
   /** クォータ縮退（§3.4 段階1）：DB_REGISTERED の Chunk だけ Blob 本体を削除しメタデータのみ残す。未検証の Chunk は再送のため残す。 */
@@ -2928,7 +2939,7 @@ export type QuotaAction = "none" | "dropped_registered_blobs" | "export_required
 
 /**
  * Chunk 保存ごとに呼ぶ。
- * 段階1: ratio >= 0.8 → DB_REGISTERED の Blob を sequenceNo 昇順に削除
+ * 段階1: ratio >= 0.8 → DB_REGISTERED の Blob を全会議から作成の古い順に削除
  * 段階2: ratio >= 0.95 かつ削除対象なし → エクスポートを要求
  */
 export async function enforceQuota(chunkStore: ChunkStore, meetingId: string, health: RecordingHealth): Promise<QuotaAction> {
@@ -2943,8 +2954,8 @@ export async function enforceQuota(chunkStore: ChunkStore, meetingId: string, he
   }
   health.degradedReasons = [...reasons, "IDB_QUOTA_WARNING"];
 
-  const chunks = await chunkStore.listByMeeting(meetingId, "mic");
-  const droppable = chunks.filter((c) => c.save.status === "DB_REGISTERED" && c.wav !== null);
+  // 現在の会議だけを見ると、過去の会議の登録済み Blob が残っていても段階2（エクスポート要求）に進んでしまう
+  const droppable = await chunkStore.listDroppable();
   if (droppable.length > 0) {
     // 古いものから、使用率が閾値を下回るまで削除する
     for (const c of droppable) {
