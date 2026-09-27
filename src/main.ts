@@ -1,5 +1,5 @@
 // エントリポイント（§31.4）。DOM の薄い層で、表示文言は src/ui/recording-view.ts が作る
-import { createApp, type App, type AppEvent, type RecordingSession } from "./app/app";
+import { createApp, type App, type AppEvent, type RecordingSession, type SessionController } from "./app/app";
 import { assessHealth, attachAudioContextMonitor } from "./recording/recording-health-monitor";
 import { openDatabase } from "./storage/idb";
 import {
@@ -60,6 +60,8 @@ interface Recording {
 }
 
 let recording: Recording | null = null;
+/** 停止後もメモリ待機が残っている controller。空になるまで書き出せるように保持する（§15） */
+const stoppedWithBacklog = new Set<SessionController>();
 let hiddenTimer: ReturnType<typeof setInterval> | null = null;
 
 function render(app: App): void {
@@ -182,6 +184,7 @@ async function stopRecording(app: App): Promise<void> {
     notify(noticeFor({ type: "error", error }) ?? "");
   } finally {
     recording = null;
+    if (current.session.controller.memoryBacklogCount > 0) stoppedWithBacklog.add(current.session.controller);
     current.detachAudioMonitor();
     await current.audioContext.close().catch(() => undefined);
     ui.stop.disabled = false;
@@ -191,14 +194,20 @@ async function stopRecording(app: App): Promise<void> {
 
 /** §15：メモリ待機中の Chunk を利用者の手元へ書き出す（メモリ待機からは外さない） */
 function exportMemoryBacklog(): void {
-  if (recording === null) return;
-  for (const file of recording.session.controller.exportMemoryBacklog()) {
-    const url = URL.createObjectURL(file.wav);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = file.fileName;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 0);
+  // 空になった controller は外す（drainMemoryBacklog でサーバーへ送れた場合など）
+  for (const controller of stoppedWithBacklog) {
+    if (controller.memoryBacklogCount === 0) stoppedWithBacklog.delete(controller);
+  }
+  const controllers = recording === null ? [...stoppedWithBacklog] : [recording.session.controller, ...stoppedWithBacklog];
+  for (const controller of controllers) {
+    for (const file of controller.exportMemoryBacklog()) {
+      const url = URL.createObjectURL(file.wav);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.fileName;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
   }
 }
 
