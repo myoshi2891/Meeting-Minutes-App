@@ -26,10 +26,10 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### 未コミットの変更
 
-- `fix(app)`: `startRecording` に開始中フラグを追加し、`session` が入る前の await 中に別会議 ID で呼ばれても `already recording` で拒否する（`src/app/app.ts`、テスト 2 件 `test/app.test.ts`）
-- `docs(phase1)`: §31 の app.ts 埋め込みコードと配線表「録音開始」行を同期
-- 残課題: `enforceQuota` の `meetingId` 引数は未使用になった（API 維持のため残置。外すなら app.ts とテスト 5 件を更新）
-- 残課題: Scheduler が saver を掴んだ後に `setToken` される競合そのものを再現する app レベルのテストは未追加
+- `fix(main)`: 停止後もメモリ待機が残る controller を `stoppedWithBacklog` に保持し、「WAV を書き出す」で書き出せるようにする（停止で `recording = null` になり書き出せなかった）。`memoryBacklogCount` が 0 になったら外す（`src/main.ts`）
+- `docs(phase1)`: §31 配線表「お知らせ」行に停止後の書き出し対象を追記
+- 残課題: `src/main.ts` は Node の Vitest 対象外のため回帰テストなし。§28.3 の手動確認で「サーバー停止＋IDB 書き込み失敗 → 停止 → 書き出し」を確認する
+- 残課題（前回から継続）: `enforceQuota` の `meetingId` 引数は未使用（API 維持のため残置）／Scheduler が saver を掴んだ後の `setToken` 競合の app レベルテストは未追加
 
 ---
 
