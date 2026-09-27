@@ -49,7 +49,14 @@ export async function enforceQuota(chunkStore: ChunkStore, meetingId: string, he
     for (const c of droppable) {
       await chunkStore.dropBlob(c.chunkKey);
       const again = await estimateQuota();
-      if (again !== null && again.ratio < QUOTA_WARN_RATIO) break;
+      if (again === null) continue;
+      // 最後の Chunk の保存だと次の enforceQuota が来ないので、ここで使用率と警告を最新にする
+      health.storageUsageRatio = again.ratio;
+      if (again.ratio < QUOTA_WARN_RATIO) {
+        // await の間に付いた他の理由は残す
+        health.degradedReasons = health.degradedReasons.filter((r) => r !== "IDB_QUOTA_WARNING");
+        break;
+      }
     }
     return "dropped_registered_blobs";
   }

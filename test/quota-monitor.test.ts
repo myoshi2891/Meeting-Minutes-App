@@ -124,7 +124,35 @@ describe("enforceQuota", () => {
     // Assert：未検証（SAVED）の Chunk は再送のため残す
     expect(action).toBe("dropped_registered_blobs");
     expect(await blobKept(chunkStore, meetingId)).toEqual([false, true, false, true]);
-    expect(health.degradedReasons).toContain("IDB_QUOTA_WARNING");
+  });
+
+  it("削除で 80% を下回ったら、最後の見積もりで使用率を更新し IDB_QUOTA_WARNING を外す（他の劣化理由は残す）", async () => {
+    // Arrange：最後の Chunk の保存で呼ばれた場合、次の enforceQuota は来ないので、ここで外さないと警告が残り続ける
+    stubStorage({ ratios: [0.9, 0.7] });
+    const { chunkStore, meetingId } = await seedChunks(["DB_REGISTERED", "DB_REGISTERED"]);
+    const health = createInitialHealth("running");
+    health.degradedReasons = ["BACKEND_UNREACHABLE"];
+    // Act
+    const action = await enforceQuota(chunkStore, meetingId, health);
+    // Assert
+    expect(action).toBe("dropped_registered_blobs");
+    expect(health.storageUsageRatio).toBe(0.7);
+    expect(health.degradedReasons).toEqual(["BACKEND_UNREACHABLE"]);
+    expect(await blobKept(chunkStore, meetingId)).toEqual([false, true]);
+  });
+
+  it("削除対象を使い切っても 80% 以上なら、最後の見積もりで使用率を更新し警告は残す", async () => {
+    // Arrange
+    stubStorage({ ratios: [0.95, 0.9, 0.85] });
+    const { chunkStore, meetingId } = await seedChunks(["DB_REGISTERED", "DB_REGISTERED"]);
+    const health = createInitialHealth("running");
+    // Act
+    const action = await enforceQuota(chunkStore, meetingId, health);
+    // Assert
+    expect(action).toBe("dropped_registered_blobs");
+    expect(health.storageUsageRatio).toBe(0.85);
+    expect(health.degradedReasons).toEqual(["IDB_QUOTA_WARNING"]);
+    expect(await blobKept(chunkStore, meetingId)).toEqual([false, false]);
   });
 
   it("使用率 80〜95% で削除できる Blob がなければ、警告だけ付けて none", async () => {
