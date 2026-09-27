@@ -89,7 +89,7 @@ AudioContext のネイティブ sample rate は 44.1kHz / 48kHz / 96kHz など�
 **結論：三段階の縮退を設計し、いずれの段階でも録音を停止しない。**
 
 1. **監視**：録音開始時に `navigator.storage.persist()` を要求し、Chunk 保存ごとに `navigator.storage.estimate()` で `usage / quota` を確認する（§21）。
-2. **段階1（使用率 ≥ 80%）**：状態が `DB_REGISTERED`（サーバー側で SHA-256 が検証済み）の Chunk から、会議・トラックを問わず作成の古い順（`createdAt` 昇順）に、使用率が 80% を下回るまで WAV Blob 本体を IndexedDB から削除し、メタデータのみ残す。サーバー側ファイルが Source of Truth の座を引き継いでいるため、録音データは失われない。
+2. **段階1（使用率 ≥ 80%）**：状態が `DB_REGISTERED`（サーバー側で SHA-256 が検証済み）の Chunk から、会議・トラックを問わず作成の古い順（`createdAt` 昇順）に、使用率が 80% を下回るまで WAV Blob 本体を IndexedDB から削除し、メタデータのみ残す。サーバー側ファイルが Source of Truth の座を引き継いでいるため、録音データは失われない。削除のたびに見積もり直した使用率で `storageUsageRatio` を更新し、80% を下回ったらその場で `IDB_QUOTA_WARNING` を外す（最後の Chunk の保存だと次の判定が来ないため）。
 3. **段階2（使用率 ≥ 95% かつ削除対象なし＝サーバー未起動で全 Chunk が滞留）**：File System Access API による緊急エクスポート（§4.5）を UI で促す。エクスポート成功後、当該 Chunk は `SAVED`（保存先 = `fsa`）として扱い、段階1 と同様に Blob 本体を削除できる。
 4. **段階3（それでも `put` が `QuotaExceededError` で失敗）**：Chunk はメモリ上の待機キューに保持し、UI に「保存領域が不足しています。サーバーを起動するかエクスポートしてください」と表示する。録音は継続する。メモリ待機キューはブラウザクラッシュで失われるため、この状態は `RecordingHealth.degradedReasons` に `IDB_QUOTA_EXHAUSTED` として記録し、UI が最上位警告として表示する。クォータ以外の理由で `put` が失敗した場合も同じくメモリ待機に回し、`IDB_WRITE_FAILED` として記録する（§15）。この場合は IndexedDB の回復を待たずにサーバーへ直接送り、サーバーにも届かなければ WAV として書き出せるようにする（§15 `drainMemoryBacklog()` / `exportMemoryBacklog()`）。`drainMemoryBacklog()` でメモリ待機が空になれば、この 2 つの理由は外す。
 
@@ -2961,7 +2961,14 @@ export async function enforceQuota(chunkStore: ChunkStore, meetingId: string, he
     for (const c of droppable) {
       await chunkStore.dropBlob(c.chunkKey);
       const again = await estimateQuota();
-      if (again !== null && again.ratio < QUOTA_WARN_RATIO) break;
+      if (again === null) continue;
+      // 最後の Chunk の保存だと次の enforceQuota が来ないので、ここで使用率と警告を最新にする
+      health.storageUsageRatio = again.ratio;
+      if (again.ratio < QUOTA_WARN_RATIO) {
+        // await の間に付いた他の理由は残す
+        health.degradedReasons = health.degradedReasons.filter((r) => r !== "IDB_QUOTA_WARNING");
+        break;
+      }
     }
     return "dropped_registered_blobs";
   }
