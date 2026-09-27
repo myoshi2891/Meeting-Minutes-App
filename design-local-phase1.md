@@ -4262,7 +4262,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 | PUT が 401 / 403 | `monitor.reportUnauthorized()` | §18 |
 | `monitor.onChange` で HEALTHY / DEGRADED かつ unauthorized でない | `scheduler.resumeAll(別タブが録音中の会議)` → `stop_requested` / `finalizing` の会議ごとに会議ロックを取って `finalizeMeeting` | §17 / §22（サーバー復帰時に Barrier を自動で再試行する） |
 | `setToken` | settings の `backendToken` に保存 → 既存の `LocalSaver` のトークンを更新（未生成なら生成）→ `monitor.checkOnce()` → 使える状態なら上と同じ再開処理 | §4.3。トークンを入れてもヘルス状態は変わらないことがある（認証なしのヘルス応答）ため、`onChange` を待たない |
-| 録音開始 | `requestPersistence` → `RecordingController.start` → `attachPageLifecycle` | §21 / §15 / §20 |
+| 録音開始 | `requestPersistence` → `RecordingController.start` → `attachPageLifecycle`。録音中か開始処理中（`session` が入る前の await 中）なら会議 ID に関係なく `already recording` で拒否する。開始中フラグは成功・失敗どちらでも `finally` で下ろす | §21 / §15 / §20 |
 | Chunk の enqueue | `scheduler.enqueue` の後に `enforceQuota` を直列で実行。`export_required` なら `AppEvent.export_required`。`dropped_registered_blobs` でメモリ待機があれば `drainMemoryBacklog()` | §21 / §15。`enforceQuota` の失敗が `persistChunk` の失敗に混ざらないよう、enqueue の Promise には含めない |
 | `onError` で `IDB_WRITE_FAILED` | `drainMemoryBacklog()`。失敗したら `AppEvent.memory_backlog_export_required`（UI が `exportMemoryBacklog()` を促す） | §15 |
 | `session.stop()` | `controller.stop()` → `detach()` → `finalizeMeeting`（`unpersistedChunkCount` はその会議の controller の `memoryBacklogCount`）→ 成功なら `AppEvent.finalized`（`missingTailMs` 付き） | §22 の呼び出し規約（stop 完了後にだけ Barrier を試みる） |
@@ -4357,6 +4357,8 @@ export class App {
   private readonly settings: SettingsStore;
   private saver: LocalSaver | null = null;
   private session: RecordingSession | null = null;
+  /** startRecording の開始処理中（session が入る前）か */
+  private starting = false;
   /** このタブで録音した会議の controller。stop 後もメモリ待機が残りうるため、Barrier の unpersistedChunkCount に使う（§22） */
   private readonly controllers = new Map<string, SessionController>();
   private unsubscribeMonitor: () => void = () => undefined;
@@ -4417,7 +4419,17 @@ export class App {
   }
 
   async startRecording(input: StartRecordingInput): Promise<RecordingSession> {
-    if (this.session !== null) throw new Error("already recording");
+    // session は開始処理の await 後に入るため、開始中フラグでも弾く（別会議 ID の同時開始を含む）
+    if (this.session !== null || this.starting) throw new Error("already recording");
+    this.starting = true;
+    try {
+      return await this.startSession(input);
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  private async startSession(input: StartRecordingInput): Promise<RecordingSession> {
     const { meetingId } = input;
     // 永続化は録音開始のついでに要求する。拒否・失敗しても録音は止めない（§3.4）
     await requestPersistence(this.health).catch((error: unknown) => this.deps.onEvent({ type: "error", error }));
