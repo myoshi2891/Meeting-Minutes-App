@@ -81,6 +81,8 @@ interface Setup {
   locks: FakeLockManager;
   track: EventTarget & { stop: ReturnType<typeof vi.fn> };
   audioContext: AudioContext;
+  /** コントローラが持つ AudioWorkletNode 側のポート（onmessage の解除を確認する） */
+  nodePort: MessagePort;
   /** 注入したタイマー。fireTimers() で期限を待たずに発火させる */
   fireTimers: () => void;
   /** Worklet へのコマンド・enqueue・onError のいずれかで condition が真になるまで待つ */
@@ -141,7 +143,7 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
   };
   const until = (condition: () => boolean) => signal.until(condition);
   const untilCommand = (type: WorkletCommand["type"]) => until(() => worklet.commands.some((c) => c.type === type));
-  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, locks, track, audioContext, fireTimers, until, untilCommand };
+  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, locks, track, audioContext, nodePort: channel.port1, fireTimers, until, untilCommand };
 }
 
 describe("makeChunkKey / sha256Hex", () => {
@@ -294,6 +296,19 @@ describe("RecordingController", () => {
     expect(s.track.stop).toHaveBeenCalled();
     // flush 後の最終フレーム数が IDB の会議レコードに反映されている（Finalizer の totalAudioFrames の元）
     expect((await s.meetingStore.get("m1"))?.sessionClock.audioFrameCount).toBe(481600);
+  });
+
+  it("stop 中に会議の保存が失敗しても、トラック停止・onmessage の解除・会議ロックの解放を行う", async () => {
+    // Arrange
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    vi.spyOn(s.meetingStore, "put").mockRejectedValueOnce(new Error("put failed"));
+    // Act
+    await expect(s.controller.stop()).rejects.toThrow("put failed");
+    // Assert
+    expect(s.track.stop).toHaveBeenCalled();
+    expect(s.nodePort.onmessage).toBeNull();
+    expect(s.locks.held.size).toBe(0);
   });
 
   it("同じインスタンスで stop 後に別の会議を start すると、Chunk の連番は 0 から始まる", async () => {
@@ -526,6 +541,23 @@ describe("RecordingController", () => {
     s.track.dispatchEvent(new Event("ended"));
     // Assert
     expect(s.health.degradedReasons).toEqual([]);
+  });
+
+  it("stop で ended リスナーを解除し、同じトラックで録り直してもリスナーが蓄積しない", async () => {
+    // Arrange：トラックに登録されたリスナーの signal を記録する
+    const s = await setup();
+    const signals: Array<AbortSignal | undefined> = [];
+    const original = s.track.addEventListener.bind(s.track);
+    s.track.addEventListener = (type, listener, options) => {
+      signals.push(typeof options === "object" ? options.signal : undefined);
+      original(type, listener, options);
+    };
+    await s.controller.start("m1", "定例", 1);
+    // Act
+    await s.controller.stop();
+    // Assert
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(true);
   });
 
   it("ended が複数回届いても MIC_TRACK_ENDED は 1 件だけ", async () => {

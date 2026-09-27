@@ -6,3 +6,4 @@ coverage/
 *.wav
 recordings/
 private/*
+dist/

@@ -286,4 +286,28 @@ describe("BackendHealthMonitor の定期ポーリング", () => {
     m.stop();
     expect(calls).toBe(1);
   });
+
+  it("チェックの応答待ち中に stop() → start() しても、ポーリングは 1 系統だけ", async () => {
+    // Arrange：1 回目のチェックだけ応答を保留し、以降は即応答する
+    let calls = 0;
+    let release: () => void = () => undefined;
+    const m = new BackendHealthMonitor({ ...CONFIG, healthyIntervalMs: 1_000 }, createInitialHealth("running"), async () => {
+      calls++;
+      if (calls === 1) {
+        await new Promise<void>((r) => {
+          release = r;
+        });
+      }
+      return json({ status: "ok", service: "minutes-local" });
+    });
+    // Act：保留中のチェックを残したまま再開し、その後で古いチェックを完了させる
+    m.start();
+    m.stop();
+    m.start();
+    release();
+    await vi.advanceTimersByTimeAsync(3_500);
+    m.stop();
+    // Assert：古いチェック 1 + 新しい系統の初回 1 + 1000ms ごとの 3 回
+    expect(calls).toBe(5);
+  });
 });

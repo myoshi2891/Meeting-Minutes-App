@@ -1,0 +1,64 @@
+// src/storage/quota-monitor.ts
+import type { ChunkStore } from "./idb";
+import type { LocalStorageQuota, RecordingHealth } from "../types/recording";
+
+export const QUOTA_WARN_RATIO = 0.8;
+export const QUOTA_CRITICAL_RATIO = 0.95;
+
+export async function requestPersistence(health: RecordingHealth): Promise<boolean | null> {
+  if (typeof navigator.storage?.persist !== "function") {
+    health.storagePersisted = null;
+    return null;
+  }
+  const granted = await navigator.storage.persist();
+  health.storagePersisted = granted;
+  return granted;
+}
+
+export async function estimateQuota(): Promise<LocalStorageQuota | null> {
+  if (typeof navigator.storage?.estimate !== "function") return null;
+  const est = await navigator.storage.estimate();
+  const usage = est.usage ?? 0;
+  const quota = est.quota ?? 0;
+  return { usageBytes: usage, quotaBytes: quota, ratio: quota > 0 ? usage / quota : 0, checkedAt: performance.now() };
+}
+
+export type QuotaAction = "none" | "dropped_registered_blobs" | "export_required";
+
+/**
+ * Chunk 保存ごとに呼ぶ。
+ * 段階1: ratio >= 0.8 → DB_REGISTERED の Blob を全会議から作成の古い順に削除
+ * 段階2: ratio >= 0.95 かつ削除対象なし → エクスポートを要求
+ */
+export async function enforceQuota(chunkStore: ChunkStore, meetingId: string, health: RecordingHealth): Promise<QuotaAction> {
+  const quota = await estimateQuota();
+  if (quota === null) return "none";
+  health.storageUsageRatio = quota.ratio;
+
+  const reasons = health.degradedReasons.filter((r) => r !== "IDB_QUOTA_WARNING");
+  if (quota.ratio < QUOTA_WARN_RATIO) {
+    health.degradedReasons = reasons;
+    return "none";
+  }
+  health.degradedReasons = [...reasons, "IDB_QUOTA_WARNING"];
+
+  // 現在の会議だけを見ると、過去の会議の登録済み Blob が残っていても段階2（エクスポート要求）に進んでしまう
+  const droppable = await chunkStore.listDroppable();
+  if (droppable.length > 0) {
+    // 古いものから、使用率が閾値を下回るまで削除する
+    for (const c of droppable) {
+      await chunkStore.dropBlob(c.chunkKey);
+      const again = await estimateQuota();
+      if (again === null) continue;
+      // 最後の Chunk の保存だと次の enforceQuota が来ないので、ここで使用率と警告を最新にする
+      health.storageUsageRatio = again.ratio;
+      if (again.ratio < QUOTA_WARN_RATIO) {
+        // await の間に付いた他の理由は残す
+        health.degradedReasons = health.degradedReasons.filter((r) => r !== "IDB_QUOTA_WARNING");
+        break;
+      }
+    }
+    return "dropped_registered_blobs";
+  }
+  return quota.ratio >= QUOTA_CRITICAL_RATIO ? "export_required" : "none";
+}
