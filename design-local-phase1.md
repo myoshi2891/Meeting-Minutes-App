@@ -204,7 +204,7 @@ Content-Security-Policy:
   frame-ancestors 'none';
 ```
 
-   `connect-src` により、`fetch` / `XMLHttpRequest` / `WebSocket` / `EventSource` の接続先が列挙したホストに限定される。`worker-src 'self'` で AudioWorklet モジュールも同一オリジンに限定する。`frame-ancestors` は `<meta http-equiv>` では無視されるため、ヘッダで配信できる経路（常駐サーバーがアプリを配信する構成）でだけ付ける。開発サーバー（§31）の `index.html` は `frame-ancestors` を除いた値を meta で付ける。
+   `connect-src` により、`fetch` / `XMLHttpRequest` / `WebSocket` / `EventSource` の接続先が列挙したホストに限定される。`worker-src 'self'` で AudioWorklet モジュールも同一オリジンに限定する。`frame-ancestors` は `<meta http-equiv>` では無視されるため、ヘッダで配信できる経路（常駐サーバーがアプリを配信する構成）でだけ付ける。開発サーバー（§31）の `index.html` は `frame-ancestors` を除いた値を meta で付け、フレーム拒否は開発サーバー・プレビューの応答ヘッダで付ける（§31.1）。
 
 2. **アプリケーション側 allowlist（§17）**：`LocalSaver` は URL を組み立てる直前に `assertLocalHost(url)` を呼び、ホスト名が `127.0.0.1` / `localhost` / `[::1]` 以外なら例外を投げる。設定画面でサーバー URL を変更できる場合でも、この関数がゲートになる。`assertLocalHost()` が検証するのは最初の URL だけなので、`fetch` は `redirect: "error"` で送り（`LocalSaver` の PUT に加え、Finalizer の `GET /chunks`・`POST /finalize`、`BackendHealthMonitor` の `GET /health` も同じ）、リダイレクト応答に従って音声本文や `Authorization` を別ホストへ再送しない（`fetch` は `TypeError` で reject し、`NETWORK` として扱う）。CSP が何らかの理由で効かない配信経路（ローカルファイルから開いた場合など）への二重防御である。
 
@@ -4250,6 +4250,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 | 待ち受け | 開発サーバー・プレビューとも `127.0.0.1` に bind し、`strictPort` でポートがずれないようにする（CSP の `connect-src` と同じ理由でホストを固定する） |
 | Worklet | `import url from "./worklet/pcm-chunker.worklet.ts?worker&url"` で URL を得て `workletModuleUrl` に渡す。`?url` だけでは本番ビルドで TypeScript が変換されずにコピーされるため、`?worker&url`（`worker.format: "es"`）で別エントリとして変換・出力する |
 | CSP | `index.html` に §4.4 の値を `<meta http-equiv>` で付ける（`frame-ancestors` を除く） |
+| フレーム拒否 | `frame-ancestors` は meta で効かないため、開発サーバー・プレビューとも `vite.config.ts` の `headers` で `X-Frame-Options: DENY` と `Content-Security-Policy: frame-ancestors 'none'` を付ける |
 | テスト | `vitest.config.ts` は `environment: "node"` のまま。`src/app/app.ts` は `?worker&url` を import しない（URL はエントリポイント `src/main.ts` が解決して渡す） |
 
 ## 31.2 配線表
