@@ -26,8 +26,9 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### 未コミットの変更
 
-- `fix(app)`: `setToken` は `LocalSaver` を作り直さず `saver.setToken()` で更新（`src/app/app.ts`、`src/api/local-saver.ts`、テスト 1 件 `test/local-saver.test.ts`）
-- `docs(phase1)`: §15 LocalSaver / app 層のコードと本文の同期（`design-local-phase3-client.md` の LocalSaver 写しも同修正）
+- `fix(storage)`: `enforceQuota` の削除対象を全会議・全トラックの DB_REGISTERED（`createdAt` 昇順）に広げる。`ChunkStore.listDroppable()` を追加（`src/storage/quota-monitor.ts`、`src/storage/idb.ts`、テスト 1 件 `test/quota-monitor.test.ts`）
+- `docs(phase1)`: §3.4 段階1 の本文と idb / quota-monitor のコード同期
+- 残課題: `enforceQuota` の `meetingId` 引数は未使用になった（API 維持のため残置。外すなら app.ts とテスト 5 件を更新）
 - 残課題: Scheduler が saver を掴んだ後に `setToken` される競合そのものを再現する app レベルのテストは未追加
 
 ---
