@@ -27,7 +27,7 @@ export type QuotaAction = "none" | "dropped_registered_blobs" | "export_required
 
 /**
  * Chunk 保存ごとに呼ぶ。
- * 段階1: ratio >= 0.8 → DB_REGISTERED の Blob を sequenceNo 昇順に削除
+ * 段階1: ratio >= 0.8 → DB_REGISTERED の Blob を全会議から作成の古い順に削除
  * 段階2: ratio >= 0.95 かつ削除対象なし → エクスポートを要求
  */
 export async function enforceQuota(chunkStore: ChunkStore, meetingId: string, health: RecordingHealth): Promise<QuotaAction> {
@@ -42,8 +42,8 @@ export async function enforceQuota(chunkStore: ChunkStore, meetingId: string, he
   }
   health.degradedReasons = [...reasons, "IDB_QUOTA_WARNING"];
 
-  const chunks = await chunkStore.listByMeeting(meetingId, "mic");
-  const droppable = chunks.filter((c) => c.save.status === "DB_REGISTERED" && c.wav !== null);
+  // 現在の会議だけを見ると、過去の会議の登録済み Blob が残っていても段階2（エクスポート要求）に進んでしまう
+  const droppable = await chunkStore.listDroppable();
   if (droppable.length > 0) {
     // 古いものから、使用率が閾値を下回るまで削除する
     for (const c of droppable) {

@@ -140,6 +140,34 @@ describe("enforceQuota", () => {
     expect(await blobKept(chunkStore, meetingId)).toEqual([true]);
   });
 
+  it("現在の会議に削除対象がなくても、過去の会議の DB_REGISTERED Blob を作成の古い順に消す（system トラックも対象）", async () => {
+    // Arrange：現在の会議は未送信だけ。過去の会議 2 つに登録済みがある。作成時刻は prev2 → prev1:system → prev1:mic の順
+    stubStorage({ ratios: [0.97, 0.9, 0.7] });
+    const { chunkStore, meetingId } = await seedChunks(["BACKEND_UNAVAILABLE"]);
+    const prev1 = `m-quota-${meetingSeq++}`;
+    const prev2 = `m-quota-${meetingSeq++}`;
+    const put = async (id: string, source: "mic" | "system", status: AudioChunkRecord["save"]["status"], createdAt: number): Promise<void> => {
+      const r = await makeChunkRecord(id, 0, 160);
+      const meta = { ...r.meta, source };
+      await chunkStore.putChunk({ ...r, chunkKey: `${id}:${source}:000000`, meta, createdAt, save: { ...r.save, status } });
+    };
+    await put(prev1, "mic", "DB_REGISTERED", 300);
+    await put(prev1, "system", "DB_REGISTERED", 200);
+    await put(prev2, "mic", "DB_REGISTERED", 100);
+    await put(prev2, "system", "SAVED", 50);
+    const health = createInitialHealth("running");
+    // Act
+    const action = await enforceQuota(chunkStore, meetingId, health);
+    // Assert：80% を下回るまでの 2 件だけ消す。未検証（SAVED）と現在の会議の未送信は残す
+    const kept = async (id: string, source: "mic" | "system"): Promise<boolean> => (await chunkStore.getChunk(`${id}:${source}:000000`))?.wav !== null;
+    expect(action).toBe("dropped_registered_blobs");
+    expect(await kept(prev2, "mic")).toBe(false);
+    expect(await kept(prev1, "system")).toBe(false);
+    expect(await kept(prev1, "mic")).toBe(true);
+    expect(await kept(prev2, "system")).toBe(true);
+    expect(await blobKept(chunkStore, meetingId)).toEqual([true]);
+  });
+
   it("使用率 95% 以上で削除できる Blob がなければ、エクスポートを要求する", async () => {
     // Arrange
     stubStorage({ ratios: [0.97] });

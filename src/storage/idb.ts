@@ -150,6 +150,17 @@ export class ChunkStore {
     return [...before, ...after].filter(isAudioChunkRecord).filter((r) => r.save.status !== "DB_REGISTERED");
   }
 
+  /** クォータ縮退用：Blob が残っている DB_REGISTERED の Chunk を、会議・トラックを問わず作成の古い順に返す。 */
+  async listDroppable(): Promise<AudioChunkRecord[]> {
+    const tx = this.db.transaction(STORE_CHUNKS, "readonly");
+    const index = tx.objectStore(STORE_CHUNKS).index("by_status");
+    const results = await requestToPromise(index.getAll(IDBKeyRange.only("DB_REGISTERED")));
+    return results
+      .filter(isAudioChunkRecord)
+      .filter((r) => r.save.status === "DB_REGISTERED" && r.wav !== null)
+      .sort((a, b) => a.createdAt - b.createdAt || (a.chunkKey < b.chunkKey ? -1 : a.chunkKey > b.chunkKey ? 1 : 0));
+  }
+
   /** クォータ縮退（§3.4 段階1）：DB_REGISTERED の Chunk だけ Blob 本体を削除しメタデータのみ残す。未検証の Chunk は再送のため残す。 */
   async dropBlob(chunkKey: string): Promise<void> {
     await this.updateSaveState(chunkKey, (record) => {
