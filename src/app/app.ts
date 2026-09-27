@@ -131,7 +131,9 @@ export class App {
     if (token === "") throw new Error("token is empty");
     await this.settings.set(BACKEND_TOKEN_KEY, token);
     this.token = token;
-    this.saver = this.createSaver(token);
+    // 差し替えずに更新する。Scheduler が IDB 読み込み中に掴んでいる saver も新しいトークンで送る
+    if (this.saver === null) this.saver = this.createSaver(token);
+    else this.saver.setToken(token);
     const state = await this.monitor.checkOnce();
     if (isUsable(state)) await this.onBackendAvailable();
   }

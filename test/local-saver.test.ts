@@ -65,6 +65,21 @@ describe("LocalSaver.put", () => {
     expect(c.init.redirect).toBe("error");
   });
 
+  it("setToken 後の put は、生成時ではなく新しいトークンで Authorization を送る", async () => {
+    // Arrange：Scheduler は送信前に saver を掴んでから IDB を待つので、その間に差し替わったトークンでも送れること
+    const r = await makeChunkRecord("m1", 0, 160);
+    const auths: (string | null)[] = [];
+    const saver = saverWith(async (_input, init) => {
+      auths.push(new Headers(init?.headers).get("Authorization"));
+      return new Response(okBody(r), { status: 201 });
+    });
+    // Act
+    saver.setToken("new-tok");
+    await saver.put(r);
+    // Assert
+    expect(auths).toEqual(["Bearer new-tok"]);
+  });
+
   it("200 は冪等再送として成功扱い", async () => {
     const r = await makeChunkRecord("m1", 0, 160);
     const outcome = await saverWith(async () => new Response(okBody(r), { status: 200 })).put(r);
