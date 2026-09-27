@@ -4596,7 +4596,7 @@ UI フレームワークは使わない（ブラウザ標準 API と TypeScript 
 | 録音開始 | `confirm(CONSENT_QUESTION)` → `getUserMedia({ audio: true })` → `new AudioContext()`（sampleRate は指定しない）→ `attachAudioContextMonitor` → `app.startRecording`。同意をキャンセルしたら開始しない。`getUserMedia` の拒否は開始前のエラーとして表示する | §3.9、§6、§19、§28.3 |
 | 録音停止 | `session.stop()` の結果を `finalizeResultText` で表示し、AudioContext を閉じる | §22 |
 | 描画ループ | 表示中は `requestAnimationFrame` で状態を読む。hidden の間は rAF が止まるので、`onHidden` で 1 秒間隔のタイマーに切り替え、visible で戻す | §19、§20 |
-| お知らせ | `onEvent` → `noticeFor`。`finalized` の `missingTailMs` は「末尾 約◯秒が保存されていません」（1 秒未満でも約 1 秒）。`memory_backlog_export_required` で「WAV を書き出す」ボタンを出し、`exportMemoryBacklog()` を Blob URL と `<a download>` で保存する | §15、§22 |
+| お知らせ | `onEvent` → `noticeFor`。`finalized` の `missingTailMs` は「末尾 約◯秒が保存されていません」（1 秒未満でも約 1 秒）。`memory_backlog_export_required` で「WAV を書き出す」ボタンを出し、`exportMemoryBacklog()` を Blob URL と `<a download>` で保存する。停止後もメモリ待機が残る controller は `memoryBacklogCount` が 0 になるまで保持し、書き出しの対象に含める | §15、§22 |
 | 確定待ちの会議 | `listPendingFinalize()` の一覧に「再試行」ボタン（`retryFinalize`）。5 秒ごとと確定・停止のたびに更新する | §31.2 |
 | 設定 | トークン入力 → `app.setToken`。`LOCAL_DATA_NOTICE`（§3.9 の利用者責任の明示）と `TAB_CLOSE_HELP`（§20 の文言）を常に表示する | §3.9、§4.3、§20 |
 | 起動失敗 | `openDatabase()` が別タブのためにアップグレードできなければ「他のタブを閉じてください」と表示する | §10 |
