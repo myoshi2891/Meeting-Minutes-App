@@ -26,11 +26,9 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### 未コミットの変更
 
-- `feat(app)`: `listPendingFinalize` / `retryFinalize`（`src/app/app.ts`、テスト 3 件 `test/app.test.ts`）
-- `feat(ui)`: `src/ui/recording-view.ts`、`test/recording-view.test.ts`
-- `feat(ui)`: 最小 UI（`src/main.ts`、`index.html`）
-- `docs(phase1)`: §31.4 最小 UI の追加と §31 の同期
-- `chore(progress)`: 本ファイル
+- `fix(app)`: `setToken` は `LocalSaver` を作り直さず `saver.setToken()` で更新（`src/app/app.ts`、`src/api/local-saver.ts`、テスト 1 件 `test/local-saver.test.ts`）
+- `docs(phase1)`: §15 LocalSaver / app 層のコードと本文の同期（`design-local-phase3-client.md` の LocalSaver 写しも同修正）
+- 残課題: Scheduler が saver を掴んだ後に `setToken` される競合そのものを再現する app レベルのテストは未追加
 
 ---
 
