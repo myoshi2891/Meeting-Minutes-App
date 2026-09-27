@@ -20,14 +20,14 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 コード・自動テスト・最小 UI あり | **未**：§28.3 の手動項目（実マイク・実サーバー、T4） |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: 21 ファイル / 287 件がすべて通過。`npm run typecheck` もエラーなし。`npm run build` も通る。
+- 自動テスト: 21 ファイル / 291 件がすべて通過。`npm run typecheck` もエラーなし。`npm run build` も通る。
 - 設計書と src の同期: `src/` の埋め込みコードはすべて一致（MISSING なし）。確認手順は `design-doc-sync` スキルにある。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
 ### 未コミットの変更
 
-- `fix(storage)`: `enforceQuota` の削除対象を全会議・全トラックの DB_REGISTERED（`createdAt` 昇順）に広げる。`ChunkStore.listDroppable()` を追加（`src/storage/quota-monitor.ts`、`src/storage/idb.ts`、テスト 1 件 `test/quota-monitor.test.ts`）
-- `docs(phase1)`: §3.4 段階1 の本文と idb / quota-monitor のコード同期
+- `fix(app)`: `startRecording` に開始中フラグを追加し、`session` が入る前の await 中に別会議 ID で呼ばれても `already recording` で拒否する（`src/app/app.ts`、テスト 2 件 `test/app.test.ts`）
+- `docs(phase1)`: §31 の app.ts 埋め込みコードと配線表「録音開始」行を同期
 - 残課題: `enforceQuota` の `meetingId` 引数は未使用になった（API 維持のため残置。外すなら app.ts とテスト 5 件を更新）
 - 残課題: Scheduler が saver を掴んだ後に `setToken` される競合そのものを再現する app レベルのテストは未追加
 
@@ -121,6 +121,10 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-27（23 回目）
+
+- レビュー指摘 1 件（有効）：`startRecording` の二重開始ガードが `session` だけを見ており、await 中の同時開始（別会議 ID）を通していた → 開始中フラグを `finally` で下ろす形で追加（回帰テスト 2 件、並行開始は修正前に Red を確認）。
 
 ### 2026-09-27（22 回目）
 
