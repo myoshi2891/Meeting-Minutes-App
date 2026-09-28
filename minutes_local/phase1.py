@@ -13,6 +13,7 @@ import re
 import secrets
 import sqlite3
 import struct
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -125,12 +126,17 @@ def error(status: int, code: str, message: str) -> JSONResponse:
 
 def _write_atomic(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    part = path.with_suffix(path.suffix + ".part")
-    with part.open("wb") as out:
-        out.write(data)
-        out.flush()
-        os.fsync(out.fileno())
-    os.replace(part, path)
+    # 同時書き込みで一時ファイルを奪い合わないよう、書き込みごとに一意な .part を使う
+    fd, part = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(part, path)
+    except BaseException:
+        Path(part).unlink(missing_ok=True)
+        raise
 
 
 def _wav_samples(data: bytes) -> int:

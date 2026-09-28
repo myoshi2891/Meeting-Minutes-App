@@ -186,3 +186,30 @@ def test_concurrent_finalize_keeps_first_result_in_db_and_snapshot(tmp_path, mon
     assert [s["endedAtEpochMs"] for s in snapshots] == [ended_at, ended_at]
     final = json.loads((tmp_path / "recordings/m-1/meeting.json").read_text())
     assert (final["endedAtEpochMs"], final["totalAudioFrames"]) == (ended_at, frames)
+
+
+def test_concurrent_atomic_writes_to_same_path_do_not_share_temp_file(tmp_path, monkeypatch):
+    import os
+    import threading
+    from minutes_local import phase1
+
+    # Arrange: 両スレッドが一時ファイルを書き終えてから rename するよう待ち合わせる
+    original_replace = os.replace
+    barrier = threading.Barrier(2)
+
+    def waiting_replace(src, dst):
+        barrier.wait(timeout=2)
+        original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", waiting_replace)
+    target = tmp_path / "recordings/m-1/meeting.json"
+
+    # Act
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(phase1._write_atomic, target, data) for data in (b"first", b"second")]
+        errors = [f.exception() for f in futures]
+
+    # Assert: どちらも成功し、一時ファイルは残らない
+    assert errors == [None, None]
+    assert target.read_bytes() in (b"first", b"second")
+    assert not list(tmp_path.rglob("*.part"))
