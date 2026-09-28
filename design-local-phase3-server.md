@@ -2363,6 +2363,9 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
                 repo.update_chunk(conn, existing.id, save_status="verified", codec="wav")
             existing = existing.model_copy(update={"save_status": "verified", "codec": "wav"})
         return JSONResponse(_chunk_response(existing), status_code=200)
+    if meeting.status not in ("created", "recording", "finalizing"):
+        # 確定後の会議には新しい Chunk を足さない（登録済み Chunk の再送・修復は上で受け付け済み）
+        return JSONResponse(error_body("CONFLICT_MEETING_FINALIZED", "meeting is already finalized"), status_code=409)
 
     rel = chunk_relative_path(meeting_id, source, sequence_no, meeting.local_user_id)
     try:
@@ -2382,6 +2385,10 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
     )
     live_job: str | None = None
     async with ctx.db.write() as conn:
+        # 読み取り後に finalize が確定させた場合に備え、書き込みロック下で状態を確かめ直す
+        current = repo.get_meeting(conn, meeting_id)
+        if current is None or current.status not in ("created", "recording", "finalizing"):
+            return JSONResponse(error_body("CONFLICT_MEETING_FINALIZED", "meeting is already finalized"), status_code=409)
         stored = repo.upsert_chunk(conn, chunk)
         if stored.id == chunk.id:
             live_job = live.on_chunk_registered(conn, ctx, meeting, stored)
@@ -2434,8 +2441,12 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
             return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", f"{source}: have {counts.get(source, 0)}, expected {expected}",
                                            ", ".join(missing) or None), status_code=409)
     async with ctx.db.write() as conn:
-        repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames)
-        if meeting.status != "finalized":
+        # 先に確定した値を正とする。書き込みロック下で状態と件数を確かめ直し、2 回目以降は更新しない
+        current = repo.get_meeting(conn, meeting_id)
+        if current is not None and current.status in ("created", "recording", "finalizing"):
+            if len(repo.list_chunks(conn, meeting_id)) != len(chunks):
+                return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "chunks changed during finalize"), status_code=409)
+            repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames)
             pipeline.on_finalized(conn, meeting_id)
         snapshot = repo.get_meeting(conn, meeting_id)
         chunks_now = repo.list_chunks(conn, meeting_id)

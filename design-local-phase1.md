@@ -1057,9 +1057,11 @@ Phase 1 の実機検証用に `minutes_local/phase1.py` がこの5 APIを実装�
 | --- | --- | --- | --- | --- |
 | `GET` | `/v1/health` | なし | `200` `HealthResponse` | 接続不能 = `UNREACHABLE` |
 | `POST` | `/v1/meetings` | `CreateMeetingRequest` | `201` `MeetingResponse`（既存なら `200`） | `401`, `422`, `507` |
-| `PUT` | `/v1/meetings/{meetingId}/chunks/{source}/{sequenceNo}` | body: WAV バイト列、`Content-Type: audio/wav`、`X-Chunk-SHA256`、`X-Chunk-Meta`（`ChunkTimingMetadata` を JSON 化し Base64URL 化） | `201` `ChunkResponse`（冪等再送は `200`） | `401`, `409`, `422`, `507`, `5xx` |
+| `PUT` | `/v1/meetings/{meetingId}/chunks/{source}/{sequenceNo}` | body: WAV バイト列、`Content-Type: audio/wav`、`X-Chunk-SHA256`、`X-Chunk-Meta`（`ChunkTimingMetadata` を JSON 化し Base64URL 化） | `201` `ChunkResponse`（冪等再送は `200`） | `401`, `404`（会議未登録）, `409`（内容不一致・確定済み会議への新規 Chunk）, `422`, `507`, `5xx` |
 | `GET` | `/v1/meetings/{meetingId}/chunks` | なし | `200` `ChunkListResponse` | `401`, `404` |
 | `POST` | `/v1/meetings/{meetingId}/finalize` | `FinalizeRequest` | `200` `FinalizeResponse` | `401`, `409`（Chunk 欠落）, `422` |
+
+PUT と finalize は SQLite の `BEGIN IMMEDIATE` で直列化する。finalize は件数・ハッシュの検証と `finalized` への更新を同じトランザクションで行い、更新は finalize 前の状態（`created` / `recording` / `finalizing`）の会議に限る。2 回目以降の finalize は `200` を返すが、最初に確定した `endedAt` / `totalAudioFrames` を書き換えない。`meeting.json` はコミット後に DB の確定値から書き出す（書き出しに失敗しても再送で書き直せる）。確定後の会議には新しい Chunk を登録せず `409 CONFLICT_MEETING_FINALIZED` を返すが、登録済み Chunk の冪等再送と破損ファイルの修復は受け付ける。
 
 ```typescript
 // src/api/contracts.ts
@@ -1128,6 +1130,7 @@ export interface ApiErrorBody {
     | "NOT_FOUND"
     | "CONFLICT_HASH_MISMATCH"
     | "CONFLICT_CHUNKS_MISSING"
+    | "CONFLICT_MEETING_FINALIZED"
     | "VALIDATION"
     | "INSUFFICIENT_STORAGE"
     | "INTERNAL";
