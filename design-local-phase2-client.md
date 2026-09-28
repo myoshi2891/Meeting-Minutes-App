@@ -32,7 +32,7 @@ Phase 2 のブラウザ側の責務は次の 3 つである。
 | `src/api/phase2-client.ts` | 新規 | 型付き fetch | §9 |
 | `src/notes/notes-store.ts` | 新規 | ノートの Autosave | §10 |
 | `src/ui/state.ts` | 新規 | UI 状態 reducer | §11 |
-| `src/worklet/pcm-chunker.worklet.ts`、`src/audio/wav.ts`、`src/storage/idb.ts`、`src/api/local-saver.ts`、`src/recording/local-save-scheduler.ts`、`src/api/backend-health-monitor.ts` | 変更なし | — | — |
+| `src/worklet/pcm-chunker.worklet.ts`、`src/audio/wav.ts`、`src/storage/idb.ts`、`src/api/local-saver.ts`、`src/api/meeting-registrar.ts`、`src/recording/local-save-scheduler.ts`、`src/api/backend-health-monitor.ts` | 変更なし | Phase 1 の会議登録を Mic/System の双方で共用 | — |
 
 変更禁止の根拠は基本設計 §2（WAV 生成・IndexedDB スキーマ・Phase 1 API 契約の不変）である。`src/storage/idb.ts` の `DB_VERSION` は 1 のままとする。
 
@@ -566,7 +566,7 @@ export function jobFromServerRow(row: Record<string, unknown>): JobSummary | nul
 
 # 4. `src/recording/recording-controller.ts` の変更
 
-変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出しを含む）。
+変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出しを含む）。Phase 1 で追加した `onMeetingCreated` は Mic 側で維持し、IDB 障害時の直接送信用の会議情報を保持する。System 側は既存の Mic 会議を使う。
 
 `stop()` の最後の会議レコード保存だけは Phase 1 と形が違う。Phase 1 は Controller が会議レコードを保持し、その `sessionClock` が Controller の時計と同じオブジェクトなので、保存し直すだけで最終 `audioFrameCount` が残る。Phase 2 は `registerMeeting` のため会議レコードを IndexedDB から読み直すので、別オブジェクトになる。そこで Mic 側は、最終 Chunk の書き込み完了後に会議レコードを読み直し、Controller の `SessionClock` を写した新しいオブジェクトとして保存する。`sessionClock` は `readonly` なので、書き換えずに置き換える。System 側は会議レコードを持たないので何もしない。
 
@@ -623,6 +623,8 @@ export interface RecordingControllerDeps {
   readonly locks: MeetingLockManager;
   /** IDB に書けない Chunk をサーバーへ直接送る（Phase 1 §15 と同じ）。省略時は直接送らない */
   readonly directSaver?: DirectChunkSaver;
+  /** Phase 1: IDB 障害時の直接送信用に開始時の会議情報を保持する。Mic 側だけが通知する。 */
+  readonly onMeetingCreated?: (meeting: MeetingRecord) => void;
 }
 
 /** Worklet が flush / stop に応答しないときに待機を打ち切るまでの時間（Phase 1 §15 と同じ） */
@@ -714,6 +716,7 @@ export class RecordingController {
           endedAt: null,
           finalChunkCount: null,
         };
+        this.deps.onMeetingCreated?.(meeting);
         await this.deps.meetingStore.put(meeting);
       }
     } catch (error) {
@@ -2130,7 +2133,9 @@ export function backendBanner(state: UiState): string | null {
   const b = state.backend;
   if (b === null) return null;
   if (b.unauthorized) return "サーバーのトークンが無効です。設定を確認してください。";
-  if (b.status === "UNREACHABLE") return "サーバー未接続 ── 録音は継続中。処理はサーバー起動後に再開します。";
+  if (b.status === "UNREACHABLE") return state.status === "recording"
+    ? "サーバー未接続 ── 録音は継続中。処理はサーバー起動後に再開します。"
+    : "サーバー未接続 ── 処理はサーバー起動後に再開します。";
   if (b.status === "DEGRADED") return "サーバーが高負荷です。処理は継続中です。";
   return null;
 }
@@ -2819,7 +2824,8 @@ describe("UI reducer", () => {
     expect(failedJobs(s).map((j) => j.jobId)).toEqual(["j1"]);
     expect(backendBanner(s)).toBeNull();
     s = reduce(s, { type: "backend", backend: { status: "UNREACHABLE", lastCheckedAt: 0, lastHealthyAt: null, latencyMs: null, consecutiveFailures: 3, capabilities: null, unauthorized: false } });
-    expect(backendBanner(s)).toMatch(/録音は継続中/);
+    expect(backendBanner(s)).not.toMatch(/録音は継続中/);
+    expect(backendBanner({ ...s, status: "recording" })).toMatch(/録音は継続中/);
     s = reduce(s, { type: "backend", backend: { ...s.backend!, unauthorized: true } });
     expect(backendBanner(s)).toMatch(/トークン/);
   });

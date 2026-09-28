@@ -1387,6 +1387,7 @@ from __future__ import annotations
 import hashlib
 import os
 import struct
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1454,15 +1455,20 @@ def chunk_relative_path(meeting_id: str, source: str, sequence_no: int) -> str:
 
 
 def write_atomic(data_dir: Path, relative_path: str, data: bytes) -> Path:
-    """{path}.part に書き、fsync 後に rename する（Phase 1 §12.1）。"""
+    """書き込みごとに一意な {path}.{ランダム}.part に書き、fsync 後に rename する（Phase 1 §12.1）。"""
     final = data_dir / relative_path
     final.parent.mkdir(parents=True, exist_ok=True)
-    part = final.with_suffix(final.suffix + ".part")
-    with part.open("wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(part, final)
+    # 同時書き込みで一時ファイルを奪い合わないよう、書き込みごとに一意な .part を使う
+    fd, part = tempfile.mkstemp(dir=final.parent, prefix=final.name + ".", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(part, final)
+    except BaseException:
+        Path(part).unlink(missing_ok=True)
+        raise
     return final
 
 
@@ -3754,13 +3760,17 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
         return JSONResponse(error_body("VALIDATION", "sha256 header mismatch"), status_code=422)
 
     with ctx.db.read() as conn:
-        if repo.get_meeting(conn, meeting_id) is None:
+        meeting = repo.get_meeting(conn, meeting_id)
+        if meeting is None:
             return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
         existing = repo.get_chunk_by_key(conn, meeting_id, source, sequence_no)
     if existing is not None:
         if existing.sha256 != sha:
             return JSONResponse(error_body("CONFLICT_HASH_MISMATCH", "chunk exists with different content"), status_code=409)
         return JSONResponse(_chunk_response(existing), status_code=200)   # 冪等再送（基本設計 §11）
+    if meeting.status not in ("created", "recording", "finalizing"):
+        # 確定後の会議には新しい Chunk を足さない（登録済み Chunk の再送・修復は上で受け付け済み）
+        return JSONResponse(error_body("CONFLICT_MEETING_FINALIZED", "meeting is already finalized"), status_code=409)
 
     rel = chunk_relative_path(meeting_id, source, sequence_no)
     try:
@@ -3785,6 +3795,10 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
     sampled_at = int(meta.get("wallClockStartEpochMs", now_ms())) + duration_ms
 
     async with ctx.db.write() as conn:
+        # 読み取り後に finalize が確定させた場合に備え、書き込みロック下で状態を確かめ直す
+        current = repo.get_meeting(conn, meeting_id)
+        if current is None or current.status not in ("created", "recording", "finalizing"):
+            return JSONResponse(error_body("CONFLICT_MEETING_FINALIZED", "meeting is already finalized"), status_code=409)
         stored = repo.upsert_chunk(conn, chunk)
         if isinstance(drift, (int, float)) and not isinstance(drift, bool) and math.isfinite(drift):
             # 冪等再送で重複しないよう INSERT OR IGNORE（UNIQUE (meeting_id, source, sequence_no)）
@@ -3833,14 +3847,18 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     async with ctx.db.write() as conn:
         for c in chunks:
             repo.update_chunk(conn, c.id, save_status="missing" if f"{c.source}/{c.sequence_no}" in missing else "verified")
-        repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames)
-        if meeting.status != "finalized":
+        # 先に確定した値を正とする。書き込みロック下で状態と件数を確かめ直し、2 回目以降は更新しない
+        current = repo.get_meeting(conn, meeting_id)
+        if current is not None and current.status in ("created", "recording", "finalizing"):
+            if len(repo.list_chunks(conn, meeting_id)) != len(chunks):
+                return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "chunks changed during finalize"), status_code=409)
+            repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames)
             pipeline.on_finalized(conn, meeting_id)
     ctx.events.publish(meeting_id, {"type": "meeting_status", "status": "transcribing"})
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 ```
 
-`finalize` は冪等である。2 回目の呼び出しはジョブを生成しない（`INSERT OR IGNORE` でも安全だが、`meeting.status` の確認で明示的に避ける）。
+`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を返す。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。
 
 ## 21.3 Phase 2 ルート `api/routes_meetings.py`
 
@@ -4619,7 +4637,7 @@ async def test_put_chunk_idempotent_and_conflict(client: httpx.AsyncClient, ctx:
     r3 = await put_chunk(client, "m-1", 0, sine_pcm(30, freq=880))
     assert r3.status_code == 409 and r3.json()["code"] == "CONFLICT_HASH_MISMATCH"
     assert (ctx.settings.data_dir / "recordings/m-1/mic/000000.wav").exists()
-    assert not (ctx.settings.data_dir / "recordings/m-1/mic/000000.wav.part").exists()
+    assert not list((ctx.settings.data_dir / "recordings/m-1/mic").glob("*.part"))
 
 
 async def test_put_chunk_rejects_invalid_wav_and_bad_hash(client: httpx.AsyncClient) -> None:

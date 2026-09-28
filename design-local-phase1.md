@@ -1049,15 +1049,19 @@ v4.0 §17 を継承する。論理一意キーは `meetingId + source + sequence
 
 # 12. ローカル常駐サーバー API 契約（Phase 1 で必要な範囲）
 
-サーバー実装は Phase 2 の対象であり、本書はブラウザ側が依存する契約のみ定義する。ベース URL は既定 `http://127.0.0.1:43117`、すべて `Authorization: Bearer {token}` 必須（`/v1/health` は認証なしでも `status` と `service` のみ返す）。
+Phase 1 の実機検証用に `minutes_local/phase1.py` がこの5 APIを実装する。STT・LLM・ジョブ処理は Phase 2 に残す。ベース URL は既定 `http://127.0.0.1:43117`、すべて `Authorization: Bearer {token}` 必須（`/v1/health` は認証なしでも `status` と `service` のみ返す）。
+
+サーバーは `127.0.0.1` のみに bind し、`http://127.0.0.1:5173` のみを CORS 許可する。OPTIONS は認証前に処理し、401・422・507 などのエラー応答にも CORS ヘッダを付ける。起動時に32バイトの乱数トークンを再生成して0600の `token` に保存する。録音ファイルと SQLite は再起動後も保持する。Phase 1 の `meetings` / `audio_chunks` は Phase 2 §7 のカラムと CHECK 制約に合わせる。
 
 | メソッド | パス | リクエスト | 成功レスポンス | 失敗 |
 | --- | --- | --- | --- | --- |
 | `GET` | `/v1/health` | なし | `200` `HealthResponse` | 接続不能 = `UNREACHABLE` |
 | `POST` | `/v1/meetings` | `CreateMeetingRequest` | `201` `MeetingResponse`（既存なら `200`） | `401`, `422`, `507` |
-| `PUT` | `/v1/meetings/{meetingId}/chunks/{source}/{sequenceNo}` | body: WAV バイト列、`Content-Type: audio/wav`、`X-Chunk-SHA256`、`X-Chunk-Meta`（`ChunkTimingMetadata` を JSON 化し Base64URL 化） | `201` `ChunkResponse`（冪等再送は `200`） | `401`, `409`, `422`, `507`, `5xx` |
+| `PUT` | `/v1/meetings/{meetingId}/chunks/{source}/{sequenceNo}` | body: WAV バイト列、`Content-Type: audio/wav`、`X-Chunk-SHA256`、`X-Chunk-Meta`（`ChunkTimingMetadata` を JSON 化し Base64URL 化） | `201` `ChunkResponse`（冪等再送は `200`） | `401`, `404`（会議未登録）, `409`（内容不一致・確定済み会議への新規 Chunk）, `422`, `507`, `5xx` |
 | `GET` | `/v1/meetings/{meetingId}/chunks` | なし | `200` `ChunkListResponse` | `401`, `404` |
 | `POST` | `/v1/meetings/{meetingId}/finalize` | `FinalizeRequest` | `200` `FinalizeResponse` | `401`, `409`（Chunk 欠落）, `422` |
+
+PUT と finalize は SQLite の `BEGIN IMMEDIATE` で直列化する。finalize は件数・ハッシュの検証と `finalized` への更新を同じトランザクションで行い、更新は finalize 前の状態（`created` / `recording` / `finalizing`）の会議に限る。2 回目以降の finalize は `200` を返すが、最初に確定した `endedAt` / `totalAudioFrames` を書き換えない。`meeting.json` はコミット後に DB の確定値から書き出す（書き出しに失敗しても再送で書き直せる）。確定後の会議には新しい Chunk を登録せず `409 CONFLICT_MEETING_FINALIZED` を返すが、登録済み Chunk の冪等再送と破損ファイルの修復は受け付ける。
 
 ```typescript
 // src/api/contracts.ts
@@ -1126,6 +1130,7 @@ export interface ApiErrorBody {
     | "NOT_FOUND"
     | "CONFLICT_HASH_MISMATCH"
     | "CONFLICT_CHUNKS_MISSING"
+    | "CONFLICT_MEETING_FINALIZED"
     | "VALIDATION"
     | "INSUFFICIENT_STORAGE"
     | "INTERNAL";
@@ -1177,7 +1182,9 @@ export function isChunkListResponse(value: unknown): value is ChunkListResponse 
 
 ## 12.1 サーバー側の書き込み原子性（契約として要求）
 
-サーバーは受信バイト列を `{path}.part` に書き、SHA-256 を検証してから `rename` で `{path}` に置き換えること。Phase 2 の STT ワーカーが `.part` を読まないことで、書き込み途中のファイルを処理する競合を避ける。この契約は本書のサーバー実装要件として §25 に再掲する。
+サーバーは受信バイト列を書き込みごとに一意な `{path}.{ランダム}.part` に書き、SHA-256 を検証してから `rename` で `{path}` に置き換えること。Phase 2 の STT ワーカーが `.part` を読まないことで、書き込み途中のファイルを処理する競合を避ける。この契約は本書のサーバー実装要件として §25 に再掲する。
+
+一時ファイル名を書き込みごとに変えるのは、コミット後に書く `meeting.json` のように直列化の外で同じパスへ並行に書く場合でも、互いの `.part` を上書き・移動しないためである。同一 Chunk キーの並行 PUT はサーバー内で直列化する。同一ハッシュの再送は200、異なるハッシュは409。SQLite 登録まで終えた場合だけ `registered: true` を返す。finalize は要求された両 source の件数・連番と、全ファイルの存在・ハッシュを確認し、不足があれば409を返す。再送時も最初の終了時刻と総フレーム数を保持する。
 
 ---
 
@@ -1641,6 +1648,8 @@ export interface RecordingControllerDeps {
   readonly locks: MeetingLockManager;
   /** IDB に書けない Chunk をサーバーへ直接送る（drainMemoryBacklog）。省略時は直接送らない */
   readonly directSaver?: DirectChunkSaver;
+  /** IDB 障害時の直接送信用に、開始時の会議情報をメモリにも保持する。 */
+  readonly onMeetingCreated?: (meeting: MeetingRecord) => void;
 }
 
 /** Worklet が flush / stop に応答しない（AudioContext が閉じられた等）ときに待機を打ち切るまでの時間 */
@@ -1714,6 +1723,7 @@ export class RecordingController {
         endedAt: null,
         finalChunkCount: null,
       };
+      this.deps.onMeetingCreated?.(meeting);
       await this.deps.meetingStore.put(meeting);
     } catch (error) {
       // recording はまだ保存されていないので会議は巻き戻さない。stop() は Worklet がないと何もしないため、マイクだけここで止める
@@ -2201,6 +2211,7 @@ function readAscii(view: DataView, offset: number, length: number): string {
 // src/api/local-saver.ts
 import { encodeChunkMetaHeader, isChunkResponse, type ApiErrorBody } from "./contracts";
 import type { AudioChunkRecord, LocalSaveError, LocalSaveErrorKind } from "../types/recording";
+import type { RegistrationOutcome } from "./meeting-registrar";
 
 const ALLOWED_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
@@ -2230,7 +2241,7 @@ export class LocalSaver {
   private readonly base: URL;
   private token: string;
 
-  constructor(private readonly config: LocalSaverConfig, private readonly fetchImpl: typeof fetch = fetch) {
+  constructor(private readonly config: LocalSaverConfig, private readonly fetchImpl: typeof fetch = fetch, private readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>) {
     this.base = new URL(config.baseUrl);
     assertLocalHost(this.base);
     this.token = config.token;
@@ -2246,6 +2257,10 @@ export class LocalSaver {
       return this.fail("VALIDATION", "wav blob already dropped", null);
     }
     const { meetingId, source, sequenceNo } = record.meta;
+    if (this.ensureMeeting !== undefined) {
+      const registration = await this.ensureMeeting(meetingId);
+      if (!registration.ok) return registration;
+    }
     const url = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks/${source}/${sequenceNo}`, this.base);
     assertLocalHost(url);
 
@@ -2336,6 +2351,113 @@ function isApiErrorBody(value: unknown): value is ApiErrorBody {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return typeof v.error === "string" && typeof v.code === "string";
+}
+```
+
+### 会議登録（PUT に先立つ共通経路）
+
+`LocalSaver.put()` は `MeetingRegistrar.ensure()` を先に呼ぶ。Registrar は IDB の会議情報を使って `POST /v1/meetings` を送り、同じ会議への並行呼び出しは実行中の Promise を共有する。録音中に IDB 読み取りが失敗した場合は、Controller が開始時にメモリへ渡した会議情報を使う。登録失敗は PUT の保存失敗として Scheduler の再試行へ返す。録音開始自体は登録応答を待たない。
+
+```typescript
+// src/api/meeting-registrar.ts
+import type { CreateMeetingRequest, MeetingResponse } from "./contracts";
+import { assertLocalHost, isRetryableError } from "./local-saver";
+import type { MeetingRecord, LocalSaveError, LocalSaveErrorKind } from "../types/recording";
+
+export type RegistrationOutcome = { readonly ok: true } | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean };
+
+export interface MeetingRegistrarDeps {
+  readonly baseUrl: string;
+  readonly token: () => string | null;
+  readonly getMeeting: (meetingId: string) => Promise<MeetingRecord | undefined>;
+  readonly fetchImpl: typeof fetch;
+  readonly timeoutMs: number;
+}
+
+/** PUT とメモリからの直接送信が共用する会議登録。並行する同一会議の POST だけ束ねる。 */
+export class MeetingRegistrar {
+  private readonly inFlight = new Map<string, Promise<RegistrationOutcome>>();
+
+  constructor(private readonly deps: MeetingRegistrarDeps) {
+    assertLocalHost(new URL(deps.baseUrl));
+  }
+
+  ensure(meetingId: string): Promise<RegistrationOutcome> {
+    const running = this.inFlight.get(meetingId);
+    if (running !== undefined) return running;
+    const promise = this.register(meetingId).finally(() => this.inFlight.delete(meetingId));
+    this.inFlight.set(meetingId, promise);
+    return promise;
+  }
+
+  private async register(meetingId: string): Promise<RegistrationOutcome> {
+    let meeting: MeetingRecord | undefined;
+    try {
+      meeting = await this.deps.getMeeting(meetingId);
+    } catch (error) {
+      return this.fail("UNKNOWN", error instanceof Error ? error.message : "meeting lookup failed", null);
+    }
+    if (meeting === undefined) return this.fail("VALIDATION", "local meeting not found", 422);
+    const body: CreateMeetingRequest = {
+      meetingId: meeting.meetingId,
+      title: meeting.title,
+      sessionStartEpochMs: meeting.sessionClock.sessionStartEpochMs,
+      nativeSampleRate: meeting.sessionClock.nativeSampleRate,
+      consentConfirmedAt: meeting.consentConfirmedAt,
+    };
+    const url = new URL("/v1/meetings", this.deps.baseUrl);
+    assertLocalHost(url);
+    let token = this.deps.token();
+    if (token === null) return this.fail("UNAUTHORIZED", "backend token is not set", null);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.deps.timeoutMs);
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await this.deps.fetchImpl(url, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          credentials: "omit",
+          redirect: "error",
+          signal: controller.signal,
+        });
+        if (response.status === 200 || response.status === 201) {
+          const value: unknown = await response.json().catch(() => null);
+          if (!isMeetingResponse(value) || value.meetingId !== meetingId) return this.fail("SERVER", "malformed MeetingResponse", response.status);
+          return { ok: true };
+        }
+        const latestToken = this.deps.token();
+        if ((response.status === 401 || response.status === 403) && latestToken !== null && latestToken !== token && attempt === 0) {
+          token = latestToken;
+          continue;
+        }
+        if (response.status === 401 || response.status === 403) return this.fail("UNAUTHORIZED", `meeting registration HTTP ${response.status}`, response.status);
+        if (response.status === 409) return this.fail("CONFLICT", "meeting registration conflict", response.status);
+        if (response.status === 400 || response.status === 422) return this.fail("VALIDATION", `meeting registration HTTP ${response.status}`, response.status);
+        if (response.status === 507) return this.fail("STORAGE_FULL", "meeting registration disk full", response.status);
+        return this.fail(response.status >= 500 ? "SERVER" : "UNKNOWN", `meeting registration HTTP ${response.status}`, response.status);
+      }
+      return this.fail("UNAUTHORIZED", "meeting registration token changed", 401);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return this.fail("TIMEOUT", "meeting registration timeout", null);
+      if (error instanceof TypeError) return this.fail("NETWORK", error.message, null);
+      return this.fail("UNKNOWN", error instanceof Error ? error.message : String(error), null);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private fail(kind: LocalSaveErrorKind, message: string, httpStatus: number | null): RegistrationOutcome {
+    const error: LocalSaveError = { kind, message, httpStatus, at: performance.now() };
+    return { ok: false, error, retryable: isRetryableError(error) };
+  }
+}
+
+function isMeetingResponse(value: unknown): value is MeetingResponse {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.meetingId === "string" && typeof v.dataPath === "string" &&
+    (v.status === "created" || v.status === "recording" || v.status === "finalizing" || v.status === "finalized");
 }
 ```
 
@@ -4186,6 +4308,8 @@ v4.0 §116（Audio）、§117（Network → ローカル起動断に読み替え
 | SHA-256 検証 | 同左 | 設計済・テスト済 | §17.1（レスポンス照合）、§22（finalize 前の一覧照合） |
 | R2 Object 存在確認 | `GET /v1/meetings/{id}/chunks` での存在・ハッシュ確認 | 設計済 | §22 |
 
+2026-09-28: Phase 1 最小サーバーのPythonテストで、会議未登録の404、認証・CORS、破損WAV・ハッシュ不一致の422、同一Chunkの再送200／異なるハッシュ409、同時PUT、容量不足507、再起動後のSQLite保持、不完全なfinalize拒否409を確認。ループバックHTTPで `/v1/health` の200を確認した。実ブラウザの既存Chunk PUT・5分停止からの復帰は未確認。
+
 ## 28.3 Browser（v4.0 §121）
 
 | 項目 | 状況 | 担保箇所 |
@@ -4271,6 +4395,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 | PUT が 401 / 403 | `monitor.reportUnauthorized()` | §18 |
 | `monitor.onChange` で HEALTHY / DEGRADED かつ unauthorized でない | `scheduler.resumeAll(別タブが録音中の会議)` → `stop_requested` / `finalizing` の会議ごとに会議ロックを取って `finalizeMeeting` | §17 / §22（サーバー復帰時に Barrier を自動で再試行する） |
 | `setToken` | settings の `backendToken` に保存 → 既存の `LocalSaver` のトークンを更新（未生成なら生成）→ `monitor.checkOnce()` → 使える状態なら上と同じ再開処理 | §4.3。トークンを入れてもヘルス状態は変わらないことがある（認証なしのヘルス応答）ため、`onChange` を待たない |
+| Chunk PUT／メモリからの直接送信 | `LocalSaver.put()` → `MeetingRegistrar.ensure()` → `POST /v1/meetings` 成功後に PUT。並行する同一会議の登録は共有 | §12。サーバーは未登録会議への PUT を404にする |
 | 録音開始 | `requestPersistence` → `RecordingController.start` → `attachPageLifecycle`。録音中か開始処理中（`session` が入る前の await 中）なら会議 ID に関係なく `already recording` で拒否する。開始中フラグは成功・失敗どちらでも `finally` で下ろす | §21 / §15 / §20 |
 | Chunk の enqueue | `scheduler.enqueue` の後に `enforceQuota` を直列で実行。`export_required` なら `AppEvent.export_required`。`dropped_registered_blobs` でメモリ待機があれば `drainMemoryBacklog()` | §21 / §15。`enforceQuota` の失敗が `persistChunk` の失敗に混ざらないよう、enqueue の Promise には含めない |
 | `onError` で `IDB_WRITE_FAILED` | `drainMemoryBacklog()`。失敗したら `AppEvent.memory_backlog_export_required`（UI が `exportMemoryBacklog()` を促す） | §15 |
@@ -4288,6 +4413,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 // src/app/app.ts
 import { BackendHealthMonitor } from "../api/backend-health-monitor";
 import { LocalSaver } from "../api/local-saver";
+import { MeetingRegistrar } from "../api/meeting-registrar";
 import { finalizeMeeting, type FinalizeResult } from "../recording/finalizer";
 import { LocalSaveScheduler } from "../recording/local-save-scheduler";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "../recording/meeting-lock";
@@ -4365,6 +4491,8 @@ export class App {
   readonly scheduler: LocalSaveScheduler;
   private readonly settings: SettingsStore;
   private saver: LocalSaver | null = null;
+  private readonly registrar: MeetingRegistrar;
+  private readonly meetingFallbacks = new Map<string, MeetingRecord>();
   private session: RecordingSession | null = null;
   /** startRecording の開始処理中（session が入る前）か */
   private starting = false;
@@ -4379,6 +4507,19 @@ export class App {
     this.chunkStore = new ChunkStore(deps.db);
     this.meetingStore = new MeetingStore(deps.db);
     this.settings = new SettingsStore(deps.db);
+    this.registrar = new MeetingRegistrar({
+      baseUrl: deps.baseUrl,
+      token: () => this.token,
+      getMeeting: async (meetingId) => {
+        try {
+          return (await this.meetingStore.get(meetingId)) ?? this.meetingFallbacks.get(meetingId);
+        } catch {
+          return this.meetingFallbacks.get(meetingId);
+        }
+      },
+      fetchImpl: deps.fetchImpl ?? fetch,
+      timeoutMs: PUT_TIMEOUT_MS,
+    });
     this.health = createInitialHealth("running");
     const fetchImpl = deps.fetchImpl ?? fetch;
     this.monitor = new BackendHealthMonitor({ baseUrl: deps.baseUrl, token: () => this.token, ...HEALTH_CONFIG }, this.health, fetchImpl);
@@ -4488,6 +4629,7 @@ export class App {
       },
       setTimer: this.deps.setTimer,
       locks: this.deps.locks,
+      onMeetingCreated: (meeting) => this.meetingFallbacks.set(meeting.meetingId, meeting),
       // 送るたびに現在の saver を引く。録音中に setToken しても、開始時のトークン（未設定・失効）で送り続けない
       directSaver: {
         put: async (record) =>
@@ -4497,6 +4639,11 @@ export class App {
     });
 
     await controller.start(meetingId, input.title, input.consentConfirmedAt);
+    // Fake controller も含め、コールバックが未実装の実装では IDB から補完する。
+    if (!this.meetingFallbacks.has(meetingId)) {
+      const startedMeeting = await this.meetingStore.get(meetingId).catch(() => undefined);
+      if (startedMeeting !== undefined) this.meetingFallbacks.set(meetingId, startedMeeting);
+    }
     this.controllers.set(meetingId, controller);
     let recording = true;
     const lifecycle = attachPageLifecycle(controller, () => recording, input.onHidden ?? (() => undefined));
@@ -4538,7 +4685,7 @@ export class App {
   }
 
   private createSaver(token: string): LocalSaver {
-    return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch);
+    return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch, (id) => this.registrar.ensure(id));
   }
 
   private async finalize(meetingId: string): Promise<FinalizeResult> {
@@ -4599,7 +4746,7 @@ UI フレームワークは使わない（ブラウザ標準 API と TypeScript 
 
 | 要素 | 振る舞い | 根拠 |
 | --- | --- | --- |
-| バナー | `backendBanner`：unauthorized → トークン無効、UNREACHABLE → 「サーバー未接続 ── 録音は継続中。N 個の Chunk をブラウザ内に保持しています」（N = `pendingChunkCount`）、DEGRADED → 高負荷。文言は phase2-client §11 の `backendBanner` と揃える | §3.6、§18 |
+| バナー | `backendBanner`：unauthorized → トークン無効、UNREACHABLE → 滞留数を表示し、録音中のみ「録音は継続中」と表示する。DEGRADED → 高負荷 | §3.6、§18 |
 | 警告 | `warningsFor`：`assessHealth` の `reasons` を重大な順に並べる。先頭は `IDB_QUOTA_EXHAUSTED`（§3.4 段階3 の最上位警告）。backend の理由はバナーと重複するので出さない。録音していない間は録音の健全性（`NO_AUDIO_FRAMES` など）を評価せず、`degradedReasons` だけを出す | §3.4、§19 |
 | 経過時間・使用率 | `elapsedText`、`storageUsageText`（`storageUsageRatio` が null なら不明） | §3.6 |
 | 録音開始 | `confirm(CONSENT_QUESTION)` → `getUserMedia({ audio: true })` → `new AudioContext()`（sampleRate は指定しない）→ `attachAudioContextMonitor` → `app.startRecording`。同意をキャンセルしたら開始しない。`getUserMedia` の拒否は開始前のエラーとして表示する | §3.9、§6、§19、§28.3 |
@@ -4635,9 +4782,11 @@ export const LOCAL_DATA_NOTICE =
 export const TAB_CLOSE_HELP = "タブを閉じる・リロードすると、直近最大 30 秒の音声が失われる可能性があります。録音停止ボタンで終了してください";
 
 /** backend の状態（§3.6 / §18）。文言は phase2-client §11 の backendBanner と揃える */
-export function backendBanner(backend: LocalBackendHealth, health: Pick<RecordingHealth, "pendingChunkCount">): string | null {
+export function backendBanner(backend: LocalBackendHealth, health: Pick<RecordingHealth, "pendingChunkCount">, recordingActive = true): string | null {
   if (backend.unauthorized) return "サーバーのトークンが無効です。設定を確認してください。";
-  if (backend.status === "UNREACHABLE") return `サーバー未接続 ── 録音は継続中。${health.pendingChunkCount} 個の Chunk をブラウザ内に保持しています`;
+  if (backend.status === "UNREACHABLE") return recordingActive
+    ? `サーバー未接続 ── 録音は継続中。${health.pendingChunkCount} 個の Chunk をブラウザ内に保持しています`
+    : `サーバー未接続 ── ${health.pendingChunkCount} 個の Chunk をブラウザ内に保持しています`;
   if (backend.status === "DEGRADED") return "サーバーが高負荷です。保存は継続中";
   return null;
 }

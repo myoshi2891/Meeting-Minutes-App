@@ -65,7 +65,7 @@ const stoppedWithBacklog = new Set<SessionController>();
 let hiddenTimer: ReturnType<typeof setInterval> | null = null;
 
 function render(app: App): void {
-  const banner = backendBanner(app.monitor.state, app.health);
+  const banner = backendBanner(app.monitor.state, app.health, recording !== null);
   ui.banner.hidden = banner === null;
   ui.banner.textContent = banner ?? "";
 

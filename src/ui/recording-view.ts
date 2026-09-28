@@ -16,9 +16,11 @@ export const LOCAL_DATA_NOTICE =
 export const TAB_CLOSE_HELP = "タブを閉じる・リロードすると、直近最大 30 秒の音声が失われる可能性があります。録音停止ボタンで終了してください";
 
 /** backend の状態（§3.6 / §18）。文言は phase2-client §11 の backendBanner と揃える */
-export function backendBanner(backend: LocalBackendHealth, health: Pick<RecordingHealth, "pendingChunkCount">): string | null {
+export function backendBanner(backend: LocalBackendHealth, health: Pick<RecordingHealth, "pendingChunkCount">, recordingActive = true): string | null {
   if (backend.unauthorized) return "サーバーのトークンが無効です。設定を確認してください。";
-  if (backend.status === "UNREACHABLE") return `サーバー未接続 ── 録音は継続中。${health.pendingChunkCount} 個の Chunk をブラウザ内に保持しています`;
+  if (backend.status === "UNREACHABLE") return recordingActive
+    ? `サーバー未接続 ── 録音は継続中。${health.pendingChunkCount} 個の Chunk をブラウザ内に保持しています`
+    : `サーバー未接続 ── ${health.pendingChunkCount} 個の Chunk をブラウザ内に保持しています`;
   if (backend.status === "DEGRADED") return "サーバーが高負荷です。保存は継続中";
   return null;
 }

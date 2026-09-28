@@ -119,6 +119,7 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
 
 /** Chunk を指定した保存状態で IDB に置く */
 async function seedChunk(db: IDBDatabase, meetingId: string, seq: number, status: AudioChunkRecord["save"]["status"]): Promise<AudioChunkRecord> {
+  if (await new MeetingStore(db).get(meetingId) === undefined) await new MeetingStore(db).put(makeMeeting(meetingId, "recording"));
   const r = await makeChunkRecord(meetingId, seq, 160);
   r.save.status = status;
   await new ChunkStore(db).putChunk(r);
@@ -159,6 +160,13 @@ afterEach(() => {
 });
 
 describe("createApp（起動時の配線）", () => {
+  it("未登録会議は登録してから PUT し、起動時復旧にも同じ順序を使う", async () => {
+    const meetingId = nextMeetingId();
+    const s = await setup({ seed: (db) => seedChunk(db, meetingId, 0, "SAVING").then(() => undefined) });
+    s.server.requireMeetingRegistration = true;
+    await vi.waitFor(async () => expect(await s.status(`${meetingId}:mic:000000`)).toBe("DB_REGISTERED"));
+    expect(s.server.requests.indexOf(`POST:${meetingId}`)).toBeLessThan(s.server.requests.indexOf(`PUT:${meetingId}`));
+  });
   it("起動時に中断された会議の未保存 Chunk を再送し、recovered を通知する", async () => {
     // Arrange：録音中のまま落ちた会議と、PUT 中に落ちた Chunk
     const meetingId = nextMeetingId();
@@ -246,6 +254,35 @@ describe("createApp（起動時の配線）", () => {
 });
 
 describe("startRecording（録音ごとの配線）", () => {
+  it("並行する直接送信は会議登録を1回だけ共有し、登録後に両ChunkをPUTする", async () => {
+    stubPageGlobals();
+    const s = await setup();
+    const meetingId = nextMeetingId();
+    await s.app.startRecording(startInput(meetingId));
+    s.server.requireMeetingRegistration = true;
+    const [a, b] = await Promise.all([makeChunkRecord(meetingId, 0, 160), makeChunkRecord(meetingId, 1, 160)]);
+    const saver = s.controllers[0].deps.directSaver;
+    expect(saver).toBeDefined();
+    const outcomes = await Promise.all([saver!.put(a), saver!.put(b)]);
+    expect(outcomes.every((o) => o.ok)).toBe(true);
+    expect(s.server.createCount).toBe(1);
+    expect(s.server.requests.slice(0, 3)).toEqual([`POST:${meetingId}`, `PUT:${meetingId}`, `PUT:${meetingId}`]);
+  });
+
+  it("会議登録の接続失敗後は再試行でき、IDB読取失敗時も開始時の会議情報で直接送信する", async () => {
+    stubPageGlobals();
+    const s = await setup();
+    const meetingId = nextMeetingId();
+    await s.app.startRecording(startInput(meetingId));
+    const record = await makeChunkRecord(meetingId, 0, 160);
+    s.server.requireMeetingRegistration = true;
+    const saver = s.controllers[0].deps.directSaver!;
+    s.server.up = false;
+    expect(await saver.put(record)).toMatchObject({ ok: false, retryable: true, error: { kind: "NETWORK" } });
+    s.server.up = true;
+    vi.spyOn(s.app.meetingStore, "get").mockRejectedValue(new Error("IDB unavailable"));
+    expect(await saver.put(record)).toMatchObject({ ok: true, registered: true });
+  });
   it("Chunk の enqueue ごとにクォータを確認し、95% 以上で削除できる Blob がなければ export_required を通知する", async () => {
     // Arrange：サーバー停止中で Chunk は DB_REGISTERED にならない
     vi.stubGlobal("navigator", { storage: { estimate: async () => ({ usage: 970, quota: 1_000 }) } });

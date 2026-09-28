@@ -20,6 +20,10 @@ describe("backendBanner", () => {
     expect(backendBanner(backend("UNREACHABLE"), { pendingChunkCount: 3 })).toBe("サーバー未接続 ── 録音は継続中。3 個の Chunk をブラウザ内に保持しています");
   });
 
+  it("録音停止後は継続中と表示しない", () => {
+    expect(backendBanner(backend("UNREACHABLE"), { pendingChunkCount: 3 }, false)).toBe("サーバー未接続 ── 3 個の Chunk をブラウザ内に保持しています");
+  });
+
   it("トークンが無効なら、状態より優先して設定を促す", () => {
     expect(backendBanner(backend("UNREACHABLE", true), { pendingChunkCount: 3 })).toBe("サーバーのトークンが無効です。設定を確認してください。");
   });

@@ -64,6 +64,7 @@ export interface ApiErrorBody {
     | "NOT_FOUND"
     | "CONFLICT_HASH_MISMATCH"
     | "CONFLICT_CHUNKS_MISSING"
+    | "CONFLICT_MEETING_FINALIZED"
     | "VALIDATION"
     | "INSUFFICIENT_STORAGE"
     | "INTERNAL";
