@@ -29,6 +29,8 @@ from pydantic import BaseModel, Field
 ORIGIN = "http://127.0.0.1:5173"
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+# finalize 前の状態。これ以外の会議には新しい Chunk を足さず、確定値も書き換えない
+OPEN_STATUSES = ("created", "recording", "finalizing")
 
 
 class StorageFullError(Exception):
@@ -255,7 +257,10 @@ def create_app(state: ServerState) -> FastAPI:
         key = (meeting_id, source, sequence_no)
         with state.key_lock(key):
             with state.connect() as db:
-                if db.execute("SELECT 1 FROM meetings WHERE id=?", (meeting_id,)).fetchone() is None:
+                # 状態確認から登録までを書き込みロック下で行い、finalize の件数検証と直列化する
+                db.execute("BEGIN IMMEDIATE")
+                meeting = db.execute("SELECT status FROM meetings WHERE id=?", (meeting_id,)).fetchone()
+                if meeting is None:
                     return error(404, "NOT_FOUND", "meeting not found")
                 existing = db.execute("SELECT * FROM audio_chunks WHERE meeting_id=? AND source=? AND sequence_no=?", key).fetchone()
                 if existing is not None:
@@ -264,6 +269,8 @@ def create_app(state: ServerState) -> FastAPI:
                     path = state.data_dir / existing["local_path"]
                     if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == sha:
                         return JSONResponse(_chunk_response(existing), status_code=200)
+                elif meeting["status"] not in OPEN_STATUSES:
+                    return error(409, "CONFLICT_MEETING_FINALIZED", "meeting is already finalized")
                 relative = f"recordings/{meeting_id}/{source}/{sequence_no:06d}.wav"
                 try:
                     _write_atomic(state.data_dir / relative, data)
@@ -301,6 +308,8 @@ def create_app(state: ServerState) -> FastAPI:
         if not SAFE_ID.fullmatch(meeting_id) or set(body.expectedChunkCounts) != {"mic", "system"} or any(v < 0 for v in body.expectedChunkCounts.values()):
             return error(422, "VALIDATION", "invalid finalize request")
         with state.connect() as db:
+            # 件数検証から確定までを PUT・他の finalize と直列化する
+            db.execute("BEGIN IMMEDIATE")
             meeting = db.execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone()
             if meeting is None:
                 return error(404, "NOT_FOUND", "meeting not found")
@@ -315,22 +324,24 @@ def create_app(state: ServerState) -> FastAPI:
                     if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != r["sha256"]:
                         return error(409, "CONFLICT_CHUNKS_MISSING", "chunk file missing or corrupt")
                 counts[source] = len(chosen)
-            snapshot_path = state.data_dir / "recordings" / meeting_id / "meeting.json"
-            snapshot = {"meetingId": meeting_id, "title": meeting["title"],
-                        "sessionStartEpochMs": meeting["session_start_epoch_ms"],
-                        "nativeSampleRate": meeting["native_sample_rate"],
-                        "consentConfirmedAt": meeting["consent_confirmed_at"],
-                        "endedAtEpochMs": meeting["ended_at"] if meeting["status"] == "finalized" else body.endedAtEpochMs,
-                        "totalAudioFrames": meeting["total_audio_frames"] if meeting["status"] == "finalized" else body.totalAudioFrames}
-            try:
-                _write_atomic(snapshot_path, json.dumps(snapshot, ensure_ascii=False).encode())
-            except OSError as exc:
-                if exc.errno == errno.ENOSPC:
-                    return error(507, "INSUFFICIENT_STORAGE", "disk full")
-                raise
-            if meeting["status"] != "finalized":
-                db.execute("UPDATE meetings SET status='finalized', ended_at=?, total_audio_frames=?, updated_at=? WHERE id=?",
-                           (body.endedAtEpochMs, body.totalAudioFrames, int(time.time() * 1000), meeting_id))
+            # 先に確定した値を正とする（2 回目以降は更新せず、保存済みの値を読み直す）
+            db.execute(f"""UPDATE meetings SET status='finalized', ended_at=?, total_audio_frames=?, updated_at=?
+                WHERE id=? AND status IN ({",".join("?" * len(OPEN_STATUSES))})""",
+                       (body.endedAtEpochMs, body.totalAudioFrames, int(time.time() * 1000), meeting_id, *OPEN_STATUSES))
+            meeting = db.execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone()
+        # コミット後に書き、meeting.json が DB より先行しないようにする。失敗しても再送で書き直せる
+        assert meeting is not None
+        snapshot = {"meetingId": meeting_id, "title": meeting["title"],
+                    "sessionStartEpochMs": meeting["session_start_epoch_ms"],
+                    "nativeSampleRate": meeting["native_sample_rate"],
+                    "consentConfirmedAt": meeting["consent_confirmed_at"],
+                    "endedAtEpochMs": meeting["ended_at"], "totalAudioFrames": meeting["total_audio_frames"]}
+        try:
+            _write_atomic(state.data_dir / "recordings" / meeting_id / "meeting.json", json.dumps(snapshot, ensure_ascii=False).encode())
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                return error(507, "INSUFFICIENT_STORAGE", "disk full")
+            raise
         return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 
     return app

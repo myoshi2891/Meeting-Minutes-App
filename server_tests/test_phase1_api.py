@@ -116,3 +116,73 @@ def test_hash_integrity_cors_and_storage_full(tmp_path, monkeypatch):
         assert client.post("/v1/meetings/m-1/finalize", json=body, headers=auth).status_code == 409
         assert put(client).status_code == 200
         assert client.post("/v1/meetings/m-1/finalize", json=body, headers=auth).status_code == 200
+
+
+def test_put_rejects_new_chunk_after_finalize_but_allows_retry_and_repair(tmp_path):
+    # Arrange: seq 0 だけで確定した会議
+    with TestClient(create_app(start_server_state(tmp_path, token="token"))) as client:
+        auth = {"Authorization": "Bearer token"}
+        client.post("/v1/meetings", json=meeting(), headers=auth)
+        assert put(client).status_code == 201
+        body = {"expectedChunkCounts": {"mic": 1, "system": 0}, "endedAtEpochMs": 2000, "totalAudioFrames": 160}
+        assert client.post("/v1/meetings/m-1/finalize", json=body, headers=auth).status_code == 200
+
+        # Act: 確定後に新しい連番を送る
+        late = put(client, seq=1)
+
+        # Assert: 409 で拒否し、ファイルも行も残さない
+        assert late.status_code == 409
+        assert late.json()["code"] == "CONFLICT_MEETING_FINALIZED"
+        assert not (tmp_path / "recordings/m-1/mic/000001.wav").exists()
+        listed = client.get("/v1/meetings/m-1/chunks", headers=auth).json()["chunks"]
+        assert [c["sequenceNo"] for c in listed] == [0]
+        # 既存 Chunk の冪等再送と破損ファイルの修復は確定後も通す
+        assert put(client).status_code == 200
+        (tmp_path / "recordings/m-1/mic/000000.wav").write_bytes(b"corrupt")
+        assert put(client).status_code == 200
+        assert put(client, mid="m-missing", seq=5).status_code == 404
+
+
+def test_concurrent_finalize_keeps_first_result_in_db_and_snapshot(tmp_path, monkeypatch):
+    import threading
+    from minutes_local import phase1
+
+    # Arrange: meeting.json の書き込みで 2 要求を待ち合わせ、競合を必ず起こす
+    original = phase1._write_atomic
+    barrier = threading.Barrier(2)
+    write_lock = threading.Lock()
+    snapshots = []
+
+    def racing_write(path, data):
+        if path.name == "meeting.json" and not barrier.broken:
+            try:
+                barrier.wait(timeout=2)
+            except threading.BrokenBarrierError:
+                pass
+        with write_lock:
+            original(path, data)
+            if path.name == "meeting.json":
+                snapshots.append(json.loads(data))
+
+    with TestClient(create_app(start_server_state(tmp_path, token="token"))) as client:
+        auth = {"Authorization": "Bearer token"}
+        client.post("/v1/meetings", json=meeting(), headers=auth)
+        assert put(client).status_code == 201
+        snapshots.clear()
+        monkeypatch.setattr(phase1, "_write_atomic", racing_write)
+
+        # Act: 異なる終了時刻で同時に finalize する
+        def finalize(ended_at):
+            body = {"expectedChunkCounts": {"mic": 1, "system": 0}, "endedAtEpochMs": ended_at, "totalAudioFrames": ended_at}
+            return client.post("/v1/meetings/m-1/finalize", json=body, headers=auth)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(finalize, [2000, 3000]))
+
+    # Assert: DB と meeting.json はどちらも最初に確定した値だけを持つ
+    assert [r.status_code for r in results] == [200, 200]
+    ended_at, frames = state_row(tmp_path)
+    assert ended_at in (2000, 3000) and frames == ended_at
+    assert [s["endedAtEpochMs"] for s in snapshots] == [ended_at, ended_at]
+    final = json.loads((tmp_path / "recordings/m-1/meeting.json").read_text())
+    assert (final["endedAtEpochMs"], final["totalAudioFrames"]) == (ended_at, frames)
