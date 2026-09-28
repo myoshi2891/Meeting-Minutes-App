@@ -1725,6 +1725,7 @@ from __future__ import annotations
 import hashlib
 import os
 import struct
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1799,12 +1800,17 @@ def meeting_dir(meeting_id: str, user_id: str = "local") -> str:
 def write_atomic(data_dir: Path, relative_path: str, data: bytes) -> Path:
     final = data_dir / relative_path
     final.parent.mkdir(parents=True, exist_ok=True)
-    part = final.with_suffix(final.suffix + ".part")
-    with part.open("wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(part, final)
+    # 同時書き込みで一時ファイルを奪い合わないよう、書き込みごとに一意な .part を使う
+    fd, part = tempfile.mkstemp(dir=final.parent, prefix=final.name + ".", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(part, final)
+    except BaseException:
+        Path(part).unlink(missing_ok=True)
+        raise
     return final
 
 
@@ -3597,7 +3603,7 @@ async def test_put_chunk_idempotent_and_conflict(client: httpx.AsyncClient, ctx:
     r3 = await put_chunk(client, "m-1", 0, sine_pcm(30, freq=880))
     assert r3.status_code == 409 and r3.json()["code"] == "CONFLICT_HASH_MISMATCH"
     assert (ctx.settings.data_dir / "recordings/local/m-1/mic/000000.wav").exists()       # Phase 3 §2.5 の階層
-    assert not (ctx.settings.data_dir / "recordings/local/m-1/mic/000000.wav.part").exists()
+    assert not list((ctx.settings.data_dir / "recordings/local/m-1/mic").glob("*.part"))
 
 
 async def test_put_chunk_rejects_invalid_wav_and_bad_hash(client: httpx.AsyncClient) -> None:
