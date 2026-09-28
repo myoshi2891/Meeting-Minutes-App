@@ -20,7 +20,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 コード・自動テスト・最小 UI あり | **未**：§28.3 の手動項目（実マイク・実サーバー、T4） |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: Python 4 件、TypeScript 22 ファイル / 298 件がすべて通過。`npm run typecheck` と `npm run build` も通過（2026-09-28）。
+- 自動テスト: Python 6 件、TypeScript 22 ファイル / 298 件がすべて通過。`npm run typecheck` と `npm run build` も通過（2026-09-28）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
@@ -29,6 +29,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - 着手時の作業ツリーは clean。2026-09-27 の「文書3件が未コミット」という引き継ぎ記述は現状と異なっていた。
 - Python / FastAPI / SQLite の最小サーバー、5 API、トークン更新、CORS、原子的Chunk保存、冪等PUT、finalize検証を実装。ローカルループバックの health 応答を確認。サーバー用テスト4件が通過。
 - クライアントの PUT 前会議登録を `MeetingRegistrar` に共通化。起動時復旧と直接送信も登録後に送る。並行登録、登録失敗からの再試行、IDB読取障害、トークン更新中の401をテスト。停止後バナーの誤表示も修正。
+- 28 回目のレビュー対応（未コミット）：サーバーの finalize を先勝ちにし（`BEGIN IMMEDIATE` で PUT と直列化、コミット後に確定値から `meeting.json` を書く）、確定済み会議への新しい Chunk の PUT を `409 CONFLICT_MEETING_FINALIZED` で拒否。`ApiErrorBody.code` に同コードを追加。Phase 1 §12・Phase 2/3 server 設計書にも反映。変更は `minutes_local/phase1.py`・`server_tests/test_phase1_api.py`・`src/api/contracts.ts`・設計書3件。
 - 2026-09-28 の作業は未コミット。コード・設計書・README の差分を保持し、コミットは利用者指示待ち。
 - README に Step 1-c の起動・読み取り専用のChunk検証・WAV再生手順を追加。実機画像で11件のIDB保存と `stop_requested` を確認。タイトル固定の検証スクリプトが「無題の会議」を見つけられなかったため、最新会議を検証する手順に修正。その後、全件の整合性と全11件の音声再生を確認済み（Chrome再生は未確認）。
 - 実機画像で判明した停止後の「録音は継続中」バナーはコードと表示文言テストで修正済み。実ブラウザでの表示確認は残す。
@@ -140,6 +141,12 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-09-28（28 回目・レビュー対応）
+
+- 指摘 3 件を検証。有効 2 件：同時 finalize で DB と `meeting.json` の確定値が食い違う／確定後の会議に新しい Chunk が登録される → 修正（Python 回帰テスト 2 件、修正前に Red を確認）。
+- スキップ 1 件：`MeetingRegistrar` の成功キャッシュ（毎 PUT の POST は冪等でループバック内のため観測できる不具合がなく、キャッシュすると 404 時の無効化経路が新たに必要になる）。
+- 残課題：同じ会議への同時 finalize は `meeting.json.part` を共有するため、まれに後発側の `os.replace` が失敗しうる（再送で回復）。
 
 ### 2026-09-28（27 回目・Step 1-d 実装）
 
