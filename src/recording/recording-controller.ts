@@ -49,6 +49,8 @@ export interface RecordingControllerDeps {
   readonly locks: MeetingLockManager;
   /** IDB に書けない Chunk をサーバーへ直接送る（drainMemoryBacklog）。省略時は直接送らない */
   readonly directSaver?: DirectChunkSaver;
+  /** IDB 障害時の直接送信用に、開始時の会議情報をメモリにも保持する。 */
+  readonly onMeetingCreated?: (meeting: MeetingRecord) => void;
 }
 
 /** Worklet が flush / stop に応答しない（AudioContext が閉じられた等）ときに待機を打ち切るまでの時間 */
@@ -122,6 +124,7 @@ export class RecordingController {
         endedAt: null,
         finalChunkCount: null,
       };
+      this.deps.onMeetingCreated?.(meeting);
       await this.deps.meetingStore.put(meeting);
     } catch (error) {
       // recording はまだ保存されていないので会議は巻き戻さない。stop() は Worklet がないと何もしないため、マイクだけここで止める

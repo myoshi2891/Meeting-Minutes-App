@@ -1,6 +1,7 @@
 // src/app/app.ts
 import { BackendHealthMonitor } from "../api/backend-health-monitor";
 import { LocalSaver } from "../api/local-saver";
+import { MeetingRegistrar } from "../api/meeting-registrar";
 import { finalizeMeeting, type FinalizeResult } from "../recording/finalizer";
 import { LocalSaveScheduler } from "../recording/local-save-scheduler";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "../recording/meeting-lock";
@@ -78,6 +79,8 @@ export class App {
   readonly scheduler: LocalSaveScheduler;
   private readonly settings: SettingsStore;
   private saver: LocalSaver | null = null;
+  private readonly registrar: MeetingRegistrar;
+  private readonly meetingFallbacks = new Map<string, MeetingRecord>();
   private session: RecordingSession | null = null;
   /** startRecording の開始処理中（session が入る前）か */
   private starting = false;
@@ -92,6 +95,19 @@ export class App {
     this.chunkStore = new ChunkStore(deps.db);
     this.meetingStore = new MeetingStore(deps.db);
     this.settings = new SettingsStore(deps.db);
+    this.registrar = new MeetingRegistrar({
+      baseUrl: deps.baseUrl,
+      token: () => this.token,
+      getMeeting: async (meetingId) => {
+        try {
+          return (await this.meetingStore.get(meetingId)) ?? this.meetingFallbacks.get(meetingId);
+        } catch {
+          return this.meetingFallbacks.get(meetingId);
+        }
+      },
+      fetchImpl: deps.fetchImpl ?? fetch,
+      timeoutMs: PUT_TIMEOUT_MS,
+    });
     this.health = createInitialHealth("running");
     const fetchImpl = deps.fetchImpl ?? fetch;
     this.monitor = new BackendHealthMonitor({ baseUrl: deps.baseUrl, token: () => this.token, ...HEALTH_CONFIG }, this.health, fetchImpl);
@@ -201,6 +217,7 @@ export class App {
       },
       setTimer: this.deps.setTimer,
       locks: this.deps.locks,
+      onMeetingCreated: (meeting) => this.meetingFallbacks.set(meeting.meetingId, meeting),
       // 送るたびに現在の saver を引く。録音中に setToken しても、開始時のトークン（未設定・失効）で送り続けない
       directSaver: {
         put: async (record) =>
@@ -210,6 +227,11 @@ export class App {
     });
 
     await controller.start(meetingId, input.title, input.consentConfirmedAt);
+    // Fake controller も含め、コールバックが未実装の実装では IDB から補完する。
+    if (!this.meetingFallbacks.has(meetingId)) {
+      const startedMeeting = await this.meetingStore.get(meetingId).catch(() => undefined);
+      if (startedMeeting !== undefined) this.meetingFallbacks.set(meetingId, startedMeeting);
+    }
     this.controllers.set(meetingId, controller);
     let recording = true;
     const lifecycle = attachPageLifecycle(controller, () => recording, input.onHidden ?? (() => undefined));
@@ -251,7 +273,7 @@ export class App {
   }
 
   private createSaver(token: string): LocalSaver {
-    return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch);
+    return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch, (id) => this.registrar.ensure(id));
   }
 
   private async finalize(meetingId: string): Promise<FinalizeResult> {

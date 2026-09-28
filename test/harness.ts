@@ -18,6 +18,10 @@ export const TOKEN = "test-token";
 /** 常駐サーバーの振る舞いを最小限で模倣する fetch 実装。 */
 export class FakeLocalServer {
   up = true;
+  requireMeetingRegistration = false;
+  readonly meetings = new Set<string>();
+  createCount = 0;
+  readonly requests: string[] = [];
   readonly stored = new Map<string, { sha256: string; sizeBytes: number }>();
   /** PUT がサーバーに到達した順（sequenceNo 順序保証の検証用） */
   readonly arrivalOrder: string[] = [];
@@ -33,8 +37,19 @@ export class FakeLocalServer {
     const auth = new Headers(init?.headers).get("Authorization");
     if (auth !== `Bearer ${TOKEN}`) return new Response(JSON.stringify({ error: "unauthorized", code: "UNAUTHORIZED" }), { status: 401 });
 
+    if (url.pathname === "/v1/meetings" && init?.method === "POST") {
+      const body = JSON.parse(String(init.body)) as { meetingId: string };
+      this.createCount++;
+      this.requests.push(`POST:${body.meetingId}`);
+      const exists = this.meetings.has(body.meetingId);
+      this.meetings.add(body.meetingId);
+      return new Response(JSON.stringify({ meetingId: body.meetingId, status: "recording", dataPath: `recordings/${body.meetingId}` }), { status: exists ? 200 : 201 });
+    }
+
     const putMatch = url.pathname.match(/^\/v1\/meetings\/([^/]+)\/chunks\/(mic|system)\/(\d+)$/);
     if (putMatch !== null && init?.method === "PUT") {
+      this.requests.push(`PUT:${putMatch[1]}`);
+      if (this.requireMeetingRegistration && !this.meetings.has(putMatch[1])) return new Response(JSON.stringify({ error: "meeting not found", code: "NOT_FOUND" }), { status: 404 });
       this.putCount++;
       this.arrivalOrder.push(`${putMatch[1]}:${putMatch[2]}:${putMatch[3]}`);
       const body = init.body;

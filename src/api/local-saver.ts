@@ -1,6 +1,7 @@
 // src/api/local-saver.ts
 import { encodeChunkMetaHeader, isChunkResponse, type ApiErrorBody } from "./contracts";
 import type { AudioChunkRecord, LocalSaveError, LocalSaveErrorKind } from "../types/recording";
+import type { RegistrationOutcome } from "./meeting-registrar";
 
 const ALLOWED_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
@@ -30,7 +31,7 @@ export class LocalSaver {
   private readonly base: URL;
   private token: string;
 
-  constructor(private readonly config: LocalSaverConfig, private readonly fetchImpl: typeof fetch = fetch) {
+  constructor(private readonly config: LocalSaverConfig, private readonly fetchImpl: typeof fetch = fetch, private readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>) {
     this.base = new URL(config.baseUrl);
     assertLocalHost(this.base);
     this.token = config.token;
@@ -46,6 +47,10 @@ export class LocalSaver {
       return this.fail("VALIDATION", "wav blob already dropped", null);
     }
     const { meetingId, source, sequenceNo } = record.meta;
+    if (this.ensureMeeting !== undefined) {
+      const registration = await this.ensureMeeting(meetingId);
+      if (!registration.ok) return registration;
+    }
     const url = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks/${source}/${sequenceNo}`, this.base);
     assertLocalHost(url);
 
