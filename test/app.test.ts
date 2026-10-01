@@ -200,6 +200,16 @@ describe("createApp（起動時の配線）", () => {
     await expect(s.app.setToken("")).rejects.toThrow("token is empty");
   });
 
+  it.each(["サーバーのトークン", "abc\u200bdef", "abc def"])("ヘッダーに使えない文字を含むトークン（%j）は保存せず、保存済みの値も変えない", async (bad) => {
+    // Arrange
+    const s = await setup();
+    // Act
+    const saving = s.app.setToken(bad);
+    // Assert
+    await expect(saving).rejects.toThrow("トークンの形式が正しくありません");
+    expect(await new SettingsStore(s.db).get(BACKEND_TOKEN_KEY)).toBe(TOKEN);
+  });
+
   it("PUT の接続不能で Monitor が UNREACHABLE になり、ヘルス復帰で待機中の Chunk を送り直す", async () => {
     // Arrange：起動時は HEALTHY。録音中にサーバーが落ちる
     stubPageGlobals();

@@ -116,7 +116,7 @@ describe("noticeFor", () => {
 
 describe("finalizeResultText", () => {
   it("サーバーへの保存待ちは確定待ちと出す", () => {
-    expect(finalizeResultText({ ok: false, stage: "waiting_local_save", detail: "2 chunks not registered" })).toBe("確定待ち（サーバーへの保存が終わると自動で確定します）");
+    expect(finalizeResultText({ ok: false, stage: "waiting_local_save", detail: "2 chunks not registered" })).toBe("確定待ち（サーバーへの保存が終わったら、確定待ちの会議の「再試行」を押してください）");
   });
 
   it("finalize の失敗は再試行を促す", () => {
