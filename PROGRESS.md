@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-09-28（ブランチ `dev`）
+最終更新: 2026-10-01（ブランチ `dev`）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -15,12 +15,12 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-a | §16 WAV エンコーダ | ✅ 自動テスト済 | `chunk-standalone.test.ts` 通過 |
 | 1-b | §14 Worklet（リサンプラ・VAD・蓄積） | ✅ 自動テスト済 | `long-recording.test.ts` / `resampler-aliasing.test.ts` 通過 |
 | 1-c | §10 IndexedDB + §15 RecordingController | ✅ 保存・全WAV音声確認済み（次Stepへ進む） | 30秒×10件＋16.115125秒×1件、全件valid。利用者が全11件の音声を確認。Chrome単体再生は未確認として残す |
-| 1-d | §17 LocalSaver / Scheduler + §18 BackendHealthMonitor | 🟡 最小サーバー・会議登録・自動テスト・HTTP health 確認済み | **未**：ブラウザの既存Chunkが実サーバーへ PUT されることを確認 |
+| 1-d | §17 LocalSaver / Scheduler + §18 BackendHealthMonitor | 🟡 実ブラウザで既存 2 会議・12 Chunk の PUT・finalize を確認（T4-A 合格、2026-10-01） | **未**：サーバー停止5分からの復帰（T4-B） |
 | 1-e | §22 Finalizer + §23 Recovery | 🟡 コード・自動テストのみ | **未**：タブ強制終了 → 再起動で再送 |
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 コード・自動テスト・最小 UI あり | **未**：§28.3 の手動項目（実マイク・実サーバー、T4） |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: Python 6 件、TypeScript 22 ファイル / 298 件がすべて通過。`npm run typecheck` と `npm run build` も通過（2026-09-28）。
+- 自動テスト: Python 6 件、TypeScript 22 ファイル / 301 件がすべて通過。`npm run typecheck` も通過（2026-10-01）。`npm run build` は 2026-09-28 に通過。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
@@ -30,7 +30,8 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - Python / FastAPI / SQLite の最小サーバー、5 API、トークン更新、CORS、原子的Chunk保存、冪等PUT、finalize検証を実装。ローカルループバックの health 応答を確認。サーバー用テスト4件が通過。
 - クライアントの PUT 前会議登録を `MeetingRegistrar` に共通化。起動時復旧と直接送信も登録後に送る。並行登録、登録失敗からの再試行、IDB読取障害、トークン更新中の401をテスト。停止後バナーの誤表示も修正。
 - 28 回目のレビュー対応（コミット済み 0a9f364・9178e96）：サーバーの finalize を先勝ちにし（`BEGIN IMMEDIATE` で PUT と直列化、コミット後に確定値から `meeting.json` を書く）、確定済み会議への新しい Chunk の PUT を `409 CONFLICT_MEETING_FINALIZED` で拒否。`ApiErrorBody.code` に同コードを追加。Phase 1 §12・Phase 2/3 server 設計書にも反映。変更は `minutes_local/phase1.py`・`server_tests/test_phase1_api.py`・`src/api/contracts.ts`・設計書3件。
-- 29 回目のレビュー対応（未コミット、利用者指示待ち）：`_write_atomic` を書き込みごとに一意な `.part`（`mkstemp`）へ変更し、同時 finalize の `meeting.json` 書き込みで一時ファイルを奪い合う問題を修正（Python 回帰テスト1件、修正前に Red を確認）。Phase 1 §12.1・Phase 2/3 server の `write_atomic` とテストに反映。README の強制終了手順をタスクマネージャー経由に、停止後の「録音は継続中」を不具合報告対象に修正。変更は `minutes_local/phase1.py`・`server_tests/test_phase1_api.py`・`README.md`・設計書3件・本ファイル。
+- 29 回目のレビュー対応（コミット済み e44341d・13d2e84・6263d40、PR #8 で main へマージ済み）：`_write_atomic` を書き込みごとに一意な `.part`（`mkstemp`）へ変更し、同時 finalize の `meeting.json` 書き込みで一時ファイルを奪い合う問題を修正（Python 回帰テスト1件、修正前に Red を確認）。Phase 1 §12.1・Phase 2/3 server の `write_atomic` とテストに反映。README の強制終了手順をタスクマネージャー経由に、停止後の「録音は継続中」を不具合報告対象に修正。変更は `minutes_local/phase1.py`・`server_tests/test_phase1_api.py`・`README.md`・設計書3件・本ファイル。
+- 31 回目（未コミット）：実ブラウザで `/v1/health`・会議登録・PUT が**送信前に** `TypeError: Illegal invocation` で失敗していた（`this.fetchImpl(...)` のメソッド呼び出し。Node の fetch は this を検査しないため自動テストで検出できず）。`BackendHealthMonitor`・`LocalSaver`・`MeetingRegistrar` で fetch をローカル変数に取り出して呼ぶよう修正。回帰テスト3件（`test/harness.ts` の `browserLikeFetch`、修正前に Red を確認）。Phase 1 §17/§18 の埋め込みコードと Phase 2/3 client の同型4か所も修正。Playwright の Chromium で health 200・バナー解消を確認。
 - README に Step 1-c の起動・読み取り専用のChunk検証・WAV再生手順を追加。実機画像で11件のIDB保存と `stop_requested` を確認。タイトル固定の検証スクリプトが「無題の会議」を見つけられなかったため、最新会議を検証する手順に修正。その後、全件の整合性と全11件の音声再生を確認済み（Chrome再生は未確認）。
 - 実機画像で判明した停止後の「録音は継続中」バナーはコードと表示文言テストで修正済み。実ブラウザでの表示確認は残す。
 - 残課題（1201352 から継続）: `src/main.ts` の停止後書き出しは Node の Vitest 対象外のため回帰テストなし。§28.3 の手動確認で「サーバー停止＋IDB 書き込み失敗 → 停止 → 書き出し」を確認する
@@ -88,7 +89,7 @@ T3-c の内容（§31.4）:
 - Playwright で dev サーバーの画面を確認済み：サーバー未接続のバナー、ヘルプ文言が出る。コンソールのエラーなし（favicon は `data:,`）、通信先は 127.0.0.1 のみ
 - 実マイクでの録音・同意ダイアログ・getUserMedia 拒否・タブの切り替えは未確認（T4）
 
-### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-f / 1-g）【次は既存会議の実サーバー送信】
+### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-f / 1-g）【A 合格・次は項目 B（サーバー停止5分）】
 
 - 1-c 結果：会議 `68c2f545-ff0a-4741-8f43-3b2fd46711c2`（無題の会議）。seq 0〜9 は各480,000サンプル、seq 10 は257,842サンプル。計316.115125秒、欠番なし、`fullChunks: 10` / `partialChunks: 1` / `allValid: true`。全11件の音声を利用者が確認した。Chromeでの単体再生は未確認（再生アプリ・OS・Chrome版も未取得）。外部通信ゼロの実機確認も未完了。録り直しは求めず、Chromeの確認を残して1-dへ進むと案内済み。
 
@@ -98,7 +99,31 @@ T3-c の内容（§31.4）:
 - 会議作成APIの配線漏れは修正済み。通常送信・復旧・直接送信は共通の登録を通り、録音開始はサーバーを待たない。
 - 結果は [design-local-phase1.md](design-local-phase1.md) §28 の「状況」列に反映する。
 
-### 次セッションへの実機確認手順（未実施）
+### 次セッションの再開点：T4 実機再確認チェックリスト（2026-10-01 作成・未実施）
+
+- **項目 A 合格（2026-10-01）**：`68c2f545…` 11 Chunk・`e8328b9e…` 1 Chunk とも SQLite `finalized`・全件 `registered`・WAV と `meeting.json` あり。サンプル合計も 1-c の記録と一致。2 件目は `waiting_local_save` で止まり手動「再試行」で確定（§31.2 の既知の制約）。**次は項目 B**。
+- 項目 A 中に見つかった別問題：保存済みトークンが 17 文字の非 ASCII（クリップボードの取り違え）で、全 fetch がヘッダー生成時に `non ISO-8859-1 code point` で失敗し「サーバー未接続」と表示されていた。再保存で解消。
+- **2026-10-01 31 回目**：項目 A の最中に、ブラウザから 43117 への要求が1件も出ない不具合を発見・修正（上記「今回の変更」）。これ以前の「実ブラウザ確認済み」報告でサーバーにデータが無かったのはこれが原因。修正後、利用者のタブを再読み込みして A から再開する。
+
+- 利用者は一度実ブラウザで確認したと報告したが、2026-10-01 にサーバー側を読み取り専用で照会すると、`private/phase1-data/minutes.sqlite` は meetings 0 件・audio_chunks 0 件、`recordings/` なし（最終更新 2026-09-28 11:44）。**実ブラウザの PUT が既定データ領域に届いた証拠はない**。1-d は通過扱いにしない。
+- 利用者の依頼で、確認項目を下表にまとめた。利用者が再確認して結果を報告 → Claude がサーバー側を照合（SQLite・`recordings/<id>/` の WAV 件数と `meeting.json`・`GET /v1/meetings/<id>/chunks`・サーバーログ）→ §28 と本ファイルへ記録、の順。報告は途中の項目まででよい。
+- 再開時の Claude 側：`npm run dev` と `.venv/bin/python -m minutes_local` をバックグラウンドで起動し `/v1/health` 200 を確認。起動のたびトークンが変わるので `pbcopy < private/phase1-data/token` でクリップボードへ渡す（値は表示しない）。2026-10-01 のセッションでは両サーバーを起動したが、終了時に停止した。
+- 共通：Chrome で **http://127.0.0.1:5173/**（localhost 不可）。DevTools の Network（Preserve log）と Application → IndexedDB `minutes-local` を開く。項目ごとに会議ID・OK/NG、NG なら HTTP ステータス・画面表示・Console を報告。
+
+| # | 項目 | 操作 | 合格条件 |
+| --- | --- | --- | --- |
+| A | 1-d 既存会議の送信・確定 | トークン保存 → 確定待ちの `68c2f545…` で「再試行」 | `POST /v1/meetings` 200/201、`PUT …/chunks/mic/0〜10` 200/201、`GET …/chunks`・`POST …/finalize` 200。IDB で会議 `finalized`・11件 `DB_REGISTERED`。停止後に「録音は継続中」が出ない。**サーバー側照合**：SQLite に会議1件・Chunk 11件、`recordings/68c2…/` に WAV 11件と `meeting.json`、GET 一覧 seq 0〜10 全件 registered |
+| B | 1-d/1-e サーバー停止5分 | 新規会議で録音 → サーバー停止（Claude に依頼可）→ 5分継続 → 再起動・新トークン入力 | 停止中「サーバー未接続」表示と IDB 滞留。復帰後に連番順で再送・全件 `DB_REGISTERED`。録音停止後 `finalized` |
+| C | 1-e 強制終了 | 別の新規会議で Chunk が1件以上入ったら Chrome タスクマネージャーでタブのプロセスを終了 → 同じ URL を開き直す | 保存済み Chunk が再送され `finalized` まで進む（直近最大30秒の欠落は仕様） |
+| D | 1-f 別タブ | 録音中に同じ URL を別タブで開く | 録音中の会議が勝手に `stop_requested` / `finalized` へ移らない |
+| E | 1-f 同意・権限 | 同意キャンセル／マイク権限拒否 | 録音が始まらずエラー表示 |
+| F | 1-f 録音中の異常 | マイク切断・タブ切替・最小化・画面ロックを個別に | 警告表示。録音状態と Chunk 連番を記録（画面ロックは観測のみ） |
+| G | 1-f WAV 書き出し | 下の手順5のとおり（サーバー停止＋putChunk 失敗注入 → 停止 → 書き出し → 再生 → 注入解除） | 警告表示、書き出した WAV が再生できる |
+| H | 横断 | Chrome で既存 Chunk を1件再生、全試験で Network を監視 | 再生できる。127.0.0.1 以外への通信なし |
+
+1-g（60分実録音）は別試験として最後。以下は各項目の詳細手順（旧版、内容は上表と同じ）。
+
+### 実機確認の詳細手順
 
 以下は順番に実施する。自動テストとループバックの `/v1/health` は通過したが、**2026-09-28 時点で既存会議の実サーバー登録は未確認**。最後の読み取り専用API確認では会議 `68c2f545-ff0a-4741-8f43-3b2fd46711c2` に404が返った。ブラウザの録音データと `private/phase1-data/` は削除せず、Step 1-c の5分録音もやり直さない。
 
@@ -108,6 +133,12 @@ T3-c の内容（§31.4）:
 4. **1-f：ブラウザの手動項目**：新規会議で一方のタブが録音中に同じURLを別タブで開き、前者が勝手に `stop_requested` / `finalized` へ移らないことを確認する。同意キャンセル、マイク権限拒否、録音中のマイク切断、タブ切替、最小化、画面ロックを個別に試し、画面の警告・録音状態・Chunk連番を記録する。画面ロック時のAudioContext動作はOS依存として観測結果のみ記す。Chrome単体での11 WAV再生と外部通信ゼロも、この機会に確認する。
 5. **1-f：IDB障害＋サーバー停止時のWAV書き出し**：既存会議に触らず短い新規会議を開始し、サーバーを停止する。DevTools Consoleで `const { ChunkStore } = await import('/src/storage/idb.ts'); window.__minutesOriginalPutChunk = ChunkStore.prototype.putChunk; ChunkStore.prototype.putChunk = async function () { throw new Error('T4 injected IDB write failure'); };` を実行する。30秒以上録音して1件以上のChunk生成を待ち、録音停止後、警告と「WAVを書き出す」ボタンからファイルを保存して再生確認する。最後に `ChunkStore.prototype.putChunk = window.__minutesOriginalPutChunk; delete window.__minutesOriginalPutChunk;` で注入を解除する（ページ再読み込みでも解除されるが、書き出し完了前は再読み込みしない）。この試験で書き出したWAVのサーバー取込経路は未設計なので、ファイルを手元に保持する。
 6. **記録と次段階**：各試験の会議ID、Chunk件数・連番、IDB状態、HTTPステータス、警告・エラー、外部通信の有無を [design-local-phase1.md](design-local-phase1.md) §28 と本ファイルへ反映する。失敗時は原因と再試験条件を記し、通過扱いにしない。必要な修正後は `.venv/bin/python -m pytest -q`、`npm run typecheck`、`npm test`、`npm run build`、`node scripts/sync-design-code.mjs --check`、`git diff --check` を実行する。1-g の60分実録音（120 Chunk、欠番なし、全件 `DB_REGISTERED`、外部通信なし）は別の試験として最後に実施する。コミットは利用者の指示・承認後のみ行う。
+
+### T9. T4-A で見つかった UI/診断の改善【T4-B の前後どちらでも可・要承認】
+
+- a. トークン保存時に形式を検証する（ISO-8859-1 外・空白混入を拒否して通知）。現状は `trim()` のみで、不正な値を保存すると全通信が送信前に例外になり「サーバー未接続」とだけ出る。
+- b. `BackendHealthMonitor.checkOnce` などの `catch {}` で UNREACHABLE とした理由を `console.warn` に残す（原因特定に時間を要した）。
+- c. `finalizeResultText` の `waiting_local_save` 文言「サーバーへの保存が終わると自動で確定します」が §31.2 の既知の制約（自動再試行されない）と食い違う。文言を直すか、Chunk 登録完了時に Barrier を再試行する配線を足すかを決める。
 
 ### T5. 録音中の会議を起動時復旧から守る ✅ 完了（9 回目のレビュー対応）
 
@@ -141,6 +172,18 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-10-01（31 回目・T4 項目 A で fetch 不具合を発見）
+
+- 両サーバーを起動しトークンを渡したが、トークン保存後も「サーバー未接続」。curl・CORS は正常で、ブラウザから要求が出ていなかった。
+- 原因は `this.fetchImpl(...)` による Illegal invocation（health・会議登録・PUT の3経路）。TDD で修正し、Phase 1/2/3 client 設計書も同期。typecheck・301 件通過。未コミット。
+- 保存済みトークンが非 ASCII だったことも判明し再保存で解消。項目 A 合格（2 会議・12 Chunk が finalized）。改善 3 件を T9 に記録。次は項目 B。
+
+### 2026-10-01（30 回目・T4 再確認の準備）
+
+- 利用者は実ブラウザ確認済みと報告したが、サーバーの SQLite は会議0件・Chunk0件で `recordings/` もなく、1-d の通過を裏付けられなかった。
+- 利用者の依頼で確認項目 A〜H を「次セッションの再開点」にまとめた。両サーバーを起動しトークンを渡したが、利用者の時間の都合で中断し、サーバーは停止。
+- PROGRESS の「29 回目は未コミット」という古い記述を訂正（PR #8 でマージ済み）。src・設計書は無変更。
 
 ### 2026-09-28（29 回目・レビュー対応）
 
