@@ -180,7 +180,7 @@ v4.0 §19 の Presigned URL は「URL 自体が短命の Bearer Token で、単�
 | Presigned URL の性質 | ローカルでの代替 |
 | --- | --- |
 | 発行者がサーバー | 常駐サーバーが起動時に 32 バイトのランダムトークンを生成し、`{dataDir}/token` に 0600 で書き出す。標準出力にも 1 回だけ表示する |
-| ブラウザへの受け渡し | 利用者がアプリ設定画面にトークンを貼り付ける（初回のみ）。ブラウザは `localStorage` ではなく IndexedDB の `settings` ストアに保存する。常駐サーバー自身が静的ファイルとしてアプリを配信する構成では、`/` へのアクセス時に `Set-Cookie: HttpOnly; SameSite=Strict` でトークンを渡してもよい |
+| ブラウザへの受け渡し | 利用者がアプリ設定画面にトークンを貼り付ける（初回のみ）。ブラウザは `localStorage` ではなく IndexedDB の `settings` ストアに保存する。保存前に形式（空白を含まない印字可能 ASCII）を検証し、取り違えた文字列を保存しない（§31.2 `setToken`）。常駐サーバー自身が静的ファイルとしてアプリを配信する構成では、`/` へのアクセス時に `Set-Cookie: HttpOnly; SameSite=Strict` でトークンを渡してもよい |
 | 短命性 | サーバー再起動でトークンが再生成される。ブラウザは `401` を受けたら設定画面へ誘導し、State Machine は `BACKEND_UNAVAILABLE` で待機する |
 | 単一オブジェクト限定 | エンドポイントが `PUT /v1/meetings/{meetingId}/chunks/{source}/{sequenceNo}` と論理キーそのものになっているため、トークンが漏れても書き込める先は本アプリのデータディレクトリ配下に限定される |
 | URL をログへ出力しない | トークンはヘッダ（`Authorization: Bearer`）で送り、URL には含めない。ブラウザ側ロガーは `Authorization` ヘッダを出力しない |
@@ -4402,7 +4402,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 | PUT が NETWORK / TIMEOUT | `monitor.reportUnreachable()` | §18 |
 | PUT が 401 / 403 | `monitor.reportUnauthorized()` | §18 |
 | `monitor.onChange` で HEALTHY / DEGRADED かつ unauthorized でない | `scheduler.resumeAll(別タブが録音中の会議)` → `stop_requested` / `finalizing` の会議ごとに会議ロックを取って `finalizeMeeting` | §17 / §22（サーバー復帰時に Barrier を自動で再試行する） |
-| `setToken` | settings の `backendToken` に保存 → 既存の `LocalSaver` のトークンを更新（未生成なら生成）→ `monitor.checkOnce()` → 使える状態なら上と同じ再開処理 | §4.3。トークンを入れてもヘルス状態は変わらないことがある（認証なしのヘルス応答）ため、`onChange` を待たない |
+| `setToken` | 空白を含まない印字可能 ASCII 以外は保存せずエラー（Authorization ヘッダーに載らず、全通信が送信前に失敗するため）→ settings の `backendToken` に保存 → 既存の `LocalSaver` のトークンを更新（未生成なら生成）→ `monitor.checkOnce()` → 使える状態なら上と同じ再開処理 | §4.3。トークンを入れてもヘルス状態は変わらないことがある（認証なしのヘルス応答）ため、`onChange` を待たない |
 | Chunk PUT／メモリからの直接送信 | `LocalSaver.put()` → `MeetingRegistrar.ensure()` → `POST /v1/meetings` 成功後に PUT。並行する同一会議の登録は共有 | §12。サーバーは未登録会議への PUT を404にする |
 | 録音開始 | `requestPersistence` → `RecordingController.start` → `attachPageLifecycle`。録音中か開始処理中（`session` が入る前の await 中）なら会議 ID に関係なく `already recording` で拒否する。開始中フラグは成功・失敗どちらでも `finally` で下ろす | §21 / §15 / §20 |
 | Chunk の enqueue | `scheduler.enqueue` の後に `enforceQuota` を直列で実行。`export_required` なら `AppEvent.export_required`。`dropped_registered_blobs` でメモリ待機があれば `drainMemoryBacklog()` | §21 / §15。`enforceQuota` の失敗が `persistChunk` の失敗に混ざらないよう、enqueue の Promise には含めない |
@@ -4435,6 +4435,9 @@ import type { LocalBackendHealth, MeetingRecord, RecordingHealth } from "../type
 
 /** settings ストアでトークンを保存するキー（§4.3） */
 export const BACKEND_TOKEN_KEY = "backendToken";
+
+/** Authorization ヘッダーに載せられる、空白を含まない印字可能 ASCII。範囲外の文字は fetch が送信前に TypeError を投げる */
+const BACKEND_TOKEN_PATTERN = /^[\x21-\x7e]+$/;
 
 /** UI への通知。UI はこれを表示するだけで、部品を直接呼ばない */
 export type AppEvent =
@@ -4567,6 +4570,8 @@ export class App {
   /** 設定画面からトークンを保存する（§4.3）。ヘルス状態が変わらなくても、待機中の Chunk をすぐ送り直す */
   async setToken(token: string): Promise<void> {
     if (token === "") throw new Error("token is empty");
+    // 保存してしまうと全通信が送信前に失敗し「サーバー未接続」としか出ないため、保存前に弾く
+    if (!BACKEND_TOKEN_PATTERN.test(token)) throw new Error("トークンの形式が正しくありません。サーバーのトークンファイルの中身をそのまま貼り付けてください");
     await this.settings.set(BACKEND_TOKEN_KEY, token);
     this.token = token;
     // 差し替えずに更新する。Scheduler が IDB 読み込み中に掴んでいる saver も新しいトークンで送る
@@ -4845,7 +4850,7 @@ export function noticeFor(event: AppEvent): string | null {
 
 export function finalizeResultText(result: FinalizeResult): string {
   if (result.ok) return result.missingTailMs === undefined ? "録音を確定しました" : `録音を確定しました。${missingTailText(result.missingTailMs)}`;
-  if (result.stage === "waiting_local_save") return "確定待ち（サーバーへの保存が終わると自動で確定します）";
+  if (result.stage === "waiting_local_save") return "確定待ち（サーバーへの保存が終わったら、確定待ちの会議の「再試行」を押してください）";
   if (result.stage === "finalize") return `確定できませんでした。再試行してください（${result.detail}）`;
   return `確定できませんでした（${result.detail}）`;
 }
