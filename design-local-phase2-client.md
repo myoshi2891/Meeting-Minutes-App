@@ -1593,7 +1593,9 @@ export class FetchEventSource implements EventSourceLike {
       const controller = new AbortController();
       this.controller = controller;
       try {
-        const res = await this.fetchImpl(this.url, {
+        // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+        const fetchImpl = this.fetchImpl;
+        const res = await fetchImpl(this.url, {
           headers: { Authorization: `Bearer ${this.token}`, Accept: "text/event-stream" },
           credentials: "omit",
           redirect: "error",
@@ -1756,7 +1758,9 @@ export class Phase2Client {
     try {
       const headers: Record<string, string> = { Authorization: `Bearer ${this.config.token}`, ...extraHeaders };
       if (body !== undefined) headers["Content-Type"] = "application/json";
-      const res = await this.fetchImpl(url, {
+      // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+      const fetchImpl = this.fetchImpl;
+      const res = await fetchImpl(url, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),

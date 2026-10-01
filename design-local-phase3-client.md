@@ -291,7 +291,9 @@ export class Phase3Client {
     try {
       const headers: Record<string, string> = { Authorization: `Bearer ${this.config.token}` };
       if (body !== undefined) headers["Content-Type"] = "application/json";
-      const res = await this.fetchImpl(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal, credentials: "omit", redirect: "error" });
+      // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+      const fetchImpl = this.fetchImpl;
+      const res = await fetchImpl(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal, credentials: "omit", redirect: "error" });
       const json: unknown = res.status === 204 ? null : await res.json().catch(() => null);
       if (res.ok) {
         const value = decode(json);
@@ -994,7 +996,9 @@ export class LocalSaver {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
     try {
-      const response = await this.fetchImpl(url, {
+      // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+      const fetchImpl = this.fetchImpl;
+      const response = await fetchImpl(url, {
         method: "PUT",
         headers: {
           Authorization: `Bearer ${this.token}`,

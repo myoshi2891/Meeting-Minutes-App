@@ -2266,8 +2266,10 @@ export class LocalSaver {
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+    // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+    const fetchImpl = this.fetchImpl;
     try {
-      const response = await this.fetchImpl(url, {
+      const response = await fetchImpl(url, {
         method: "PUT",
         headers: {
           Authorization: `Bearer ${this.token}`,
@@ -2411,9 +2413,11 @@ export class MeetingRegistrar {
     if (token === null) return this.fail("UNAUTHORIZED", "backend token is not set", null);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.deps.timeoutMs);
+    // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+    const { fetchImpl } = this.deps;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
-        const response = await this.deps.fetchImpl(url, {
+        const response = await fetchImpl(url, {
           method: "POST",
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -2824,7 +2828,9 @@ export class BackendHealthMonitor {
       const token = this.config.token();
       const headers: Record<string, string> = {};
       if (token !== null) headers.Authorization = `Bearer ${token}`;
-      const response = await this.fetchImpl(this.healthUrl, { method: "GET", headers, signal: controller.signal, credentials: "omit", redirect: "error" });
+      // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+      const fetchImpl = this.fetchImpl;
+      const response = await fetchImpl(this.healthUrl, { method: "GET", headers, signal: controller.signal, credentials: "omit", redirect: "error" });
       const latency = performance.now() - started;
 
       if (response.status === 401 || response.status === 403) {
@@ -4309,6 +4315,8 @@ v4.0 §116（Audio）、§117（Network → ローカル起動断に読み替え
 | R2 Object 存在確認 | `GET /v1/meetings/{id}/chunks` での存在・ハッシュ確認 | 設計済 | §22 |
 
 2026-09-28: Phase 1 最小サーバーのPythonテストで、会議未登録の404、認証・CORS、破損WAV・ハッシュ不一致の422、同一Chunkの再送200／異なるハッシュ409、同時PUT、容量不足507、再起動後のSQLite保持、不完全なfinalize拒否409を確認。ループバックHTTPで `/v1/health` の200を確認した。実ブラウザの既存Chunk PUT・5分停止からの復帰は未確認。
+
+2026-10-01: 実ブラウザ（Chrome、http://127.0.0.1:5173）で Step 1-c の既存会議を実サーバーへ送信・確定した。会議 `68c2f545…` は Chunk 11 件（seq 0〜10、計 5,057,842 サンプル）、会議 `e8328b9e…` は 1 件（112,456 サンプル）がすべて `registered`、両会議とも SQLite で `finalized`、`recordings/<id>/mic/` に WAV、`meeting.json` に `totalAudioFrames` を確認。2 件目は Barrier が `waiting_local_save` で止まり、手動の「再試行」で確定した（§31.2 の既知の制約どおり）。この確認の過程で、`LocalSaver` / `MeetingRegistrar` / `BackendHealthMonitor` が `fetch` をメソッドとして呼び、実ブラウザで Illegal invocation になる不具合を修正した（§17・§18）。5分停止からの復帰は未確認。
 
 ## 28.3 Browser（v4.0 §121）
 
