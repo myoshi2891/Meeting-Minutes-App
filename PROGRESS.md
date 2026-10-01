@@ -20,7 +20,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 コード・自動テスト・最小 UI あり | **未**：§28.3 の手動項目（実マイク・実サーバー、T4） |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: Python 6 件、TypeScript 22 ファイル / 301 件がすべて通過。`npm run typecheck` も通過（2026-10-01）。`npm run build` は 2026-09-28 に通過。
+- 自動テスト: Python 6 件、TypeScript 22 ファイル / 304 件がすべて通過。`npm run typecheck` も通過（2026-10-01）。`npm run build` は 2026-09-28 に通過。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
@@ -134,11 +134,13 @@ T3-c の内容（§31.4）:
 5. **1-f：IDB障害＋サーバー停止時のWAV書き出し**：既存会議に触らず短い新規会議を開始し、サーバーを停止する。DevTools Consoleで `const { ChunkStore } = await import('/src/storage/idb.ts'); window.__minutesOriginalPutChunk = ChunkStore.prototype.putChunk; ChunkStore.prototype.putChunk = async function () { throw new Error('T4 injected IDB write failure'); };` を実行する。30秒以上録音して1件以上のChunk生成を待ち、録音停止後、警告と「WAVを書き出す」ボタンからファイルを保存して再生確認する。最後に `ChunkStore.prototype.putChunk = window.__minutesOriginalPutChunk; delete window.__minutesOriginalPutChunk;` で注入を解除する（ページ再読み込みでも解除されるが、書き出し完了前は再読み込みしない）。この試験で書き出したWAVのサーバー取込経路は未設計なので、ファイルを手元に保持する。
 6. **記録と次段階**：各試験の会議ID、Chunk件数・連番、IDB状態、HTTPステータス、警告・エラー、外部通信の有無を [design-local-phase1.md](design-local-phase1.md) §28 と本ファイルへ反映する。失敗時は原因と再試験条件を記し、通過扱いにしない。必要な修正後は `.venv/bin/python -m pytest -q`、`npm run typecheck`、`npm test`、`npm run build`、`node scripts/sync-design-code.mjs --check`、`git diff --check` を実行する。1-g の60分実録音（120 Chunk、欠番なし、全件 `DB_REGISTERED`、外部通信なし）は別の試験として最後に実施する。コミットは利用者の指示・承認後のみ行う。
 
-### T9. T4-A で見つかった UI/診断の改善【T4-B の前後どちらでも可・要承認】
+### T9. T4-A で見つかった UI/診断の改善【a・c 完了／b は次回以降】
 
-- a. トークン保存時に形式を検証する（ISO-8859-1 外・空白混入を拒否して通知）。現状は `trim()` のみで、不正な値を保存すると全通信が送信前に例外になり「サーバー未接続」とだけ出る。
+- a. ✅ 完了（2026-10-01・32 回目）：`App.setToken` が空白を含まない印字可能 ASCII 以外を保存せずエラーにする。テスト3件（修正前に Red を確認）。§4.3・§31.2 に反映。
+  - 元の課題：トークン保存時に形式を検証する（ISO-8859-1 外・空白混入を拒否して通知）。現状は `trim()` のみで、不正な値を保存すると全通信が送信前に例外になり「サーバー未接続」とだけ出る。
 - b. `BackendHealthMonitor.checkOnce` などの `catch {}` で UNREACHABLE とした理由を `console.warn` に残す（原因特定に時間を要した）。
-- c. `finalizeResultText` の `waiting_local_save` 文言「サーバーへの保存が終わると自動で確定します」が §31.2 の既知の制約（自動再試行されない）と食い違う。文言を直すか、Chunk 登録完了時に Barrier を再試行する配線を足すかを決める。
+- c. ✅ 完了（2026-10-01・32 回目、文言修正を採用）：「確定待ち（サーバーへの保存が終わったら、確定待ちの会議の「再試行」を押してください）」に変更。Chunk 登録完了時の自動再試行は未着手（必要になったら別タスク）。
+  - 元の課題：`finalizeResultText` の `waiting_local_save` 文言「サーバーへの保存が終わると自動で確定します」が §31.2 の既知の制約（自動再試行されない）と食い違う。文言を直すか、Chunk 登録完了時に Barrier を再試行する配線を足すかを決める。
 
 ### T5. 録音中の会議を起動時復旧から守る ✅ 完了（9 回目のレビュー対応）
 
@@ -172,6 +174,12 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-10-01（32 回目・T9 a/c）
+
+- 31 回目の変更は利用者がコミット済み（ed90d84・ecd198a・53199a4）。
+- T9-a（トークン形式の検証）と T9-c（確定待ち文言）を TDD で実装し、Phase 1 設計書を同期。typecheck・304 件通過。未コミット。
+- 項目 B と T9-b は利用者の指示で次回以降。サーバー2つは30分の制限で停止済み（再開時に起動し直し、トークンを再保存する）。
 
 ### 2026-10-01（31 回目・T4 項目 A で fetch 不具合を発見）
 
