@@ -79,7 +79,9 @@ export class BackendHealthMonitor {
       const token = this.config.token();
       const headers: Record<string, string> = {};
       if (token !== null) headers.Authorization = `Bearer ${token}`;
-      const response = await this.fetchImpl(this.healthUrl, { method: "GET", headers, signal: controller.signal, credentials: "omit", redirect: "error" });
+      // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+      const fetchImpl = this.fetchImpl;
+      const response = await fetchImpl(this.healthUrl, { method: "GET", headers, signal: controller.signal, credentials: "omit", redirect: "error" });
       const latency = performance.now() - started;
 
       if (response.status === 401 || response.status === 403) {

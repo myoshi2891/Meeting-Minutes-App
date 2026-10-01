@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BackendHealthMonitor, type BackendHealthMonitorConfig } from "../src/api/backend-health-monitor";
 import { createInitialHealth } from "../src/recording/recording-health-monitor";
 import type { LocalBackendCapabilities, LocalBackendStatus } from "../src/types/recording";
+import { browserLikeFetch } from "./harness";
 
 const CONFIG: BackendHealthMonitorConfig = {
   baseUrl: "http://127.0.0.1:43117",
@@ -43,6 +44,15 @@ describe("BackendHealthMonitor.checkOnce", () => {
     expect(s.lastHealthyAt).not.toBeNull();
     expect(health.lastBackendHealthCheckAt).toBeGreaterThan(0);
     expect(health.degradedReasons).toEqual([]);
+  });
+
+  it("ブラウザの fetch を渡してもメソッド呼び出しにせず HEALTHY になる（Illegal invocation にならない）", async () => {
+    // Arrange
+    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), browserLikeFetch(async () => json({ status: "ok", service: "minutes-local" })));
+    // Act
+    const s = await m.checkOnce();
+    // Assert
+    expect(s.status).toBe("HEALTHY");
   });
 
   it("ヘルスチェックはリダイレクトを拒否する（ローカル外への転送を防ぐ）", async () => {

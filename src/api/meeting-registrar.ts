@@ -50,9 +50,11 @@ export class MeetingRegistrar {
     if (token === null) return this.fail("UNAUTHORIZED", "backend token is not set", null);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.deps.timeoutMs);
+    // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+    const { fetchImpl } = this.deps;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
-        const response = await this.deps.fetchImpl(url, {
+        const response = await fetchImpl(url, {
           method: "POST",
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify(body),
