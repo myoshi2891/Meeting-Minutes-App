@@ -30,6 +30,8 @@ export class BackendHealthMonitor {
   /** 最後に onChange で通知した (status, unauthorized)。どちらかが変わったら通知する。 */
   private notified: { status: LocalBackendHealth["status"]; unauthorized: boolean } = { status: "UNKNOWN", unauthorized: false };
   private readonly listeners = new Set<(state: LocalBackendHealth) => void>();
+  /** 最後に console.warn した接続失敗の理由。同じ理由をポーリングのたびに出さないために使い、到達できたら null に戻す。 */
+  private lastWarnedReason: string | null = null;
   private readonly healthUrl: URL;
 
   constructor(
@@ -100,8 +102,14 @@ export class BackendHealthMonitor {
       const status = body.status === "degraded" || latency > this.config.degradedLatencyMs ? "DEGRADED" : "HEALTHY";
       this.transition(status, latency, body.capabilities ?? null);
       return this.state;
-    } catch {
-      // AbortError（タイムアウト）/ TypeError（接続不能）いずれも UNREACHABLE
+    } catch (error) {
+      // AbortError（タイムアウト）/ TypeError（接続不能・ヘッダー生成失敗）いずれも UNREACHABLE。
+      // 画面には「サーバー未接続」としか出ないため、原因を特定できるよう理由を残す（トークン値は例外に含まれない）
+      const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      if (reason !== this.lastWarnedReason) {
+        this.lastWarnedReason = reason;
+        console.warn("[BackendHealthMonitor] health check failed:", reason);
+      }
       this.transition("UNREACHABLE", null, null);
       return this.state;
     } finally {
@@ -118,6 +126,7 @@ export class BackendHealthMonitor {
     this.state.latencyMs = reachable ? latency : null;
     this.state.capabilities = reachable ? caps ?? this.state.capabilities : null;
     if (reachable) {
+      this.lastWarnedReason = null;
       this.state.lastHealthyAt = performance.now();
       this.state.consecutiveFailures = 0;
     } else {
