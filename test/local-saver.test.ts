@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { assertLocalHost, LocalSaver } from "../src/api/local-saver";
 import type { AudioChunkRecord } from "../src/types/recording";
-import { makeChunkRecord } from "./harness";
+import { browserLikeFetch, makeChunkRecord } from "./harness";
 
 const BASE = "http://127.0.0.1:43117";
 
@@ -78,6 +78,16 @@ describe("LocalSaver.put", () => {
     await saver.put(r);
     // Assert
     expect(auths).toEqual(["Bearer new-tok"]);
+  });
+
+  it("ブラウザの fetch を渡してもメソッド呼び出しにせず PUT を送る（Illegal invocation にならない）", async () => {
+    // Arrange
+    const r = await makeChunkRecord("m1", 0, 160);
+    const saver = saverWith(browserLikeFetch(async () => new Response(okBody(r), { status: 201 })));
+    // Act
+    const outcome = await saver.put(r);
+    // Assert
+    expect(outcome).toEqual({ ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false });
   });
 
   it("200 は冪等再送として成功扱い", async () => {

@@ -16,6 +16,9 @@ import type { LocalBackendHealth, MeetingRecord, RecordingHealth } from "../type
 /** settings ストアでトークンを保存するキー（§4.3） */
 export const BACKEND_TOKEN_KEY = "backendToken";
 
+/** Authorization ヘッダーに載せられる、空白を含まない印字可能 ASCII。範囲外の文字は fetch が送信前に TypeError を投げる */
+const BACKEND_TOKEN_PATTERN = /^[\x21-\x7e]+$/;
+
 /** UI への通知。UI はこれを表示するだけで、部品を直接呼ばない */
 export type AppEvent =
   | { readonly type: "recovered"; readonly report: RecoveryReport }
@@ -147,6 +150,8 @@ export class App {
   /** 設定画面からトークンを保存する（§4.3）。ヘルス状態が変わらなくても、待機中の Chunk をすぐ送り直す */
   async setToken(token: string): Promise<void> {
     if (token === "") throw new Error("token is empty");
+    // 保存してしまうと全通信が送信前に失敗し「サーバー未接続」としか出ないため、保存前に弾く
+    if (!BACKEND_TOKEN_PATTERN.test(token)) throw new Error("トークンの形式が正しくありません。サーバーのトークンファイルの中身をそのまま貼り付けてください");
     await this.settings.set(BACKEND_TOKEN_KEY, token);
     this.token = token;
     // 差し替えずに更新する。Scheduler が IDB 読み込み中に掴んでいる saver も新しいトークンで送る

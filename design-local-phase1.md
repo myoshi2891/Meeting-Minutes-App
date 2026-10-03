@@ -180,7 +180,7 @@ v4.0 §19 の Presigned URL は「URL 自体が短命の Bearer Token で、単�
 | Presigned URL の性質 | ローカルでの代替 |
 | --- | --- |
 | 発行者がサーバー | 常駐サーバーが起動時に 32 バイトのランダムトークンを生成し、`{dataDir}/token` に 0600 で書き出す。標準出力にも 1 回だけ表示する |
-| ブラウザへの受け渡し | 利用者がアプリ設定画面にトークンを貼り付ける（初回のみ）。ブラウザは `localStorage` ではなく IndexedDB の `settings` ストアに保存する。常駐サーバー自身が静的ファイルとしてアプリを配信する構成では、`/` へのアクセス時に `Set-Cookie: HttpOnly; SameSite=Strict` でトークンを渡してもよい |
+| ブラウザへの受け渡し | 利用者がアプリ設定画面にトークンを貼り付ける（初回のみ）。ブラウザは `localStorage` ではなく IndexedDB の `settings` ストアに保存する。保存前に形式（空白を含まない印字可能 ASCII）を検証し、取り違えた文字列を保存しない（§31.2 `setToken`）。常駐サーバー自身が静的ファイルとしてアプリを配信する構成では、`/` へのアクセス時に `Set-Cookie: HttpOnly; SameSite=Strict` でトークンを渡してもよい |
 | 短命性 | サーバー再起動でトークンが再生成される。ブラウザは `401` を受けたら設定画面へ誘導し、State Machine は `BACKEND_UNAVAILABLE` で待機する |
 | 単一オブジェクト限定 | エンドポイントが `PUT /v1/meetings/{meetingId}/chunks/{source}/{sequenceNo}` と論理キーそのものになっているため、トークンが漏れても書き込める先は本アプリのデータディレクトリ配下に限定される |
 | URL をログへ出力しない | トークンはヘッダ（`Authorization: Bearer`）で送り、URL には含めない。ブラウザ側ロガーは `Authorization` ヘッダを出力しない |
@@ -2266,8 +2266,10 @@ export class LocalSaver {
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+    // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+    const fetchImpl = this.fetchImpl;
     try {
-      const response = await this.fetchImpl(url, {
+      const response = await fetchImpl(url, {
         method: "PUT",
         headers: {
           Authorization: `Bearer ${this.token}`,
@@ -2411,9 +2413,11 @@ export class MeetingRegistrar {
     if (token === null) return this.fail("UNAUTHORIZED", "backend token is not set", null);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.deps.timeoutMs);
+    // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+    const { fetchImpl } = this.deps;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
-        const response = await this.deps.fetchImpl(url, {
+        const response = await fetchImpl(url, {
           method: "POST",
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -2775,6 +2779,8 @@ export class BackendHealthMonitor {
   /** 最後に onChange で通知した (status, unauthorized)。どちらかが変わったら通知する。 */
   private notified: { status: LocalBackendHealth["status"]; unauthorized: boolean } = { status: "UNKNOWN", unauthorized: false };
   private readonly listeners = new Set<(state: LocalBackendHealth) => void>();
+  /** 最後に console.warn した接続失敗の理由。同じ理由をポーリングのたびに出さないために使い、到達できたら null に戻す。 */
+  private lastWarnedReason: string | null = null;
   private readonly healthUrl: URL;
 
   constructor(
@@ -2824,7 +2830,9 @@ export class BackendHealthMonitor {
       const token = this.config.token();
       const headers: Record<string, string> = {};
       if (token !== null) headers.Authorization = `Bearer ${token}`;
-      const response = await this.fetchImpl(this.healthUrl, { method: "GET", headers, signal: controller.signal, credentials: "omit", redirect: "error" });
+      // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+      const fetchImpl = this.fetchImpl;
+      const response = await fetchImpl(this.healthUrl, { method: "GET", headers, signal: controller.signal, credentials: "omit", redirect: "error" });
       const latency = performance.now() - started;
 
       if (response.status === 401 || response.status === 403) {
@@ -2843,8 +2851,14 @@ export class BackendHealthMonitor {
       const status = body.status === "degraded" || latency > this.config.degradedLatencyMs ? "DEGRADED" : "HEALTHY";
       this.transition(status, latency, body.capabilities ?? null);
       return this.state;
-    } catch {
-      // AbortError（タイムアウト）/ TypeError（接続不能）いずれも UNREACHABLE
+    } catch (error) {
+      // AbortError（タイムアウト）/ TypeError（接続不能・ヘッダー生成失敗）いずれも UNREACHABLE。
+      // 画面には「サーバー未接続」としか出ないため、原因を特定できるよう理由を残す（トークン値は例外に含まれない）
+      const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      if (reason !== this.lastWarnedReason) {
+        this.lastWarnedReason = reason;
+        console.warn("[BackendHealthMonitor] health check failed:", reason);
+      }
       this.transition("UNREACHABLE", null, null);
       return this.state;
     } finally {
@@ -2861,6 +2875,7 @@ export class BackendHealthMonitor {
     this.state.latencyMs = reachable ? latency : null;
     this.state.capabilities = reachable ? caps ?? this.state.capabilities : null;
     if (reachable) {
+      this.lastWarnedReason = null;
       this.state.lastHealthyAt = performance.now();
       this.state.consecutiveFailures = 0;
     } else {
@@ -2901,6 +2916,8 @@ export class BackendHealthMonitor {
 `transition()` は `UNREACHABLE` に遷移するとき、経路（接続不能・タイムアウト・401 / 403・service 不一致・Scheduler からの通知）を問わず `latencyMs` と `capabilities` を `null` にする。`LocalBackendHealth` の型定義が「UNREACHABLE のときは null」と定めているためで、401 応答の応答時間や、直前の `HEALTHY` で得た `capabilities` を残さない。`HEALTHY` / `DEGRADED` では、認証なしの応答（`capabilities` なし）でも直前の `capabilities` を保持する。
 
 認証エラーも同じ構造で配線する。Scheduler の `onBackendUnauthorized` に `() => monitor.reportUnauthorized()` を渡すと、PUT が 401 / 403 を受けた時点で `unauthorized` が立ち、Scheduler は PUT を止める。`/v1/health` は認証なしでも `status` と `service` だけを返す（§12）ため、`capabilities` を含まない応答ではトークンの正しさを判断できない。そのため `unauthorized` は、`capabilities` を含む認証済みの応答でだけ解除する。解除は `status` が `HEALTHY` のまま起こりうるので、`onChange` は `status` と `unauthorized` のどちらかが変わったときに通知する。これにより、トークン修正後の最初のポーリングで `resumeAll()` が呼ばれる。
+
+`checkOnce` が例外（タイムアウトの `AbortError`、接続不能やヘッダー生成失敗の `TypeError`）で `UNREACHABLE` にしたときは、例外の名前とメッセージを `console.warn` に残す。画面は原因によらず「サーバー未接続」になるため、非 ASCII トークンでヘッダーを作れない場合と、サーバー停止とを Console で見分けるためである。同じ理由はポーリングのたびには出さず、理由が変わったときと、到達できた後に初めて失敗したときだけ出す。
 
 `start()` は多重に呼んでもポーリングを 1 系統しか作らない。`stop()` はポーリング中フラグを下ろしてタイマーを解除する。フラグだけでは、`checkOnce()` の実行中に `stop()` → `start()` が挟まると、古いチェックが完了後に再びフラグが立っているのを見て 2 系統目のループを作ってしまう。そこで `start()` / `stop()` のたびに世代番号 `generation` を進め、各ループは開始時の世代を持ち回る。`checkOnce()` の完了後、ポーリング中かつ世代が一致するときだけ次のタイマーを仕掛ける。
 
@@ -4301,14 +4318,18 @@ v4.0 §116（Audio）、§117（Network → ローカル起動断に読み替え
 
 | v4.0 項目 | 読み替え | 状況 | 担保箇所 |
 | --- | --- | --- | --- |
-| Wi-Fi 断 5 分 | 常駐サーバー停止 5 分 | テスト済 | §24.3 |
+| Wi-Fi 断 5 分 | 常駐サーバー停止 5 分 | テスト済・手動確認済（2026-10-03） | §24.3 |
 | IndexedDB 保持 | 同左 | テスト済 | §24.3（停止中の滞留）、§24.4 |
-| 再接続後順序保証 | サーバー復帰後 `sequenceNo` 順 | テスト済 | §17.2（`insertSorted`）、§24.3 |
+| 再接続後順序保証 | サーバー復帰後 `sequenceNo` 順 | テスト済・手動確認済（2026-10-03） | §17.2（`insertSorted`）、§24.3 |
 | 重複 Upload 防止 | 重複 PUT の冪等化 | 設計済・テスト済 | §11、§24.4（`SAVING` 中断 Chunk の再送で 200） |
 | SHA-256 検証 | 同左 | 設計済・テスト済 | §17.1（レスポンス照合）、§22（finalize 前の一覧照合） |
 | R2 Object 存在確認 | `GET /v1/meetings/{id}/chunks` での存在・ハッシュ確認 | 設計済 | §22 |
 
 2026-09-28: Phase 1 最小サーバーのPythonテストで、会議未登録の404、認証・CORS、破損WAV・ハッシュ不一致の422、同一Chunkの再送200／異なるハッシュ409、同時PUT、容量不足507、再起動後のSQLite保持、不完全なfinalize拒否409を確認。ループバックHTTPで `/v1/health` の200を確認した。実ブラウザの既存Chunk PUT・5分停止からの復帰は未確認。
+
+2026-10-01: 実ブラウザ（Chrome、http://127.0.0.1:5173）で Step 1-c の既存会議を実サーバーへ送信・確定した。会議 `68c2f545…` は Chunk 11 件（seq 0〜10、計 5,057,842 サンプル）、会議 `e8328b9e…` は 1 件（112,456 サンプル）がすべて `registered`、両会議とも SQLite で `finalized`、`recordings/<id>/mic/` に WAV、`meeting.json` に `totalAudioFrames` を確認。2 件目は Barrier が `waiting_local_save` で止まり、手動の「再試行」で確定した（§31.2 の既知の制約どおり）。この確認の過程で、`LocalSaver` / `MeetingRegistrar` / `BackendHealthMonitor` が `fetch` をメソッドとして呼び、実ブラウザで Illegal invocation になる不具合を修正した（§17・§18）。5分停止からの復帰は未確認。
+
+2026-10-03: 実ブラウザで常駐サーバー停止 5 分からの復帰を確認した。会議 `fb47e917…` を録音中、seq 0〜4 の登録後にサーバーを約 5 分 20 秒停止。停止中は「サーバー未接続 —— 録音は継続中。N 個の Chunk をブラウザ内に保持しています」の N が増え、health は約 5 秒間隔で失敗、PUT は出ず、Console の `[BackendHealthMonitor] health check failed: TypeError: Failed to fetch` は 1 回だけ（§18）。再起動直後は古いトークンで `POST /v1/meetings` が 401 となり送信が止まり、新トークンの保存と同時に滞留 12 件（seq 5〜16）が連番順に登録された。録音停止後、計 26 Chunk（seq 0〜25、12,380,951 サンプル）がすべて `registered`、WAV 26 件、`meeting.json` の `totalAudioFrames` も一致し `finalized`。確定は今回も `waiting_local_save` からの手動「再試行」が必要だった（§31.2）。
 
 ## 28.3 Browser（v4.0 §121）
 
@@ -4318,11 +4339,17 @@ v4.0 §116（Audio）、§117（Network → ローカル起動断に読み替え
 | minimize | 設計済・手動 | §19 |
 | screen lock | 手動 | OS 依存。AudioContext が suspended になる場合は §19 で検知し UI 表示。断定しない（§5） |
 | network offline | 該当なし（ローカル通信のみ）。サーバー停止として §24.3 で代替 | §3.6 |
-| permission denied | 設計済・手動 | `getUserMedia` 拒否は録音開始前のエラーとして UI 表示。録音中の取り消しは `MIC_TRACK_ENDED`（§15） |
+| permission denied | 設計済・手動確認済（2026-10-03） | `getUserMedia` 拒否は録音開始前のエラーとして UI 表示。録音中の取り消しは `MIC_TRACK_ENDED`（§15） |
 | mic disconnected | 設計済・手動 | §15（`track.ended`）、§14.3（入力なしでも Processor は維持） |
 | system audio unavailable | Phase 2 | — |
 | AudioContext statechange | 設計済・手動 | §19 `attachAudioContextMonitor` |
-| browser crash | 設計済・テスト済 | §23、§24.4 |
+| browser crash | 設計済・テスト済・手動確認済（2026-10-03、未送信 Chunk の再送は未確認） | §23、§24.4 |
+
+2026-10-03: Chrome のタスクマネージャーで録音中のタブのプロセスを終了し、同じ URL を開き直した。会議 `d250e47c…` は終了前に seq 0〜8（各 480,000 サンプル）が登録済みで、終了は録音開始から 4 分 30 秒〜5 分の間（seq 9 の生成前）。再読み込み時に「前回中断された会議が 1 件あります」と通知され、§23 の復旧が `totalAudioFrames` を最大 `endFrame`（4,320,000）から復元し、手動操作なしで `finalized` になった。失われたのはメモリ上の末尾 30 秒未満で仕様どおり。終了時点で未送信の Chunk がなかったため、復旧時の再送は今回の試験では通っていない。
+
+2026-10-03: 録音中に同じ URL を別タブで開いた。会議 `5bf17d06…` は新しいタブで「前回中断された会議」として扱われず、確定待ちにも出ず、元のタブの Chunk は 30 秒間隔のまま途切れなかった（T5 の会議ごとの Web Lock、§23）。停止後は会議が `stop_requested` になり両タブの確定待ちに表示され、新しいタブ側の「再試行」で `finalized`（5 Chunk、2,158,041 サンプル、`totalAudioFrames` 一致）。
+
+2026-10-03: 同意ダイアログのキャンセルでは録音もマイク要求も会議登録も行われず、表示もない（§3.9 はスキップ禁止のみを要求）。サイト設定でマイクを Block にして開始すると、同意後に「マイクの使用が許可されていません。ブラウザの設定を確認してください」と表示され、録音は始まらず開始ボタンは再び押せる。どちらもサーバーの会議数は増えない。
 
 ## 28.4 Phase 1 固有の追加項目
 
@@ -4332,7 +4359,7 @@ v4.0 §116（Audio）、§117（Network → ローカル起動断に読み替え
 | IndexedDB クォータ逼迫 | 設計済・手動 | §3.4、§21 |
 | タブクローズ・リロード | 設計済・手動 | §3.5、§20 |
 | 録音同意の確認 | 設計済 | §3.9（`consentConfirmedAt`） |
-| 401 からの復帰 | テスト済 | §24.3 |
+| 401 からの復帰 | テスト済・手動確認済（2026-10-03） | §24.3 |
 | エイリアシング | テスト済 | §24.6 |
 
 ---
@@ -4394,7 +4421,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 | PUT が NETWORK / TIMEOUT | `monitor.reportUnreachable()` | §18 |
 | PUT が 401 / 403 | `monitor.reportUnauthorized()` | §18 |
 | `monitor.onChange` で HEALTHY / DEGRADED かつ unauthorized でない | `scheduler.resumeAll(別タブが録音中の会議)` → `stop_requested` / `finalizing` の会議ごとに会議ロックを取って `finalizeMeeting` | §17 / §22（サーバー復帰時に Barrier を自動で再試行する） |
-| `setToken` | settings の `backendToken` に保存 → 既存の `LocalSaver` のトークンを更新（未生成なら生成）→ `monitor.checkOnce()` → 使える状態なら上と同じ再開処理 | §4.3。トークンを入れてもヘルス状態は変わらないことがある（認証なしのヘルス応答）ため、`onChange` を待たない |
+| `setToken` | 空白を含まない印字可能 ASCII 以外は保存せずエラー（Authorization ヘッダーに載らず、全通信が送信前に失敗するため）→ settings の `backendToken` に保存 → 既存の `LocalSaver` のトークンを更新（未生成なら生成）→ `monitor.checkOnce()` → 使える状態なら上と同じ再開処理 | §4.3。トークンを入れてもヘルス状態は変わらないことがある（認証なしのヘルス応答）ため、`onChange` を待たない |
 | Chunk PUT／メモリからの直接送信 | `LocalSaver.put()` → `MeetingRegistrar.ensure()` → `POST /v1/meetings` 成功後に PUT。並行する同一会議の登録は共有 | §12。サーバーは未登録会議への PUT を404にする |
 | 録音開始 | `requestPersistence` → `RecordingController.start` → `attachPageLifecycle`。録音中か開始処理中（`session` が入る前の await 中）なら会議 ID に関係なく `already recording` で拒否する。開始中フラグは成功・失敗どちらでも `finally` で下ろす | §21 / §15 / §20 |
 | Chunk の enqueue | `scheduler.enqueue` の後に `enforceQuota` を直列で実行。`export_required` なら `AppEvent.export_required`。`dropped_registered_blobs` でメモリ待機があれば `drainMemoryBacklog()` | §21 / §15。`enforceQuota` の失敗が `persistChunk` の失敗に混ざらないよう、enqueue の Promise には含めない |
@@ -4427,6 +4454,9 @@ import type { LocalBackendHealth, MeetingRecord, RecordingHealth } from "../type
 
 /** settings ストアでトークンを保存するキー（§4.3） */
 export const BACKEND_TOKEN_KEY = "backendToken";
+
+/** Authorization ヘッダーに載せられる、空白を含まない印字可能 ASCII。範囲外の文字は fetch が送信前に TypeError を投げる */
+const BACKEND_TOKEN_PATTERN = /^[\x21-\x7e]+$/;
 
 /** UI への通知。UI はこれを表示するだけで、部品を直接呼ばない */
 export type AppEvent =
@@ -4559,6 +4589,8 @@ export class App {
   /** 設定画面からトークンを保存する（§4.3）。ヘルス状態が変わらなくても、待機中の Chunk をすぐ送り直す */
   async setToken(token: string): Promise<void> {
     if (token === "") throw new Error("token is empty");
+    // 保存してしまうと全通信が送信前に失敗し「サーバー未接続」としか出ないため、保存前に弾く
+    if (!BACKEND_TOKEN_PATTERN.test(token)) throw new Error("トークンの形式が正しくありません。サーバーのトークンファイルの中身をそのまま貼り付けてください");
     await this.settings.set(BACKEND_TOKEN_KEY, token);
     this.token = token;
     // 差し替えずに更新する。Scheduler が IDB 読み込み中に掴んでいる saver も新しいトークンで送る
@@ -4837,7 +4869,7 @@ export function noticeFor(event: AppEvent): string | null {
 
 export function finalizeResultText(result: FinalizeResult): string {
   if (result.ok) return result.missingTailMs === undefined ? "録音を確定しました" : `録音を確定しました。${missingTailText(result.missingTailMs)}`;
-  if (result.stage === "waiting_local_save") return "確定待ち（サーバーへの保存が終わると自動で確定します）";
+  if (result.stage === "waiting_local_save") return "確定待ち（サーバーへの保存が終わったら、確定待ちの会議の「再試行」を押してください）";
   if (result.stage === "finalize") return `確定できませんでした。再試行してください（${result.detail}）`;
   return `確定できませんでした（${result.detail}）`;
 }

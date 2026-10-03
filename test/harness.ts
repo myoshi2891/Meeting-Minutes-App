@@ -15,6 +15,17 @@ import type { MeetingLockManager } from "../src/recording/meeting-lock";
 export const BASE_URL = "http://127.0.0.1:43117";
 export const TOKEN = "test-token";
 
+/**
+ * ブラウザの window.fetch と同じく、オブジェクトのメソッドとして呼ばれると TypeError（Illegal invocation）を投げる fetch。
+ * Node の fetch は this を検査しないため、偽の fetch だけでは `this.fetchImpl(...)` の不具合を検出できない。
+ */
+export function browserLikeFetch(impl: typeof fetch): typeof fetch {
+  return function (this: unknown, input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    if (this !== undefined && this !== globalThis) throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+    return impl(input, init);
+  };
+}
+
 /** 常駐サーバーの振る舞いを最小限で模倣する fetch 実装。 */
 export class FakeLocalServer {
   up = true;

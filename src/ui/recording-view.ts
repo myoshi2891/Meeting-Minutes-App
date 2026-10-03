@@ -71,7 +71,7 @@ export function noticeFor(event: AppEvent): string | null {
 
 export function finalizeResultText(result: FinalizeResult): string {
   if (result.ok) return result.missingTailMs === undefined ? "録音を確定しました" : `録音を確定しました。${missingTailText(result.missingTailMs)}`;
-  if (result.stage === "waiting_local_save") return "確定待ち（サーバーへの保存が終わると自動で確定します）";
+  if (result.stage === "waiting_local_save") return "確定待ち（サーバーへの保存が終わったら、確定待ちの会議の「再試行」を押してください）";
   if (result.stage === "finalize") return `確定できませんでした。再試行してください（${result.detail}）`;
   return `確定できませんでした（${result.detail}）`;
 }

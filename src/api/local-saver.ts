@@ -56,8 +56,10 @@ export class LocalSaver {
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+    // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+    const fetchImpl = this.fetchImpl;
     try {
-      const response = await this.fetchImpl(url, {
+      const response = await fetchImpl(url, {
         method: "PUT",
         headers: {
           Authorization: `Bearer ${this.token}`,

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BackendHealthMonitor, type BackendHealthMonitorConfig } from "../src/api/backend-health-monitor";
 import { createInitialHealth } from "../src/recording/recording-health-monitor";
 import type { LocalBackendCapabilities, LocalBackendStatus } from "../src/types/recording";
+import { browserLikeFetch } from "./harness";
 
 const CONFIG: BackendHealthMonitorConfig = {
   baseUrl: "http://127.0.0.1:43117",
@@ -43,6 +44,15 @@ describe("BackendHealthMonitor.checkOnce", () => {
     expect(s.lastHealthyAt).not.toBeNull();
     expect(health.lastBackendHealthCheckAt).toBeGreaterThan(0);
     expect(health.degradedReasons).toEqual([]);
+  });
+
+  it("ブラウザの fetch を渡してもメソッド呼び出しにせず HEALTHY になる（Illegal invocation にならない）", async () => {
+    // Arrange
+    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), browserLikeFetch(async () => json({ status: "ok", service: "minutes-local" })));
+    // Act
+    const s = await m.checkOnce();
+    // Assert
+    expect(s.status).toBe("HEALTHY");
   });
 
   it("ヘルスチェックはリダイレクトを拒否する（ローカル外への転送を防ぐ）", async () => {
@@ -110,6 +120,46 @@ describe("BackendHealthMonitor.checkOnce", () => {
     const s = await m.checkOnce();
     expect(s.status).toBe("UNREACHABLE");
     expect(s.consecutiveFailures).toBe(2);
+  });
+
+  it("接続不能で UNREACHABLE にした理由（例外の名前とメッセージ）を console.warn に残す", async () => {
+    // Arrange
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async () => {
+        throw new TypeError("String contains non ISO-8859-1 code point.");
+      });
+      // Act
+      await m.checkOnce();
+      // Assert
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.join(" "))).toContain("TypeError: String contains non ISO-8859-1 code point.");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("同じ理由の失敗が続いても警告は 1 回だけ、到達できた後の失敗では再び警告する", async () => {
+    // Arrange：失敗 → 失敗 → 成功 → 失敗
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      let reachable = false;
+      const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async () => {
+        if (reachable) return json({ status: "ok", service: "minutes-local", capabilities: CAPS });
+        throw new TypeError("Failed to fetch");
+      });
+      // Act
+      await m.checkOnce();
+      await m.checkOnce();
+      reachable = true;
+      await m.checkOnce();
+      reachable = false;
+      await m.checkOnce();
+      // Assert
+      expect(warn).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("timeoutMs 以内に応答しなければ UNREACHABLE", async () => {
