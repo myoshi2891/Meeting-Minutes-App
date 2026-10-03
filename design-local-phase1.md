@@ -4343,7 +4343,9 @@ v4.0 §116（Audio）、§117（Network → ローカル起動断に読み替え
 | mic disconnected | 設計済・手動 | §15（`track.ended`）、§14.3（入力なしでも Processor は維持） |
 | system audio unavailable | Phase 2 | — |
 | AudioContext statechange | 設計済・手動 | §19 `attachAudioContextMonitor` |
-| browser crash | 設計済・テスト済 | §23、§24.4 |
+| browser crash | 設計済・テスト済・手動確認済（2026-10-03、未送信 Chunk の再送は未確認） | §23、§24.4 |
+
+2026-10-03: Chrome のタスクマネージャーで録音中のタブのプロセスを終了し、同じ URL を開き直した。会議 `d250e47c…` は終了前に seq 0〜8（各 480,000 サンプル）が登録済みで、終了は録音開始から 4 分 30 秒〜5 分の間（seq 9 の生成前）。再読み込み時に「前回中断された会議が 1 件あります」と通知され、§23 の復旧が `totalAudioFrames` を最大 `endFrame`（4,320,000）から復元し、手動操作なしで `finalized` になった。失われたのはメモリ上の末尾 30 秒未満で仕様どおり。終了時点で未送信の Chunk がなかったため、復旧時の再送は今回の試験では通っていない。
 
 ## 28.4 Phase 1 固有の追加項目
 
