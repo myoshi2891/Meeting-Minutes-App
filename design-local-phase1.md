@@ -4318,9 +4318,9 @@ v4.0 §116（Audio）、§117（Network → ローカル起動断に読み替え
 
 | v4.0 項目 | 読み替え | 状況 | 担保箇所 |
 | --- | --- | --- | --- |
-| Wi-Fi 断 5 分 | 常駐サーバー停止 5 分 | テスト済 | §24.3 |
+| Wi-Fi 断 5 分 | 常駐サーバー停止 5 分 | テスト済・手動確認済（2026-10-03） | §24.3 |
 | IndexedDB 保持 | 同左 | テスト済 | §24.3（停止中の滞留）、§24.4 |
-| 再接続後順序保証 | サーバー復帰後 `sequenceNo` 順 | テスト済 | §17.2（`insertSorted`）、§24.3 |
+| 再接続後順序保証 | サーバー復帰後 `sequenceNo` 順 | テスト済・手動確認済（2026-10-03） | §17.2（`insertSorted`）、§24.3 |
 | 重複 Upload 防止 | 重複 PUT の冪等化 | 設計済・テスト済 | §11、§24.4（`SAVING` 中断 Chunk の再送で 200） |
 | SHA-256 検証 | 同左 | 設計済・テスト済 | §17.1（レスポンス照合）、§22（finalize 前の一覧照合） |
 | R2 Object 存在確認 | `GET /v1/meetings/{id}/chunks` での存在・ハッシュ確認 | 設計済 | §22 |
@@ -4328,6 +4328,8 @@ v4.0 §116（Audio）、§117（Network → ローカル起動断に読み替え
 2026-09-28: Phase 1 最小サーバーのPythonテストで、会議未登録の404、認証・CORS、破損WAV・ハッシュ不一致の422、同一Chunkの再送200／異なるハッシュ409、同時PUT、容量不足507、再起動後のSQLite保持、不完全なfinalize拒否409を確認。ループバックHTTPで `/v1/health` の200を確認した。実ブラウザの既存Chunk PUT・5分停止からの復帰は未確認。
 
 2026-10-01: 実ブラウザ（Chrome、http://127.0.0.1:5173）で Step 1-c の既存会議を実サーバーへ送信・確定した。会議 `68c2f545…` は Chunk 11 件（seq 0〜10、計 5,057,842 サンプル）、会議 `e8328b9e…` は 1 件（112,456 サンプル）がすべて `registered`、両会議とも SQLite で `finalized`、`recordings/<id>/mic/` に WAV、`meeting.json` に `totalAudioFrames` を確認。2 件目は Barrier が `waiting_local_save` で止まり、手動の「再試行」で確定した（§31.2 の既知の制約どおり）。この確認の過程で、`LocalSaver` / `MeetingRegistrar` / `BackendHealthMonitor` が `fetch` をメソッドとして呼び、実ブラウザで Illegal invocation になる不具合を修正した（§17・§18）。5分停止からの復帰は未確認。
+
+2026-10-03: 実ブラウザで常駐サーバー停止 5 分からの復帰を確認した。会議 `fb47e917…` を録音中、seq 0〜4 の登録後にサーバーを約 5 分 20 秒停止。停止中は「サーバー未接続 —— 録音は継続中。N 個の Chunk をブラウザ内に保持しています」の N が増え、health は約 5 秒間隔で失敗、PUT は出ず、Console の `[BackendHealthMonitor] health check failed: TypeError: Failed to fetch` は 1 回だけ（§18）。再起動直後は古いトークンで `POST /v1/meetings` が 401 となり送信が止まり、新トークンの保存と同時に滞留 12 件（seq 5〜16）が連番順に登録された。録音停止後、計 26 Chunk（seq 0〜25、12,380,951 サンプル）がすべて `registered`、WAV 26 件、`meeting.json` の `totalAudioFrames` も一致し `finalized`。確定は今回も `waiting_local_save` からの手動「再試行」が必要だった（§31.2）。
 
 ## 28.3 Browser（v4.0 §121）
 
@@ -4351,7 +4353,7 @@ v4.0 §116（Audio）、§117（Network → ローカル起動断に読み替え
 | IndexedDB クォータ逼迫 | 設計済・手動 | §3.4、§21 |
 | タブクローズ・リロード | 設計済・手動 | §3.5、§20 |
 | 録音同意の確認 | 設計済 | §3.9（`consentConfirmedAt`） |
-| 401 からの復帰 | テスト済 | §24.3 |
+| 401 からの復帰 | テスト済・手動確認済（2026-10-03） | §24.3 |
 | エイリアシング | テスト済 | §24.6 |
 
 ---
