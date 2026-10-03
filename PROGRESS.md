@@ -15,7 +15,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-a | §16 WAV エンコーダ | ✅ 自動テスト済 | `chunk-standalone.test.ts` 通過 |
 | 1-b | §14 Worklet（リサンプラ・VAD・蓄積） | ✅ 自動テスト済 | `long-recording.test.ts` / `resampler-aliasing.test.ts` 通過 |
 | 1-c | §10 IndexedDB + §15 RecordingController | ✅ 保存・全WAV音声確認済み（次Stepへ進む） | 30秒×10件＋16.115125秒×1件、全件valid。利用者が全11件の音声を確認。Chrome単体再生は未確認として残す |
-| 1-d | §17 LocalSaver / Scheduler + §18 BackendHealthMonitor | 🟡 実ブラウザで既存 2 会議・12 Chunk の PUT・finalize を確認（T4-A 合格、2026-10-01） | **未**：サーバー停止5分からの復帰（T4-B） |
+| 1-d | §17 LocalSaver / Scheduler + §18 BackendHealthMonitor | ✅ 実ブラウザで確認（T4-A 合格 2026-10-01、T4-B サーバー停止5分 合格 2026-10-03） | — |
 | 1-e | §22 Finalizer + §23 Recovery | 🟡 コード・自動テストのみ | **未**：タブ強制終了 → 再起動で再送 |
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 コード・自動テスト・最小 UI あり | **未**：§28.3 の手動項目（実マイク・実サーバー、T4） |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
@@ -89,7 +89,7 @@ T3-c の内容（§31.4）:
 - Playwright で dev サーバーの画面を確認済み：サーバー未接続のバナー、ヘルプ文言が出る。コンソールのエラーなし（favicon は `data:,`）、通信先は 127.0.0.1 のみ
 - 実マイクでの録音・同意ダイアログ・getUserMedia 拒否・タブの切り替えは未確認（T4）
 
-### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-f / 1-g）【A 合格・次は項目 B（サーバー停止5分）】
+### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-f / 1-g）【A・B 合格・次は項目 C（強制終了）】
 
 - 1-c 結果：会議 `68c2f545-ff0a-4741-8f43-3b2fd46711c2`（無題の会議）。seq 0〜9 は各480,000サンプル、seq 10 は257,842サンプル。計316.115125秒、欠番なし、`fullChunks: 10` / `partialChunks: 1` / `allValid: true`。全11件の音声を利用者が確認した。Chromeでの単体再生は未確認（再生アプリ・OS・Chrome版も未取得）。外部通信ゼロの実機確認も未完了。録り直しは求めず、Chromeの確認を残して1-dへ進むと案内済み。
 
@@ -101,6 +101,8 @@ T3-c の内容（§31.4）:
 
 ### 次セッションの再開点：T4 実機再確認チェックリスト（2026-10-01 作成・未実施）
 
+- **項目 B 合格（2026-10-03）**：会議 `fb47e917…`。seq 0〜4 登録後にサーバーを 16:49:55〜16:55:15 停止。停止中はバナーの保持件数が増え、health は約5秒ごとに失敗、PUT なし、`[BackendHealthMonitor]` 警告は1回のみ。再起動直後は旧トークンで `POST /v1/meetings` 401 → 新トークン保存（16:55:42）で滞留 seq 5〜16 の12件が連番順に登録。停止後 26 Chunk（12,380,951 サンプル）全件 `registered`・WAV 26件・`meeting.json` 一致・`finalized`。確定は `waiting_local_save` から手動「再試行」（→ T10）。**次は項目 C**。
+  - 途中経過：最初の会議 `c8512a13…`（7 Chunk）は旧トークンで 401 → 保存で seq 0〜5 を一括再送（401 復帰の実機確認）。利用者が誤って録音停止したため B には使わず、「再試行」で `finalized`。DevTools Network のフィルタに `health` が残っていて PUT が見えなかった点に注意。
 - **項目 A 合格（2026-10-01）**：`68c2f545…` 11 Chunk・`e8328b9e…` 1 Chunk とも SQLite `finalized`・全件 `registered`・WAV と `meeting.json` あり。サンプル合計も 1-c の記録と一致。2 件目は `waiting_local_save` で止まり手動「再試行」で確定（§31.2 の既知の制約）。**次は項目 B**。
 - 項目 A 中に見つかった別問題：保存済みトークンが 17 文字の非 ASCII（クリップボードの取り違え）で、全 fetch がヘッダー生成時に `non ISO-8859-1 code point` で失敗し「サーバー未接続」と表示されていた。再保存で解消。
 - **2026-10-01 31 回目**：項目 A の最中に、ブラウザから 43117 への要求が1件も出ない不具合を発見・修正（上記「今回の変更」）。これ以前の「実ブラウザ確認済み」報告でサーバーにデータが無かったのはこれが原因。修正後、利用者のタブを再読み込みして A から再開する。
@@ -133,6 +135,12 @@ T3-c の内容（§31.4）:
 4. **1-f：ブラウザの手動項目**：新規会議で一方のタブが録音中に同じURLを別タブで開き、前者が勝手に `stop_requested` / `finalized` へ移らないことを確認する。同意キャンセル、マイク権限拒否、録音中のマイク切断、タブ切替、最小化、画面ロックを個別に試し、画面の警告・録音状態・Chunk連番を記録する。画面ロック時のAudioContext動作はOS依存として観測結果のみ記す。Chrome単体での11 WAV再生と外部通信ゼロも、この機会に確認する。
 5. **1-f：IDB障害＋サーバー停止時のWAV書き出し**：既存会議に触らず短い新規会議を開始し、サーバーを停止する。DevTools Consoleで `const { ChunkStore } = await import('/src/storage/idb.ts'); window.__minutesOriginalPutChunk = ChunkStore.prototype.putChunk; ChunkStore.prototype.putChunk = async function () { throw new Error('T4 injected IDB write failure'); };` を実行する。30秒以上録音して1件以上のChunk生成を待ち、録音停止後、警告と「WAVを書き出す」ボタンからファイルを保存して再生確認する。最後に `ChunkStore.prototype.putChunk = window.__minutesOriginalPutChunk; delete window.__minutesOriginalPutChunk;` で注入を解除する（ページ再読み込みでも解除されるが、書き出し完了前は再読み込みしない）。この試験で書き出したWAVのサーバー取込経路は未設計なので、ファイルを手元に保持する。
 6. **記録と次段階**：各試験の会議ID、Chunk件数・連番、IDB状態、HTTPステータス、警告・エラー、外部通信の有無を [design-local-phase1.md](design-local-phase1.md) §28 と本ファイルへ反映する。失敗時は原因と再試験条件を記し、通過扱いにしない。必要な修正後は `.venv/bin/python -m pytest -q`、`npm run typecheck`、`npm test`、`npm run build`、`node scripts/sync-design-code.mjs --check`、`git diff --check` を実行する。1-g の60分実録音（120 Chunk、欠番なし、全件 `DB_REGISTERED`、外部通信なし）は別の試験として最後に実施する。コミットは利用者の指示・承認後のみ行う。
+
+### T10. 録音停止のたびに「確定待ち」になる【T4 の後／要方針確認】
+
+- T4-A・`c8512a13`・T4-B の 3 回とも、停止直後は末尾 Chunk が PUT 中のため Barrier が `waiting_local_save` で止まり、手動の「再試行」が要った。§31.2 の「既知の制約」は実際には毎回起こる。
+- 案：Chunk の登録完了（Scheduler の成功通知）で、その会議が確定待ちなら Barrier を自動で再試行する。1-g（60分録音）の前に入れるかを利用者と決める。
+- 付随の観察：`MeetingRegistrar` は成功結果を覚えないため、PUT 2 件ごとに冪等な `POST /v1/meetings` が出る。実害はないが、要求数を減らすなら登録済み会議をメモする。
 
 ### T9. T4-A で見つかった UI/診断の改善 ✅ 完了（a・c 2026-10-01、b 2026-10-03）
 
@@ -175,6 +183,12 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-10-03（34 回目・T4 項目 B 合格）
+
+- T9-b は利用者がコミット済み（4dc9d5f・9dfc146・1bbbe81）。
+- T4-B を実施し合格（会議 `fb47e917…`、26 Chunk、停止中12件を連番順に再送）。401 からの復帰も実機で確認。§28.2・§28.4 と本ファイルに記録。
+- 停止のたびに手動「再試行」が要る点を T10 として起票。次は項目 C（強制終了）。
 
 ### 2026-10-03（33 回目・T9-b）
 
