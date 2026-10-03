@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-10-01（ブランチ `dev`）
+最終更新: 2026-10-03（ブランチ `dev`）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -20,7 +20,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 コード・自動テスト・最小 UI あり | **未**：§28.3 の手動項目（実マイク・実サーバー、T4） |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: Python 6 件、TypeScript 22 ファイル / 304 件がすべて通過。`npm run typecheck` も通過（2026-10-01）。`npm run build` は 2026-09-28 に通過。
+- 自動テスト: Python 6 件、TypeScript 22 ファイル / 306 件がすべて通過。`npm run typecheck` も通過（2026-10-03）。`npm run build` は 2026-09-28 に通過。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
@@ -31,7 +31,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 - クライアントの PUT 前会議登録を `MeetingRegistrar` に共通化。起動時復旧と直接送信も登録後に送る。並行登録、登録失敗からの再試行、IDB読取障害、トークン更新中の401をテスト。停止後バナーの誤表示も修正。
 - 28 回目のレビュー対応（コミット済み 0a9f364・9178e96）：サーバーの finalize を先勝ちにし（`BEGIN IMMEDIATE` で PUT と直列化、コミット後に確定値から `meeting.json` を書く）、確定済み会議への新しい Chunk の PUT を `409 CONFLICT_MEETING_FINALIZED` で拒否。`ApiErrorBody.code` に同コードを追加。Phase 1 §12・Phase 2/3 server 設計書にも反映。変更は `minutes_local/phase1.py`・`server_tests/test_phase1_api.py`・`src/api/contracts.ts`・設計書3件。
 - 29 回目のレビュー対応（コミット済み e44341d・13d2e84・6263d40、PR #8 で main へマージ済み）：`_write_atomic` を書き込みごとに一意な `.part`（`mkstemp`）へ変更し、同時 finalize の `meeting.json` 書き込みで一時ファイルを奪い合う問題を修正（Python 回帰テスト1件、修正前に Red を確認）。Phase 1 §12.1・Phase 2/3 server の `write_atomic` とテストに反映。README の強制終了手順をタスクマネージャー経由に、停止後の「録音は継続中」を不具合報告対象に修正。変更は `minutes_local/phase1.py`・`server_tests/test_phase1_api.py`・`README.md`・設計書3件・本ファイル。
-- 31 回目（未コミット）：実ブラウザで `/v1/health`・会議登録・PUT が**送信前に** `TypeError: Illegal invocation` で失敗していた（`this.fetchImpl(...)` のメソッド呼び出し。Node の fetch は this を検査しないため自動テストで検出できず）。`BackendHealthMonitor`・`LocalSaver`・`MeetingRegistrar` で fetch をローカル変数に取り出して呼ぶよう修正。回帰テスト3件（`test/harness.ts` の `browserLikeFetch`、修正前に Red を確認）。Phase 1 §17/§18 の埋め込みコードと Phase 2/3 client の同型4か所も修正。Playwright の Chromium で health 200・バナー解消を確認。
+- 31 回目（コミット済み ed90d84・ecd198a・53199a4）：実ブラウザで `/v1/health`・会議登録・PUT が**送信前に** `TypeError: Illegal invocation` で失敗していた（`this.fetchImpl(...)` のメソッド呼び出し。Node の fetch は this を検査しないため自動テストで検出できず）。`BackendHealthMonitor`・`LocalSaver`・`MeetingRegistrar` で fetch をローカル変数に取り出して呼ぶよう修正。回帰テスト3件（`test/harness.ts` の `browserLikeFetch`、修正前に Red を確認）。Phase 1 §17/§18 の埋め込みコードと Phase 2/3 client の同型4か所も修正。Playwright の Chromium で health 200・バナー解消を確認。
 - README に Step 1-c の起動・読み取り専用のChunk検証・WAV再生手順を追加。実機画像で11件のIDB保存と `stop_requested` を確認。タイトル固定の検証スクリプトが「無題の会議」を見つけられなかったため、最新会議を検証する手順に修正。その後、全件の整合性と全11件の音声再生を確認済み（Chrome再生は未確認）。
 - 実機画像で判明した停止後の「録音は継続中」バナーはコードと表示文言テストで修正済み。実ブラウザでの表示確認は残す。
 - 残課題（1201352 から継続）: `src/main.ts` の停止後書き出しは Node の Vitest 対象外のため回帰テストなし。§28.3 の手動確認で「サーバー停止＋IDB 書き込み失敗 → 停止 → 書き出し」を確認する
@@ -134,11 +134,12 @@ T3-c の内容（§31.4）:
 5. **1-f：IDB障害＋サーバー停止時のWAV書き出し**：既存会議に触らず短い新規会議を開始し、サーバーを停止する。DevTools Consoleで `const { ChunkStore } = await import('/src/storage/idb.ts'); window.__minutesOriginalPutChunk = ChunkStore.prototype.putChunk; ChunkStore.prototype.putChunk = async function () { throw new Error('T4 injected IDB write failure'); };` を実行する。30秒以上録音して1件以上のChunk生成を待ち、録音停止後、警告と「WAVを書き出す」ボタンからファイルを保存して再生確認する。最後に `ChunkStore.prototype.putChunk = window.__minutesOriginalPutChunk; delete window.__minutesOriginalPutChunk;` で注入を解除する（ページ再読み込みでも解除されるが、書き出し完了前は再読み込みしない）。この試験で書き出したWAVのサーバー取込経路は未設計なので、ファイルを手元に保持する。
 6. **記録と次段階**：各試験の会議ID、Chunk件数・連番、IDB状態、HTTPステータス、警告・エラー、外部通信の有無を [design-local-phase1.md](design-local-phase1.md) §28 と本ファイルへ反映する。失敗時は原因と再試験条件を記し、通過扱いにしない。必要な修正後は `.venv/bin/python -m pytest -q`、`npm run typecheck`、`npm test`、`npm run build`、`node scripts/sync-design-code.mjs --check`、`git diff --check` を実行する。1-g の60分実録音（120 Chunk、欠番なし、全件 `DB_REGISTERED`、外部通信なし）は別の試験として最後に実施する。コミットは利用者の指示・承認後のみ行う。
 
-### T9. T4-A で見つかった UI/診断の改善【a・c 完了／b は次回以降】
+### T9. T4-A で見つかった UI/診断の改善 ✅ 完了（a・c 2026-10-01、b 2026-10-03）
 
 - a. ✅ 完了（2026-10-01・32 回目）：`App.setToken` が空白を含まない印字可能 ASCII 以外を保存せずエラーにする。テスト3件（修正前に Red を確認）。§4.3・§31.2 に反映。
   - 元の課題：トークン保存時に形式を検証する（ISO-8859-1 外・空白混入を拒否して通知）。現状は `trim()` のみで、不正な値を保存すると全通信が送信前に例外になり「サーバー未接続」とだけ出る。
-- b. `BackendHealthMonitor.checkOnce` などの `catch {}` で UNREACHABLE とした理由を `console.warn` に残す（原因特定に時間を要した）。
+- b. ✅ 完了（2026-10-03・33 回目）：`BackendHealthMonitor.checkOnce` の例外で UNREACHABLE にしたとき、`<name>: <message>` を `console.warn` に残す。同じ理由は連続して出さず、到達できたらリセット。テスト2件（修正前に Red を確認）。§18 の本文に追記。`LocalSaver`・`MeetingRegistrar` は元から理由を `fail()` に残しているため対象外。`App` の `getMeeting` フォールバックの `catch {}` は代替値を返す設計なので据え置き。
+  - 元の課題：`BackendHealthMonitor.checkOnce` などの `catch {}` で UNREACHABLE とした理由を `console.warn` に残す（原因特定に時間を要した）。
 - c. ✅ 完了（2026-10-01・32 回目、文言修正を採用）：「確定待ち（サーバーへの保存が終わったら、確定待ちの会議の「再試行」を押してください）」に変更。Chunk 登録完了時の自動再試行は未着手（必要になったら別タスク）。
   - 元の課題：`finalizeResultText` の `waiting_local_save` 文言「サーバーへの保存が終わると自動で確定します」が §31.2 の既知の制約（自動再試行されない）と食い違う。文言を直すか、Chunk 登録完了時に Barrier を再試行する配線を足すかを決める。
 
@@ -174,6 +175,12 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-10-03（33 回目・T9-b）
+
+- 着手時の作業ツリーは clean（32 回目の変更はコミット済み 1e57bd6・2cd0d4b・8df9be4）。
+- T9-b（ヘルスチェック失敗理由の `console.warn`）を TDD で実装し、Phase 1 §18 を同期。typecheck・306 件通過。未コミット。
+- 次は T4 項目 B（サーバー停止5分）。Console の `[BackendHealthMonitor] health check failed:` で停止中の理由を確認できる。
 
 ### 2026-10-01（32 回目・T9 a/c）
 
