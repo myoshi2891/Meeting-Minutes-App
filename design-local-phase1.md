@@ -2779,6 +2779,8 @@ export class BackendHealthMonitor {
   /** 最後に onChange で通知した (status, unauthorized)。どちらかが変わったら通知する。 */
   private notified: { status: LocalBackendHealth["status"]; unauthorized: boolean } = { status: "UNKNOWN", unauthorized: false };
   private readonly listeners = new Set<(state: LocalBackendHealth) => void>();
+  /** 最後に console.warn した接続失敗の理由。同じ理由をポーリングのたびに出さないために使い、到達できたら null に戻す。 */
+  private lastWarnedReason: string | null = null;
   private readonly healthUrl: URL;
 
   constructor(
@@ -2849,8 +2851,14 @@ export class BackendHealthMonitor {
       const status = body.status === "degraded" || latency > this.config.degradedLatencyMs ? "DEGRADED" : "HEALTHY";
       this.transition(status, latency, body.capabilities ?? null);
       return this.state;
-    } catch {
-      // AbortError（タイムアウト）/ TypeError（接続不能）いずれも UNREACHABLE
+    } catch (error) {
+      // AbortError（タイムアウト）/ TypeError（接続不能・ヘッダー生成失敗）いずれも UNREACHABLE。
+      // 画面には「サーバー未接続」としか出ないため、原因を特定できるよう理由を残す（トークン値は例外に含まれない）
+      const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      if (reason !== this.lastWarnedReason) {
+        this.lastWarnedReason = reason;
+        console.warn("[BackendHealthMonitor] health check failed:", reason);
+      }
       this.transition("UNREACHABLE", null, null);
       return this.state;
     } finally {
@@ -2867,6 +2875,7 @@ export class BackendHealthMonitor {
     this.state.latencyMs = reachable ? latency : null;
     this.state.capabilities = reachable ? caps ?? this.state.capabilities : null;
     if (reachable) {
+      this.lastWarnedReason = null;
       this.state.lastHealthyAt = performance.now();
       this.state.consecutiveFailures = 0;
     } else {
@@ -2907,6 +2916,8 @@ export class BackendHealthMonitor {
 `transition()` は `UNREACHABLE` に遷移するとき、経路（接続不能・タイムアウト・401 / 403・service 不一致・Scheduler からの通知）を問わず `latencyMs` と `capabilities` を `null` にする。`LocalBackendHealth` の型定義が「UNREACHABLE のときは null」と定めているためで、401 応答の応答時間や、直前の `HEALTHY` で得た `capabilities` を残さない。`HEALTHY` / `DEGRADED` では、認証なしの応答（`capabilities` なし）でも直前の `capabilities` を保持する。
 
 認証エラーも同じ構造で配線する。Scheduler の `onBackendUnauthorized` に `() => monitor.reportUnauthorized()` を渡すと、PUT が 401 / 403 を受けた時点で `unauthorized` が立ち、Scheduler は PUT を止める。`/v1/health` は認証なしでも `status` と `service` だけを返す（§12）ため、`capabilities` を含まない応答ではトークンの正しさを判断できない。そのため `unauthorized` は、`capabilities` を含む認証済みの応答でだけ解除する。解除は `status` が `HEALTHY` のまま起こりうるので、`onChange` は `status` と `unauthorized` のどちらかが変わったときに通知する。これにより、トークン修正後の最初のポーリングで `resumeAll()` が呼ばれる。
+
+`checkOnce` が例外（タイムアウトの `AbortError`、接続不能やヘッダー生成失敗の `TypeError`）で `UNREACHABLE` にしたときは、例外の名前とメッセージを `console.warn` に残す。画面は原因によらず「サーバー未接続」になるため、非 ASCII トークンでヘッダーを作れない場合と、サーバー停止とを Console で見分けるためである。同じ理由はポーリングのたびには出さず、理由が変わったときと、到達できた後に初めて失敗したときだけ出す。
 
 `start()` は多重に呼んでもポーリングを 1 系統しか作らない。`stop()` はポーリング中フラグを下ろしてタイマーを解除する。フラグだけでは、`checkOnce()` の実行中に `stop()` → `start()` が挟まると、古いチェックが完了後に再びフラグが立っているのを見て 2 系統目のループを作ってしまう。そこで `start()` / `stop()` のたびに世代番号 `generation` を進め、各ループは開始時の世代を持ち回る。`checkOnce()` の完了後、ポーリング中かつ世代が一致するときだけ次のタイマーを仕掛ける。
 
