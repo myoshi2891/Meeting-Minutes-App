@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Mock } from "vitest";
 import { attachPageLifecycle } from "../src/recording/page-lifecycle";
 
 // DOM ライブラリは使わず、window / document を EventTarget で差し替える（§24.1）
@@ -22,10 +23,10 @@ function returnValueOf(event: Event): unknown {
 describe("attachPageLifecycle", () => {
   let win: EventTarget;
   let doc: FakeDocument;
-  let flush: ReturnType<typeof vi.fn>;
+  let flush: Mock<() => Promise<void>>;
   let controller: { flush: () => Promise<void> };
   let recording: boolean;
-  let onHidden: ReturnType<typeof vi.fn>;
+  let onHidden: Mock<() => void>;
 
   beforeEach(() => {
     win = new EventTarget();
