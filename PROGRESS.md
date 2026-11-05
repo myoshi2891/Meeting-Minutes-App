@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-10-07 終了時（ブランチ `dev`）
+最終更新: 2026-11-06 終了時（ブランチ `dev`）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -20,7 +20,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | ✅ T4-D〜H 合格（2026-10-03・10-07） | 観察 4 件を T12 に起票（不合格扱いにはしない） |
 | 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: Python 6 件、TypeScript 22 ファイル / 306 件がすべて通過。`npm run typecheck` も通過（2026-10-03）。`npm run build` は 2026-09-28 に通過。
+- 自動テスト: Python 7 件、TypeScript 22 ファイル / 306 件がすべて通過。`npm run typecheck`・`npm run build` も通過、`npm audit` は 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
@@ -214,6 +214,13 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-11-06（36 回目・依存脆弱性の対応）
+
+- Dependabot 9 件に加え、npm audit のみで出る tinypool（Critical 2）・source-map-js（High）を精査。実害のある経路はなかったが全件更新で解消。
+- vite 7.3.7・vitest 5.1.0・source-map-js 1.2.2・certifi 2026.10.23 へ更新。vitest は 3.2.x では tinypool が残り、4.1.x は npm 10.9.8 の依存解決がクラッシュするため 5 系を採用。`vi.fn` の型が厳密になったので `test/page-lifecycle.test.ts` の宣言を `Mock<...>` に変更。
+- certifi は 2026.10.18 に固定しない（emSign ルートを全削除した版。アドバイザリは 10.19 以降を推奨）。Windows で使う場合、launch-editor 系の修正が vite 7.3.7 に含まれることが前提。
+- GitHub のアラートは main へのマージで閉じる。src・設計書は無変更。
 
 ### 2026-10-07（35 回目・T4 項目 F〜H 合格）
 
