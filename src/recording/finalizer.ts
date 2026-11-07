@@ -15,6 +15,7 @@ export interface FinalizerDeps {
   readonly fetchImpl?: typeof fetch;
   /** GET /chunks と POST /finalize それぞれのタイムアウト。既定 30000ms */
   readonly timeoutMs?: number;
+  readonly onBackendUnauthorized?: () => void;
   /** IDB に書けずメモリ待機中の Chunk 数（RecordingController.memoryBacklogCount）。0 でない限り Barrier を通さない。 */
   readonly unpersistedChunkCount: () => number;
 }
@@ -89,6 +90,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   } finally {
     clearTimeout(listTimer);
   }
+  if (listRes.status === 401 || listRes.status === 403) deps.onBackendUnauthorized?.();
   if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
   // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
@@ -171,6 +173,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   } finally {
     clearTimeout(finTimer);
   }
+  if (finRes.status === 401 || finRes.status === 403) deps.onBackendUnauthorized?.();
   if (!finRes.ok) {
     await restore();
     return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}` };

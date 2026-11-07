@@ -215,7 +215,7 @@ export interface LocalStorageQuota {
 }
 
 /** Meeting の Phase 1 状態。v4.0 §42 の Phase 1 部分のみ。 */
-export type MeetingStatus = "created" | "recording" | "stop_requested" | "finalizing" | "finalized";
+export type MeetingStatus = "created" | "recording" | "stop_requested" | "finalizing" | "finalized" | "abandoned";
 
 /** IndexedDB の meetings レコード */
 export interface MeetingRecord {

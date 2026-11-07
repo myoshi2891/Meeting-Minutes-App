@@ -5,13 +5,14 @@ import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
 import type { AudioChunkRecord, MeetingRecord } from "../types/recording";
 
 export interface RecoveryReport {
+  /** status は復旧前の値。recording と通常停止後の確定待ちを UI で区別する。 */
   readonly interruptedMeetings: ReadonlyArray<{ readonly meetingId: string; readonly status: MeetingRecord["status"]; readonly chunkCount: number }>;
   readonly requeuedChunks: number;
 }
 
 /**
  * アプリ起動時に 1 回呼ぶ。
- * - status が recording / stop_requested / finalizing の会議を「中断された会議」として列挙
+ * - recording / stop_requested / finalizing を復旧前の状態付きで列挙。abandoned は復旧・再送しない
  * - 保存の途中で止まった Chunk（GENERATED / SAVING）を LOCAL_SAVE_PENDING に書き戻し、resumeAll で再投入する（冪等 PUT なので安全）
  *   non-retryable の LOCAL_SAVE_FAILED は resumeAll の判定に任せ、SAVED は Finalizer のサーバー一覧照合に任せる
  * - recording のまま残っていた会議は stop_requested に落とす（音声はもう来ない）
@@ -26,7 +27,7 @@ export async function recoverOnStartup(
 ): Promise<RecoveryReport> {
   const interrupted: Array<{ meetingId: string; status: MeetingRecord["status"]; chunkCount: number }> = [];
   const seen = new Set<string>();
-  const active = new Set<string>();
+  const active = new Set((await meetingStore.listByStatus("abandoned")).map((m) => m.meetingId));
   for (const status of ["recording", "stop_requested", "finalizing"] as const) {
     for (const m of await meetingStore.listByStatus(status)) {
       // recording → stop_requested に更新した会議を次の status で二重に拾わない
@@ -39,6 +40,13 @@ export async function recoverOnStartup(
         continue;
       }
       try {
+        // 一覧取得後に別タブが確定・中止した会議を巻き戻さない。
+        const current = await meetingStore.get(m.meetingId);
+        if (current?.status !== status) {
+          if (current?.status === "abandoned") active.add(m.meetingId);
+          continue;
+        }
+        const originalStatus = m.status;
         const chunks = await chunkStore.listByMeeting(m.meetingId, "mic");
         if (m.status === "recording") {
           // Finalizer が totalAudioFrames として送る値。既に大きい値があれば維持する
@@ -48,7 +56,7 @@ export async function recoverOnStartup(
           m.updatedAt = Date.now();
           await meetingStore.put(m);
         }
-        interrupted.push({ meetingId: m.meetingId, status: m.status, chunkCount: chunks.length });
+        interrupted.push({ meetingId: m.meetingId, status: originalStatus, chunkCount: chunks.length });
       } finally {
         release();
       }

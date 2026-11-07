@@ -16,6 +16,10 @@ export interface SchedulerDeps {
   readonly onBackendUnreachable: () => void;
   /** PUT が 401/403 で失敗したとき呼ぶ。配線先は BackendHealthMonitor.reportUnauthorized()（§18） */
   readonly onBackendUnauthorized: () => void;
+  /** 明示的に確定中止された会議は、再投入時と送信直前に除外する。 */
+  readonly isMeetingAbandoned?: (meetingId: string) => Promise<boolean>;
+  /** 成功状態を IDB に保存した後の通知。SAVED も Barrier のサーバー照合を再開させる。 */
+  readonly onChunkSaved?: (meetingId: string) => void;
 }
 
 export class LocalSaveScheduler {
@@ -49,7 +53,7 @@ export class LocalSaveScheduler {
   async resumeAll(skipMeetingIds: ReadonlySet<string> = new Set()): Promise<void> {
     const unfinished = await this.deps.chunkStore.listUnfinished();
     for (const r of unfinished) {
-      if (skipMeetingIds.has(r.meta.meetingId)) continue;
+      if (skipMeetingIds.has(r.meta.meetingId) || await this.deps.isMeetingAbandoned?.(r.meta.meetingId)) continue;
       if (isResumable(r) && !this.pending.includes(r.chunkKey) && !this.inFlight.has(r.chunkKey)) {
         await this.deps.chunkStore.updateSaveState(r.chunkKey, (x) => {
           // 一覧取得後に別経路で保存が進んでいたら書き戻さない
@@ -173,7 +177,7 @@ export class LocalSaveScheduler {
 
   private async runOne(chunkKey: string, saver: LocalSaver): Promise<void> {
     const record = await this.deps.chunkStore.getChunk(chunkKey);
-    if (record === undefined) return;
+    if (record === undefined || await this.deps.isMeetingAbandoned?.(record.meta.meetingId)) return;
     // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
     // SAVED（ファイル保存済み・DB 未登録）の登録確認は Finalizer のサーバー一覧照合に任せる
     if (record.save.status === "DB_REGISTERED" || record.save.status === "SAVED" || record.save.status === "SAVING") return;
@@ -198,6 +202,7 @@ export class LocalSaveScheduler {
         r.save.nextRetryAt = null;
       });
       this.deps.health.lastSuccessfulLocalSaveAt = this.deps.now();
+      this.deps.onChunkSaved?.(record.meta.meetingId);
       return;
     }
 

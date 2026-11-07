@@ -11,6 +11,7 @@ export interface MeetingRegistrarDeps {
   readonly getMeeting: (meetingId: string) => Promise<MeetingRecord | undefined>;
   readonly fetchImpl: typeof fetch;
   readonly timeoutMs: number;
+  readonly onBackendUnauthorized?: () => void;
 }
 
 /** PUT とメモリからの直接送信が共用する会議登録。並行する同一会議の POST だけ束ねる。 */
@@ -72,7 +73,10 @@ export class MeetingRegistrar {
           token = latestToken;
           continue;
         }
-        if (response.status === 401 || response.status === 403) return this.fail("UNAUTHORIZED", `meeting registration HTTP ${response.status}`, response.status);
+        if (response.status === 401 || response.status === 403) {
+          this.deps.onBackendUnauthorized?.();
+          return this.fail("UNAUTHORIZED", `meeting registration HTTP ${response.status}`, response.status);
+        }
         if (response.status === 409) return this.fail("CONFLICT", "meeting registration conflict", response.status);
         if (response.status === 400 || response.status === 422) return this.fail("VALIDATION", `meeting registration HTTP ${response.status}`, response.status);
         if (response.status === 507) return this.fail("STORAGE_FULL", "meeting registration disk full", response.status);

@@ -46,7 +46,7 @@ describe("ブラウザクラッシュ後の復旧", () => {
     after.server.stored.clear();
     for (const [k, v] of before.server.stored) after.server.stored.set(k, v);
     const report = await recoverOnStartup(after.meetingStore, after.chunkStore, after.scheduler, after.locks);
-    expect(report.interruptedMeetings).toEqual([{ meetingId, status: "stop_requested", chunkCount: 3 }]);
+    expect(report.interruptedMeetings).toEqual([{ meetingId, status: "recording", chunkCount: 3 }]);
     expect(report.requeuedChunks).toBe(2); // SAVING と IDB_STORED
 
     for (let i = 0; i < 20; i++) await after.advance(100);
