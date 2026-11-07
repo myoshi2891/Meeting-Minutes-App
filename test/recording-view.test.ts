@@ -16,12 +16,16 @@ function backend(status: LocalBackendHealth["status"], unauthorized = false): Lo
 }
 
 describe("backendBanner", () => {
+  it("IDB 側が 0 件でもメモリ内の未保存音声を区別する", () => {
+    expect(backendBanner(backend("UNREACHABLE"), { pendingChunkCount: 0 }, false, 2)).toContain("ブラウザ保存済み・未送信 0 件／メモリ内未保存 2 件");
+  });
+
   it("サーバー未接続なら、録音が継続中であることとブラウザ内の滞留数を出す（§3.6）", () => {
-    expect(backendBanner(backend("UNREACHABLE"), { pendingChunkCount: 3 })).toBe("サーバー未接続 ── 録音は継続中。3 個の Chunk をブラウザ内に保持しています");
+    expect(backendBanner(backend("UNREACHABLE"), { pendingChunkCount: 3 })).toBe("サーバー未接続 ── 録音は継続中。ブラウザ保存済み・未送信 3 件／メモリ内未保存 0 件");
   });
 
   it("録音停止後は継続中と表示しない", () => {
-    expect(backendBanner(backend("UNREACHABLE"), { pendingChunkCount: 3 }, false)).toBe("サーバー未接続 ── 3 個の Chunk をブラウザ内に保持しています");
+    expect(backendBanner(backend("UNREACHABLE"), { pendingChunkCount: 3 }, false)).toBe("サーバー未接続 ── ブラウザ保存済み・未送信 3 件／メモリ内未保存 0 件");
   });
 
   it("トークンが無効なら、状態より優先して設定を促す", () => {
@@ -80,6 +84,17 @@ describe("missingTailText", () => {
 });
 
 describe("noticeFor", () => {
+  it("通常停止の確定待ちは中断と呼ばず、混在時は件数を分ける", () => {
+    const stopped = { meetingId: "a", status: "stop_requested" as const, chunkCount: 1 };
+    const notice = noticeFor({ type: "recovered", report: { interruptedMeetings: [stopped], requeuedChunks: 0 } });
+    expect(notice).toContain("確定待ちの会議が 1 件");
+    expect(notice).not.toContain("中断");
+    const mixed = noticeFor({ type: "recovered", report: { interruptedMeetings: [stopped, { ...stopped, meetingId: "b", status: "recording" }], requeuedChunks: 0 } });
+    expect(mixed).toContain("中断された会議が 1 件");
+    expect(mixed).toContain("確定待ちの会議が 1 件");
+    expect(mixed).toContain("確定待ちの会議」");
+  });
+
   it("中断された会議が 0 件なら何も知らせない", () => {
     expect(noticeFor({ type: "recovered", report: { interruptedMeetings: [], requeuedChunks: 0 } })).toBeNull();
   });
@@ -115,8 +130,14 @@ describe("noticeFor", () => {
 });
 
 describe("finalizeResultText", () => {
+  it("保存待ちには具体的な失敗理由を添える", () => {
+    const text = finalizeResultText({ ok: false, stage: "waiting_local_save", detail: "2 chunks not persisted to IDB" });
+    expect(text).toContain("メモリ内に未保存の音声が 2 件");
+    expect(text).toContain("WAV");
+  });
+
   it("サーバーへの保存待ちは確定待ちと出す", () => {
-    expect(finalizeResultText({ ok: false, stage: "waiting_local_save", detail: "2 chunks not registered" })).toBe("確定待ち（サーバーへの保存が終わったら、確定待ちの会議の「再試行」を押してください）");
+    expect(finalizeResultText({ ok: false, stage: "waiting_local_save", detail: "2 chunks not registered" })).toBe("確定待ち：サーバー未登録の音声が 2 件あります。保存完了時に自動で再試行します。進まない場合は「再試行」を押してください");
   });
 
   it("finalize の失敗は再試行を促す", () => {

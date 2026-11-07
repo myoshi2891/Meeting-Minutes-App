@@ -13,6 +13,8 @@ import {
   TAB_CLOSE_HELP,
   warningsFor,
 } from "./ui/recording-view";
+import { confirmAbandon } from "./ui/pending-actions";
+import type { MemoryBacklogFile } from "./recording/recording-controller";
 import workletModuleUrl from "./worklet/pcm-chunker.worklet.ts?worker&url";
 
 const BACKEND_BASE_URL = "http://127.0.0.1:43117";
@@ -65,7 +67,7 @@ const stoppedWithBacklog = new Set<SessionController>();
 let hiddenTimer: ReturnType<typeof setInterval> | null = null;
 
 function render(app: App): void {
-  const banner = backendBanner(app.monitor.state, app.health, recording !== null);
+  const banner = backendBanner(app.monitor.state, app.health, recording !== null, app.memoryBacklogCount());
   ui.banner.hidden = banner === null;
   ui.banner.textContent = banner ?? "";
 
@@ -108,25 +110,55 @@ function onHidden(app: App): void {
   hiddenTimer = setInterval(() => render(app), HIDDEN_RENDER_INTERVAL_MS);
 }
 
+let pendingGeneration = 0;
+const pendingBusy = new Set<string>();
 async function refreshPending(app: App): Promise<void> {
+  const generation = ++pendingGeneration;
   const meetings = await app.listPendingFinalize();
+  const details = await Promise.all(meetings.map(async (m) => {
+    const chunks = await app.chunkStore.listByMeeting(m.meetingId, "mic");
+    const registered = chunks.filter((c) => c.save.status === "DB_REGISTERED").length;
+    return `サーバー登録確認済み ${registered} 件／ブラウザ保存済み・未送信 ${chunks.length - registered} 件／メモリ内未保存 ${app.memoryBacklogCount(m.meetingId)} 件`;
+  }));
+  if (generation !== pendingGeneration) return;
   ui.pending.replaceChildren(
-    ...meetings.map((m) => {
+    ...meetings.map((m, index) => {
       const li = document.createElement("li");
       const label = document.createElement("span");
       label.textContent = `${m.title}（${new Date(m.createdAt).toLocaleString()}） `;
       const retry = document.createElement("button");
       retry.type = "button";
       retry.textContent = "再試行";
+      retry.disabled = pendingBusy.has(m.meetingId);
       retry.addEventListener("click", () => {
         retry.disabled = true;
+        pendingBusy.add(m.meetingId);
         void app
           .retryFinalize(m.meetingId)
-          .then((result) => notify(`${m.title}: ${finalizeResultText(result)}`))
+          .then((result) => {
+            if (!result.ok && app.getFinalizeIssue(m.meetingId) !== result) notify(`${m.title}: ${finalizeResultText(result)}`);
+          })
           .catch((error: unknown) => notify(noticeFor({ type: "error", error }) ?? ""))
-          .finally(() => void refreshPending(app));
+          .finally(() => { pendingBusy.delete(m.meetingId); void refreshPending(app); });
       });
-      li.append(label, retry);
+      const abandon = document.createElement("button");
+      abandon.type = "button";
+      abandon.textContent = "確定を中止";
+      abandon.disabled = pendingBusy.has(m.meetingId);
+      abandon.addEventListener("click", () => {
+        pendingBusy.add(m.meetingId);
+        abandon.disabled = retry.disabled = true;
+        void confirmAbandon(m, app.memoryBacklogCount(m.meetingId), {
+          confirm: (message) => window.confirm(message),
+          exportWav: () => downloadWavs(app.exportMemoryBacklog(m.meetingId)),
+          abandon: (id, confirmed) => app.abandonFinalize(id, confirmed),
+        }).catch((error: unknown) => notify(noticeFor({ type: "error", error }) ?? ""))
+          .finally(() => { pendingBusy.delete(m.meetingId); void refreshPending(app); });
+      });
+      const detail = document.createElement("p");
+      const issue = app.getFinalizeIssue(m.meetingId);
+      detail.textContent = `${details[index]}${issue === undefined ? "" : `。${finalizeResultText(issue)}`}`;
+      li.append(label, retry, abandon, detail);
       return li;
     }),
   );
@@ -163,6 +195,7 @@ async function startRecording(app: App): Promise<void> {
       onHidden: () => onHidden(app),
     });
     recording = { session, audioContext, detachAudioMonitor, startedAt: performance.now() };
+    if (app.currentSession !== session) releaseRecording(session.meetingId);
   } catch (error) {
     detachAudioMonitor();
     for (const track of mediaStream.getTracks()) track.stop();
@@ -173,20 +206,26 @@ async function startRecording(app: App): Promise<void> {
   }
 }
 
+function releaseRecording(meetingId: string): void {
+  if (recording?.session.meetingId !== meetingId) return;
+  const current = recording;
+  recording = null;
+  if (current.session.controller.memoryBacklogCount > 0) stoppedWithBacklog.add(current.session.controller);
+  current.detachAudioMonitor();
+  void current.audioContext.close().catch(() => undefined);
+}
+
 async function stopRecording(app: App): Promise<void> {
   if (recording === null) return;
   const current = recording;
   ui.stop.disabled = true;
   try {
     const result = await current.session.stop();
-    notify(finalizeResultText(result));
+    if (!result.ok && app.getFinalizeIssue(current.session.meetingId) !== result) notify(finalizeResultText(result));
   } catch (error) {
     notify(noticeFor({ type: "error", error }) ?? "");
   } finally {
-    recording = null;
-    if (current.session.controller.memoryBacklogCount > 0) stoppedWithBacklog.add(current.session.controller);
-    current.detachAudioMonitor();
-    await current.audioContext.close().catch(() => undefined);
+    releaseRecording(current.session.meetingId);
     ui.stop.disabled = false;
     await refreshPending(app);
   }
@@ -200,18 +239,23 @@ function exportMemoryBacklog(): void {
   }
   const controllers = recording === null ? [...stoppedWithBacklog] : [recording.session.controller, ...stoppedWithBacklog];
   for (const controller of controllers) {
-    for (const file of controller.exportMemoryBacklog()) {
-      const url = URL.createObjectURL(file.wav);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = file.fileName;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 0);
-    }
+    downloadWavs(controller.exportMemoryBacklog());
+  }
+}
+
+function downloadWavs(files: readonly MemoryBacklogFile[]): void {
+  for (const file of files) {
+    const url = URL.createObjectURL(file.wav);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = file.fileName;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 }
 
 function onEvent(event: AppEvent): void {
+  if (event.type === "recording_stopped") releaseRecording(event.meetingId);
   const text = noticeFor(event);
   if (text !== null) notify(text);
   if (event.type === "memory_backlog_export_required") ui.exportRow.hidden = false;
@@ -240,7 +284,7 @@ async function main(): Promise<void> {
     locks: navigator.locks,
     onEvent: (event) => {
       onEvent(event);
-      if (event.type === "finalized" && created !== null) void refreshPending(created);
+      if ((event.type === "finalized" || event.type === "finalize_pending" || event.type === "finalize_abandoned" || event.type === "recording_stopped") && created !== null) void refreshPending(created);
     },
   });
   created = app;
