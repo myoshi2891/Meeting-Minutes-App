@@ -16,11 +16,11 @@ export const LOCAL_DATA_NOTICE =
 export const TAB_CLOSE_HELP = "タブを閉じる・リロードすると、直近最大 30 秒の音声が失われる可能性があります。録音停止ボタンで終了してください";
 
 /** backend の状態（§3.6 / §18）。文言は phase2-client §11 の backendBanner と揃える */
-export function backendBanner(backend: LocalBackendHealth, health: Pick<RecordingHealth, "pendingChunkCount">, recordingActive = true): string | null {
+export function backendBanner(backend: LocalBackendHealth, health: Pick<RecordingHealth, "pendingChunkCount">, recordingActive = true, memoryCount = 0): string | null {
   if (backend.unauthorized) return "サーバーのトークンが無効です。設定を確認してください。";
   if (backend.status === "UNREACHABLE") return recordingActive
-    ? `サーバー未接続 ── 録音は継続中。${health.pendingChunkCount} 個の Chunk をブラウザ内に保持しています`
-    : `サーバー未接続 ── ${health.pendingChunkCount} 個の Chunk をブラウザ内に保持しています`;
+    ? `サーバー未接続 ── 録音は継続中。ブラウザ保存済み・未送信 ${health.pendingChunkCount} 件／メモリ内未保存 ${memoryCount} 件`
+    : `サーバー未接続 ── ブラウザ保存済み・未送信 ${health.pendingChunkCount} 件／メモリ内未保存 ${memoryCount} 件`;
   if (backend.status === "DEGRADED") return "サーバーが高負荷です。保存は継続中";
   return null;
 }
@@ -30,7 +30,7 @@ const WARNING_TEXT: ReadonlyArray<readonly [DegradedReason, string]> = [
   // §3.4 段階3：メモリ待機はクラッシュで失われるため最上位
   ["IDB_QUOTA_EXHAUSTED", "保存領域が不足しています。サーバーを起動するかエクスポートしてください"],
   ["IDB_WRITE_FAILED", "ブラウザ内に保存できない音声があります。サーバーを起動するか、WAV を書き出してください"],
-  ["MIC_TRACK_ENDED", "マイクが切断されました。録音を止めて、マイクを確認してください"],
+  ["MIC_TRACK_ENDED", "マイクが切断されました。取得済みの音声を保存して停止します。マイクを確認し、新しい録音を開始してください"],
   ["NO_AUDIO_FRAMES", "音声が届いていません（5 秒以上）"],
   ["AUDIO_CONTEXT_CLOSED", "音声処理が停止しました。録音を止めてやり直してください"],
   ["AUDIO_CONTEXT_SUSPENDED", "音声処理が一時停止しています（画面ロックなど）"],
@@ -55,9 +55,21 @@ export function missingTailText(missingTailMs: number): string {
 export function noticeFor(event: AppEvent): string | null {
   switch (event.type) {
     case "recovered": {
-      const count = event.report.interruptedMeetings.length;
-      return count === 0 ? null : `前回中断された会議が ${count} 件あります。サーバーへの保存と確定を再開します`;
+      const meetings = event.report.interruptedMeetings;
+      if (meetings.length === 0) return null;
+      const interrupted = meetings.filter((m) => m.status === "recording").length;
+      const pending = meetings.length - interrupted;
+      const parts: string[] = [];
+      if (interrupted > 0) parts.push(`前回中断された会議が ${interrupted} 件あります`);
+      if (pending > 0) parts.push(`確定待ちの会議が ${pending} 件あります`);
+      return `${parts.join("。")}。サーバーへの保存と確定を再開します。「確定待ちの会議」で状況を確認してください`;
     }
+    case "finalize_pending":
+      return `会議 ${event.meetingId}: ${finalizeResultText(event.result)}`;
+    case "finalize_abandoned":
+      return `会議 ${event.meetingId} の確定を中止しました。保存済みの音声は削除していません`;
+    case "recording_stopped":
+      return event.reason === "mic_ended" ? "マイクが切断されたため録音を停止しました。保存状況は「確定待ちの会議」で確認し、マイクを選び直して新しい録音を開始してください" : null;
     case "finalized":
       return event.missingTailMs === undefined ? "録音を確定しました" : `録音を確定しました。${missingTailText(event.missingTailMs)}`;
     case "export_required":
@@ -71,7 +83,13 @@ export function noticeFor(event: AppEvent): string | null {
 
 export function finalizeResultText(result: FinalizeResult): string {
   if (result.ok) return result.missingTailMs === undefined ? "録音を確定しました" : `録音を確定しました。${missingTailText(result.missingTailMs)}`;
-  if (result.stage === "waiting_local_save") return "確定待ち（サーバーへの保存が終わったら、確定待ちの会議の「再試行」を押してください）";
+  if (/HTTP (401|403)$/.test(result.detail) || result.detail === "backend token is not set") return "サーバーのトークンを設定で確認・保存してください。保存済みの音声は保持しています";
+  if (result.stage === "waiting_local_save") {
+    const memory = result.detail.match(/^(\d+) chunks not persisted to IDB$/);
+    if (memory) return `確定待ち：メモリ内に未保存の音声が ${memory[1]} 件あります。WAV を書き出してから、サーバーの状態を確認してください`;
+    const pending = result.detail.match(/^(\d+) chunks not registered$/);
+    return `確定待ち：${pending ? `サーバー未登録の音声が ${pending[1]} 件あります` : result.detail}。保存完了時に自動で再試行します。進まない場合は「再試行」を押してください`;
+  }
   if (result.stage === "finalize") return `確定できませんでした。再試行してください（${result.detail}）`;
   return `確定できませんでした（${result.detail}）`;
 }

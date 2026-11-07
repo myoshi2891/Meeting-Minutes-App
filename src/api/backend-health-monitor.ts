@@ -67,7 +67,7 @@ export class BackendHealthMonitor {
     this.transition("UNREACHABLE", null, null);
   }
 
-  /** PUT が 401/403 を受けたときに Scheduler から呼ばれる。認証付きのヘルス応答が返るまで unauthorized を保持する。 */
+  /** PUT・会議登録・一覧照合・確定が 401/403 を受けたときに呼ばれる。認証付きのヘルス応答が返るまで unauthorized を保持する。 */
   reportUnauthorized(): void {
     this.state.unauthorized = true;
     this.transition("UNREACHABLE", null, null);

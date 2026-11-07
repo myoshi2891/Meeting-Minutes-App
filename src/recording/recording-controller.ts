@@ -43,6 +43,7 @@ export interface RecordingControllerDeps {
   readonly health: RecordingHealth;
   readonly workletModuleUrl: string;
   readonly onError: (error: Error) => void;
+  readonly onMicEnded?: () => void;
   /** flush / stop の応答待ちタイムアウト用。既定は setTimeout（テストでは差し替える） */
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
   /** 録音中の会議ロック（本番は navigator.locks）。§23 の復旧はロック保持中の会議に触らない */
@@ -167,6 +168,7 @@ export class RecordingController {
           if (this.node === null) return;
           if (this.deps.health.degradedReasons.includes("MIC_TRACK_ENDED")) return;
           this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "MIC_TRACK_ENDED"];
+          this.deps.onMicEnded?.();
         },
         { signal: this.trackListeners.signal },
       );

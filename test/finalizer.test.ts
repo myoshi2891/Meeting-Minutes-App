@@ -73,6 +73,17 @@ function deps(h: Harness, fetchImpl: typeof fetch = h.server.fetch): FinalizerDe
 }
 
 describe("finalizeMeeting（Finalization Barrier）", () => {
+  it.each([401, 403])("確定 POST の %s を通知し、stop_requested に戻す", async (status) => {
+    const h = await createHarness();
+    await recordAndSave(h, 0);
+    const unauthorized = vi.fn();
+    const fetchImpl: typeof fetch = (input, init) => init?.method === "POST"
+      ? Promise.resolve(new Response(null, { status })) : h.server.fetch(input, init);
+    expect(await finalizeMeeting({ ...deps(h, fetchImpl), onBackendUnauthorized: unauthorized }, MEETING_ID)).toMatchObject({ ok: false, stage: "finalize" });
+    expect(unauthorized).toHaveBeenCalledOnce();
+    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
+  });
+
   it("全 Chunk が DB_REGISTERED かつサーバー一覧と一致すれば finalized になる", async () => {
     // Arrange
     const h = await createHarness();

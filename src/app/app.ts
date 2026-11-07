@@ -6,7 +6,7 @@ import { finalizeMeeting, type FinalizeResult } from "../recording/finalizer";
 import { LocalSaveScheduler } from "../recording/local-save-scheduler";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "../recording/meeting-lock";
 import { attachPageLifecycle } from "../recording/page-lifecycle";
-import { RecordingController, type ChunkEnqueuer, type RecordingControllerDeps } from "../recording/recording-controller";
+import { RecordingController, type ChunkEnqueuer, type MemoryBacklogFile, type RecordingControllerDeps } from "../recording/recording-controller";
 import { createInitialHealth } from "../recording/recording-health-monitor";
 import { recoverOnStartup, type RecoveryReport } from "../recording/recovery";
 import { ChunkStore, MeetingStore, SettingsStore } from "../storage/idb";
@@ -21,6 +21,9 @@ const BACKEND_TOKEN_PATTERN = /^[\x21-\x7e]+$/;
 
 /** UI への通知。UI はこれを表示するだけで、部品を直接呼ばない */
 export type AppEvent =
+  | { readonly type: "finalize_pending"; readonly meetingId: string; readonly result: Extract<FinalizeResult, { ok: false }> }
+  | { readonly type: "finalize_abandoned"; readonly meetingId: string }
+  | { readonly type: "recording_stopped"; readonly meetingId: string; readonly reason: "manual" | "mic_ended" }
   | { readonly type: "recovered"; readonly report: RecoveryReport }
   /** missingTailMs：末尾が欠けたまま確定した長さ（§22）。UI は「末尾 約◯秒が保存されていません」と警告する */
   | { readonly type: "finalized"; readonly meetingId: string; readonly missingTailMs?: number }
@@ -90,6 +93,11 @@ export class App {
   /** このタブで録音した会議の controller。stop 後もメモリ待機が残りうるため、Barrier の unpersistedChunkCount に使う（§22） */
   private readonly controllers = new Map<string, SessionController>();
   private unsubscribeMonitor: () => void = () => undefined;
+  private disposed = false;
+  private readonly finalizing = new Map<string, Promise<FinalizeResult>>();
+  private readonly finalizeRequested = new Set<string>();
+  private readonly waitingForSave = new Set<string>();
+  private readonly finalizeIssues = new Map<string, Extract<FinalizeResult, { ok: false }>>();
 
   constructor(
     private readonly deps: AppDeps,
@@ -110,6 +118,7 @@ export class App {
       },
       fetchImpl: deps.fetchImpl ?? fetch,
       timeoutMs: PUT_TIMEOUT_MS,
+      onBackendUnauthorized: () => this.monitor.reportUnauthorized(),
     });
     this.health = createInitialHealth("running");
     const fetchImpl = deps.fetchImpl ?? fetch;
@@ -125,6 +134,8 @@ export class App {
       // §18：PUT の失敗をポーリングを待たずに Monitor へ伝える
       onBackendUnreachable: () => this.monitor.reportUnreachable(),
       onBackendUnauthorized: () => this.monitor.reportUnauthorized(),
+      isMeetingAbandoned: async (id) => (await this.meetingStore.get(id))?.status === "abandoned",
+      onChunkSaved: (meetingId) => { void this.onChunkSaved(meetingId); },
     });
     if (token !== null) this.saver = this.createSaver(token);
   }
@@ -143,6 +154,7 @@ export class App {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.unsubscribeMonitor();
     this.monitor.stop();
   }
@@ -206,6 +218,8 @@ export class App {
         });
       },
     };
+    let micEnded = false;
+    let stopForMic: (() => void) | undefined;
     const create = this.deps.createController ?? ((d: RecordingControllerDeps) => new RecordingController(d));
     const controller = create({
       audioContext: input.audioContext,
@@ -222,6 +236,10 @@ export class App {
       },
       setTimer: this.deps.setTimer,
       locks: this.deps.locks,
+      onMicEnded: () => {
+        micEnded = true;
+        stopForMic?.();
+      },
       onMeetingCreated: (meeting) => this.meetingFallbacks.set(meeting.meetingId, meeting),
       // 送るたびに現在の saver を引く。録音中に setToken しても、開始時のトークン（未設定・失効）で送り続けない
       directSaver: {
@@ -240,30 +258,73 @@ export class App {
     this.controllers.set(meetingId, controller);
     let recording = true;
     const lifecycle = attachPageLifecycle(controller, () => recording, input.onHidden ?? (() => undefined));
+    let stopping: Promise<FinalizeResult> | undefined;
+    const stopOnce = async (): Promise<FinalizeResult> => {
+      try {
+        await controller.stop();
+      } finally {
+        recording = false;
+        lifecycle.detach();
+        this.session = null;
+        this.deps.onEvent({ type: "recording_stopped", meetingId, reason: micEnded ? "mic_ended" : "manual" });
+        if (controller.memoryBacklogCount > 0) {
+          this.deps.onEvent({ type: "memory_backlog_export_required", meetingId, error: new Error("audio remains in memory") });
+        }
+      }
+      // stop 完了後に会議ロックを取り直し、確定中止操作との競合も防ぐ。
+      return this.retryFinalize(meetingId);
+    };
     const session: RecordingSession = {
       meetingId,
       controller,
-      stop: async () => {
-        try {
-          await controller.stop();
-        } finally {
-          recording = false;
-          lifecycle.detach();
-          this.session = null;
-        }
-        // stop() 完了後にだけ Barrier を試みる（§22 の呼び出し規約）
-        return this.finalize(meetingId);
-      },
+      stop: () => stopping ??= stopOnce(),
     };
     this.session = session;
+    stopForMic = () => { void session.stop().catch((error: unknown) => this.deps.onEvent({ type: "error", error })); };
+    if (micEnded) stopForMic();
     return session;
   }
 
-  /** 停止したが確定していない会議（§31.2 の既知の制約）。UI は「確定待ち」として表示し、手動で再試行させる */
+  /** 停止したが確定していない会議。自動再試行に加えて UI からの手動再試行も用意する */
   async listPendingFinalize(): Promise<MeetingRecord[]> {
     const stopped = await this.meetingStore.listByStatus("stop_requested");
     const finalizing = await this.meetingStore.listByStatus("finalizing");
     return [...stopped, ...finalizing];
+  }
+
+  getFinalizeIssue(meetingId: string): Extract<FinalizeResult, { ok: false }> | undefined {
+    return this.finalizeIssues.get(meetingId);
+  }
+
+  memoryBacklogCount(meetingId?: string): number {
+    if (meetingId !== undefined) return this.controllers.get(meetingId)?.memoryBacklogCount ?? 0;
+    return [...this.controllers.values()].reduce((sum, c) => sum + c.memoryBacklogCount, 0);
+  }
+
+  exportMemoryBacklog(meetingId: string): MemoryBacklogFile[] {
+    return this.controllers.get(meetingId)?.exportMemoryBacklog() ?? [];
+  }
+
+  /** UI で対象・未保存の可能性を説明し、確認した場合だけ呼ぶ。データは削除しない。 */
+  async abandonFinalize(meetingId: string, confirmed: boolean): Promise<void> {
+    if (!confirmed) throw new Error("確定の中止には確認が必要です");
+    if (this.session?.meetingId === meetingId) throw new Error("録音中の会議は中止できません");
+    const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
+    if (release === null) throw new Error("別の処理がこの会議を使用中です。完了後にやり直してください");
+    try {
+      const meeting = await this.meetingStore.get(meetingId);
+      if (meeting?.status === "abandoned") return;
+      if (meeting?.status !== "stop_requested" && meeting?.status !== "finalizing") throw new Error("確定待ちの会議だけ中止できます");
+      meeting.status = "abandoned";
+      meeting.updatedAt = (this.deps.now ?? Date.now)();
+      await this.meetingStore.put(meeting);
+      this.waitingForSave.delete(meetingId);
+      this.finalizeRequested.delete(meetingId);
+      this.finalizeIssues.delete(meetingId);
+      this.deps.onEvent({ type: "finalize_abandoned", meetingId });
+    } finally {
+      release();
+    }
   }
 
   /** 会議ロックを取って Barrier を再試行する。別タブが録音・確定中の会議には触らない（§23 と同じ） */
@@ -281,18 +342,70 @@ export class App {
     return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch, (id) => this.registrar.ensure(id));
   }
 
-  private async finalize(meetingId: string): Promise<FinalizeResult> {
+  private async onChunkSaved(meetingId: string): Promise<void> {
+    if (this.disposed || this.session?.meetingId === meetingId) return;
+    // Barrier が未登録一覧を読んだ直後に保存が終わっても、完了後にもう一度判定する。
+    if (this.finalizing.has(meetingId)) {
+      this.finalizeRequested.add(meetingId);
+      return;
+    }
+    // 照合不一致による再送は、成功 PUT → 不一致 → 再送のループにしない。
+    if (!this.waitingForSave.has(meetingId)) return;
+    try {
+      const meeting = await this.meetingStore.get(meetingId);
+      if (!this.disposed && (meeting?.status === "stop_requested" || meeting?.status === "finalizing")) {
+        await this.retryFinalize(meetingId);
+      }
+    } catch (error) {
+      this.deps.onEvent({ type: "error", error });
+    }
+  }
+
+  private finalize(meetingId: string): Promise<FinalizeResult> {
+    const running = this.finalizing.get(meetingId);
+    if (running !== undefined) return running;
+    const run = async (): Promise<FinalizeResult> => {
+      let result: FinalizeResult;
+      do {
+        this.finalizeRequested.delete(meetingId);
+        result = await this.finalizeOnce(meetingId);
+        if (!result.ok && result.stage === "waiting_local_save") this.waitingForSave.add(meetingId);
+        else this.waitingForSave.delete(meetingId);
+      } while (this.waitingForSave.has(meetingId) && !this.disposed && this.finalizeRequested.has(meetingId));
+      if (result.ok) this.finalizeIssues.delete(meetingId);
+      else {
+        const previous = this.finalizeIssues.get(meetingId);
+        this.finalizeIssues.set(meetingId, result);
+        if (previous?.stage !== result.stage || previous.detail !== result.detail) {
+          this.deps.onEvent({ type: "finalize_pending", meetingId, result });
+        }
+      }
+      return result;
+    };
+    const promise = run().finally(() => {
+      this.finalizing.delete(meetingId);
+      this.finalizeRequested.delete(meetingId);
+    });
+    this.finalizing.set(meetingId, promise);
+    return promise;
+  }
+
+  private async finalizeOnce(meetingId: string): Promise<FinalizeResult> {
     if (this.token === null) return { ok: false, stage: "waiting_local_save", detail: "backend token is not set" };
     const controller = this.controllers.get(meetingId);
+    const token = this.token;
     const result = await finalizeMeeting(
       {
         chunkStore: this.chunkStore,
         meetingStore: this.meetingStore,
         scheduler: this.scheduler,
         baseUrl: this.deps.baseUrl,
-        token: this.token,
+        token,
         fetchImpl: this.deps.fetchImpl,
         unpersistedChunkCount: () => controller?.memoryBacklogCount ?? 0,
+        onBackendUnauthorized: () => {
+          if (this.token === token) this.monitor.reportUnauthorized();
+        },
       },
       meetingId,
     );

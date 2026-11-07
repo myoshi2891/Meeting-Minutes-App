@@ -216,7 +216,7 @@ export interface LocalStorageQuota {
   readonly checkedAt: number;
 }
 
-export type MeetingStatus = "created" | "recording" | "stop_requested" | "finalizing" | "finalized";
+export type MeetingStatus = "created" | "recording" | "stop_requested" | "finalizing" | "finalized" | "abandoned";
 
 export interface MeetingRecord {
   readonly meetingId: string;
@@ -617,6 +617,8 @@ export interface RecordingControllerDeps {
   readonly health: RecordingHealth;
   readonly workletModuleUrl: string;
   readonly onError: (error: Error) => void;
+  /** mic の ended だけを上位へ通知する（Phase 1 T12-b）。system 終了では mic を止めない。 */
+  readonly onMicEnded?: () => void;
   /** flush / stop の応答待ちタイムアウト用。既定は setTimeout（Phase 1 §15 と同じ） */
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
   /** 録音中の会議ロック（本番は navigator.locks、Phase 1 §15 と同じ）。会議レコードを作る側（Mic）だけが取る */
@@ -760,6 +762,7 @@ export class RecordingController {
           if (this.node === null) return;
           if (!this.deps.health.degradedReasons.includes(endedReason)) {
             this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, endedReason];
+            if (this.source === "mic") this.deps.onMicEnded?.();
           }
         },
         { signal: this.trackListeners.signal },
@@ -1079,6 +1082,8 @@ export async function acquireSystemAudio(deps: SystemAudioDeps | null): Promise<
 ---
 
 # 6. 複数ソース録音 `src/recording/multi-source-recorder.ts`
+
+T12-b の mic 切断通知を組み立て層へ接続するときは、このコーディネータ全体の停止を一度だけ呼び、system 終了とは区別する。T12-d の `abandoned` はブラウザ内だけの状態であり、サーバーの `MeetingStatusV2` へ追加しない。
 
 Mic と System の 2 つの `RecordingController` を束ね、共有 `LocalSaveScheduler` に流し、ドリフト差を計測する。Controller の生成は依存として注入し、テストでは Fake を使う。
 

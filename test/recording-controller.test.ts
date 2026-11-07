@@ -91,7 +91,7 @@ interface Setup {
   untilCommand: (type: WorkletCommand["type"]) => Promise<void>;
 }
 
-async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, directSaver?: DirectChunkSaver): Promise<Setup> {
+async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, directSaver?: DirectChunkSaver, onMicEnded?: () => void): Promise<Setup> {
   const db = await openDatabase(new IDBFactory());
   const chunkStore = chunkStoreOverride?.(db) ?? new ChunkStore(db);
   const meetingStore = new MeetingStore(db);
@@ -137,6 +137,7 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
     setTimer: (fn) => timers.push(fn),
     locks,
     directSaver,
+    onMicEnded,
   });
   const fireTimers = () => {
     for (const fn of timers.splice(0)) fn();
@@ -523,6 +524,17 @@ describe("RecordingController", () => {
     s.worklet.port.postMessage({ type: "ready", nativeSampleRate: 44100, renderQuantum: 128 });
     await s.until(() => s.errors.length >= 1);
     expect(s.errors[0]?.message).toContain("sampleRate mismatch");
+  });
+
+  it("mute では停止を要求せず、ended だけ一度通知する", async () => {
+    const ended = vi.fn();
+    const s = await setup(undefined, undefined, ended);
+    await s.controller.start("mic-ended", "定例", 1);
+    s.track.dispatchEvent(new Event("mute"));
+    expect(ended).not.toHaveBeenCalled();
+    s.track.dispatchEvent(new Event("ended"));
+    s.track.dispatchEvent(new Event("ended"));
+    expect(ended).toHaveBeenCalledOnce();
   });
 
   it("Mic トラック終了で MIC_TRACK_ENDED が degradedReasons に入る", async () => {
