@@ -83,6 +83,7 @@ let apps: App[] = [];
 
 interface SetupOptions {
   token?: string | null;
+  wrapFetch?: (fetchImpl: typeof fetch) => typeof fetch;
   serverUp?: boolean;
   seed?: (db: IDBDatabase, server: FakeLocalServer, locks: FakeLockManager) => Promise<void>;
 }
@@ -104,7 +105,7 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
     workletModuleUrl: "/worklet.js",
     locks,
     onEvent: (e) => events.push(e),
-    fetchImpl: server.fetch,
+    fetchImpl: options.wrapFetch?.(server.fetch) ?? server.fetch,
     setTimer: () => undefined,
     createController: (deps) => {
       const c = new FakeController(deps, log);
@@ -160,6 +161,33 @@ afterEach(() => {
 });
 
 describe("createApp（起動時の配線）", () => {
+  it.each([401, 403])("Chunk がなくても一覧の %s を認証エラーとして表示し、トークン修正後に回復する", async (status) => {
+    stubPageGlobals();
+    const s = await setup({ token: "stale", wrapFetch: (fetchImpl) => async (input, init) => {
+      const auth = new Headers(init?.headers).get("Authorization");
+      if (String(input).endsWith("/chunks") && auth !== `Bearer ${TOKEN}`) return new Response(null, { status });
+      if (String(input).endsWith("/health") && auth === `Bearer ${TOKEN}`) {
+        return new Response(JSON.stringify({ status: "ok", service: "minutes-local", capabilities: { localSave: true, localTranscribe: false, localSummarize: false } }));
+      }
+      return fetchImpl(input, init);
+    } });
+    const session = await s.app.startRecording(startInput(nextMeetingId()));
+    await session.stop();
+    expect(s.app.monitor.state.unauthorized).toBe(true);
+    await s.app.setToken(TOKEN);
+    await vi.waitFor(async () => expect((await s.app.meetingStore.get(session.meetingId))?.status).toBe("finalized"));
+    expect(s.app.monitor.state.unauthorized).toBe(false);
+  });
+
+  it("直接送信の会議登録 401 も Monitor に伝える", async () => {
+    stubPageGlobals();
+    const s = await setup({ token: "stale" });
+    const id = nextMeetingId();
+    await s.app.startRecording(startInput(id));
+    await s.controllers[0].deps.directSaver!.put(await makeChunkRecord(id, 0, 160));
+    expect(s.app.monitor.state.unauthorized).toBe(true);
+  });
+
   it("未登録会議は登録してから PUT し、起動時復旧にも同じ順序を使う", async () => {
     const meetingId = nextMeetingId();
     const s = await setup({ seed: (db) => seedChunk(db, meetingId, 0, "SAVING").then(() => undefined) });
@@ -401,6 +429,74 @@ describe("startRecording（録音ごとの配線）", () => {
 });
 
 describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () => {
+  it("停止からの確定 POST 実行中は中止できず、完了状態を上書きしない", async () => {
+    stubPageGlobals();
+    let release!: () => void;
+    let reached!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const postStarted = new Promise<void>((r) => { reached = r; });
+    const s = await setup({ wrapFetch: (fetchImpl) => async (input, init) => {
+      if (String(input).endsWith("/finalize")) { reached(); await gate; }
+      return fetchImpl(input, init);
+    } });
+    const session = await s.app.startRecording(startInput(nextMeetingId()));
+    const stopping = session.stop();
+    await postStarted;
+    await expect(s.app.abandonFinalize(session.meetingId, true)).rejects.toThrow("使用中");
+    release();
+    expect(await stopping).toMatchObject({ ok: true });
+    await expect(s.app.abandonFinalize(session.meetingId, true)).rejects.toThrow("確定待ち");
+    expect((await s.app.meetingStore.get(session.meetingId))?.status).toBe("finalized");
+  });
+
+  it("確定中止はデータを残し、再起動・復帰後の再送と確定から除外する", async () => {
+    const id = nextMeetingId();
+    const s = await setup({ serverUp: false, seed: async (db) => {
+      await seedChunk(db, id, 0, "SAVING");
+      await seedMeeting(db, makeMeeting(id, "stop_requested"));
+    } });
+    await s.app.abandonFinalize(id, true);
+    expect((await s.app.meetingStore.get(id))?.status).toBe("abandoned");
+    expect((await s.app.chunkStore.getChunk(`${id}:mic:000000`))?.wav).not.toBeNull();
+    expect(await s.app.listPendingFinalize()).toEqual([]);
+    // 同じ DB で再起動する。中止会議を復旧・自動再送に含めない。
+    s.app.dispose();
+    const restarted = await createApp({ db: s.db, baseUrl: BASE_URL, workletModuleUrl: "/worklet.js", locks: s.locks,
+      onEvent: (e) => s.events.push(e), fetchImpl: s.server.fetch, setTimer: () => undefined });
+    apps.push(restarted);
+    s.server.up = true;
+    await restarted.setToken(TOKEN);
+    expect(s.server.putCount).toBe(0);
+    expect(await restarted.listPendingFinalize()).toEqual([]);
+    expect((await restarted.meetingStore.get(id))?.status).toBe("abandoned");
+    expect(await restarted.retryFinalize(id)).toMatchObject({ ok: false, stage: "verify" });
+  });
+
+  it("確認なし・録音中・別タブロック中は確定中止しない", async () => {
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    await expect(s.app.abandonFinalize(id, true)).rejects.toThrow();
+    await session.stop();
+    await expect(s.app.abandonFinalize(id, false)).rejects.toThrow();
+    const release = await tryAcquireMeetingLock(s.locks, id);
+    await expect(s.app.abandonFinalize(id, true)).rejects.toThrow();
+    release?.();
+    expect((await s.app.meetingStore.get(id))?.status).toBe("stop_requested");
+  });
+
+  it("自動確定の失敗を会議ごとに通知し、同じ失敗を重複通知しない", async () => {
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const session = await s.app.startRecording(startInput(nextMeetingId()));
+    s.controllers[0].memoryBacklogCount = 1;
+    await session.stop();
+    await s.app.retryFinalize(session.meetingId);
+    expect(s.events.filter((e) => e.type === "finalize_pending")).toHaveLength(1);
+    expect(s.app.getFinalizeIssue(session.meetingId)).toMatchObject({ stage: "waiting_local_save" });
+  });
+
   it("stop_requested と finalizing の会議だけを確定待ちとして返す", async () => {
     // Arrange
     const [stopped, finalizing, done] = [nextMeetingId(), nextMeetingId(), nextMeetingId()];
@@ -460,6 +556,137 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
 });
 
 describe("RecordingSession.stop", () => {
+  it("マイク切断だけで停止し、取得済み音声を確定する", async () => {
+    stubPageGlobals();
+    const s = await setup();
+    const id = nextMeetingId();
+    await s.app.startRecording(startInput(id));
+    const r = await seedChunk(s.db, id, 0, "DB_REGISTERED");
+    registerOnServer(s.server, r);
+    s.controllers[0].audioFrameCount = r.meta.endFrame;
+    s.controllers[0].deps.onMicEnded?.();
+    await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
+    expect(s.log.filter((x) => x === "stop")).toHaveLength(1);
+    expect(s.app.currentSession).toBeNull();
+  });
+
+  it("マイク切断と手動停止が重なっても一度だけ停止し、保存不能なら書き出しを通知する", async () => {
+    stubPageGlobals();
+    const s = await setup();
+    const session = await s.app.startRecording(startInput(nextMeetingId()));
+    s.controllers[0].memoryBacklogCount = 1;
+    s.controllers[0].deps.onMicEnded?.();
+    s.controllers[0].deps.onMicEnded?.();
+    await session.stop();
+    expect(s.log.filter((x) => x === "stop")).toHaveLength(1);
+    expect(s.app.currentSession).toBeNull();
+    expect(s.events.filter((e) => e.type === "recording_stopped")).toEqual([{ type: "recording_stopped", meetingId: session.meetingId, reason: "mic_ended" }]);
+    expect(s.events.some((e) => e.type === "memory_backlog_export_required")).toBe(true);
+  });
+
+  it("照合不一致による再送完了で確定と再送を繰り返さない", async () => {
+    stubPageGlobals();
+    const s = await setup();
+    const meetingId = nextMeetingId();
+    const session = await s.app.startRecording(startInput(meetingId));
+    const r = await seedChunk(s.db, meetingId, 0, "DB_REGISTERED");
+    registerOnServer(s.server, r);
+    const list = s.app.chunkStore.listByMeeting.bind(s.app.chunkStore);
+    let reads = 0;
+    vi.spyOn(s.app.chunkStore, "listByMeeting").mockImplementation(async (...args) => {
+      const chunks = await list(...args);
+      // バグがあっても無限に回さず、3 回目以降は通常応答に戻す。
+      return ++reads <= 2 ? chunks.map((c) => ({ ...c, meta: { ...c.meta, sha256: "0".repeat(64) } })) : chunks;
+    });
+    await session.stop();
+    await vi.waitFor(() => {
+      expect(s.server.putCount).toBeGreaterThan(0);
+      expect(s.app.scheduler.pendingCount).toBe(0);
+    });
+    expect(reads).toBe(1);
+    expect((await s.app.meetingStore.get(meetingId))?.status).toBe("stop_requested");
+  });
+
+  it.each([false, true])("末尾 PUT 完了で自動確定する（Barrier 実行中の完了: %s）", async (duringBarrier) => {
+    stubPageGlobals();
+    const s = await setup();
+    const meetingId = nextMeetingId();
+    const session = await s.app.startRecording(startInput(meetingId));
+    const r = await seedChunk(s.db, meetingId, 0, "IDB_STORED");
+    s.controllers[0].audioFrameCount = r.meta.endFrame;
+    // PUT の完了を制御し、停止時には必ず未登録の Chunk を残す。
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const update = s.app.chunkStore.updateSaveState.bind(s.app.chunkStore);
+    vi.spyOn(s.app.chunkStore, "updateSaveState").mockImplementation(async (key, change) => {
+      const probe = await s.app.chunkStore.getChunk(key);
+      if (probe) {
+        change(probe);
+        if (probe.save.status === "DB_REGISTERED") await gate;
+      }
+      return update(key, change);
+    });
+    await s.app.scheduler.enqueue(r.chunkKey);
+    await vi.waitFor(async () => expect(await s.status(r.chunkKey)).toBe("SAVING"));
+    if (duringBarrier) {
+      const resume = s.app.scheduler.resumeAll.bind(s.app.scheduler);
+      vi.spyOn(s.app.scheduler, "resumeAll").mockImplementationOnce(async () => {
+        release();
+        await vi.waitFor(async () => expect(await s.status(r.chunkKey)).toBe("DB_REGISTERED"));
+        await resume();
+      });
+    }
+    const result = await session.stop();
+    if (!duringBarrier) {
+      expect(result).toMatchObject({ ok: false, stage: "waiting_local_save" });
+      release();
+    }
+    await vi.waitFor(async () => expect((await s.app.meetingStore.get(meetingId))?.status).toBe("finalized"));
+    expect(s.events.filter((e) => e.type === "finalized" && e.meetingId === meetingId)).toHaveLength(1);
+    expect(await s.app.listPendingFinalize()).toEqual([]);
+  });
+
+  it("録音中の Chunk 保存完了では自動確定しない", async () => {
+    stubPageGlobals();
+    const s = await setup();
+    const meetingId = nextMeetingId();
+    await s.app.startRecording(startInput(meetingId));
+    const r = await seedChunk(s.db, meetingId, 0, "IDB_STORED");
+    await s.app.scheduler.enqueue(r.chunkKey);
+    await vi.waitFor(async () => expect(await s.status(r.chunkKey)).toBe("DB_REGISTERED"));
+    expect((await s.app.meetingStore.get(meetingId))?.status).toBe("recording");
+    expect(s.events.filter((e) => e.type === "finalized")).toEqual([]);
+  });
+
+  it.each(["normal", "locked", "memory"])("サーバー復帰後の複数 Chunk 保存は Barrier とロックを守る（%s）", async (mode) => {
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const meetingId = nextMeetingId();
+    const session = await s.app.startRecording(startInput(meetingId));
+    for (let seq = 0; seq < 2; seq++) {
+      const r = await seedChunk(s.db, meetingId, seq, "IDB_STORED");
+      await s.app.scheduler.enqueue(r.chunkKey);
+      s.controllers[0].audioFrameCount = r.meta.endFrame;
+    }
+    if (mode === "memory") s.controllers[0].memoryBacklogCount = 1;
+    expect(await session.stop()).toMatchObject({ ok: false, stage: "waiting_local_save" });
+    const release = mode === "locked" ? await tryAcquireMeetingLock(s.locks, meetingId) : null;
+    s.server.up = true;
+    await s.app.monitor.checkOnce();
+    await vi.waitFor(async () => {
+      for (const r of await s.app.chunkStore.listByMeeting(meetingId, "mic")) expect(r.save.status).toBe("DB_REGISTERED");
+      expect(s.app.scheduler.pendingCount).toBe(0);
+    });
+    if (mode === "normal") {
+      await vi.waitFor(async () => expect((await s.app.meetingStore.get(meetingId))?.status).toBe("finalized"));
+      expect(s.events.filter((e) => e.type === "finalized")).toHaveLength(1);
+    } else {
+      expect((await s.app.meetingStore.get(meetingId))?.status).toBe("stop_requested");
+      expect(s.events.filter((e) => e.type === "finalized")).toEqual([]);
+    }
+    release?.();
+  });
+
   it("stop → ページライフサイクルの解除 → finalize の順に進み、末尾の欠けを finalized で通知する", async () => {
     // Arrange：保存済みの Chunk より 2 秒ぶん長く録音していた（Worklet の stop 無応答など）
     const win = stubPageGlobals();
