@@ -213,3 +213,68 @@ def test_concurrent_atomic_writes_to_same_path_do_not_share_temp_file(tmp_path, 
     assert errors == [None, None]
     assert target.read_bytes() in (b"first", b"second")
     assert not list(tmp_path.rglob("*.part"))
+
+
+def test_stop_metadata_persists_across_restart_and_first_finalize_wins(tmp_path):
+    # Arrange
+    state = start_server_state(tmp_path, token="token")
+    auth = {"Authorization": "Bearer token"}
+    body = {"expectedChunkCounts": {"mic": 0, "system": 0}, "endedAtEpochMs": 2000,
+            "totalAudioFrames": 0, "stopReason": "mic_ended", "stopDetectedAtEpochMs": 1800}
+    with TestClient(create_app(state)) as client:
+        client.post("/v1/meetings", json=meeting(), headers=auth)
+        # Act
+        assert client.post("/v1/meetings/m-1/finalize", json=body, headers=auth).status_code == 200
+        changed = {**body, "stopReason": "manual", "stopDetectedAtEpochMs": 1900}
+        assert client.post("/v1/meetings/m-1/finalize", json=changed, headers=auth).status_code == 200
+    # Assert
+    state = start_server_state(tmp_path, token="token")
+    with state.connect() as db:
+        row = db.execute("SELECT stop_reason,stop_detected_at FROM meetings WHERE id='m-1'").fetchone()
+        assert tuple(row) == ("mic_ended", 1800)
+    snapshot = json.loads((tmp_path / "recordings/m-1/meeting.json").read_text())
+    assert (snapshot["stopReason"], snapshot["stopDetectedAtEpochMs"]) == ("mic_ended", 1800)
+
+
+def test_invalid_stop_metadata_is_rejected_and_legacy_request_stays_unknown(tmp_path):
+    # Arrange
+    state = start_server_state(tmp_path, token="token")
+    auth = {"Authorization": "Bearer token"}
+    base = {"expectedChunkCounts": {"mic": 0, "system": 0}, "endedAtEpochMs": 2000, "totalAudioFrames": 0}
+    with TestClient(create_app(state)) as client:
+        client.post("/v1/meetings", json=meeting(), headers=auth)
+        # Act / Assert
+        for invalid in [{"stopReason": "manual"}, {"stopDetectedAtEpochMs": 1800},
+                        {"stopReason": "cable_unplugged", "stopDetectedAtEpochMs": 1800},
+                        {"stopReason": "manual", "stopDetectedAtEpochMs": -1},
+                        {"stopReason": "manual", "stopDetectedAtEpochMs": True}]:
+            assert client.post("/v1/meetings/m-1/finalize", json={**base, **invalid}, headers=auth).status_code == 422
+        assert client.post("/v1/meetings/m-1/finalize", json=base, headers=auth).status_code == 200
+        # 旧クライアントで確定済みの理由を後から推定して埋めない
+        assert client.post("/v1/meetings/m-1/finalize", json={**base, "stopReason": "manual", "stopDetectedAtEpochMs": 1800}, headers=auth).status_code == 200
+    snapshot = json.loads((tmp_path / "recordings/m-1/meeting.json").read_text())
+    assert snapshot["stopReason"] is None and snapshot["stopDetectedAtEpochMs"] is None
+
+
+def test_existing_database_gets_nullable_stop_columns_without_changing_recordings(tmp_path):
+    # Arrange: 停止理由列を持たない旧スキーマ
+    import sqlite3
+    state = start_server_state(tmp_path, token="token")
+    with TestClient(create_app(state)) as client:
+        client.post("/v1/meetings", json=meeting(), headers={"Authorization": "Bearer token"})
+        assert put(client).status_code == 201
+    with sqlite3.connect(tmp_path / "minutes.sqlite") as db:
+        columns = {r[1] for r in db.execute("PRAGMA table_info(meetings)")}
+        for name in ("stop_reason", "stop_detected_at"):
+            if name in columns:
+                db.execute(f"ALTER TABLE meetings DROP COLUMN {name}")
+    before = (tmp_path / "recordings/m-1/mic/000000.wav").read_bytes()
+    # Act: 再起動2回でもマイグレーションできる
+    start_server_state(tmp_path, token="token")
+    state = start_server_state(tmp_path, token="token")
+    # Assert
+    with state.connect() as db:
+        row = db.execute("SELECT stop_reason,stop_detected_at FROM meetings WHERE id='m-1'").fetchone()
+        assert tuple(row) == (None, None)
+        assert db.execute("SELECT COUNT(*) FROM audio_chunks").fetchone()[0] == 1
+    assert (tmp_path / "recordings/m-1/mic/000000.wav").read_bytes() == before
