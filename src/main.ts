@@ -158,6 +158,11 @@ async function refreshPending(app: App): Promise<void> {
           confirm: (message) => window.confirm(message),
           exportWav: () => downloadWavs(app.exportMemoryBacklog(m.meetingId)),
           abandon: (id, confirmed) => app.abandonFinalize(id, confirmed),
+        }).then((outcome) => {
+          // キャンセルは状態を変えないので、一覧の再読込（IDB 読み取り）を待たずにボタンを戻す
+          if (outcome !== "cancelled") return;
+          pendingBusy.delete(m.meetingId);
+          abandon.disabled = retry.disabled = false;
         }).catch((error: unknown) => notify(noticeFor({ type: "error", error }) ?? ""))
           .finally(() => { pendingBusy.delete(m.meetingId); void refreshPending(app); });
       });
