@@ -1013,12 +1013,13 @@ export class LocalSaver {
           credentials: "omit",
           redirect: "error",
         });
-        // 送信後にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（Phase 1 §17.1）
-        if ((response.status === 401 || response.status === 403) && this.token !== token) {
+        const outcome = await this.interpret(response, record);
+        // 送信後（本文の読み取り中を含む）にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（Phase 1 §17.1）
+        if (!outcome.ok && outcome.error.kind === "UNAUTHORIZED" && this.token !== token) {
           token = this.token;
           continue;
         }
-        return await this.interpret(response, record);
+        return outcome;
       }
       // 送り直し中にもトークンが変わった。失効として通知させないよう、再試行できる失敗で返す（Phase 1 §17.1）
       return this.fail("UNKNOWN", "token changed during upload", null);

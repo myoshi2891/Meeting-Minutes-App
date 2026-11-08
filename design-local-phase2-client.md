@@ -575,9 +575,9 @@ export function jobFromServerRow(row: Record<string, unknown>): JobSummary | nul
 1. Mic の Controller にだけ `otherSourceBacklogCount: () => systemController.memoryBacklogCount` を渡す。Mic の `stop()` の最後と `drainMemoryBacklog()` が空になったときの解放は、自身のメモリ待機に加えてこの値も 0 のときだけロックを解放する。
 2. 停止は `DualRecorder.stop()`（§6）のとおり System を先に止め、完了してから Mic を止める。System の末尾 Chunk がメモリ待機に入るか確定した後で、Mic がロックを手放すか決めるためである。録音中に `dropSystem()` で System だけ止めた場合も、App はその System Controller を保持し続け、`otherSourceBacklogCount` と合計件数に数える（null にした後もメモリ待機は残りうる）。
 3. App は Mic の `stop()` の直後に `takeMeetingLock()` でロックを受け取り（Phase 1 §31 の `heldLocks`）、`memoryBacklogCount(meetingId)` と `releaseHeldLockIfDrained()` は Mic と System の件数の合計で判定する。合計が 0 になるまでロックを解放しない。
-4. System 側の drain も Mic 側と同じく App の drain 関数で包む。空になったら `releaseHeldLockIfDrained()` を呼び、確定の再試行（`onChunkSaved`）を起こす。サーバー復帰時（`onBackendAvailable`）は Mic と System の両方を drain してから確定を再試行する。Finalizer の `unpersistedChunkCount` も両方の合計を渡す（§7）。Phase 1 で追加した `onMeetingCreated` は Mic 側で維持し、IDB 障害時の直接送信用の会議情報を保持する。System 側は既存の Mic 会議を使う。
+4. System 側の drain も Mic 側と同じく App の drain 関数で包む。空になったら `releaseHeldLockIfDrained()` を呼び、確定の再試行（`onChunkSaved`）を起こす。サーバー復帰時（`onBackendAvailable`）は Mic と System の両方を drain してから確定を再試行する。Finalizer の `unpersistedChunkCount` も両方の合計を渡す（§7）。`retryFinalize()` がサーバーの使えるときに Barrier の前に行う drain（Phase 1 §31）も、Mic と System の両方を対象にする。共有の IDB 保存警告を外す判定（`otherMeetingsBacklogCount`）には、他の会議に加えて同じ会議のもう一方の source の Controller も数える。Phase 1 で追加した `onMeetingCreated` は Mic 側で維持し、IDB 障害時の直接送信用の会議情報を保持する。System 側は既存の Mic 会議を使う。
 
-`stop()` の最後の会議レコード保存だけは Phase 1 と形が違う。Phase 1 は Controller が会議レコードを保持し、その `sessionClock` が Controller の時計と同じオブジェクトなので、保存し直すだけで最終 `audioFrameCount` が残る。Phase 2 は `registerMeeting` のため会議レコードを IndexedDB から読み直すので、別オブジェクトになる。そこで Mic 側は、最終 Chunk の書き込み完了後に会議レコードを読み直し、Controller の `SessionClock` を写した新しいオブジェクトとして保存する。`sessionClock` は `readonly` なので、書き換えずに置き換える。System 側は会議レコードを持たないので何もしない。
+`stop()` の最後の会議レコード保存だけは Phase 1 と形が違う。Phase 1 は Controller が会議レコードを保持し、その `sessionClock` が Controller の時計と同じオブジェクトなので、保存し直すだけで最終 `audioFrameCount` が残る。Phase 2 は `registerMeeting` のため会議レコードを IndexedDB から読み直すので、別オブジェクトになる。そこで Mic 側は、最終 Chunk の書き込み完了後に会議レコードを読み直し、Controller の `SessionClock` を写した新しいオブジェクトとして保存する。`sessionClock` は `readonly` なので、書き換えずに置き換える。最初の読み取り（`meetingStore.get`）に失敗した場合も書き込み失敗と同じく扱い、`requestFlush("stop")` で末尾を Chunk にしてから Worklet を切り離す。最後の保存では `status: "stop_requested"` と、未記録なら最初の停止理由・検出時刻も書く。最初の読み書きに失敗したまま会議が `recording` で残り、停止が完了したことにならないようにするためである。System 側は会議レコードを持たないので何もしない。
 
 ```typescript
 // src/recording/recording-controller.ts
@@ -639,6 +639,8 @@ export interface RecordingControllerDeps {
   readonly onMeetingCreated?: (meeting: MeetingRecord) => void;
   /** Mic 側だけに渡す System Controller の memoryBacklogCount。0 でない間は stop 後も会議ロックを解放しない（§4） */
   readonly otherSourceBacklogCount?: () => number;
+  /** このタブの他の Controller（他の会議と、同じ会議のもう一方の source）のメモリ待機件数。0 になるまで共有の IDB 保存警告を外さない（Phase 1 §15） */
+  readonly otherMeetingsBacklogCount?: () => number;
 }
 
 /** Worklet が flush / stop に応答しないときに待機を打ち切るまでの時間（Phase 1 §15 と同じ） */
@@ -829,7 +831,13 @@ export class RecordingController {
     let finalSaved = false;
     try {
       if (this.source === "mic") {
-        const meeting = await this.deps.meetingStore.get(this.meetingId);
+        // 読み取りに失敗しても下の requestFlush まで進み、末尾を Chunk にしてから Worklet を切り離す（書き込み失敗と同じ扱い）
+        let meeting: MeetingRecord | undefined;
+        try {
+          meeting = await this.deps.meetingStore.get(this.meetingId);
+        } catch (error) {
+          statusError = error;
+        }
         if (meeting !== undefined) {
           if (meeting.stopReason === undefined) {
             meeting.stopReason = reason;
@@ -851,7 +859,9 @@ export class RecordingController {
         // 会議レコードは IDB から読み直した別オブジェクトなので、Controller の SessionClock を写して保存し直す
         const meeting = await this.deps.meetingStore.get(this.meetingId);
         if (meeting !== undefined) {
-          await this.deps.meetingStore.put({ ...meeting, sessionClock: { ...this.clock }, updatedAt: Date.now() });
+          // 最初の読み書きに失敗していても、ここで stop_requested と最初の停止理由を書く（recording のまま停止を完了させない）
+          const firstStop = meeting.stopReason === undefined ? { stopReason: reason, stopDetectedAtEpochMs: detectedAtEpochMs } : {};
+          await this.deps.meetingStore.put({ ...meeting, ...firstStop, status: "stop_requested", sessionClock: { ...this.clock }, updatedAt: Date.now() });
           finalSaved = true;
         }
       }
@@ -904,10 +914,12 @@ export class RecordingController {
       drained++;
     }
     if (this.memoryBacklog.length === 0) {
-      // IDB の劣化理由は「メモリ待機がクラッシュで失われうる」ことの警告。空になったら外す（次に書けなければ persistChunk が付け直す）
-      this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
-        (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
-      );
+      // IDB の劣化理由は「メモリ待機がクラッシュで失われうる」ことの警告。このタブの全 Controller のメモリ待機が空になったら外す（Phase 1 §15）
+      if ((this.deps.otherMeetingsBacklogCount?.() ?? 0) === 0) {
+        this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
+          (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
+        );
+      }
       // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する。System 側のメモリ待機が残るうちは持ち続ける
       if (this.node === null && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0) this.unlock();
     }
