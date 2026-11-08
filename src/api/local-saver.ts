@@ -23,7 +23,8 @@ export interface LocalSaverConfig {
 
 export type SaveOutcome =
   | { readonly ok: true; readonly registered: boolean; readonly serverPath: string; readonly idempotent: boolean }
-  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean };
+  /** unauthorizedReported：会議登録の 401/403 を MeetingRegistrar が Monitor へ報告済み */
+  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean; readonly unauthorizedReported?: boolean };
 
 const RETRYABLE: ReadonlySet<LocalSaveErrorKind> = new Set(["NETWORK", "TIMEOUT", "SERVER", "STORAGE_FULL", "HASH_MISMATCH", "UNKNOWN"]);
 

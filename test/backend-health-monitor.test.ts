@@ -194,6 +194,26 @@ describe("BackendHealthMonitor.checkOnce", () => {
     expect(health.degradedReasons).toEqual([]);
   });
 
+  it("失効の報告より前に始めたヘルスチェックの成功応答では unauthorized を解除しない", async () => {
+    // Arrange：認証済みの応答を返すチェックを途中で止める
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let calls = 0;
+    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async () => {
+      if (++calls === 1) await gate;
+      return json({ status: "ok", service: "minutes-local", capabilities: CAPS });
+    });
+    const stale = m.checkOnce();
+    // Act：応答待ちの間に PUT などが 401 を受けて報告する
+    m.reportUnauthorized();
+    release();
+    await stale;
+    // Assert：古い結果は捨て、報告後に始めたチェックだけが解除できる
+    expect(m.state.unauthorized).toBe(true);
+    expect(m.state.status).toBe("UNREACHABLE");
+    expect((await m.checkOnce()).unauthorized).toBe(false);
+  });
+
   it("401 応答で UNREACHABLE になったときは latencyMs と capabilities を持たない", async () => {
     // Arrange：認証済みで HEALTHY（capabilities あり）にしてから 401 を返す
     let authorized = true;

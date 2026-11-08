@@ -33,8 +33,10 @@ describe("MeetingRegistrar", () => {
   it("再送の 401 でもトークンがさらに変わっていれば、認証エラーにせず再試行できる失敗にする", async () => {
     // Arrange：応答が返るたびに設定画面でトークンが更新される
     let generation = 0;
+    const auths: string[] = [];
     const onBackendUnauthorized = vi.fn();
-    const fetchImpl: typeof fetch = async () => {
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      auths.push(new Headers(init?.headers).get("Authorization") ?? "");
       generation++;
       return new Response(null, { status: 401 });
     };
@@ -43,16 +45,17 @@ describe("MeetingRegistrar", () => {
     // Act
     const outcome = await registrar.ensure(meeting.meetingId);
     // Assert
+    expect(auths).toEqual(["Bearer token-0", "Bearer token-1"]);
     expect(onBackendUnauthorized).not.toHaveBeenCalled();
     expect(outcome).toMatchObject({ ok: false, retryable: true });
     expect(outcome.ok === false && outcome.error.kind).not.toBe("UNAUTHORIZED");
   });
 
-  it("現在のトークンへの 401 は認証エラーとして通知する", async () => {
+  it.each([401, 403])("現在のトークンへの %s は認証エラーとして通知する", async (status) => {
     // Arrange
     const onBackendUnauthorized = vi.fn();
     const registrar = new MeetingRegistrar({ baseUrl: "http://127.0.0.1:43117", token: () => "tok",
-      getMeeting: async () => meeting, fetchImpl: async () => new Response(null, { status: 401 }), timeoutMs: 1000, onBackendUnauthorized });
+      getMeeting: async () => meeting, fetchImpl: async () => new Response(null, { status }), timeoutMs: 1000, onBackendUnauthorized });
     // Act
     const outcome = await registrar.ensure(meeting.meetingId);
     // Assert

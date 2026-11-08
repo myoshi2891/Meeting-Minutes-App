@@ -3,7 +3,10 @@ import type { CreateMeetingRequest, MeetingResponse } from "./contracts";
 import { assertLocalHost, isRetryableError } from "./local-saver";
 import type { MeetingRecord, LocalSaveError, LocalSaveErrorKind } from "../types/recording";
 
-export type RegistrationOutcome = { readonly ok: true } | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean };
+/** unauthorizedReported：この 401/403 を Monitor へ報告済み。呼び出し元（Scheduler）は重ねて報告しない */
+export type RegistrationOutcome =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean; readonly unauthorizedReported?: boolean };
 
 export interface MeetingRegistrarDeps {
   readonly baseUrl: string;
@@ -76,7 +79,7 @@ export class MeetingRegistrar {
         }
         if (response.status === 401 || response.status === 403) {
           this.deps.onBackendUnauthorized?.();
-          return this.fail("UNAUTHORIZED", `meeting registration HTTP ${response.status}`, response.status);
+          return { ...this.fail("UNAUTHORIZED", `meeting registration HTTP ${response.status}`, response.status), unauthorizedReported: this.deps.onBackendUnauthorized !== undefined };
         }
         if (response.status === 409) return this.fail("CONFLICT", "meeting registration conflict", response.status);
         if (response.status === 400 || response.status === 422) return this.fail("VALIDATION", `meeting registration HTTP ${response.status}`, response.status);
@@ -94,7 +97,7 @@ export class MeetingRegistrar {
     }
   }
 
-  private fail(kind: LocalSaveErrorKind, message: string, httpStatus: number | null): RegistrationOutcome {
+  private fail(kind: LocalSaveErrorKind, message: string, httpStatus: number | null): Extract<RegistrationOutcome, { ok: false }> {
     const error: LocalSaveError = { kind, message, httpStatus, at: performance.now() };
     return { ok: false, error, retryable: isRetryableError(error) };
   }
