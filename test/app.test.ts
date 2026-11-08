@@ -625,10 +625,10 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
   }
   const isRegistration = (url: string, init?: RequestInit) => url.endsWith("/v1/meetings") && init?.method === "POST";
 
-  it("会議登録の待機中に中止が完了したら Scheduler の PUT を始めず、音声を残す", async () => {
-    // Arrange：SAVING に進み、会議登録の応答待ちで止まっている
+  /** Scheduler の送信を match の応答待ちで止めたまま録音を止め、確定を中止する。release() で応答を返す */
+  async function abandonWhileRequestHeld(match: (url: string, init?: RequestInit) => boolean) {
     stubPageGlobals();
-    const hold = holdRequest(isRegistration);
+    const hold = holdRequest(match);
     const s = await setup({ wrapFetch: hold.wrapFetch });
     await s.app.monitor.checkOnce();
     const id = nextMeetingId();
@@ -637,9 +637,14 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     await s.app.scheduler.enqueue(r.chunkKey);
     await hold.started;
     await session.stop();
-    // Act
     await s.app.abandonFinalize(id, true);
-    hold.release();
+    return { s, id, r, release: hold.release };
+  }
+
+  it("会議登録の待機中に中止が完了したら Scheduler の PUT を始めず、音声を残す", async () => {
+    // Arrange・Act：SAVING に進み、会議登録の応答待ちの間に確定を中止する
+    const { s, r, release } = await abandonWhileRequestHeld(isRegistration);
+    release();
     await vi.waitFor(async () => expect(await s.status(r.chunkKey)).toBe("LOCAL_SAVE_FAILED"));
     // Assert
     expect(s.server.putCount).toBe(0);
@@ -706,20 +711,9 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
   });
 
   it("開始済みの PUT は中止後も完了を記録する", async () => {
-    // Arrange
-    stubPageGlobals();
-    const hold = holdRequest((url, init) => init?.method === "PUT" && url.includes("/chunks/"));
-    const s = await setup({ wrapFetch: hold.wrapFetch });
-    await s.app.monitor.checkOnce();
-    const id = nextMeetingId();
-    const session = await s.app.startRecording(startInput(id));
-    const r = await seedChunk(s.db, id, 0, "IDB_STORED");
-    await s.app.scheduler.enqueue(r.chunkKey);
-    await hold.started;
-    await session.stop();
-    // Act
-    await s.app.abandonFinalize(id, true);
-    hold.release();
+    // Arrange・Act：PUT の応答待ちの間に確定を中止する
+    const { s, id, r, release } = await abandonWhileRequestHeld((url, init) => init?.method === "PUT" && url.includes("/chunks/"));
+    release();
     // Assert
     await vi.waitFor(async () => expect(await s.status(r.chunkKey)).toBe("DB_REGISTERED"));
     expect((await s.app.meetingStore.get(id))?.status).toBe("abandoned");

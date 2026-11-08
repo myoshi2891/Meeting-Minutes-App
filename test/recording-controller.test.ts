@@ -345,17 +345,11 @@ describe("RecordingController", () => {
 
   it("メモリ待機を残して stop したら会議ロックを保持し続け、drain で空になったら解放する", async () => {
     // Arrange：IDB に書けず、直接送信も最初は失敗する
-    let serverUp = false;
-    const s = await setup(closedStore, {
-      put: async () => serverUp
-        ? { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false }
-        : { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } },
-    });
-    await s.controller.start("m1", "定例", 1);
+    const { s, bringServerUp } = await startWithUnsavableBacklog();
     // Act
     await s.controller.stop();
     const heldAfterStop = s.locks.held.has(meetingLockName("m1"));
-    serverUp = true;
+    bringServerUp();
     await s.controller.drainMemoryBacklog();
     // Assert：別タブが末尾をメモリに残したまま確定しないよう、空になるまでロックを渡さない
     expect(heldAfterStop).toBe(true);
@@ -364,17 +358,11 @@ describe("RecordingController", () => {
 
   it("stop 後に保持したロックは takeMeetingLock で呼び出し元へ渡し、以後 drain では解放しない", async () => {
     // Arrange
-    let serverUp = false;
-    const s = await setup(closedStore, {
-      put: async () => serverUp
-        ? { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false }
-        : { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } },
-    });
-    await s.controller.start("m1", "定例", 1);
+    const { s, bringServerUp } = await startWithUnsavableBacklog();
     await s.controller.stop();
     // Act
     const release = s.controller.takeMeetingLock();
-    serverUp = true;
+    bringServerUp();
     await s.controller.drainMemoryBacklog();
     // Assert
     expect(release).not.toBeNull();
@@ -386,20 +374,14 @@ describe("RecordingController", () => {
 
   it("前の録音のメモリ待機が残る間は、同じインスタンスで次の録音を始めず、保持したロックも手放さない", async () => {
     // Arrange：m1 の末尾がメモリ待機に残り、ロックを保持したまま止まっている
-    let serverUp = false;
-    const s = await setup(closedStore, {
-      put: async () => serverUp
-        ? { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false }
-        : { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } },
-    });
-    await s.controller.start("m1", "定例", 1);
+    const { s, bringServerUp } = await startWithUnsavableBacklog();
     await s.controller.stop();
     // Act
     const starting = s.controller.start("m2", "定例2", 2);
     // Assert：m1 のロックの解放手段を上書きせず、drain で空になれば解放できる
     await expect(starting).rejects.toThrow("memory backlog");
     expect(s.locks.held.has(meetingLockName("m2"))).toBe(false);
-    serverUp = true;
+    bringServerUp();
     await s.controller.drainMemoryBacklog();
     expect(s.locks.held.has(meetingLockName("m1"))).toBe(false);
   });
@@ -533,6 +515,18 @@ describe("RecordingController", () => {
         throw new DOMException("The database connection is closing.", "InvalidStateError");
       }
     })(db);
+
+  /** IDB に書けず、直接送信も bringServerUp() までは失敗する状態で m1 の録音を始める（末尾がメモリ待機に残る） */
+  async function startWithUnsavableBacklog(): Promise<{ s: Setup; bringServerUp: () => void }> {
+    let serverUp = false;
+    const s = await setup(closedStore, {
+      put: async () => serverUp
+        ? { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false }
+        : { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } },
+    });
+    await s.controller.start("m1", "定例", 1);
+    return { s, bringServerUp: () => { serverUp = true; } };
+  }
 
   it("IDB に書けない Chunk は drain でサーバーへ直接送り、メモリ待機から外す", async () => {
     // Arrange
