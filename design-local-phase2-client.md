@@ -877,7 +877,8 @@ export class RecordingController {
       this.trackListeners = null;
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
       // メモリ待機が残るうちはロックを持ち続ける（Phase 1 §15。別タブの Barrier はこのタブのメモリ待機を数えられない）。System 側の分も数える
-      if (this.memoryBacklog.length === 0 && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0) this.unlock();
+      // Mic の最終保存（最終の audioFrameCount）に失敗したときも、別タブが古い値で確定しないよう保持する（Phase 1 §15）
+      if (this.memoryBacklog.length === 0 && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0 && (this.source !== "mic" || finalSaved)) this.unlock();
     }
   }
 
@@ -902,7 +903,13 @@ export class RecordingController {
       try {
         await this.deps.chunkStore.putChunk(record);
       } catch (error) {
-        if (isQuotaExceeded(error)) break;
+        // クォータ超過は空きを待つ。ただし停止後は空きを作る保存が続かないので、サーバーに登録できれば直接送る（Phase 1 §15）
+        if (isQuotaExceeded(error)) {
+          if (!(await this.sendDirect(record))) break;
+          this.memoryBacklog.shift();
+          drained++;
+          continue;
+        }
         if (!(await this.sendDirect(record))) throw error;
         this.memoryBacklog.shift();
         drained++;

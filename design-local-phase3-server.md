@@ -1916,7 +1916,7 @@ def restore_latest(db_path: Path, backups_dir: Path) -> Path | None:
 
 # 18. 再構築 `storage/rebuild.py` と `meeting.json`
 
-finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` がそれと音声ファイルから欠損行を復元する。`meeting.json` は手で編集・破損しうる外部入力なので、停止理由（`stopReason`）と検出時刻（`stopDetectedAtEpochMs`）は `Meeting` を組み立てる前に組で検証する（`_stop_metadata()`）。未知の停止理由で `Meeting` の検証が失敗したり、範囲外の時刻で SQLite への挿入が `OverflowError` になったりすると、rebuild 全体が止まって他の会議も復元できなくなるためである。停止理由が `manual` / `mic_ended` のどちらかで、検出時刻が確定 API と同じ範囲（0〜2⁶³−1、SQLite INTEGER の上限）の整数（`bool` を除く）のときだけ両方を残し、どちらかが不正なら両方を `None` にする。
+finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` がそれと音声ファイルから欠損行を復元する。Phase 1/2 の確定 API は終了時刻を `endedAtEpochMs` で書き、移行 011 はそのファイルを `recordings/local/` へ移すだけなので、rebuild は `endedAt` がなければ `endedAtEpochMs` を読む（終了時刻を失わない）。`meeting.json` は手で編集・破損しうる外部入力なので、停止理由（`stopReason`）と検出時刻（`stopDetectedAtEpochMs`）は `Meeting` を組み立てる前に組で検証する（`_stop_metadata()`）。未知の停止理由で `Meeting` の検証が失敗したり、範囲外の時刻で SQLite への挿入が `OverflowError` になったりすると、rebuild 全体が止まって他の会議も復元できなくなるためである。停止理由が `manual` / `mic_ended` のどちらかで、検出時刻が確定 API と同じ範囲（0〜2⁶³−1、SQLite INTEGER の上限）の整数（`bool` を除く）のときだけ両方を残し、どちらかが不正なら両方を `None` にする。
 
 ```python
 # minutes_local/storage/rebuild.py
@@ -2013,7 +2013,8 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
                 id=meeting_id, local_user_id=str(meta.get("localUserId", user_id)), title=str(meta.get("title", "復元された会議")),
                 status="finalized", session_start_epoch_ms=int(meta.get("sessionStartEpochMs", 0)),
                 native_sample_rate=int(meta.get("nativeSampleRate", 0)), consent_confirmed_at=int(meta.get("consentConfirmedAt", 0)),
-                ended_at=meta.get("endedAt"), total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
+                # Phase 1/2 の finalize は endedAtEpochMs で書く（移行 011 で recordings/local/ へ移った meeting.json）。Phase 3 は endedAt
+                ended_at=meta.get("endedAt", meta.get("endedAtEpochMs")), total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
                 stop_reason=stop_reason, stop_detected_at=stop_detected_at,
             ))
             report.meetings_created += 1
@@ -3988,6 +3989,8 @@ async def test_dominant_language_selects_prompt(client3: httpx.AsyncClient, ctx3
 # tests/test_codec_recovery.py
 from __future__ import annotations
 
+import json
+
 import httpx
 
 from minutes_local.bootstrap import open_database_with_recovery
@@ -4073,6 +4076,21 @@ async def test_rebuild_from_recordings(client3: httpx.AsyncClient, ctx3: AppCont
     assert report.meetings_created == 1 and report.chunks_created == 2 and report.skipped_files == []
     assert m is not None and m.local_user_id == "local" and m.status == "finalized" and m.title == "t"
     assert after == before
+
+
+async def test_rebuild_keeps_end_time_from_phase2_snapshot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """Phase 1/2 の finalize が書いた meeting.json（endedAtEpochMs）を、移行 011 で移した後に rebuild しても終了時刻を失わない。"""
+    await _completed_meeting(client3, runner3, ctx3)
+    path = ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["endedAtEpochMs"] = snapshot.pop("endedAt")                                 # Phase 2 §21.2 の確定 API と同じキー
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+    with ctx3.db.write_sync() as conn:
+        rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    assert m is not None and m.ended_at == snapshot["endedAtEpochMs"] and m.ended_at is not None
 
 
 async def test_missing_chunk_is_reported_for_resync(client3: httpx.AsyncClient, ctx3: AppContext) -> None:
@@ -4183,7 +4201,7 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | エコー除去 | `test_echo_from_system_is_dropped_on_mic` |
 | Chunk 単位言語判定・比率・混在時の要約言語 | `test_auto_detects_per_chunk_and_mixed_summary_language`、`test_dominant_language_selects_prompt`、`test_resolve_chunk_language_rules` |
 | 圧縮の往復検証・不一致時の保持 | `test_compress_replaces_wav_after_roundtrip`、`test_compress_keeps_wav_when_roundtrip_mismatches` |
-| バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_missing_chunk_is_reported_for_resync` |
+| バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
 | マイグレーション 008〜011 | `test_apply_phase3_moves_files_and_extends_job_types` |
 | Phase 2 の回帰 | Phase 2 §23 の 34 テスト（`test_phase1_contract.py` は物理パスのみ更新） |
