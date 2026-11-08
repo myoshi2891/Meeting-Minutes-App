@@ -428,14 +428,15 @@ export class App {
     const release = await this.acquireMeetingLock(meetingId);
     if (release === null) return { ok: false, stage: "verify", detail: "meeting is locked by another tab" };
     try {
-      const unsaved = await this.saveUnsavedStop(meetingId);
-      if (unsaved !== null) return unsaved;
       // メモリ待機が残る会議は、Barrier の前に末尾を直接送信する（送れなければ Barrier が waiting_local_save を返す）。
+      // 停止状態を書けていなくても音声は先に送る（IDB が書けないときこそメモリ待機しか残っていない）。確定は下で止める。
       // サーバーが使えない間は送れないので試さない（停止時に memory_backlog_export_required を重ねて通知しない）
       const drain = this.drains.get(meetingId);
       if (drain !== undefined && this.session?.meetingId !== meetingId && this.memoryBacklogCount(meetingId) > 0 && isUsable(this.monitor.state)) {
         await drain(false);
       }
+      const unsaved = await this.saveUnsavedStop(meetingId);
+      if (unsaved !== null) return unsaved;
       return await this.finalize(meetingId);
     } finally {
       release();

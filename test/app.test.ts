@@ -924,6 +924,28 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(await s.app.listPendingFinalize()).toEqual([]);
   });
 
+  it("停止状態を IDB に書けなくても、サーバーが使えればメモリ待機の末尾を先に直接送り、確定は書き直すまで止める", async () => {
+    // Arrange：サーバーは使える。停止時にメモリ待機が残り、会議の書き込みは失敗し続ける
+    stubPageGlobals();
+    const s = await setup();
+    await settleMonitor(s);
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    controller.memoryBacklogCount = 1;
+    controller.drainEffect = () => { controller.memoryBacklogCount = 0; };
+    // Act：stop は内部で retryFinalize を呼ぶ
+    const put = vi.spyOn(s.app.meetingStore, "put").mockRejectedValue(new Error("IDB write failed"));
+    const result = await session.stop();
+    put.mockRestore();
+    // Assert：音声は送り、停止状態を保存するまで確定しない（ロックも保持）
+    expect(controller.drainCount).toBe(1);
+    expect(s.app.memoryBacklogCount(id)).toBe(0);
+    expect(result).toMatchObject({ ok: false, stage: "verify" });
+    expect(s.server.requests.filter((r) => r === `FINALIZE:${id}`)).toHaveLength(0);
+    expect(s.locks.held.size).toBe(1);
+  });
+
   it("flush 後の最終保存だけに失敗したら、stop_requested の会議に最終の音声フレーム数を書き直してから確定する", async () => {
     // Arrange：stop_requested は書けたが、末尾の Chunk 化でクォータを使い切り、最終保存（audioFrameCount）に失敗した
     stubPageGlobals();
@@ -1250,8 +1272,10 @@ describe("RecordingSession.stop", () => {
     });
     // Act
     await settleMonitor(s);
+    // 2 回目の送り直しの PUT と、その保存完了通知（onChunkSaved は Scheduler の送信枠を空ける前に同期で走る）が済むまで待つ
     await vi.waitFor(() => expect(s.server.putCount).toBe(2));
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await vi.waitFor(() => expect(s.server.requests.filter((r) => r === `LIST:${id}`)).toHaveLength(2));
+    await vi.waitFor(() => expect(s.app.scheduler.pendingCount).toBe(0));
     // Assert：最初の照合 + 送り直し後の再確認 1 回
     expect(s.server.putCount).toBe(2);
     expect(s.server.requests.filter((r) => r === `LIST:${id}`)).toHaveLength(2);
