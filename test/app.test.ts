@@ -15,6 +15,7 @@ class FakeController implements SessionController {
   /** drainMemoryBacklog の成功時の副作用（直接送信でメモリ待機が空になる等） */
   drainEffect: (() => void) | null = null;
   audioFrameCount = 0;
+  private heldLock: (() => void) | null = null;
   constructor(
     readonly deps: RecordingControllerDeps,
     private readonly log: string[],
@@ -30,7 +31,14 @@ class FakeController implements SessionController {
       meeting.sessionClock.audioFrameCount = this.audioFrameCount;
       await this.deps.meetingStore.put(meeting);
     }
+    // 本物と同じく、メモリ待機が残れば会議ロックを持ったまま止まる
+    if (this.memoryBacklogCount > 0 && this.meetingId !== null) this.heldLock = await tryAcquireMeetingLock(this.deps.locks, this.meetingId);
     this.log.push("stop");
+  }
+  takeMeetingLock(): (() => void) | null {
+    const release = this.heldLock;
+    this.heldLock = null;
+    return release;
   }
   async flush(): Promise<void> {
     this.log.push("flush");
@@ -39,6 +47,7 @@ class FakeController implements SessionController {
     this.drainCount++;
     if (this.drainError !== null) throw this.drainError;
     this.drainEffect?.();
+    if (this.memoryBacklogCount === 0) this.takeMeetingLock()?.();
     return 0;
   }
   exportMemoryBacklog(): MemoryBacklogFile[] {
@@ -187,6 +196,8 @@ describe("createApp（起動時の配線）", () => {
     await vi.waitFor(async () => expect((await s.app.meetingStore.get(session.meetingId))?.status).toBe("finalized"));
     expect(s.app.monitor.state.unauthorized).toBe(false);
   });
+
+
 
   it("直接送信の会議登録 401 も Monitor に伝える", async () => {
     stubPageGlobals();
@@ -661,6 +672,44 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
 });
 
 describe("RecordingSession.stop", () => {
+  it.each(["manual", "mic_ended"] as const)("停止が競合しても最初の理由 %s と検出時刻をコントローラへ一度だけ渡す", async (reason) => {
+    // Arrange
+    stubPageGlobals();
+    const s = await setup({ token: null });
+    const session = await s.app.startRecording(startInput(nextMeetingId()));
+    const stop = vi.spyOn(s.controllers[0], "stop");
+    const now = vi.spyOn(Date, "now").mockReturnValue(123456);
+    // Act: IDB 書き込み待ちの間にもう一方の停止要求が来る
+    if (reason === "mic_ended") s.controllers[0].deps.onMicEnded?.();
+    const result = session.stop();
+    now.mockReturnValue(999999);
+    s.controllers[0].deps.onMicEnded?.();
+    await result;
+    // Assert
+    expect(stop).toHaveBeenCalledExactlyOnceWith(reason, 123456);
+    expect(s.events.filter(e => e.type === "recording_stopped")).toEqual([
+      { type: "recording_stopped", meetingId: session.meetingId, reason },
+    ]);
+  });
+  it("開始処理の途中でマイクが切断されたら、開始完了後に一度だけ停止する", async () => {
+    // Arrange：start の完了前に onMicEnded が届く
+    stubPageGlobals();
+    const s = await setup();
+    const start = FakeController.prototype.start;
+    vi.spyOn(FakeController.prototype, "start").mockImplementationOnce(async function (this: FakeController, ...args) {
+      await start.apply(this, args);
+      this.deps.onMicEnded?.();
+    });
+    // Act
+    const session = await s.app.startRecording(startInput(nextMeetingId()));
+    // Assert
+    await vi.waitFor(() => expect(s.events.filter((e) => e.type === "recording_stopped")).toEqual([
+      { type: "recording_stopped", meetingId: session.meetingId, reason: "mic_ended" },
+    ]));
+    expect(s.log.filter((x) => x === "stop")).toHaveLength(1);
+    expect(s.app.currentSession).toBeNull();
+  });
+
   it("マイク切断だけで停止し、取得済み音声を確定する", async () => {
     stubPageGlobals();
     const s = await setup();
@@ -769,6 +818,32 @@ describe("RecordingSession.stop", () => {
     await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
   });
 
+  it("メモリ待機を残して停止した会議は別タブから確定できず、自タブの drain で空になってから確定する", async () => {
+    // Arrange：タブ A は末尾をメモリ待機に残して停止した
+    stubPageGlobals();
+    const s = await setup();
+    await settleMonitor(s);
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    controller.memoryBacklogCount = 1;
+    expect(await session.stop()).toMatchObject({ ok: false, stage: "waiting_local_save" });
+    // Act：同じ DB・ロックを使う別タブ B
+    const other = await createApp({ db: s.db, baseUrl: BASE_URL, workletModuleUrl: "/worklet.js", locks: s.locks,
+      onEvent: () => undefined, fetchImpl: s.server.fetch, setTimer: () => undefined });
+    apps.push(other);
+    const fromOther = await other.retryFinalize(id);
+    // Assert：B はメモリ待機を数えられないので、末尾が欠けたまま確定させない
+    expect(fromOther).toMatchObject({ ok: false, stage: "verify" });
+    expect((await s.app.meetingStore.get(id))?.status).toBe("stop_requested");
+    // A の直接送信でメモリ待機が空になれば、ロックを手放して確定する
+    controller.drainEffect = () => { controller.memoryBacklogCount = 0; };
+    s.app.health.degradedReasons = ["IDB_WRITE_FAILED"];
+    controller.deps.onError(new Error("idb write failed"));
+    await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
+    await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
+  });
+
   it("drain 後もメモリ待機が残っていれば確定を再試行しない", async () => {
     // Arrange
     stubPageGlobals();
@@ -795,11 +870,14 @@ describe("RecordingSession.stop", () => {
     const s = await setup();
     const id = nextMeetingId();
     await s.app.startRecording(startInput(id));
+    const record = await makeChunkRecord(id, 0, 160);
     // Act
-    await s.controllers[0].deps.directSaver?.put(await makeChunkRecord(id, 0, 160));
+    await s.controllers[0].deps.directSaver?.put(record);
     // Assert
     expect(s.app.directRegisteredCount(id)).toBe(1);
     expect(s.app.directRegisteredCount("other")).toBe(0);
+    expect(s.app.offIdbEndFrame(id)).toBe(record.meta.endFrame);
+    expect(s.app.offIdbEndFrame("other")).toBe(0);
   });
 
   it("録音中の Chunk 保存完了では自動確定しない", async () => {

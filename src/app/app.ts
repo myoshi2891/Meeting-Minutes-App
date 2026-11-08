@@ -11,7 +11,7 @@ import { createInitialHealth } from "../recording/recording-health-monitor";
 import { recoverOnStartup, type RecoveryReport } from "../recording/recovery";
 import { ChunkStore, MeetingStore, SettingsStore } from "../storage/idb";
 import { enforceQuota, requestPersistence } from "../storage/quota-monitor";
-import type { LocalBackendHealth, MeetingRecord, RecordingHealth } from "../types/recording";
+import type { LocalBackendHealth, MeetingRecord, RecordingHealth, RecordingStopReason } from "../types/recording";
 
 /** settings ストアでトークンを保存するキー（§4.3） */
 export const BACKEND_TOKEN_KEY = "backendToken";
@@ -34,7 +34,7 @@ export type AppEvent =
   | { readonly type: "error"; readonly error: unknown };
 
 /** 録音セッションが使う RecordingController の口。テストでは Fake を差し込む */
-export type SessionController = Pick<RecordingController, "start" | "stop" | "flush" | "drainMemoryBacklog" | "exportMemoryBacklog" | "memoryBacklogCount">;
+export type SessionController = Pick<RecordingController, "start" | "stop" | "flush" | "drainMemoryBacklog" | "exportMemoryBacklog" | "memoryBacklogCount" | "takeMeetingLock">;
 
 export interface AppDeps {
   readonly db: IDBDatabase;
@@ -92,6 +92,10 @@ export class App {
   private starting = false;
   /** このタブで録音した会議の controller。stop 後もメモリ待機が残りうるため、Barrier の unpersistedChunkCount に使う（§22） */
   private readonly controllers = new Map<string, SessionController>();
+  /** stop 後もメモリ待機が残る会議のロック。別タブの Barrier はこのタブのメモリ待機を数えられないため、空になるまで持つ（§22） */
+  private readonly heldLocks = new Map<string, () => void>();
+  /** heldLocks を借りて確定・中止を実行中の会議。借用中は同じタブの別処理にも貸さない */
+  private readonly heldLockBusy = new Set<string>();
   private unsubscribeMonitor: () => void = () => undefined;
   private disposed = false;
   private readonly finalizing = new Map<string, Promise<FinalizeResult>>();
@@ -100,6 +104,8 @@ export class App {
   private readonly finalizeTokenChanged = new Set<string>();
   /** 直接送信で DB 登録まで済んだ件数。IDB に残らないので、確定待ちの件数表示に足す */
   private readonly directRegistered = new Map<string, number>();
+  /** 直接送信で DB 登録まで済んだ Chunk の最大 endFrame。確定待ちの末尾の網羅確認に使う */
+  private readonly directRegisteredEndFrame = new Map<string, number>();
   private readonly waitingForSave = new Set<string>();
   private readonly finalizeIssues = new Map<string, Extract<FinalizeResult, { ok: false }>>();
 
@@ -201,7 +207,10 @@ export class App {
       try {
         await controller.drainMemoryBacklog();
         // 直接送信は Scheduler を通らず onChunkSaved が来ない。空になったら停止後の Barrier を再開させる
-        if (controller.memoryBacklogCount === 0) void this.onChunkSaved(meetingId);
+        if (controller.memoryBacklogCount === 0) {
+          this.releaseHeldLockIfDrained(meetingId);
+          void this.onChunkSaved(meetingId);
+        }
       } catch (error) {
         this.deps.onEvent({ type: "memory_backlog_export_required", meetingId, error });
       } finally {
@@ -225,6 +234,7 @@ export class App {
       },
     };
     let micEnded = false;
+    let micEndedAt = 0;
     let stopForMic: (() => void) | undefined;
     const create = this.deps.createController ?? ((d: RecordingControllerDeps) => new RecordingController(d));
     const controller = create({
@@ -243,6 +253,7 @@ export class App {
       setTimer: this.deps.setTimer,
       locks: this.deps.locks,
       onMicEnded: () => {
+        if (!micEnded) micEndedAt = (this.deps.now ?? Date.now)();
         micEnded = true;
         stopForMic?.();
       },
@@ -252,7 +263,10 @@ export class App {
         put: async (record) => {
           const outcome = (await this.saver?.put(record)) ??
             { ok: false, retryable: false, error: { kind: "UNAUTHORIZED", message: "backend token is not set", httpStatus: null, at: (this.deps.now ?? Date.now)() } };
-          if (outcome.ok && outcome.registered) this.directRegistered.set(meetingId, this.directRegisteredCount(meetingId) + 1);
+          if (outcome.ok && outcome.registered) {
+            this.directRegistered.set(meetingId, this.directRegisteredCount(meetingId) + 1);
+            this.directRegisteredEndFrame.set(meetingId, Math.max(this.directRegisteredEndFrame.get(meetingId) ?? 0, record.meta.endFrame));
+          }
           return outcome;
         },
       },
@@ -268,14 +282,16 @@ export class App {
     let recording = true;
     const lifecycle = attachPageLifecycle(controller, () => recording, input.onHidden ?? (() => undefined));
     let stopping: Promise<FinalizeResult> | undefined;
-    const stopOnce = async (): Promise<FinalizeResult> => {
+    const stopOnce = async (reason: RecordingStopReason, detectedAtEpochMs: number): Promise<FinalizeResult> => {
       try {
-        await controller.stop();
+        await controller.stop(reason, detectedAtEpochMs);
       } finally {
         recording = false;
+        const held = controller.takeMeetingLock();
+        if (held !== null) this.heldLocks.set(meetingId, held);
         lifecycle.detach();
         this.session = null;
-        this.deps.onEvent({ type: "recording_stopped", meetingId, reason: micEnded ? "mic_ended" : "manual" });
+        this.deps.onEvent({ type: "recording_stopped", meetingId, reason });
         if (controller.memoryBacklogCount > 0) {
           this.deps.onEvent({ type: "memory_backlog_export_required", meetingId, error: new Error("audio remains in memory") });
         }
@@ -286,10 +302,10 @@ export class App {
     const session: RecordingSession = {
       meetingId,
       controller,
-      stop: () => stopping ??= stopOnce(),
+      stop: () => stopping ??= stopOnce("manual", (this.deps.now ?? Date.now)()),
     };
     this.session = session;
-    stopForMic = () => { void session.stop().catch((error: unknown) => this.deps.onEvent({ type: "error", error })); };
+    stopForMic = () => { void (stopping ??= stopOnce("mic_ended", micEndedAt)).catch((error: unknown) => this.deps.onEvent({ type: "error", error })); };
     if (micEnded) stopForMic();
     return session;
   }
@@ -315,6 +331,12 @@ export class App {
     return this.directRegistered.get(meetingId) ?? 0;
   }
 
+  /** IDB に残らない Chunk（このタブの直接送信・メモリ待機）の最大 endFrame。再読み込みで失われる */
+  offIdbEndFrame(meetingId: string): number {
+    const memory = this.exportMemoryBacklog(meetingId).map((f) => f.meta.endFrame);
+    return Math.max(this.directRegisteredEndFrame.get(meetingId) ?? 0, ...memory);
+  }
+
   exportMemoryBacklog(meetingId: string): MemoryBacklogFile[] {
     return this.controllers.get(meetingId)?.exportMemoryBacklog() ?? [];
   }
@@ -323,7 +345,7 @@ export class App {
   async abandonFinalize(meetingId: string, confirmed: boolean): Promise<void> {
     if (!confirmed) throw new Error("確定の中止には確認が必要です");
     if (this.session?.meetingId === meetingId) throw new Error("録音中の会議は中止できません");
-    const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
+    const release = await this.acquireMeetingLock(meetingId);
     if (release === null) throw new Error("別の処理がこの会議を使用中です。完了後にやり直してください");
     try {
       const meeting = await this.meetingStore.get(meetingId);
@@ -343,13 +365,32 @@ export class App {
 
   /** 会議ロックを取って Barrier を再試行する。別タブが録音・確定中の会議には触らない（§23 と同じ） */
   async retryFinalize(meetingId: string): Promise<FinalizeResult> {
-    const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
+    const release = await this.acquireMeetingLock(meetingId);
     if (release === null) return { ok: false, stage: "verify", detail: "meeting is locked by another tab" };
     try {
       return await this.finalize(meetingId);
     } finally {
       release();
     }
+  }
+
+  /** 自タブが stop 後も保持しているロックがあれば借り、なければ取りにいく。取れなければ null */
+  private async acquireMeetingLock(meetingId: string): Promise<(() => void) | null> {
+    if (!this.heldLocks.has(meetingId)) return tryAcquireMeetingLock(this.deps.locks, meetingId);
+    if (this.heldLockBusy.has(meetingId)) return null;
+    this.heldLockBusy.add(meetingId);
+    return () => {
+      this.heldLockBusy.delete(meetingId);
+      this.releaseHeldLockIfDrained(meetingId);
+    };
+  }
+
+  /** メモリ待機が空になり、借用中でなければ保持していたロックを解放する */
+  private releaseHeldLockIfDrained(meetingId: string): void {
+    const release = this.heldLocks.get(meetingId);
+    if (release === undefined || this.heldLockBusy.has(meetingId) || this.memoryBacklogCount(meetingId) > 0) return;
+    this.heldLocks.delete(meetingId);
+    release();
   }
 
   private createSaver(token: string): LocalSaver {
