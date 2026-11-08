@@ -103,18 +103,21 @@ export interface PendingCounts {
   /** このタブの直接送信で登録した件数（IDB に残らない）。再読み込みすると 0 に戻る */
   readonly directRegistered: number;
   readonly memoryCount: number;
+  /** IDB に残らない Chunk（このタブの直接送信・メモリ待機）の最大 endFrame。なければ 0 */
+  readonly offIdbEndFrame?: number;
 }
 
 /**
  * 確定待ちの内訳。IDB の Chunk・直接送信・メモリ待機で説明できない音声があれば、登録件数を不完全と明示する
  * （再読み込み後の直接送信はサーバーに問い合わせないと数えられない）。
  */
-export function pendingCountsText({ chunks, audioFrameCount, directRegistered, memoryCount }: PendingCounts): string {
+export function pendingCountsText({ chunks, audioFrameCount, directRegistered, memoryCount, offIdbEndFrame = 0 }: PendingCounts): string {
   const registered = chunks.filter((c) => c.save.status === "DB_REGISTERED").length;
   const saved = chunks.filter((c) => c.save.status === "SAVED").length;
   const accounted = chunks.length + directRegistered + memoryCount;
   const hasGap = Math.max(-1, ...chunks.map((c) => c.meta.sequenceNo)) + 1 > accounted;
-  const hasUnknownTail = accounted === chunks.length && audioFrameCount > Math.max(0, ...chunks.map((c) => c.meta.endFrame));
+  // 件数が合っていても末尾まで届いているとは限らない。把握している Chunk の最大 endFrame で網羅を確かめる
+  const hasUnknownTail = audioFrameCount > Math.max(0, offIdbEndFrame, ...chunks.map((c) => c.meta.endFrame));
   const note = hasGap || hasUnknownTail ? INCOMPLETE_COUNT_NOTE : "";
   return `サーバー登録確認済み ${registered + directRegistered} 件${note}／サーバー保存済み・登録未確認 ${saved} 件／ブラウザ保存済み・未送信 ${chunks.length - registered - saved} 件／メモリ内未保存 ${memoryCount} 件`;
 }

@@ -123,6 +123,7 @@ async function refreshPending(app: App): Promise<void> {
       audioFrameCount: m.sessionClock.audioFrameCount,
       directRegistered: app.directRegisteredCount(m.meetingId),
       memoryCount: app.memoryBacklogCount(m.meetingId),
+      offIdbEndFrame: app.offIdbEndFrame(m.meetingId),
     });
   }));
   if (generation !== pendingGeneration) return;

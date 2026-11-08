@@ -214,4 +214,16 @@ describe("pendingCountsText", () => {
     // Assert
     expect(text).not.toContain(INCOMPLETE_COUNT_NOTE);
   });
+
+  it.each([
+    ["直接送信・メモリ待機の Chunk が末尾まで届いていない", 200, true],
+    ["直接送信・メモリ待機の Chunk が末尾まで届いている", 300, false],
+  ])("IDB 外の Chunk があっても末尾の網羅を確かめる（%s）", (_name, offIdbEndFrame, incomplete) => {
+    // Arrange：IDB には seq 0 だけ。seq 1 は直接送信済みだが、音声は 300 フレームまで進んでいる
+    const chunks = [chunk(0, "DB_REGISTERED")];
+    // Act
+    const text = pendingCountsText({ chunks, audioFrameCount: 300, directRegistered: 1, memoryCount: 0, offIdbEndFrame });
+    // Assert
+    expect(text.includes(INCOMPLETE_COUNT_NOTE)).toBe(incomplete);
+  });
 });
