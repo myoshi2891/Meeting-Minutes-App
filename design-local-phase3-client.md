@@ -998,20 +998,30 @@ export class LocalSaver {
     try {
       // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
       const fetchImpl = this.fetchImpl;
-      const response = await fetchImpl(url, {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "audio/wav",
-          "X-Chunk-SHA256": record.meta.sha256,
-          "X-Chunk-Meta": encodeChunkMetaHeader(record.meta),
-        },
-        body: record.wav,
-        signal: controller.signal,
-        credentials: "omit",
-        redirect: "error",
-      });
-      return await this.interpret(response, record);
+      let token = this.token;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await fetchImpl(url, {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "audio/wav",
+            "X-Chunk-SHA256": record.meta.sha256,
+            "X-Chunk-Meta": encodeChunkMetaHeader(record.meta),
+          },
+          body: record.wav,
+          signal: controller.signal,
+          credentials: "omit",
+          redirect: "error",
+        });
+        // 送信後にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（Phase 1 §17.1）
+        if ((response.status === 401 || response.status === 403) && this.token !== token) {
+          token = this.token;
+          continue;
+        }
+        return await this.interpret(response, record);
+      }
+      // 送り直し中にもトークンが変わった。失効として通知させないよう、再試行できる失敗で返す（Phase 1 §17.1）
+      return this.fail("UNKNOWN", "token changed during upload", null);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         return this.fail("TIMEOUT", `timeout after ${this.config.requestTimeoutMs}ms`, null);

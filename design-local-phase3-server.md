@@ -1916,7 +1916,7 @@ def restore_latest(db_path: Path, backups_dir: Path) -> Path | None:
 
 # 18. 再構築 `storage/rebuild.py` と `meeting.json`
 
-finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` がそれと音声ファイルから欠損行を復元する。
+finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` がそれと音声ファイルから欠損行を復元する。`meeting.json` は手で編集・破損しうる外部入力なので、停止理由（`stopReason`）と検出時刻（`stopDetectedAtEpochMs`）は `Meeting` を組み立てる前に組で検証する（`_stop_metadata()`）。未知の停止理由で `Meeting` の検証が失敗したり、範囲外の時刻で SQLite への挿入が `OverflowError` になったりすると、rebuild 全体が止まって他の会議も復元できなくなるためである。停止理由が `manual` / `mic_ended` のどちらかで、検出時刻が確定 API と同じ範囲（0〜2⁶³−1、SQLite INTEGER の上限）の整数（`bool` を除く）のときだけ両方を残し、どちらかが不正なら両方を `None` にする。
 
 ```python
 # minutes_local/storage/rebuild.py
@@ -1983,6 +1983,15 @@ def _chunk_from_file(path: Path, codec: AudioCodec | None) -> tuple[int, str, by
     return None
 
 
+def _stop_metadata(meta: dict[str, Any]) -> tuple[str | None, int | None]:
+    """meeting.json の停止理由と検出時刻を組で検証する。片方でも不正なら両方 None（Meeting の検証で rebuild 全体を止めない）。"""
+    reason, detected = meta.get("stopReason"), meta.get("stopDetectedAtEpochMs")
+    # bool は int のサブクラスなので明示的に除く。範囲は確定 API と同じ SQLite INTEGER（範囲外は insert で OverflowError）
+    if reason in ("manual", "mic_ended") and isinstance(detected, int) and not isinstance(detected, bool) and 0 <= detected <= 2**63 - 1:
+        return reason, detected
+    return None, None
+
+
 def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) -> RebuildReport:
     report = RebuildReport(skipped_files=[])
     recordings = data_dir / "recordings"
@@ -1999,12 +2008,13 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
                 meta = {}
         t = now_ms()
         if repo.get_meeting(conn, meeting_id) is None:
+            stop_reason, stop_detected_at = _stop_metadata(meta)
             repo.insert_meeting(conn, Meeting(
                 id=meeting_id, local_user_id=str(meta.get("localUserId", user_id)), title=str(meta.get("title", "復元された会議")),
                 status="finalized", session_start_epoch_ms=int(meta.get("sessionStartEpochMs", 0)),
                 native_sample_rate=int(meta.get("nativeSampleRate", 0)), consent_confirmed_at=int(meta.get("consentConfirmedAt", 0)),
                 ended_at=meta.get("endedAt"), total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
-                stop_reason=meta.get("stopReason"), stop_detected_at=meta.get("stopDetectedAtEpochMs"),
+                stop_reason=stop_reason, stop_detected_at=stop_detected_at,
             ))
             report.meetings_created += 1
         meta_chunks = {(c["source"], int(c["sequenceNo"])): c for c in meta.get("chunks", []) if "source" in c and "sequenceNo" in c}

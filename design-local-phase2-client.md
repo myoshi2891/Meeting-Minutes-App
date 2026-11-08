@@ -570,7 +570,12 @@ export function jobFromServerRow(row: Record<string, unknown>): JobSummary | nul
 
 # 4. `src/recording/recording-controller.ts` の変更
 
-変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出し、`stop_requested` の保存に失敗しても末尾を Chunk にしてから Worklet を切り離すこと、メモリ待機が残る間は stop 後も会議ロックを保持し `takeMeetingLock()` で App へ渡すことを含む）。会議ロックは Mic の Controller だけが持つため、System 側のメモリ待機が残る場合のロック保持は Phase 2 の App 配線で扱う（未設計）。Phase 1 で追加した `onMeetingCreated` は Mic 側で維持し、IDB 障害時の直接送信用の会議情報を保持する。System 側は既存の Mic 会議を使う。
+変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出し、`stop_requested` の保存に失敗しても末尾を Chunk にしてから Worklet を切り離すこと、メモリ待機が残る間は stop 後も会議ロックを保持し `takeMeetingLock()` で App へ渡すことを含む）。会議ロックは Mic の Controller だけが持つ。そこで Mic または System のどちらかのメモリ待機が残る間は、Mic の stop 後もロックを持ち続け、両方が空になってから解放する。Mic のメモリ待機だけを見ると、Mic が空で System に末尾が残るときに Mic の `stop()` がロックを手放し、別タブの Barrier が System の末尾を数えられないまま確定しうるためである。配線は次のとおり。
+
+1. Mic の Controller にだけ `otherSourceBacklogCount: () => systemController.memoryBacklogCount` を渡す。Mic の `stop()` の最後と `drainMemoryBacklog()` が空になったときの解放は、自身のメモリ待機に加えてこの値も 0 のときだけロックを解放する。
+2. 停止は `DualRecorder.stop()`（§6）のとおり System を先に止め、完了してから Mic を止める。System の末尾 Chunk がメモリ待機に入るか確定した後で、Mic がロックを手放すか決めるためである。録音中に `dropSystem()` で System だけ止めた場合も、App はその System Controller を保持し続け、`otherSourceBacklogCount` と合計件数に数える（null にした後もメモリ待機は残りうる）。
+3. App は Mic の `stop()` の直後に `takeMeetingLock()` でロックを受け取り（Phase 1 §31 の `heldLocks`）、`memoryBacklogCount(meetingId)` と `releaseHeldLockIfDrained()` は Mic と System の件数の合計で判定する。合計が 0 になるまでロックを解放しない。
+4. System 側の drain も Mic 側と同じく App の drain 関数で包む。空になったら `releaseHeldLockIfDrained()` を呼び、確定の再試行（`onChunkSaved`）を起こす。サーバー復帰時（`onBackendAvailable`）は Mic と System の両方を drain してから確定を再試行する。Finalizer の `unpersistedChunkCount` も両方の合計を渡す（§7）。Phase 1 で追加した `onMeetingCreated` は Mic 側で維持し、IDB 障害時の直接送信用の会議情報を保持する。System 側は既存の Mic 会議を使う。
 
 `stop()` の最後の会議レコード保存だけは Phase 1 と形が違う。Phase 1 は Controller が会議レコードを保持し、その `sessionClock` が Controller の時計と同じオブジェクトなので、保存し直すだけで最終 `audioFrameCount` が残る。Phase 2 は `registerMeeting` のため会議レコードを IndexedDB から読み直すので、別オブジェクトになる。そこで Mic 側は、最終 Chunk の書き込み完了後に会議レコードを読み直し、Controller の `SessionClock` を写した新しいオブジェクトとして保存する。`sessionClock` は `readonly` なので、書き換えずに置き換える。System 側は会議レコードを持たないので何もしない。
 
@@ -632,6 +637,8 @@ export interface RecordingControllerDeps {
   readonly directSaver?: DirectChunkSaver;
   /** Phase 1: IDB 障害時の直接送信用に開始時の会議情報を保持する。Mic 側だけが通知する。 */
   readonly onMeetingCreated?: (meeting: MeetingRecord) => void;
+  /** Mic 側だけに渡す System Controller の memoryBacklogCount。0 でない間は stop 後も会議ロックを解放しない（§4） */
+  readonly otherSourceBacklogCount?: () => number;
 }
 
 /** Worklet が flush / stop に応答しないときに待機を打ち切るまでの時間（Phase 1 §15 と同じ） */
@@ -859,8 +866,8 @@ export class RecordingController {
       this.trackListeners?.abort();
       this.trackListeners = null;
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
-      // メモリ待機が残るうちはロックを持ち続ける（Phase 1 §15。別タブの Barrier はこのタブのメモリ待機を数えられない）
-      if (this.memoryBacklog.length === 0) this.unlock();
+      // メモリ待機が残るうちはロックを持ち続ける（Phase 1 §15。別タブの Barrier はこのタブのメモリ待機を数えられない）。System 側の分も数える
+      if (this.memoryBacklog.length === 0 && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0) this.unlock();
     }
   }
 
@@ -901,8 +908,8 @@ export class RecordingController {
       this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
         (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
       );
-      // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する
-      if (this.node === null) this.unlock();
+      // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する。System 側のメモリ待機が残るうちは持ち続ける
+      if (this.node === null && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0) this.unlock();
     }
     return drained;
   }
@@ -1273,6 +1280,7 @@ import type { ChunkStore, MeetingStore } from "../storage/idb";
 import type { LocalSaveScheduler } from "./local-save-scheduler";
 import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
+import type { RegistrationOutcome } from "../api/meeting-registrar";
 import type { AudioChunkRecord, AudioSource } from "../types/recording";
 import { frameToOffsetMs } from "./session-clock";
 
@@ -1287,6 +1295,8 @@ export interface FinalizerDeps {
   readonly fetchImpl?: typeof fetch;
   /** mic / system 両 Controller の memoryBacklogCount の合計。0 でない限り Barrier を通さない（Phase 1 §22）。 */
   readonly unpersistedChunkCount: () => number;
+  /** 照合の前に会議をサーバーへ登録する（MeetingRegistrar.ensure、Phase 1 §22）。未登録の会議は一覧・確定が 404 になるため */
+  readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>;
 }
 
 /**
@@ -1366,6 +1376,12 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
       await deps.scheduler.resumeAll();
       return { ok: false, stage: "waiting_local_save", detail: `${source}: ${notRegistered.length} chunks not registered` };
     }
+  }
+
+  // 再試行でも毎回通す。登録に失敗したら一覧を取らない（Phase 1 §22）
+  if (deps.ensureMeeting !== undefined) {
+    const registration = await deps.ensureMeeting(meetingId);
+    if (!registration.ok) return { ok: false, stage: "verify", detail: `meeting registration failed: ${registration.error.message}` };
   }
 
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
