@@ -62,6 +62,11 @@ export class LocalSaver {
     let token = this.token;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
+        // 送り直す前に送信可否を確かめ直す。最初の応答待ちの間に確定中止された会議へ新しい PUT を始めない
+        if (attempt > 0 && this.ensureMeeting !== undefined) {
+          const registration = await this.ensureMeeting(meetingId);
+          if (!registration.ok) return registration;
+        }
         const response = await fetchImpl(url, {
           method: "PUT",
           headers: {

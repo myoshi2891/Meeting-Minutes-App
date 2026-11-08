@@ -137,8 +137,31 @@ describe("LocalSaver.put", () => {
     });
     // Act
     const outcome = await saver.put(r);
-    // Assert
+    // Assert：送り直しは 1 回だけ
     expect(outcome).toMatchObject({ ok: false, retryable: true, error: { kind: "UNKNOWN" } });
+    expect(n).toBe(2);
+  });
+
+  it("トークン変更で送り直す前に会議の送信可否を確かめ、確定中止されていれば PUT しない", async () => {
+    // Arrange：最初の PUT の応答待ち中にトークンが変わり、同時に会議が確定中止された
+    const r = await makeChunkRecord("m1", 0, 160);
+    let puts = 0;
+    let abandoned = false;
+    let saver: LocalSaver | undefined;
+    const ensure = async () => abandoned
+      ? { ok: false as const, retryable: false, error: { kind: "VALIDATION" as const, message: "meeting abandoned", httpStatus: null, at: 0 } }
+      : { ok: true as const };
+    saver = new LocalSaver({ baseUrl: BASE, token: "tok", requestTimeoutMs: 1000 }, async () => {
+      puts++;
+      saver?.setToken("new-tok");
+      abandoned = true;
+      return new Response("{}", { status: 401 });
+    }, ensure);
+    // Act
+    const outcome = await saver.put(r);
+    // Assert
+    expect(puts).toBe(1);
+    expect(outcome).toMatchObject({ ok: false, retryable: false, error: { kind: "VALIDATION", message: "meeting abandoned" } });
   });
 
   it("トークンが変わっていない 401 は UNAUTHORIZED で返す", async () => {
