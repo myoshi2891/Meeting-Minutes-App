@@ -33,7 +33,7 @@ export class BackendHealthMonitor {
   /** 最後に console.warn した接続失敗の理由。同じ理由をポーリングのたびに出さないために使い、到達できたら null に戻す。 */
   private lastWarnedReason: string | null = null;
   private readonly healthUrl: URL;
-  /** reportUnauthorized() の回数。報告より前に始めたヘルスチェックの結果で unauthorized を上書きしないために使う */
+  /** reportUnauthorized() とヘルスチェックの 401/403 の回数。失効より前に始めたヘルスチェックの結果で unauthorized を上書きしないために使う */
   private unauthorizedReports = 0;
 
   constructor(
@@ -91,6 +91,10 @@ export class BackendHealthMonitor {
       const latency = performance.now() - started;
 
       if (response.status === 401 || response.status === 403) {
+        // 応答待ちの間にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（新しいトークンのチェックに任せる）
+        if (this.config.token() !== token) return this.state;
+        // 先に始めた別のチェックの成功が後から届いても、この失効を打ち消さない
+        this.unauthorizedReports++;
         this.state.unauthorized = true;
         this.transition("UNREACHABLE", latency, null);
         return this.state;

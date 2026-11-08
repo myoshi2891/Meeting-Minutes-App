@@ -77,12 +77,13 @@ export class LocalSaver {
           // リダイレクト先は assertLocalHost を通らないため追従しない（録音データを外部へ再送させない、§4.4）
           redirect: "error",
         });
-        // 送信後にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（MeetingRegistrar と同じ）
-        if ((response.status === 401 || response.status === 403) && this.token !== token) {
+        const outcome = await this.interpret(response, record);
+        // 送信後（本文の読み取り中を含む）にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（MeetingRegistrar と同じ）
+        if (!outcome.ok && outcome.error.kind === "UNAUTHORIZED" && this.token !== token) {
           token = this.token;
           continue;
         }
-        return await this.interpret(response, record);
+        return outcome;
       }
       // 送り直し中にもトークンが変わった。UNAUTHORIZED にすると Scheduler が失効として通知するため、再試行できる失敗で返す
       return this.fail("UNKNOWN", "token changed during upload", null);
