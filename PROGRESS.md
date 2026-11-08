@@ -26,14 +26,15 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### 今回の変更と残課題
 
-- 2026-11-08（47 回目・未コミット）：PR #12 の SonarCloud 品質ゲート失敗（新規コードの重複 3.3% > 3%）に対応。重複は `test/app.test.ts`（中止テスト 2 件の Arrange、25 行）と `test/recording-controller.test.ts`（メモリ待機のロック保持テスト 3 件の Arrange、37 行）のみで、それぞれ `abandonWhileRequestHeld()` / `startWithUnsavableBacklog()` に切り出した。テストの振る舞いは不変、TypeScript 383 件・typecheck 通過。
+- 2026-11-08（48 回目・未コミット）：レビュー指摘 15 件を全件有効と判定して修正。(1) ヘルスチェックの 401/403 も失効回数に数える（応答待ち中にトークンが変わった 401 は無視）。(2) `LocalSaver` は 401 の本文読み取り後にトークン変化を確かめる。(3) 確定の会議登録がトークン変更中に失敗したら `finalizeTokenChanged` でやり直す。(4) 停止状態を IDB に書けなかった会議は `unsavedStops` で確定待ちに残し、会議ロック下で書き直す（`recording` なら丸ごと、`stop_requested` なら最終の `audioFrameCount` と未記録の停止理由だけ。それ以外は上書きしない。`session.stop()` は reject せず結果を返す）。(5) `retryFinalize` はサーバーが使えればメモリ待機を先に drain。(6) サーバー復帰時の drain を IDB の一覧取得より前へ。(7) 共有の IDB 保存警告は他の会議のメモリ待機が空になるまで外さない（Controller の `otherMeetingsBacklogCount`）。(8) 確定待ちの欠番判定を IDB 外の連番（`App.offIdbSequenceNos()`）で行う。(9) マイク切断の警告文言から保存の約束を外す。(10) pydantic v2 を依存に明記し lock 更新。(11) README の SQLite 確認を会議 ID 指定に。(12) Phase 2 client の `stop()` で最初の読み取り失敗でも flush し、最後に stop_requested と停止理由を書く。(13) テストの FakeController を本物と同じく開始時からロック保持にし、停止処理中の別タブ確定・中止の拒否をテスト。TypeScript 397 件・Python 10 件・typecheck 通過。Phase 1 埋め込み同期（DIFF 0）・本文、Phase 2 client、Phase 3 client を更新。
+- 2026-11-08（47 回目・コミット済み f836da1 まで）：PR #12 の SonarCloud 品質ゲート失敗（新規コードの重複 3.3% > 3%）に対応。重複は `test/app.test.ts`（中止テスト 2 件の Arrange、25 行）と `test/recording-controller.test.ts`（メモリ待機のロック保持テスト 3 件の Arrange、37 行）のみで、それぞれ `abandonWhileRequestHeld()` / `startWithUnsavableBacklog()` に切り出した。テストの振る舞いは不変、TypeScript 383 件・typecheck 通過。
 - 2026-11-08（46 回目・コミット済み 218e72e まで）：レビュー指摘 10 件を全件有効と判定して修正。(1) `LocalSaver.put()` は送信中にトークンが変わった 401/403 を新しいトークンで送り直し、それでも変われば再試行できる `UNKNOWN` で返す（古いトークンの 401 で失効報告・新トークンのヘルス成功の打ち消しをしない。Monitor は無変更）。(2) 直接送信の PUT の 401/403 を App が Monitor へ報告。(3) `prepareChunkPut()` は会議ロックを持たない会議の中止判定が読めなければ retryable で PUT を始めない。(4) Finalizer に `ensureMeeting` を追加し、一覧取得前に毎回会議を登録（Chunk 0 件の会議が 404 で止まらない）。(5) Scheduler：`runOne()` の中止判定の読み取り失敗は状態に触れず再投入、`resumeAll()` は会議ごとに判定して失敗した会議だけ次回へ、`markAllPendingUnavailable()` の settled 除去に index 確認。テストハーネスは `requireMeetingRegistration` 時に一覧・確定も 404 にし、`LIST:` / `FINALIZE:` を記録。テスト 11 件追加（うち 9 件と、既存の認証回復テスト 2 件の強化は修正前の Red を確認。残り 2 件は報告しない側のガード）。Phase 1 埋め込み同期（DIFF 0）・本文、Phase 2 client（Finalizer の登録、Mic/System のメモリ待機両方でのロック保持）、Phase 3 client LocalSaver、Phase 3 server rebuild の停止理由の組検証を更新。TypeScript 383 件・typecheck 通過。
 - 2026-11-08（45 回目・コミット済み 8e550a0 まで）：CodeRabbit 指摘対応。(1) サーバーの `stopDetectedAtEpochMs` を SQLite 整数上限で検証（範囲外は 422）。(2) 会議登録の 401/403 を Scheduler が二重に Monitor へ報告しない（`unauthorizedReported`）。(3) 失効報告より前に始めたヘルスチェックの成功で `unauthorized` を解除しない。(4) `stop()` の最初の状態保存失敗が最終保存で回復したら停止を完了して確定へ進む（失敗は `onError`）。(5) メモリ待機が残る Controller の `start()` を拒否。(6) サーバー復帰時、確定の前に停止後のメモリ待機を drain（従来の残課題を解消）。(7) IDB が読めなくてもこのタブで中止した会議へ PUT しない。(8) 中止した会議の Chunk を待機件数から外す（`discardMeeting()`）。(9) 中止確認のキャンセルでボタンを即時復帰。テスト追加・Red確認済み。Phase 2 server の finalize にコミット後の `meeting.json` 書き出しを追加。ドキュメント網羅率（docstring）はスキップ。Python 10件・TypeScript 372件・typecheck・build 通過。テスト以外のサーバー起動はしていない。
 
 - **最新：利用者指示で停止中。** 本作業のテスト・API・Viteを停止。5173・5188・43117・43118に待ち受けなし、関連テストプロセスも残っていないことを確認した。以下の過去ログの「起動中」は現在の状態ではない。
 - 停止理由の永続化は作業途中・未コミット。`manual` / `mic_ended` と検出時刻をIDB→確定API→SQLite／`meeting.json`へ保存し、既存DBの列追加と旧データの未記録扱いを実装。追加テストのRedを確認後、TypeScript 358件・Python 10件、typecheck・buildが通過。Phase 1の埋め込みコード同期も確認済み。
 - 2026-11-08（44 回目・未コミット）：レビュー指摘対応。(1) `stop()` は `stop_requested` の保存に失敗しても Worklet の末尾を Chunk にしてから切り離す。(2) メモリ待機が残る会議は stop 後も会議ロックを保持し、`takeMeetingLock()` で App が受け取って確定・中止に借用、空になったら解放（別タブが末尾欠けのまま確定しない）。(3) 確定待ちの不完全表示を件数でなく末尾フレームの網羅で判定（`App.offIdbEndFrame()`、`PendingCounts.offIdbEndFrame`）。(4) 開始処理中のマイク切断のテストを追加。復旧の状態不一致時の `SAVING` 再送とドキュメント網羅率はスキップ。TypeScript 365件・typecheck 通過。Phase 1 §15・App 配線表、Phase 2 client の Controller を同期。
-- 残課題（44 回目から）：~~stop 後にメモリ待機が残ったまま、サーバー復帰で自動 drain する経路がない~~（45 回目で解消。ただし IDB にもサーバーにも送れない間はタブを閉じるまでロックを保持）。Phase 2 の System 側メモリ待機のロック保持は未設計。
+- 残課題（44 回目から）：~~stop 後にメモリ待機が残ったまま、サーバー復帰で自動 drain する経路がない~~（45 回目で解消。ただし IDB にもサーバーにも送れない間はタブを閉じるまでロックを保持）。Phase 2 の System 側メモリ待機のロック保持は 46 回目で設計済み（Mic・System 両方のメモリ待機が空になるまで保持）、実装は未着手。
 - 再開時の残り：後続フェーズ設計書の変更レビュー、専用Chromeによる停止理由保存の結合検証、READMEの確認手順更新。ブラウザ検証は利用者の中断で実行完了していない。通常APIは旧コードのまま停止したため、通常データへの列追加は次回起動時になる。テスト・サーバーの再開は利用者の指示を待つ。
 
 - 2026-11-08（43 回目）：マイク切断試験の案内後に作られた最新会議 `bbd1a297-f448-42b6-8c08-c69839d01d1d`（無題の会議、10:11:21〜10:11:34 JST）を照合。13.25725秒・212,116サンプル・seq 0の1 Chunkが登録済み、サーバー状態は `finalized`。WAVのヘッダ・バイト数・SHA-256・サンプル数と、SQLite／`meeting.json`の確定値が一致。証跡は `private/next-action-2026-11-08/mic-disconnect-result.json`。サーバーに停止理由は記録されないため、T12-b は物理切断による自動停止・通知の利用者報告待ち。
@@ -262,6 +263,15 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-11-08（48 回目・レビュー指摘 15 件）
+
+- 15 件すべて有効と判定し修正（コード 9・テスト 1・文書 5）。修正前の Red を確認したテストを中心に追加。flush 後の最終保存だけ失敗する経路も追加で修正。
+- Phase 1 同期（DIFF 0）、Phase 2 client・Phase 3 client に波及。重複は前回のヘルパーへ寄せ直した。コミット未実施。
+
+### 2026-11-08（47 回目・SonarCloud 重複率）
+
+- PR #12 の品質ゲート（新規コードの重複 3.3%）をテストのヘルパー抽出で解消。f836da1 までコミット済み。
 
 ### 2026-11-08（46 回目・レビュー指摘 10 件）
 
