@@ -1594,7 +1594,7 @@ export {};
 
 # 15. メインスレッド：RecordingController
 
-T12-b：mic トラックの `ended` を `onMicEnded` で App へ通知する。App は通常の停止処理を一度だけ実行し、取得済み音声を保存してから確定を試す。`mute` や無音だけでは停止しない。停止完了を UI に通知して AudioContext を閉じ、メモリ未保存音声があれば WAV 書き出しを案内する。
+T12-b：mic トラックの `ended` を `onMicEnded` で App へ通知する。App は通常の停止処理を一度だけ実行し、取得済み音声を保存してから確定を試す。`mute` や無音だけでは停止しない。切断の処理は録音ごとに 1 回で、`RecordingHealth` は録音をまたいで共有されるため、重複判定に `degradedReasons` は使わない。録音開始時に前回の `MIC_TRACK_ENDED` を外す。リスナー登録前に終了していたトラックには `ended` が届かないので、登録直後に `readyState` も確認する。停止完了を UI に通知して AudioContext を閉じ、メモリ未保存音声があれば WAV 書き出しを案内する。
 
 Worklet から受け取った PCM に WAV ヘッダを付け、SHA-256 を計算し、IndexedDB へ書き、State Machine に投入するまでを担う。
 
@@ -1684,6 +1684,8 @@ export class RecordingController {
   private releaseLock: (() => void) | null = null;
   /** トラックの ended リスナーの解除用。同じ mediaStream で録り直したときにリスナーが蓄積しないよう stop で abort する */
   private trackListeners: AbortController | null = null;
+  /** この録音で切断を処理済みか。health は録音をまたいで共有されるので、degradedReasons では判定しない */
+  private micEndedHandled = false;
 
   constructor(private readonly deps: RecordingControllerDeps) {}
 
@@ -1760,20 +1762,24 @@ export class RecordingController {
       throw error;
     }
 
+    this.micEndedHandled = false;
+    // 前の録音の切断を、この録音の不健全として表示しない
+    this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter((r) => r !== "MIC_TRACK_ENDED");
     this.trackListeners = new AbortController();
     for (const track of mediaStream.getAudioTracks()) {
-      track.addEventListener(
-        "ended",
-        () => {
-          // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する
-          if (this.node === null) return;
-          if (this.deps.health.degradedReasons.includes("MIC_TRACK_ENDED")) return;
-          this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "MIC_TRACK_ENDED"];
-          this.deps.onMicEnded?.();
-        },
-        { signal: this.trackListeners.signal },
-      );
+      track.addEventListener("ended", () => this.handleMicEnded(), { signal: this.trackListeners.signal });
+      // 登録前に終了したトラックには ended が届かない
+      if (track.readyState === "ended") this.handleMicEnded();
     }
+  }
+
+  /** マイク切断を録音ごとに 1 回だけ処理する。 */
+  private handleMicEnded(): void {
+    // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する
+    if (this.node === null || this.micEndedHandled) return;
+    this.micEndedHandled = true;
+    this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "MIC_TRACK_ENDED"];
+    this.deps.onMicEnded?.();
   }
 
   /**
@@ -2362,7 +2368,7 @@ function isApiErrorBody(value: unknown): value is ApiErrorBody {
 
 ### 会議登録（PUT に先立つ共通経路）
 
-`LocalSaver.put()` は `MeetingRegistrar.ensure()` を先に呼ぶ。Registrar は IDB の会議情報を使って `POST /v1/meetings` を送り、同じ会議への並行呼び出しは実行中の Promise を共有する。録音中に IDB 読み取りが失敗した場合は、Controller が開始時にメモリへ渡した会議情報を使う。登録失敗は PUT の保存失敗として Scheduler の再試行へ返す。録音開始自体は登録応答を待たない。
+`LocalSaver.put()` は `MeetingRegistrar.ensure()` を先に呼ぶ。Registrar は IDB の会議情報を使って `POST /v1/meetings` を送り、同じ会議への並行呼び出しは実行中の Promise を共有する。録音中に IDB 読み取りが失敗した場合は、Controller が開始時にメモリへ渡した会議情報を使う。登録失敗は PUT の保存失敗として Scheduler の再試行へ返す。送信後にトークンが変わっていた 401/403 は現在のトークンの失効を示さないので、新しいトークンで送り直す。送り直しの間にもトークンが変わったら、Monitor へ通知せず再試行できる失敗（`UNKNOWN`・`httpStatus: null`）で返す。録音開始自体は登録応答を待たない。
 
 ```typescript
 // src/api/meeting-registrar.ts
@@ -2436,7 +2442,8 @@ export class MeetingRegistrar {
           return { ok: true };
         }
         const latestToken = this.deps.token();
-        if ((response.status === 401 || response.status === 403) && latestToken !== null && latestToken !== token && attempt === 0) {
+        // 送信後にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない
+        if ((response.status === 401 || response.status === 403) && latestToken !== null && latestToken !== token) {
           token = latestToken;
           continue;
         }
@@ -2449,7 +2456,8 @@ export class MeetingRegistrar {
         if (response.status === 507) return this.fail("STORAGE_FULL", "meeting registration disk full", response.status);
         return this.fail(response.status >= 500 ? "SERVER" : "UNKNOWN", `meeting registration HTTP ${response.status}`, response.status);
       }
-      return this.fail("UNAUTHORIZED", "meeting registration token changed", 401);
+      // 再送中にもトークンが変わった。UNAUTHORIZED にすると Scheduler が失効として通知するため、再試行できる失敗で返す
+      return this.fail("UNKNOWN", "meeting registration token changed", null);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return this.fail("TIMEOUT", "meeting registration timeout", null);
       if (error instanceof TypeError) return this.fail("NETWORK", error.message, null);
@@ -3374,7 +3382,7 @@ function errorMessage(error: unknown): string {
 
 # 23. ブラウザクラッシュ後の IndexedDB 復旧
 
-T12-c/d：復旧レポートの status は更新前の値を保持し、`recording` の中断と `stop_requested` / `finalizing` の確定待ちを分けて表示する。`abandoned` はブラウザ内だけの中止状態で、復旧・自動再送・確定の対象外。ロック取得後に状態を読み直し、別タブで確定・中止された会議を巻き戻さない。ストアとインデックスの構造は変わらないため DB_VERSION は 1 のまま。
+T12-c/d：復旧レポートの status は更新前の値を保持し、`recording` の中断と `stop_requested` / `finalizing` の確定待ちを分けて表示する。`abandoned` はブラウザ内だけの中止状態で、復旧・自動再送・確定の対象外。ロック取得後に状態を読み直し、別タブで停止・確定・中止された会議は巻き戻さず、その Chunk の書き戻しと再投入も行わない。停止後の Scheduler は会議ロックを持たないため、状態が変わっていない会議で別タブの送信中の `SAVING` を見分けることはできない。この場合の重複は冪等 PUT で吸収する。ストアとインデックスの構造は変わらないため DB_VERSION は 1 のまま。
 
 ```typescript
 // src/recording/recovery.ts
@@ -3419,10 +3427,10 @@ export async function recoverOnStartup(
         continue;
       }
       try {
-        // 一覧取得後に別タブが確定・中止した会議を巻き戻さない。
+        // 一覧取得後に別タブが停止・確定・中止した会議を巻き戻さない。Chunk の再送もそのタブに任せる。
         const current = await meetingStore.get(m.meetingId);
         if (current?.status !== status) {
-          if (current?.status === "abandoned") active.add(m.meetingId);
+          active.add(m.meetingId);
           continue;
         }
         const originalStatus = m.status;
@@ -4464,7 +4472,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 | Chunk PUT／メモリからの直接送信 | `LocalSaver.put()` → `MeetingRegistrar.ensure()` → `POST /v1/meetings` 成功後に PUT。並行する同一会議の登録は共有 | §12。サーバーは未登録会議への PUT を404にする |
 | 録音開始 | `requestPersistence` → `RecordingController.start` → `attachPageLifecycle`。録音中か開始処理中（`session` が入る前の await 中）なら会議 ID に関係なく `already recording` で拒否する。開始中フラグは成功・失敗どちらでも `finally` で下ろす | §21 / §15 / §20 |
 | Chunk の enqueue | `scheduler.enqueue` の後に `enforceQuota` を直列で実行。`export_required` なら `AppEvent.export_required`。`dropped_registered_blobs` でメモリ待機があれば `drainMemoryBacklog()` | §21 / §15。`enforceQuota` の失敗が `persistChunk` の失敗に混ざらないよう、enqueue の Promise には含めない |
-| `onError` で `IDB_WRITE_FAILED` | `drainMemoryBacklog()`。失敗したら `AppEvent.memory_backlog_export_required`（UI が `exportMemoryBacklog()` を促す） | §15 |
+| `onError` で `IDB_WRITE_FAILED` | `drainMemoryBacklog()`。失敗したら `AppEvent.memory_backlog_export_required`（UI が `exportMemoryBacklog()` を促す）。メモリ待機が空になったら、停止後の Barrier を再試行する（直接送信は Scheduler を通らず `onChunkSaved` が来ないため） | §15 / §22 |
 | `session.stop()` | `controller.stop()` → `detach()` → `finalizeMeeting`（`unpersistedChunkCount` はその会議の controller の `memoryBacklogCount`）→ 成功なら `AppEvent.finalized`（`missingTailMs` 付き） | §22 の呼び出し規約（stop 完了後にだけ Barrier を試みる） |
 
 - `unpersistedChunkCount` は、stop 後もこのタブで録音した会議の controller を引く。stop の後に会議ロックが外れた会議を、サーバー復帰の再試行が拾う可能性があるためである。`() => 0` を渡すと、メモリ待機中の末尾 Chunk を残したまま Barrier を通してしまう。
@@ -4479,7 +4487,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 // src/app/app.ts
 import { BackendHealthMonitor } from "../api/backend-health-monitor";
 import { LocalSaver } from "../api/local-saver";
-import { MeetingRegistrar } from "../api/meeting-registrar";
+import { MeetingRegistrar, type RegistrationOutcome } from "../api/meeting-registrar";
 import { finalizeMeeting, type FinalizeResult } from "../recording/finalizer";
 import { LocalSaveScheduler } from "../recording/local-save-scheduler";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "../recording/meeting-lock";
@@ -4574,6 +4582,10 @@ export class App {
   private disposed = false;
   private readonly finalizing = new Map<string, Promise<FinalizeResult>>();
   private readonly finalizeRequested = new Set<string>();
+  /** 実行中の Barrier が古いトークンで 401/403 を受けた会議。ロックを持ったまま現在のトークンでやり直す */
+  private readonly finalizeTokenChanged = new Set<string>();
+  /** 直接送信で DB 登録まで済んだ件数。IDB に残らないので、確定待ちの件数表示に足す */
+  private readonly directRegistered = new Map<string, number>();
   private readonly waitingForSave = new Set<string>();
   private readonly finalizeIssues = new Map<string, Extract<FinalizeResult, { ok: false }>>();
 
@@ -4674,6 +4686,8 @@ export class App {
       draining = true;
       try {
         await controller.drainMemoryBacklog();
+        // 直接送信は Scheduler を通らず onChunkSaved が来ない。空になったら停止後の Barrier を再開させる
+        if (controller.memoryBacklogCount === 0) void this.onChunkSaved(meetingId);
       } catch (error) {
         this.deps.onEvent({ type: "memory_backlog_export_required", meetingId, error });
       } finally {
@@ -4721,9 +4735,12 @@ export class App {
       onMeetingCreated: (meeting) => this.meetingFallbacks.set(meeting.meetingId, meeting),
       // 送るたびに現在の saver を引く。録音中に setToken しても、開始時のトークン（未設定・失効）で送り続けない
       directSaver: {
-        put: async (record) =>
-          this.saver?.put(record) ??
-          { ok: false, retryable: false, error: { kind: "UNAUTHORIZED", message: "backend token is not set", httpStatus: null, at: (this.deps.now ?? Date.now)() } },
+        put: async (record) => {
+          const outcome = (await this.saver?.put(record)) ??
+            { ok: false, retryable: false, error: { kind: "UNAUTHORIZED", message: "backend token is not set", httpStatus: null, at: (this.deps.now ?? Date.now)() } };
+          if (outcome.ok && outcome.registered) this.directRegistered.set(meetingId, this.directRegisteredCount(meetingId) + 1);
+          return outcome;
+        },
       },
     });
 
@@ -4779,6 +4796,11 @@ export class App {
     return [...this.controllers.values()].reduce((sum, c) => sum + c.memoryBacklogCount, 0);
   }
 
+  /** このタブが直接送信で登録した件数。再読み込みで失われるので、0 は「直接送信なし」を保証しない */
+  directRegisteredCount(meetingId: string): number {
+    return this.directRegistered.get(meetingId) ?? 0;
+  }
+
   exportMemoryBacklog(meetingId: string): MemoryBacklogFile[] {
     return this.controllers.get(meetingId)?.exportMemoryBacklog() ?? [];
   }
@@ -4817,7 +4839,21 @@ export class App {
   }
 
   private createSaver(token: string): LocalSaver {
-    return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch, (id) => this.registrar.ensure(id));
+    return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch, (id) => this.prepareChunkPut(id));
+  }
+
+  /**
+   * PUT の直前処理。Scheduler と直接送信の両方がここを通る。
+   * 登録を待つ間に確定中止された会議には新しい PUT を始めない（開始済みの PUT は完了させる）。
+   * 再送しても結果が変わらないので non-retryable で返し、音声は IDB またはメモリ待機に残す。
+   */
+  private async prepareChunkPut(meetingId: string): Promise<RegistrationOutcome> {
+    const registration = await this.registrar.ensure(meetingId);
+    if (!registration.ok) return registration;
+    // IDB が読めないときこそ直接送信が必要で、同じ障害で中止も書けないので送信を止めない
+    const meeting = await this.meetingStore.get(meetingId).catch(() => undefined);
+    if (meeting?.status !== "abandoned") return registration;
+    return { ok: false, retryable: false, error: { kind: "VALIDATION", message: "meeting abandoned", httpStatus: null, at: (this.deps.now ?? Date.now)() } };
   }
 
   private async onChunkSaved(meetingId: string): Promise<void> {
@@ -4846,10 +4882,11 @@ export class App {
       let result: FinalizeResult;
       do {
         this.finalizeRequested.delete(meetingId);
+        this.finalizeTokenChanged.delete(meetingId);
         result = await this.finalizeOnce(meetingId);
         if (!result.ok && result.stage === "waiting_local_save") this.waitingForSave.add(meetingId);
         else this.waitingForSave.delete(meetingId);
-      } while (this.waitingForSave.has(meetingId) && !this.disposed && this.finalizeRequested.has(meetingId));
+      } while (!this.disposed && (this.finalizeTokenChanged.has(meetingId) || (this.waitingForSave.has(meetingId) && this.finalizeRequested.has(meetingId))));
       if (result.ok) this.finalizeIssues.delete(meetingId);
       else {
         const previous = this.finalizeIssues.get(meetingId);
@@ -4863,6 +4900,7 @@ export class App {
     const promise = run().finally(() => {
       this.finalizing.delete(meetingId);
       this.finalizeRequested.delete(meetingId);
+      this.finalizeTokenChanged.delete(meetingId);
     });
     this.finalizing.set(meetingId, promise);
     return promise;
@@ -4883,6 +4921,8 @@ export class App {
         unpersistedChunkCount: () => controller?.memoryBacklogCount ?? 0,
         onBackendUnauthorized: () => {
           if (this.token === token) this.monitor.reportUnauthorized();
+          // setToken からの再試行は実行中のロックに阻まれているので、この Barrier が終わったら自分でやり直す
+          else this.finalizeTokenChanged.add(meetingId);
         },
       },
       meetingId,
@@ -4924,9 +4964,9 @@ function isUsable(state: LocalBackendHealth): boolean {
 
 ## 31.4 最小 UI
 
-T12：会議ごとに確定の失敗理由と、サーバー登録確認済み・ブラウザ保存済みの未送信・メモリ内未保存の件数を表示する。自動再試行の失敗も `finalize_pending` で通知し、同一会議の同じ stage/detail は繰り返し通知しない。手動停止と自動停止は同じ Promise を共有する。
+T12：会議ごとに確定の失敗理由と、サーバー登録確認済み・サーバー保存済みで登録未確認（`SAVED`）・ブラウザ保存済みの未送信・メモリ内未保存の件数を表示する。登録確認済みには、このタブの直接送信で登録した件数（IndexedDB に残らない）を足す。再読み込み後の直接送信は数えられないので、連番の欠けや末尾より先の音声を IndexedDB・直接送信・メモリ待機で説明できなければ、登録件数が不完全だと明示する。自動再試行の失敗も `finalize_pending` で通知し、同一会議の同じ stage/detail は繰り返し通知しない。手動停止と自動停止は同じ Promise を共有する。確定を待たずに次の録音を始められるので、停止ボタンは録音の解放時点で有効に戻し、前の録音の確定完了では操作しない。古いトークンの確定が 401/403 で終わったときは、Monitor へ通知せず、会議ロックを持ったまま現在のトークンで Barrier をやり直す（`setToken` 側の再試行はロックに阻まれるため）。
 
-「確定を中止」は対象のタイトル・ID と音声欠落の可能性を示して確認し、メモリ待機があれば先に WAV を書き出す。会議ロック下で `abandoned` に更新するだけで、音声・会議情報・サーバーデータは削除しない。確定処理中・録音中には中止できない。再読み込み後も一覧から除外し、Scheduler は再投入時と送信前に中止状態を確認する。既に送信中の PUT は取り消さず、保存済みの音声も取り消さない。中止を元に戻す操作と WAV の取り込みは今回の範囲外。
+「確定を中止」は対象のタイトル・ID と音声欠落の可能性を示して確認し、メモリ待機があれば先に WAV を書き出す。会議ロック下で `abandoned` に更新するだけで、音声・会議情報・サーバーデータは削除しない。確定処理中・録音中には中止できない。再読み込み後も一覧から除外し、Scheduler は再投入時と送信前に中止状態を確認する。さらに Scheduler と直接送信の両方が通る `prepareChunkPut()` が、会議登録の完了後・PUT の直前に中止状態を確認する。中止済みなら PUT を始めず non-retryable の失敗を返すので、Scheduler の Chunk は Blob を保持したまま `LOCAL_SAVE_FAILED` になり、直接送信の Chunk はメモリ待機に残って `drainMemoryBacklog()` も止まる。既に送信中の PUT は取り消さず、保存済みの音声も取り消さない。中止を元に戻す操作と WAV の取り込みは今回の範囲外。
 
 `main.ts` は `recording_stopped` を受けて録音 UI と AudioContext を解放し、メモリ待機の controller を保持する。一覧の並行更新には世代番号を使い、古い読み取り結果で中止済みの行を再表示しない。確認操作は §31.5 に分離してテストする。
 
@@ -4958,7 +4998,7 @@ UI フレームワークは使わない（ブラウザ標準 API と TypeScript 
 import type { AppEvent } from "../app/app";
 import type { FinalizeResult } from "../recording/finalizer";
 import type { HealthAssessment } from "../recording/recording-health-monitor";
-import type { DegradedReason, LocalBackendHealth, RecordingHealth } from "../types/recording";
+import type { ChunkTimingMetadata, DegradedReason, LocalBackendHealth, LocalSaveStatus, RecordingHealth } from "../types/recording";
 
 /** §3.9：録音開始ボタン押下時に確認する。スキップするオプションは設けない */
 export const CONSENT_QUESTION = "この会議の参加者に録音の同意を得ましたか？";
@@ -5051,6 +5091,30 @@ export function finalizeResultText(result: FinalizeResult): string {
 }
 
 /** 録音の経過時間。1 時間未満は mm:ss、以上は h:mm:ss */
+export const INCOMPLETE_COUNT_NOTE = "（ブラウザに記録のない音声があり、実際はこれより多い可能性があります）";
+
+export interface PendingCounts {
+  readonly chunks: ReadonlyArray<{ readonly meta: Pick<ChunkTimingMetadata, "sequenceNo" | "endFrame">; readonly save: { readonly status: LocalSaveStatus } }>;
+  readonly audioFrameCount: number;
+  /** このタブの直接送信で登録した件数（IDB に残らない）。再読み込みすると 0 に戻る */
+  readonly directRegistered: number;
+  readonly memoryCount: number;
+}
+
+/**
+ * 確定待ちの内訳。IDB の Chunk・直接送信・メモリ待機で説明できない音声があれば、登録件数を不完全と明示する
+ * （再読み込み後の直接送信はサーバーに問い合わせないと数えられない）。
+ */
+export function pendingCountsText({ chunks, audioFrameCount, directRegistered, memoryCount }: PendingCounts): string {
+  const registered = chunks.filter((c) => c.save.status === "DB_REGISTERED").length;
+  const saved = chunks.filter((c) => c.save.status === "SAVED").length;
+  const accounted = chunks.length + directRegistered + memoryCount;
+  const hasGap = Math.max(-1, ...chunks.map((c) => c.meta.sequenceNo)) + 1 > accounted;
+  const hasUnknownTail = accounted === chunks.length && audioFrameCount > Math.max(0, ...chunks.map((c) => c.meta.endFrame));
+  const note = hasGap || hasUnknownTail ? INCOMPLETE_COUNT_NOTE : "";
+  return `サーバー登録確認済み ${registered + directRegistered} 件${note}／サーバー保存済み・登録未確認 ${saved} 件／ブラウザ保存済み・未送信 ${chunks.length - registered - saved} 件／メモリ内未保存 ${memoryCount} 件`;
+}
+
 export function elapsedText(ms: number): string {
   const total = Math.floor(ms / 1000);
   const h = Math.floor(total / 3600);

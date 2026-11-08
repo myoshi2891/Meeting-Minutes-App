@@ -666,6 +666,8 @@ export class RecordingController {
   private nextRequestId = 0;
   /** 会議ロックの解放。registerMeeting の start で取得し、stop の完了で解放する（Phase 1 §15 と同じ） */
   private releaseLock: (() => void) | null = null;
+  /** この録音で切断を処理済みか。health は録音をまたいで共有されるので、degradedReasons では判定しない（Phase 1 §15 と同じ） */
+  private trackEndedHandled = false;
   /** トラックの ended リスナーの解除用。stop で abort する（Phase 1 §15 と同じ） */
   private trackListeners: AbortController | null = null;
 
@@ -752,22 +754,31 @@ export class RecordingController {
       throw error;
     }
 
-    const endedReason = this.source === "mic" ? "MIC_TRACK_ENDED" : "SYSTEM_TRACK_ENDED";
+    this.trackEndedHandled = false;
+    // 前の録音の切断を、この録音の不健全として表示しない（Phase 1 §15 と同じ）
+    this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter((r) => r !== this.endedReason);
     this.trackListeners = new AbortController();
     for (const track of mediaStream.getAudioTracks()) {
-      track.addEventListener(
-        "ended",
-        () => {
-          // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する（Phase 1 §15 と同じ）
-          if (this.node === null) return;
-          if (!this.deps.health.degradedReasons.includes(endedReason)) {
-            this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, endedReason];
-            if (this.source === "mic") this.deps.onMicEnded?.();
-          }
-        },
-        { signal: this.trackListeners.signal },
-      );
+      track.addEventListener("ended", () => this.handleTrackEnded(), { signal: this.trackListeners.signal });
+      // 登録前に終了したトラックには ended が届かない（Phase 1 §15 と同じ）
+      if (track.readyState === "ended") this.handleTrackEnded();
     }
+  }
+
+  private get endedReason(): "MIC_TRACK_ENDED" | "SYSTEM_TRACK_ENDED" {
+    return this.source === "mic" ? "MIC_TRACK_ENDED" : "SYSTEM_TRACK_ENDED";
+  }
+
+  /** トラックの切断を録音ごとに 1 回だけ処理する。 */
+  private handleTrackEnded(): void {
+    // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する（Phase 1 §15 と同じ）
+    if (this.node === null || this.trackEndedHandled) return;
+    this.trackEndedHandled = true;
+    // SYSTEM_TRACK_ENDED は SystemCapture 側の addReason でも追加されるので重複させない
+    if (!this.deps.health.degradedReasons.includes(this.endedReason)) {
+      this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, this.endedReason];
+    }
+    if (this.source === "mic") this.deps.onMicEnded?.();
   }
 
   /**
