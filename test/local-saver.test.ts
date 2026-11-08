@@ -137,9 +137,32 @@ describe("LocalSaver.put", () => {
     });
     // Act
     const outcome = await saver.put(r);
-    // Assert：送り直しは 1 回だけ
-    expect(outcome).toMatchObject({ ok: false, retryable: true, error: { kind: "UNKNOWN" } });
+    // Assert：送り直しは 1 回だけ。Scheduler が上限に数えず送り直せるよう、トークン変更による失敗と分かる印を付ける
+    expect(outcome).toMatchObject({ ok: false, retryable: true, tokenChanged: true, error: { kind: "UNKNOWN" } });
     expect(n).toBe(2);
+  });
+
+  it("送り直し前の会議確認を待つ間にトークンが変わったら、確認後の最新トークンで送る", async () => {
+    // Arrange：最初の PUT 中に tok → tok-2、送り直し前の ensureMeeting 中に tok-2 → tok-3。サーバーは tok-3 だけ受け付ける
+    const r = await makeChunkRecord("m1", 0, 160);
+    const sent: string[] = [];
+    let ensures = 0;
+    let saver: LocalSaver | undefined;
+    const ensure = async () => {
+      if (++ensures === 2) saver?.setToken("tok-3");
+      return { ok: true as const };
+    };
+    saver = new LocalSaver({ baseUrl: BASE, token: "tok", requestTimeoutMs: 1000 }, async (_input, init) => {
+      const auth = new Headers(init?.headers).get("Authorization") ?? "";
+      sent.push(auth);
+      if (sent.length === 1) saver?.setToken("tok-2");
+      return auth === "Bearer tok-3" ? new Response(okBody(r), { status: 201 }) : new Response("{}", { status: 401 });
+    }, ensure);
+    // Act
+    const outcome = await saver.put(r);
+    // Assert
+    expect(sent).toEqual(["Bearer tok", "Bearer tok-3"]);
+    expect(outcome).toMatchObject({ ok: true });
   });
 
   it("トークン変更で送り直す前に会議の送信可否を確かめ、確定中止されていれば PUT しない", async () => {

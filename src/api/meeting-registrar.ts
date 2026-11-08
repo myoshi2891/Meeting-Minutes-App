@@ -3,10 +3,13 @@ import type { CreateMeetingRequest, MeetingResponse } from "./contracts";
 import { assertLocalHost, isRetryableError } from "./local-saver";
 import type { MeetingRecord, LocalSaveError, LocalSaveErrorKind } from "../types/recording";
 
-/** unauthorizedReported：この 401/403 を Monitor へ報告済み。呼び出し元（Scheduler）は重ねて報告しない */
+/**
+ * unauthorizedReported：この 401/403 を Monitor へ報告済み。呼び出し元（Scheduler）は重ねて報告しない。
+ * tokenChanged：登録中にトークンが替わり続けて登録できなかった。Scheduler は試行上限に数えず送り直す（LocalSaver と同じ）
+ */
 export type RegistrationOutcome =
   | { readonly ok: true }
-  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean; readonly unauthorizedReported?: boolean };
+  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean; readonly unauthorizedReported?: boolean; readonly tokenChanged?: boolean };
 
 export interface MeetingRegistrarDeps {
   readonly baseUrl: string;
@@ -87,7 +90,7 @@ export class MeetingRegistrar {
         return this.fail(response.status >= 500 ? "SERVER" : "UNKNOWN", `meeting registration HTTP ${response.status}`, response.status);
       }
       // 再送中にもトークンが変わった。UNAUTHORIZED にすると Scheduler が失効として通知するため、再試行できる失敗で返す
-      return this.fail("UNKNOWN", "meeting registration token changed", null);
+      return { ...this.fail("UNKNOWN", "meeting registration token changed", null), tokenChanged: true };
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return this.fail("TIMEOUT", "meeting registration timeout", null);
       if (error instanceof TypeError) return this.fail("NETWORK", error.message, null);

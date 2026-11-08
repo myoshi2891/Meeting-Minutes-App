@@ -47,7 +47,8 @@ describe("MeetingRegistrar", () => {
     // Assert
     expect(auths).toEqual(["Bearer token-0", "Bearer token-1"]);
     expect(onBackendUnauthorized).not.toHaveBeenCalled();
-    expect(outcome).toMatchObject({ ok: false, retryable: true });
+    // Scheduler が試行上限に数えず送り直せるよう、トークン変更による失敗と分かる印を付ける
+    expect(outcome).toMatchObject({ ok: false, retryable: true, tokenChanged: true });
     expect(outcome.ok === false && outcome.error.kind).not.toBe("UNAUTHORIZED");
   });
 

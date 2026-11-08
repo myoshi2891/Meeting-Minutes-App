@@ -23,8 +23,11 @@ export interface LocalSaverConfig {
 
 export type SaveOutcome =
   | { readonly ok: true; readonly registered: boolean; readonly serverPath: string; readonly idempotent: boolean }
-  /** unauthorizedReported：会議登録の 401/403 を MeetingRegistrar が Monitor へ報告済み */
-  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean; readonly unauthorizedReported?: boolean };
+  /**
+   * unauthorizedReported：会議登録の 401/403 を MeetingRegistrar が Monitor へ報告済み。
+   * tokenChanged：送信中にトークンが替わり続けて送れなかった。サーバーの拒否ではないので、Scheduler は試行上限に数えず送り直す
+   */
+  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean; readonly unauthorizedReported?: boolean; readonly tokenChanged?: boolean };
 
 const RETRYABLE: ReadonlySet<LocalSaveErrorKind> = new Set(["NETWORK", "TIMEOUT", "SERVER", "STORAGE_FULL", "HASH_MISMATCH", "UNKNOWN"]);
 
@@ -62,10 +65,14 @@ export class LocalSaver {
     let token = this.token;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
-        // 送り直す前に送信可否を確かめ直す。最初の応答待ちの間に確定中止された会議へ新しい PUT を始めない
-        if (attempt > 0 && this.ensureMeeting !== undefined) {
-          const registration = await this.ensureMeeting(meetingId);
-          if (!registration.ok) return registration;
+        if (attempt > 0) {
+          // 送り直す前に送信可否を確かめ直す。最初の応答待ちの間に確定中止された会議へ新しい PUT を始めない
+          if (this.ensureMeeting !== undefined) {
+            const registration = await this.ensureMeeting(meetingId);
+            if (!registration.ok) return registration;
+          }
+          // 確認を待つ間にもトークンは変わりうる。送り直しは送信直前の最新トークンで送る
+          token = this.token;
         }
         const response = await fetchImpl(url, {
           method: "PUT",
@@ -84,14 +91,11 @@ export class LocalSaver {
         });
         const outcome = await this.interpret(response, record);
         // 送信後（本文の読み取り中を含む）にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（MeetingRegistrar と同じ）
-        if (!outcome.ok && outcome.error.kind === "UNAUTHORIZED" && this.token !== token) {
-          token = this.token;
-          continue;
-        }
+        if (!outcome.ok && outcome.error.kind === "UNAUTHORIZED" && this.token !== token) continue;
         return outcome;
       }
       // 送り直し中にもトークンが変わった。UNAUTHORIZED にすると Scheduler が失効として通知するため、再試行できる失敗で返す
-      return this.fail("UNKNOWN", "token changed during upload", null);
+      return { ...this.fail("UNKNOWN", "token changed during upload", null), tokenChanged: true };
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         return this.fail("TIMEOUT", `timeout after ${this.config.requestTimeoutMs}ms`, null);
@@ -136,7 +140,7 @@ export class LocalSaver {
     return this.fail("UNKNOWN", detail, status);
   }
 
-  private fail(kind: LocalSaveErrorKind, message: string, httpStatus: number | null): SaveOutcome {
+  private fail(kind: LocalSaveErrorKind, message: string, httpStatus: number | null): Extract<SaveOutcome, { ok: false }> {
     return {
       ok: false,
       error: { kind, message, httpStatus, at: performance.now() },
