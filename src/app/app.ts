@@ -96,8 +96,11 @@ export class App {
   private readonly heldLocks = new Map<string, () => void>();
   /** heldLocks を借りて確定・中止を実行中の会議。借用中は同じタブの別処理にも貸さない */
   private readonly heldLockBusy = new Set<string>();
-  /** 会議ごとのメモリ待機の drain。stop 後に残った末尾を、サーバー復帰時に確定より先に送る */
-  private readonly drains = new Map<string, (notify: boolean) => Promise<void>>();
+  /**
+   * 会議ごとのメモリ待機の drain。stop 後に残った末尾を、サーバー復帰時に確定より先に送る。
+   * direct：false ならサーバーへの直接送信を試さず、IDB への書き戻しだけ行う（失敗も通知しない）
+   */
+  private readonly drains = new Map<string, (notify: boolean, direct?: boolean) => Promise<void>>();
   private unsubscribeMonitor: () => void = () => undefined;
   private disposed = false;
   private readonly finalizing = new Map<string, Promise<FinalizeResult>>();
@@ -216,10 +219,16 @@ export class App {
 
     let quotaCheck: Promise<void> = Promise.resolve();
     let draining = false;
+    /** 実行中の drain が直接送信を許すか。サーバーが使えない間の確定再試行は IDB への書き戻しだけ試す */
+    let directAllowed = true;
+    /** 実行中の drain の直接送信が、送信中のトークン変更で送れなかったか */
+    let tokenChangedDuringDrain = false;
     /** notify：空になったら確定を再開させる。onBackendAvailable は自分で確定するので false で呼ぶ */
-    const drain = async (notify = true): Promise<void> => {
+    const drain = async (notify = true, direct = true): Promise<void> => {
       if (draining) return;
       draining = true;
+      directAllowed = direct;
+      tokenChangedDuringDrain = false;
       try {
         await controller.drainMemoryBacklog();
         // 直接送信は Scheduler を通らず onChunkSaved が来ない。空になったら停止後の Barrier を再開させる
@@ -230,10 +239,15 @@ export class App {
           if (notify) void this.onChunkSaved(meetingId);
         }
       } catch (error) {
-        this.deps.onEvent({ type: "memory_backlog_export_required", meetingId, error });
+        // トークン変更の失敗はすぐ送り直す。直接送信を試さなかった失敗は停止時に通知済み
+        if (!tokenChangedDuringDrain && direct) this.deps.onEvent({ type: "memory_backlog_export_required", meetingId, error });
       } finally {
         draining = false;
+        directAllowed = true;
       }
+      // setToken からの drain は実行中の drain に弾かれているので、終わってから新しいトークンで送り直す。
+      // draining を戻した直後に同期的に呼ぶので、別の drain と並行しない。空になれば notify に従って確定を再開する
+      if (tokenChangedDuringDrain && controller.memoryBacklogCount > 0) await drain(notify, direct);
     };
     const enqueuer: ChunkEnqueuer = {
       enqueue: async (chunkKey) => {
@@ -281,8 +295,12 @@ export class App {
       // 送るたびに現在の saver を引く。録音中に setToken しても、開始時のトークン（未設定・失効）で送り続けない
       directSaver: {
         put: async (record) => {
+          const at = (this.deps.now ?? Date.now)();
+          // サーバーが使えない間の確定再試行では送らない（IDB への書き戻しだけ試す）
+          if (!directAllowed) return { ok: false, retryable: true, error: { kind: "NETWORK", message: "backend unavailable", httpStatus: null, at } };
           const outcome = (await this.saver?.put(record)) ??
-            { ok: false, retryable: false, error: { kind: "UNAUTHORIZED", message: "backend token is not set", httpStatus: null, at: (this.deps.now ?? Date.now)() } };
+            { ok: false, retryable: false, error: { kind: "UNAUTHORIZED", message: "backend token is not set", httpStatus: null, at } };
+          if (!outcome.ok && outcome.tokenChanged === true) tokenChangedDuringDrain = true;
           // Scheduler を通らないので、PUT の 401/403 はここで Monitor へ伝える（会議登録の分は MeetingRegistrar が報告済み）
           if (!outcome.ok && outcome.error.kind === "UNAUTHORIZED" && outcome.unauthorizedReported !== true &&
             (outcome.error.httpStatus === 401 || outcome.error.httpStatus === 403)) {
@@ -428,12 +446,12 @@ export class App {
     const release = await this.acquireMeetingLock(meetingId);
     if (release === null) return { ok: false, stage: "verify", detail: "meeting is locked by another tab" };
     try {
-      // メモリ待機が残る会議は、Barrier の前に末尾を直接送信する（送れなければ Barrier が waiting_local_save を返す）。
+      // メモリ待機が残る会議は、Barrier の前に末尾を IDB へ書き戻すか直接送信する（残れば Barrier が waiting_local_save を返す）。
       // 停止状態を書けていなくても音声は先に送る（IDB が書けないときこそメモリ待機しか残っていない）。確定は下で止める。
-      // サーバーが使えない間は送れないので試さない（停止時に memory_backlog_export_required を重ねて通知しない）
+      // サーバーが使えない間も IDB への書き戻しは試す。直接送信は試さず、停止時の memory_backlog_export_required も重ねて通知しない
       const drain = this.drains.get(meetingId);
-      if (drain !== undefined && this.session?.meetingId !== meetingId && this.memoryBacklogCount(meetingId) > 0 && isUsable(this.monitor.state)) {
-        await drain(false);
+      if (drain !== undefined && this.session?.meetingId !== meetingId && this.memoryBacklogCount(meetingId) > 0) {
+        await drain(false, isUsable(this.monitor.state));
       }
       const unsaved = await this.saveUnsavedStop(meetingId);
       if (unsaved !== null) return unsaved;
@@ -572,7 +590,7 @@ export class App {
   }
 
   private async finalizeOnce(meetingId: string): Promise<FinalizeResult> {
-    if (this.token === null) return { ok: false, stage: "waiting_local_save", detail: "backend token is not set" };
+    if (this.token === null) return { ok: false, stage: "waiting_local_save", detail: "backend token is not set", reason: "unauthorized" };
     const controller = this.controllers.get(meetingId);
     const token = this.token;
     const result = await finalizeMeeting(

@@ -1,5 +1,6 @@
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { LocalSaver } from "../src/api/local-saver";
 import { BACKEND_TOKEN_KEY, createApp, type App, type AppEvent, type SessionController } from "../src/app/app";
 import { tryAcquireMeetingLock } from "../src/recording/meeting-lock";
 import type { MemoryBacklogFile, RecordingControllerDeps } from "../src/recording/recording-controller";
@@ -1381,6 +1382,59 @@ describe("RecordingSession.stop", () => {
     expect(result).toMatchObject({ ok: true });
     sentTail();
     await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
+  });
+
+  it("サーバー停止中の停止でも、メモリ待機を IDB へ書き戻すことは試す", async () => {
+    // Arrange：IDB は回復しており、drain すれば IDB へ書き戻せる（直接送信は不要）
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    controller.memoryBacklogCount = 1;
+    controller.drainEffect = () => { controller.memoryBacklogCount = 0; };
+    // Act
+    await session.stop();
+    // Assert
+    expect(controller.drainCount).toBe(1);
+    expect(controller.memoryBacklogCount).toBe(0);
+  });
+
+  it("サーバー停止中の停止では直接送信を試さず、メモリ待機の書き出しも重ねて促さない", async () => {
+    // Arrange：末尾は IDB にもサーバーにもない
+    stubPageGlobals();
+    const puts: string[] = [];
+    const s = await setup({ serverUp: false, wrapFetch: (f) => async (input, init) => {
+      if (init?.method === "PUT") puts.push(String(input));
+      return f(input, init);
+    } });
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    controller.backlog.push(await makeChunkRecord(id, 0, 160));
+    controller.memoryBacklogCount = 1;
+    // Act
+    const result = await session.stop();
+    // Assert
+    expect(result).toMatchObject({ ok: false, stage: "waiting_local_save" });
+    expect(puts).toEqual([]);
+    expect(s.events.filter((e) => e.type === "memory_backlog_export_required")).toHaveLength(1);
+    expect(controller.memoryBacklogCount).toBe(1);
+  });
+
+  it("直接送信が送信中のトークン変更で送れなければ、drain を終えてから送り直して確定する", async () => {
+    // Arrange：停止後の drain の 1 回目の PUT だけ、トークンが替わり続けて送れない
+    vi.spyOn(LocalSaver.prototype, "put").mockImplementationOnce(async () => ({
+      ok: false, retryable: true, tokenChanged: true,
+      error: { kind: "UNKNOWN", message: "token changed during upload", httpStatus: null, at: 0 },
+    }));
+    // Act
+    const { s, id, controller, result, sentTail } = await stopWithMemoryTail(true);
+    // Assert：書き出しの催促は停止時の 1 回だけで、確定まで進む
+    expect(result).toMatchObject({ ok: true });
+    sentTail();
+    expect(controller.memoryBacklogCount).toBe(0);
+    expect(s.events.filter((e) => e.type === "memory_backlog_export_required" && e.meetingId === id)).toHaveLength(1);
   });
 
   it("サーバー復帰時に IDB の会議一覧が読めなくても、停止後のメモリ待機は直接送信する", async () => {
