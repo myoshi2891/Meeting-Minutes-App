@@ -153,6 +153,14 @@ describe("finalizeResultText", () => {
     expect(finalizeResultText({ ok: false, stage: "finalize", detail: "HTTP 500" })).toBe("確定できませんでした。再試行してください（HTTP 500）");
   });
 
+  it("認証エラーに分類された失敗はトークンの確認を案内する", () => {
+    expect(finalizeResultText({ ok: false, stage: "verify", detail: "list HTTP 401", reason: "unauthorized" })).toBe("サーバーのトークンを設定で確認・保存してください。保存済みの音声は保持しています");
+  });
+
+  it("detail が HTTP 403 で終わっても、認証エラーに分類されていなければエラーとして出す", () => {
+    expect(finalizeResultText({ ok: false, stage: "verify", detail: "list meetingId mismatch: x HTTP 403" })).toBe("確定できませんでした（list meetingId mismatch: x HTTP 403）");
+  });
+
   it("検証の失敗は理由を出す", () => {
     expect(finalizeResultText({ ok: false, stage: "verify", detail: "sha256 mismatch" })).toBe("確定できませんでした（sha256 mismatch）");
   });

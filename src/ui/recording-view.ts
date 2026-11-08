@@ -83,7 +83,8 @@ export function noticeFor(event: AppEvent): string | null {
 
 export function finalizeResultText(result: FinalizeResult): string {
   if (result.ok) return result.missingTailMs === undefined ? "録音を確定しました" : `録音を確定しました。${missingTailText(result.missingTailMs)}`;
-  if (/HTTP (401|403)$/.test(result.detail) || result.detail === "backend token is not set") return "サーバーのトークンを設定で確認・保存してください。保存済みの音声は保持しています";
+  // detail の文字列一致で判定すると、サーバー由来の値（一覧の meetingId など）が "HTTP 403" で終わるだけで認証エラーに見える
+  if (result.reason === "unauthorized") return "サーバーのトークンを設定で確認・保存してください。保存済みの音声は保持しています";
   if (result.stage === "waiting_local_save") {
     const memory = result.detail.match(/^(\d+) chunks not persisted to IDB$/);
     if (memory) return `確定待ち：メモリ内に未保存の音声が ${memory[1]} 件あります。WAV を書き出してから、サーバーの状態を確認してください`;
