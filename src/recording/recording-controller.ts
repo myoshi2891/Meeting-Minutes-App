@@ -95,6 +95,8 @@ export class RecordingController {
 
   async start(meetingId: string, title: string, consentConfirmedAt: number): Promise<void> {
     const { audioContext, mediaStream, workletModuleUrl } = this.deps;
+    // 前の録音のメモリ待機が残るうちは始めない。保持中のロックの解放手段を上書きし、別会議の Chunk も混ざるため
+    if (this.memoryBacklog.length > 0) throw new Error("memory backlog from the previous recording remains");
 
     // recording を書く前にロックを取る。先に書くと、別タブの復旧がロックのない recording を中断扱いにできてしまう
     const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
@@ -224,11 +226,11 @@ export class RecordingController {
       }
       meeting.status = "stop_requested";
       // 保存に失敗しても Worklet を切り離す前に末尾を Chunk にする（IDB かメモリ待機に残り、WAV で書き出せる）
-      let statusError: { readonly error: unknown } | null = null;
+      let statusError: unknown = null;
       try {
         await this.deps.meetingStore.put(meeting);
       } catch (error) {
-        statusError = { error };
+        statusError = error;
       }
 
       await this.requestFlush("stop");
@@ -236,7 +238,8 @@ export class RecordingController {
       // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
       meeting.updatedAt = Date.now();
       await this.deps.meetingStore.put(meeting);
-      if (statusError !== null) throw statusError.error;
+      // 最終保存で stop_requested も書けたので停止は完了している。最初の失敗は通知だけにし、呼び出し元を確定へ進める
+      if (statusError !== null) this.deps.onError(statusError instanceof Error ? statusError : new Error(String(statusError)));
     } finally {
       // 途中で reject してもマイクと Worklet を解放する
       this.sourceNode?.disconnect();

@@ -68,6 +68,21 @@ export class LocalSaveScheduler {
     void this.pump();
   }
 
+  /**
+   * 確定中止した会議の待機キーを外す。backend の状態に関係なく呼べる。送信中のキーは完了まで待つ（runOne が送信前に中止を確認する）。
+   * IDB の Chunk には触らない（音声は残す）。
+   */
+  discardMeeting(meetingId: string): void {
+    const prefix = `${meetingId}:`;
+    for (let i = this.pending.length - 1; i >= 0; i--) {
+      const key = this.pending[i];
+      if (!key.startsWith(prefix) || this.inFlight.has(key)) continue;
+      this.pending.splice(i, 1);
+      this.markedUnavailable.delete(key);
+    }
+    this.deps.health.pendingChunkCount = this.pendingCount;
+  }
+
   get pendingCount(): number {
     // runOne 中の再投入で pending と inFlight の両方に同じキーが一時的に載りうるため、重複を数えない
     return this.pending.filter((k) => !this.inFlight.has(k)).length + this.inFlight.size;
@@ -123,8 +138,22 @@ export class LocalSaveScheduler {
   }
 
   private async markAllPendingUnavailable(): Promise<void> {
+    const abandoned = new Map<string, boolean>();
     // 保存済みのキーを pending から外すため、コピーを走査する
     for (const key of [...this.pending]) {
+      // 中止後にリトライタイマーが再投入したキーも、backend 停止中の件数に数えない
+      const meetingId = key.slice(0, key.indexOf(":"));
+      if (this.deps.isMeetingAbandoned !== undefined && !abandoned.has(meetingId)) {
+        // 読めなければ中止とみなさない（件数に残すだけで、送信は runOne が送信前に再確認する）
+        abandoned.set(meetingId, await this.deps.isMeetingAbandoned(meetingId).catch(() => false));
+      }
+      if (abandoned.get(meetingId) === true) {
+        // 読み取りを待つ間に discardMeeting などで外れていれば何もしない（-1 で末尾を消さない）
+        const index = this.pending.indexOf(key);
+        if (index !== -1) this.pending.splice(index, 1);
+        this.markedUnavailable.delete(key);
+        continue;
+      }
       if (this.markedUnavailable.has(key)) continue;
       let settled = false;
       await this.deps.chunkStore.updateSaveState(key, (r) => {
@@ -209,7 +238,8 @@ export class LocalSaveScheduler {
     const { error, retryable } = outcome;
     if (error.kind === "UNAUTHORIZED") {
       // Monitor が unauthorized を知らないままだと再投入 → 即 401 の連打になる。通知して resumeAll() まで待機させる
-      this.deps.onBackendUnauthorized();
+      // 会議登録の 401/403 は MeetingRegistrar が報告済み。同じ要求を二重に数えない
+      if (outcome.unauthorizedReported !== true) this.deps.onBackendUnauthorized();
       await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
         r.save.status = "BACKEND_UNAVAILABLE";
         r.save.lastError = error;

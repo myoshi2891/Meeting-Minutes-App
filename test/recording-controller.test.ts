@@ -314,11 +314,11 @@ describe("RecordingController", () => {
     expect((await s.meetingStore.get("m1"))?.sessionClock.audioFrameCount).toBe(481600);
   });
 
-  it("stop 中に会議の保存が失敗しても、トラック停止・onmessage の解除・会議ロックの解放を行う", async () => {
+  it("stop 中に会議の保存が失敗し続けたら reject し、トラック停止・onmessage の解除・会議ロックの解放を行う", async () => {
     // Arrange
     const s = await setup();
     await s.controller.start("m1", "定例", 1);
-    vi.spyOn(s.meetingStore, "put").mockRejectedValueOnce(new Error("put failed"));
+    vi.spyOn(s.meetingStore, "put").mockRejectedValue(new Error("put failed"));
     // Act
     await expect(s.controller.stop()).rejects.toThrow("put failed");
     // Assert
@@ -327,14 +327,17 @@ describe("RecordingController", () => {
     expect(s.locks.held.size).toBe(0);
   });
 
-  it("stop_requested の保存に失敗しても Worklet の末尾を Chunk にしてから解放し、元の例外を返す", async () => {
+  it("最初の stop_requested の保存に失敗しても、末尾の Chunk 化と最終保存が済めば停止を完了し、失敗は onError に通知する", async () => {
     // Arrange
     const s = await setup();
     await s.controller.start("m1", "定例", 1);
     vi.spyOn(s.meetingStore, "put").mockRejectedValueOnce(new Error("put failed"));
     // Act
-    await expect(s.controller.stop()).rejects.toThrow("put failed");
-    // Assert：切り離す前に stop を送り、部分 Chunk を IDB に残す
+    await s.controller.stop();
+    // Assert：最終保存で stop_requested が残るので、呼び出し元は確定へ進める
+    expect(s.errors.map((e) => e.message)).toEqual(["put failed"]);
+    expect((await s.meetingStore.get("m1"))?.status).toBe("stop_requested");
+    // 切り離す前に stop を送り、部分 Chunk を IDB に残す
     expect(s.worklet.commands.some((c) => c.type === "stop")).toBe(true);
     expect(s.enqueued).toEqual(["m1:mic:000000"]);
     expect((await s.chunkStore.getChunk("m1:mic:000000"))?.meta.sampleCount).toBe(1600);
@@ -379,6 +382,26 @@ describe("RecordingController", () => {
     release?.();
     await vi.waitFor(() => expect(s.locks.held.has(meetingLockName("m1"))).toBe(false));
     expect(s.controller.takeMeetingLock()).toBeNull();
+  });
+
+  it("前の録音のメモリ待機が残る間は、同じインスタンスで次の録音を始めず、保持したロックも手放さない", async () => {
+    // Arrange：m1 の末尾がメモリ待機に残り、ロックを保持したまま止まっている
+    let serverUp = false;
+    const s = await setup(closedStore, {
+      put: async () => serverUp
+        ? { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false }
+        : { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } },
+    });
+    await s.controller.start("m1", "定例", 1);
+    await s.controller.stop();
+    // Act
+    const starting = s.controller.start("m2", "定例2", 2);
+    // Assert：m1 のロックの解放手段を上書きせず、drain で空になれば解放できる
+    await expect(starting).rejects.toThrow("memory backlog");
+    expect(s.locks.held.has(meetingLockName("m2"))).toBe(false);
+    serverUp = true;
+    await s.controller.drainMemoryBacklog();
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(false);
   });
 
   it("同じインスタンスで stop 後に別の会議を start すると、Chunk の連番は 0 から始まる", async () => {
