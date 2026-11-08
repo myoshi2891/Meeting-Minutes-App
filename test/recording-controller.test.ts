@@ -79,7 +79,7 @@ interface Setup {
   health: RecordingHealth;
   errors: Error[];
   locks: FakeLockManager;
-  track: EventTarget & { stop: ReturnType<typeof vi.fn> };
+  track: EventTarget & { stop: ReturnType<typeof vi.fn>; readyState: MediaStreamTrackState };
   audioContext: AudioContext;
   /** コントローラが持つ AudioWorkletNode 側のポート（onmessage の解除を確認する） */
   nodePort: MessagePort;
@@ -104,7 +104,7 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
       readonly port = channel.port1;
     },
   );
-  const track = Object.assign(new EventTarget(), { stop: vi.fn() });
+  const track = Object.assign(new EventTarget(), { stop: vi.fn(), readyState: "live" as MediaStreamTrackState });
   const audioContext = {
     sampleRate: 48000,
     currentTime: 0,
@@ -535,6 +535,34 @@ describe("RecordingController", () => {
     s.track.dispatchEvent(new Event("ended"));
     s.track.dispatchEvent(new Event("ended"));
     expect(ended).toHaveBeenCalledOnce();
+  });
+
+  it("前の録音の MIC_TRACK_ENDED が残っていても、次の録音の切断を通知する", async () => {
+    // Arrange：health は録音をまたいで共有される
+    const ended = vi.fn();
+    const s = await setup(undefined, undefined, ended);
+    await s.controller.start("m1", "定例", 1);
+    s.track.dispatchEvent(new Event("ended"));
+    await s.controller.stop();
+    // Act
+    await s.controller.start("m2", "定例", 1);
+    expect(s.health.degradedReasons).toEqual([]);
+    s.track.dispatchEvent(new Event("ended"));
+    // Assert
+    expect(ended).toHaveBeenCalledTimes(2);
+    expect(s.health.degradedReasons).toEqual(["MIC_TRACK_ENDED"]);
+  });
+
+  it("リスナー登録前に終了していたトラックも切断として通知する", async () => {
+    // Arrange
+    const ended = vi.fn();
+    const s = await setup(undefined, undefined, ended);
+    s.track.readyState = "ended";
+    // Act
+    await s.controller.start("m1", "定例", 1);
+    // Assert
+    expect(ended).toHaveBeenCalledOnce();
+    expect(s.health.degradedReasons).toEqual(["MIC_TRACK_ENDED"]);
   });
 
   it("Mic トラック終了で MIC_TRACK_ENDED が degradedReasons に入る", async () => {

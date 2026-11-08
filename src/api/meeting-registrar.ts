@@ -69,7 +69,8 @@ export class MeetingRegistrar {
           return { ok: true };
         }
         const latestToken = this.deps.token();
-        if ((response.status === 401 || response.status === 403) && latestToken !== null && latestToken !== token && attempt === 0) {
+        // 送信後にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない
+        if ((response.status === 401 || response.status === 403) && latestToken !== null && latestToken !== token) {
           token = latestToken;
           continue;
         }
@@ -82,7 +83,8 @@ export class MeetingRegistrar {
         if (response.status === 507) return this.fail("STORAGE_FULL", "meeting registration disk full", response.status);
         return this.fail(response.status >= 500 ? "SERVER" : "UNKNOWN", `meeting registration HTTP ${response.status}`, response.status);
       }
-      return this.fail("UNAUTHORIZED", "meeting registration token changed", 401);
+      // 再送中にもトークンが変わった。UNAUTHORIZED にすると Scheduler が失効として通知するため、再試行できる失敗で返す
+      return this.fail("UNKNOWN", "meeting registration token changed", null);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return this.fail("TIMEOUT", "meeting registration timeout", null);
       if (error instanceof TypeError) return this.fail("NETWORK", error.message, null);

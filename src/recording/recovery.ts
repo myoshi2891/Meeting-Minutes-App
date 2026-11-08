@@ -40,10 +40,10 @@ export async function recoverOnStartup(
         continue;
       }
       try {
-        // 一覧取得後に別タブが確定・中止した会議を巻き戻さない。
+        // 一覧取得後に別タブが停止・確定・中止した会議を巻き戻さない。Chunk の再送もそのタブに任せる。
         const current = await meetingStore.get(m.meetingId);
         if (current?.status !== status) {
-          if (current?.status === "abandoned") active.add(m.meetingId);
+          active.add(m.meetingId);
           continue;
         }
         const originalStatus = m.status;

@@ -83,6 +83,8 @@ export class RecordingController {
   private releaseLock: (() => void) | null = null;
   /** トラックの ended リスナーの解除用。同じ mediaStream で録り直したときにリスナーが蓄積しないよう stop で abort する */
   private trackListeners: AbortController | null = null;
+  /** この録音で切断を処理済みか。health は録音をまたいで共有されるので、degradedReasons では判定しない */
+  private micEndedHandled = false;
 
   constructor(private readonly deps: RecordingControllerDeps) {}
 
@@ -159,20 +161,24 @@ export class RecordingController {
       throw error;
     }
 
+    this.micEndedHandled = false;
+    // 前の録音の切断を、この録音の不健全として表示しない
+    this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter((r) => r !== "MIC_TRACK_ENDED");
     this.trackListeners = new AbortController();
     for (const track of mediaStream.getAudioTracks()) {
-      track.addEventListener(
-        "ended",
-        () => {
-          // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する
-          if (this.node === null) return;
-          if (this.deps.health.degradedReasons.includes("MIC_TRACK_ENDED")) return;
-          this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "MIC_TRACK_ENDED"];
-          this.deps.onMicEnded?.();
-        },
-        { signal: this.trackListeners.signal },
-      );
+      track.addEventListener("ended", () => this.handleMicEnded(), { signal: this.trackListeners.signal });
+      // 登録前に終了したトラックには ended が届かない
+      if (track.readyState === "ended") this.handleMicEnded();
     }
+  }
+
+  /** マイク切断を録音ごとに 1 回だけ処理する。 */
+  private handleMicEnded(): void {
+    // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する
+    if (this.node === null || this.micEndedHandled) return;
+    this.micEndedHandled = true;
+    this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, "MIC_TRACK_ENDED"];
+    this.deps.onMicEnded?.();
   }
 
   /**

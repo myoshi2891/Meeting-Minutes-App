@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MeetingRegistrar } from "../src/api/meeting-registrar";
 import type { MeetingRecord } from "../src/types/recording";
 import { browserLikeFetch } from "./harness";
@@ -28,6 +28,36 @@ describe("MeetingRegistrar", () => {
       getMeeting: async () => meeting, fetchImpl, timeoutMs: 1000 });
     expect(await registrar.ensure(meeting.meetingId)).toEqual({ ok: true });
     expect(auths).toEqual(["Bearer old", "Bearer new"]);
+  });
+
+  it("再送の 401 でもトークンがさらに変わっていれば、認証エラーにせず再試行できる失敗にする", async () => {
+    // Arrange：応答が返るたびに設定画面でトークンが更新される
+    let generation = 0;
+    const onBackendUnauthorized = vi.fn();
+    const fetchImpl: typeof fetch = async () => {
+      generation++;
+      return new Response(null, { status: 401 });
+    };
+    const registrar = new MeetingRegistrar({ baseUrl: "http://127.0.0.1:43117", token: () => `token-${generation}`,
+      getMeeting: async () => meeting, fetchImpl, timeoutMs: 1000, onBackendUnauthorized });
+    // Act
+    const outcome = await registrar.ensure(meeting.meetingId);
+    // Assert
+    expect(onBackendUnauthorized).not.toHaveBeenCalled();
+    expect(outcome).toMatchObject({ ok: false, retryable: true });
+    expect(outcome.ok === false && outcome.error.kind).not.toBe("UNAUTHORIZED");
+  });
+
+  it("現在のトークンへの 401 は認証エラーとして通知する", async () => {
+    // Arrange
+    const onBackendUnauthorized = vi.fn();
+    const registrar = new MeetingRegistrar({ baseUrl: "http://127.0.0.1:43117", token: () => "tok",
+      getMeeting: async () => meeting, fetchImpl: async () => new Response(null, { status: 401 }), timeoutMs: 1000, onBackendUnauthorized });
+    // Act
+    const outcome = await registrar.ensure(meeting.meetingId);
+    // Assert
+    expect(onBackendUnauthorized).toHaveBeenCalledOnce();
+    expect(outcome).toMatchObject({ ok: false, retryable: false, error: { kind: "UNAUTHORIZED" } });
   });
 
   it("ブラウザの fetch を渡してもメソッド呼び出しにせず POST を送る（Illegal invocation にならない）", async () => {
