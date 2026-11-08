@@ -80,6 +80,48 @@ describe("LocalSaver.put", () => {
     expect(auths).toEqual(["Bearer new-tok"]);
   });
 
+  it("送信中にトークンが変わって 401 になったら、失効として返さず新しいトークンで送り直す", async () => {
+    // Arrange：古いトークンの PUT の応答待ち中に setToken される
+    const r = await makeChunkRecord("m1", 0, 160);
+    const auths: (string | null)[] = [];
+    let saver: LocalSaver | undefined;
+    saver = saverWith(async (_input, init) => {
+      const auth = new Headers(init?.headers).get("Authorization");
+      auths.push(auth);
+      if (auth === "Bearer tok") {
+        saver?.setToken("new-tok");
+        return new Response(JSON.stringify({ error: "unauthorized", code: "UNAUTHORIZED" }), { status: 401 });
+      }
+      return new Response(okBody(r), { status: 201 });
+    });
+    // Act
+    const outcome = await saver.put(r);
+    // Assert
+    expect(outcome).toMatchObject({ ok: true, registered: true });
+    expect(auths).toEqual(["Bearer tok", "Bearer new-tok"]);
+  });
+
+  it("送り直し中にもトークンが変わったら、失効ではなく再試行できる失敗で返す", async () => {
+    // Arrange：送るたびにトークンが差し替わる
+    const r = await makeChunkRecord("m1", 0, 160);
+    let n = 0;
+    let saver: LocalSaver | undefined;
+    saver = saverWith(async () => {
+      saver?.setToken(`tok-${++n}`);
+      return new Response("{}", { status: 403 });
+    });
+    // Act
+    const outcome = await saver.put(r);
+    // Assert
+    expect(outcome).toMatchObject({ ok: false, retryable: true, error: { kind: "UNKNOWN" } });
+  });
+
+  it("トークンが変わっていない 401 は UNAUTHORIZED で返す", async () => {
+    const r = await makeChunkRecord("m1", 0, 160);
+    const saver = saverWith(async () => new Response("{}", { status: 401 }));
+    expect(await saver.put(r)).toMatchObject({ ok: false, retryable: false, error: { kind: "UNAUTHORIZED", httpStatus: 401 } });
+  });
+
   it("ブラウザの fetch を渡してもメソッド呼び出しにせず PUT を送る（Illegal invocation にならない）", async () => {
     // Arrange
     const r = await makeChunkRecord("m1", 0, 160);

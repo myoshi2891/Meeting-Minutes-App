@@ -59,23 +59,33 @@ export class LocalSaver {
     const timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
     // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
     const fetchImpl = this.fetchImpl;
+    let token = this.token;
     try {
-      const response = await fetchImpl(url, {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "audio/wav",
-          "X-Chunk-SHA256": record.meta.sha256,
-          "X-Chunk-Meta": encodeChunkMetaHeader(record.meta),
-        },
-        body: record.wav,
-        signal: controller.signal,
-        // ローカルサーバーなので credentials は不要。Cookie 方式（§4.3）の場合のみ "include"。
-        credentials: "omit",
-        // リダイレクト先は assertLocalHost を通らないため追従しない（録音データを外部へ再送させない、§4.4）
-        redirect: "error",
-      });
-      return await this.interpret(response, record);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await fetchImpl(url, {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "audio/wav",
+            "X-Chunk-SHA256": record.meta.sha256,
+            "X-Chunk-Meta": encodeChunkMetaHeader(record.meta),
+          },
+          body: record.wav,
+          signal: controller.signal,
+          // ローカルサーバーなので credentials は不要。Cookie 方式（§4.3）の場合のみ "include"。
+          credentials: "omit",
+          // リダイレクト先は assertLocalHost を通らないため追従しない（録音データを外部へ再送させない、§4.4）
+          redirect: "error",
+        });
+        // 送信後にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（MeetingRegistrar と同じ）
+        if ((response.status === 401 || response.status === 403) && this.token !== token) {
+          token = this.token;
+          continue;
+        }
+        return await this.interpret(response, record);
+      }
+      // 送り直し中にもトークンが変わった。UNAUTHORIZED にすると Scheduler が失効として通知するため、再試行できる失敗で返す
+      return this.fail("UNKNOWN", "token changed during upload", null);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         return this.fail("TIMEOUT", `timeout after ${this.config.requestTimeoutMs}ms`, null);
