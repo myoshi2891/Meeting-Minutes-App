@@ -26,7 +26,8 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### 今回の変更と残課題
 
-- 2026-11-08（45 回目・未コミット）：CodeRabbit 指摘対応。(1) サーバーの `stopDetectedAtEpochMs` を SQLite 整数上限で検証（範囲外は 422）。(2) 会議登録の 401/403 を Scheduler が二重に Monitor へ報告しない（`unauthorizedReported`）。(3) 失効報告より前に始めたヘルスチェックの成功で `unauthorized` を解除しない。(4) `stop()` の最初の状態保存失敗が最終保存で回復したら停止を完了して確定へ進む（失敗は `onError`）。(5) メモリ待機が残る Controller の `start()` を拒否。(6) サーバー復帰時、確定の前に停止後のメモリ待機を drain（従来の残課題を解消）。(7) IDB が読めなくてもこのタブで中止した会議へ PUT しない。(8) 中止した会議の Chunk を待機件数から外す（`discardMeeting()`）。(9) 中止確認のキャンセルでボタンを即時復帰。テスト追加・Red確認済み。Phase 2 server の finalize にコミット後の `meeting.json` 書き出しを追加。ドキュメント網羅率（docstring）はスキップ。Python 10件・TypeScript 372件・typecheck・build 通過。テスト以外のサーバー起動はしていない。
+- 2026-11-08（46 回目・未コミット）：レビュー指摘 10 件を全件有効と判定して修正。(1) `LocalSaver.put()` は送信中にトークンが変わった 401/403 を新しいトークンで送り直し、それでも変われば再試行できる `UNKNOWN` で返す（古いトークンの 401 で失効報告・新トークンのヘルス成功の打ち消しをしない。Monitor は無変更）。(2) 直接送信の PUT の 401/403 を App が Monitor へ報告。(3) `prepareChunkPut()` は会議ロックを持たない会議の中止判定が読めなければ retryable で PUT を始めない。(4) Finalizer に `ensureMeeting` を追加し、一覧取得前に毎回会議を登録（Chunk 0 件の会議が 404 で止まらない）。(5) Scheduler：`runOne()` の中止判定の読み取り失敗は状態に触れず再投入、`resumeAll()` は会議ごとに判定して失敗した会議だけ次回へ、`markAllPendingUnavailable()` の settled 除去に index 確認。テストハーネスは `requireMeetingRegistration` 時に一覧・確定も 404 にし、`LIST:` / `FINALIZE:` を記録。テスト 11 件追加（うち 9 件と、既存の認証回復テスト 2 件の強化は修正前の Red を確認。残り 2 件は報告しない側のガード）。Phase 1 埋め込み同期（DIFF 0）・本文、Phase 2 client（Finalizer の登録、Mic/System のメモリ待機両方でのロック保持）、Phase 3 client LocalSaver、Phase 3 server rebuild の停止理由の組検証を更新。TypeScript 383 件・typecheck 通過。
+- 2026-11-08（45 回目・コミット済み 8e550a0 まで）：CodeRabbit 指摘対応。(1) サーバーの `stopDetectedAtEpochMs` を SQLite 整数上限で検証（範囲外は 422）。(2) 会議登録の 401/403 を Scheduler が二重に Monitor へ報告しない（`unauthorizedReported`）。(3) 失効報告より前に始めたヘルスチェックの成功で `unauthorized` を解除しない。(4) `stop()` の最初の状態保存失敗が最終保存で回復したら停止を完了して確定へ進む（失敗は `onError`）。(5) メモリ待機が残る Controller の `start()` を拒否。(6) サーバー復帰時、確定の前に停止後のメモリ待機を drain（従来の残課題を解消）。(7) IDB が読めなくてもこのタブで中止した会議へ PUT しない。(8) 中止した会議の Chunk を待機件数から外す（`discardMeeting()`）。(9) 中止確認のキャンセルでボタンを即時復帰。テスト追加・Red確認済み。Phase 2 server の finalize にコミット後の `meeting.json` 書き出しを追加。ドキュメント網羅率（docstring）はスキップ。Python 10件・TypeScript 372件・typecheck・build 通過。テスト以外のサーバー起動はしていない。
 
 - **最新：利用者指示で停止中。** 本作業のテスト・API・Viteを停止。5173・5188・43117・43118に待ち受けなし、関連テストプロセスも残っていないことを確認した。以下の過去ログの「起動中」は現在の状態ではない。
 - 停止理由の永続化は作業途中・未コミット。`manual` / `mic_ended` と検出時刻をIDB→確定API→SQLite／`meeting.json`へ保存し、既存DBの列追加と旧データの未記録扱いを実装。追加テストのRedを確認後、TypeScript 358件・Python 10件、typecheck・buildが通過。Phase 1の埋め込みコード同期も確認済み。
@@ -260,6 +261,11 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-11-08（46 回目・レビュー指摘 10 件）
+
+- 10 件すべて有効と判定し修正（コード 6・テスト 1・文書 3）。テスト 11 件追加（Red 確認 9 件＋既存 2 件強化）。
+- Phase 1 同期（DIFF 0）、Phase 2 client・Phase 3 client/server に波及。コミット未実施。
 
 ### 2026-11-08（45 回目・CodeRabbit 指摘対応）
 
