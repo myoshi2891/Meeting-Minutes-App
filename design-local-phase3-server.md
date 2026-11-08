@@ -3992,9 +3992,11 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 
 from minutes_local.bootstrap import open_database_with_recovery
 from minutes_local.db import repo
+from minutes_local.db.models import Meeting
 from minutes_local.db.connection import Database
 from minutes_local.jobs import scheduler
 from minutes_local.jobs.context import AppContext
@@ -4002,7 +4004,7 @@ from minutes_local.jobs.runner import JobRunner
 from minutes_local.storage import backup
 from minutes_local.storage.codec import FakeCodec
 from minutes_local.storage.files import InvalidWavError, read_pcm
-from minutes_local.storage.rebuild import rebuild
+from minutes_local.storage.rebuild import RebuildReport, rebuild
 from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm
 
 
@@ -4091,6 +4093,43 @@ async def test_rebuild_keeps_end_time_from_phase2_snapshot(client3: httpx.AsyncC
         rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
         m = repo.get_meeting(conn, "m-1")
     assert m is not None and m.ended_at == snapshot["endedAtEpochMs"] and m.ended_at is not None
+
+
+def _rewrite_snapshot_and_rebuild(ctx3: AppContext, **fields: object) -> tuple[RebuildReport, Meeting | None]:
+    """meeting.json の項目を書き換え、DB 行を消してから rebuild する。"""
+    path = ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot.update(fields)
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        return report, repo.get_meeting(conn, "m-1")
+
+
+async def test_rebuild_keeps_valid_stop_pair(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """有効な停止理由と検出時刻の組は、rebuild 後もそのまま残る。"""
+    await _completed_meeting(client3, runner3, ctx3)
+    report, m = _rewrite_snapshot_and_rebuild(ctx3, stopReason="mic_ended", stopDetectedAtEpochMs=1_700_000_000_000)
+    assert report.meetings_created == 1 and report.skipped_files == []
+    assert m is not None and m.stop_reason == "mic_ended" and m.stop_detected_at == 1_700_000_000_000
+
+
+@pytest.mark.parametrize(("reason", "detected"), [
+    ("unplugged", 1),                 # 未知の停止理由
+    ("manual", -1),                   # 範囲外（負）
+    ("manual", 2**63),                # 範囲外（SQLite INTEGER 超過）
+    ("manual", True),                 # bool は int のサブクラスだが時刻ではない
+    ("manual", "1"),                  # 文字列
+    (None, 1),                        # 片方だけ
+])
+async def test_rebuild_drops_malformed_stop_pair(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                 reason: object, detected: object) -> None:
+    """不正な停止理由・検出時刻は組ごと None にし、rebuild 全体を止めない（会議と Chunk は復元する）。"""
+    await _completed_meeting(client3, runner3, ctx3)
+    report, m = _rewrite_snapshot_and_rebuild(ctx3, stopReason=reason, stopDetectedAtEpochMs=detected)
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert m is not None and m.status == "finalized" and m.stop_reason is None and m.stop_detected_at is None
 
 
 async def test_missing_chunk_is_reported_for_resync(client3: httpx.AsyncClient, ctx3: AppContext) -> None:

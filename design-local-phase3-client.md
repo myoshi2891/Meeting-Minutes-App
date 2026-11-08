@@ -892,7 +892,7 @@ export async function resyncMissingChunks(deps: ResyncDeps, meetingId: string): 
 
 ## 7.1 `src/api/local-saver.ts`（変更）
 
-Phase 1 §17.1 の全文に、許可 origin の設定関数を加える。既定は loopback のみで、Phase 1・2 の挙動は変わらない。
+Phase 1 §17.1 の全文に、許可 origin の設定関数を加える。既定は loopback のみで、Phase 1・2 の挙動は変わらない。トークン変更時の送り直し（送り直す前の `ensureMeeting` による送信可否の再確認、確認後の最新トークンでの送信、送り直し中も替わり続けたときの `tokenChanged: true` 付きの再試行できる失敗）と `unauthorizedReported`・`isRetryableError()` も Phase 1 のまま持つ（Scheduler は `tokenChanged` を試行上限に数えず送り直す。Phase 1 §9.2）。
 
 あわせて、サーバーへ出る `fetch` はすべて `redirect: "error"` にする（`Phase3Client.request()`、`resyncMissingChunks()`、`LocalSaver.put()`）。`assertLocalHost()` が検証するのは最初の URL だけで、既定の `redirect: "follow"` のままだと、リダイレクト応答を返すサーバー（または経路上の代理）に `Authorization` ヘッダと音声本文を検証していない別 origin まで運ばれうる。`"error"` なら `fetch` が `TypeError` で reject し、既存の catch が `NETWORK` として扱う。ローカル API はリダイレクトを返さないので、正常系の挙動は変わらない。
 
@@ -900,6 +900,7 @@ Phase 1 §17.1 の全文に、許可 origin の設定関数を加える。既定
 // src/api/local-saver.ts
 import { encodeChunkMetaHeader, isChunkResponse, type ApiErrorBody } from "./contracts";
 import type { AudioChunkRecord, LocalSaveError, LocalSaveErrorKind } from "../types/recording";
+import type { RegistrationOutcome } from "./meeting-registrar";
 
 const LOOPBACK_HOSTS: ReadonlyArray<string> = ["127.0.0.1", "localhost", "[::1]"];
 let allowedOrigins: ReadonlySet<string> = new Set();
@@ -959,14 +960,18 @@ export function assertLocalHost(url: URL): void {
 }
 
 export interface LocalSaverConfig {
-  readonly baseUrl: string;
+  readonly baseUrl: string;      // 例: "http://127.0.0.1:43117"
   readonly token: string;
-  readonly requestTimeoutMs: number;
+  readonly requestTimeoutMs: number; // 既定 30000。1MB のローカル書き込みには十分
 }
 
 export type SaveOutcome =
   | { readonly ok: true; readonly registered: boolean; readonly serverPath: string; readonly idempotent: boolean }
-  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean };
+  /**
+   * unauthorizedReported：会議登録の 401/403 を MeetingRegistrar が Monitor へ報告済み。
+   * tokenChanged：送信中にトークンが替わり続けて送れなかった。サーバーの拒否ではないので、Scheduler は試行上限に数えず送り直す
+   */
+  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean; readonly unauthorizedReported?: boolean; readonly tokenChanged?: boolean };
 
 const RETRYABLE: ReadonlySet<LocalSaveErrorKind> = new Set(["NETWORK", "TIMEOUT", "SERVER", "STORAGE_FULL", "HASH_MISMATCH", "UNKNOWN"]);
 
@@ -974,7 +979,7 @@ export class LocalSaver {
   private readonly base: URL;
   private token: string;
 
-  constructor(private readonly config: LocalSaverConfig, private readonly fetchImpl: typeof fetch = fetch) {
+  constructor(private readonly config: LocalSaverConfig, private readonly fetchImpl: typeof fetch = fetch, private readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>) {
     this.base = new URL(config.baseUrl);
     assertLocalHost(this.base);
     this.token = config.token;
@@ -990,16 +995,29 @@ export class LocalSaver {
       return this.fail("VALIDATION", "wav blob already dropped", null);
     }
     const { meetingId, source, sequenceNo } = record.meta;
+    if (this.ensureMeeting !== undefined) {
+      const registration = await this.ensureMeeting(meetingId);
+      if (!registration.ok) return registration;
+    }
     const url = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks/${source}/${sequenceNo}`, this.base);
     assertLocalHost(url);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+    // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+    const fetchImpl = this.fetchImpl;
+    let token = this.token;
     try {
-      // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
-      const fetchImpl = this.fetchImpl;
-      let token = this.token;
       for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+          // 送り直す前に送信可否を確かめ直す。最初の応答待ちの間に確定中止された会議へ新しい PUT を始めない
+          if (this.ensureMeeting !== undefined) {
+            const registration = await this.ensureMeeting(meetingId);
+            if (!registration.ok) return registration;
+          }
+          // 確認を待つ間にもトークンは変わりうる。送り直しは送信直前の最新トークンで送る
+          token = this.token;
+        }
         const response = await fetchImpl(url, {
           method: "PUT",
           headers: {
@@ -1010,23 +1028,23 @@ export class LocalSaver {
           },
           body: record.wav,
           signal: controller.signal,
+          // ローカルサーバーなので credentials は不要。Cookie 方式（Phase 1 §4.3）の場合のみ "include"。
           credentials: "omit",
+          // リダイレクト先は assertLocalHost を通らないため追従しない（録音データを外部へ再送させない、Phase 1 §4.4）
           redirect: "error",
         });
         const outcome = await this.interpret(response, record);
-        // 送信後（本文の読み取り中を含む）にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（Phase 1 §17.1）
-        if (!outcome.ok && outcome.error.kind === "UNAUTHORIZED" && this.token !== token) {
-          token = this.token;
-          continue;
-        }
+        // 送信後（本文の読み取り中を含む）にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（Phase 1 §17.1、MeetingRegistrar と同じ）
+        if (!outcome.ok && outcome.error.kind === "UNAUTHORIZED" && this.token !== token) continue;
         return outcome;
       }
-      // 送り直し中にもトークンが変わった。失効として通知させないよう、再試行できる失敗で返す（Phase 1 §17.1）
-      return this.fail("UNKNOWN", "token changed during upload", null);
+      // 送り直し中にもトークンが変わった。UNAUTHORIZED にすると Scheduler が失効として通知するため、再試行できる失敗で返す
+      return { ...this.fail("UNKNOWN", "token changed during upload", null), tokenChanged: true };
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         return this.fail("TIMEOUT", `timeout after ${this.config.requestTimeoutMs}ms`, null);
       }
+      // fetch の接続失敗は TypeError。サーバー未起動・ポート閉塞・CSP 拒否がここに来る。
       if (error instanceof TypeError) {
         return this.fail("NETWORK", error.message, null);
       }
@@ -1051,6 +1069,7 @@ export class LocalSaver {
       if (body.meetingId !== meetingId || body.source !== source || body.sequenceNo !== sequenceNo || typeof body.path !== "string") {
         return this.fail("SERVER", `ChunkResponse mismatch: server=${body.meetingId}/${body.source}/${body.sequenceNo} local=${meetingId}/${source}/${sequenceNo}`, status);
       }
+      // v4.0 §93 相当：2xx だけでなくハッシュとサイズを照合する
       if (body.sha256 !== record.meta.sha256 || body.sizeBytes !== record.meta.sizeBytes) {
         return this.fail("HASH_MISMATCH", `server=${body.sha256}/${body.sizeBytes} local=${record.meta.sha256}/${record.meta.sizeBytes}`, status);
       }
@@ -1066,9 +1085,24 @@ export class LocalSaver {
     return this.fail("UNKNOWN", detail, status);
   }
 
-  private fail(kind: LocalSaveErrorKind, message: string, httpStatus: number | null): SaveOutcome {
-    return { ok: false, error: { kind, message, httpStatus, at: performance.now() }, retryable: RETRYABLE.has(kind) };
+  private fail(kind: LocalSaveErrorKind, message: string, httpStatus: number | null): Extract<SaveOutcome, { ok: false }> {
+    return {
+      ok: false,
+      error: { kind, message, httpStatus, at: performance.now() },
+      retryable: isRetryableError({ kind, httpStatus }),
+    };
   }
+}
+
+/** 同じリクエストを送り直せば結果が変わりうる失敗か。LocalSaver.fail と Scheduler の再投入判定（resumeAll）で共有する。 */
+export function isRetryableError(error: Pick<LocalSaveError, "kind" | "httpStatus">): boolean {
+  return RETRYABLE.has(error.kind) && !isNonRetryableClientError(error.httpStatus);
+}
+
+/** 408 / 429 を除く 4xx は同じリクエストを送り直しても結果が変わらない（kind が UNKNOWN でも再試行しない）。 */
+function isNonRetryableClientError(httpStatus: number | null): boolean {
+  if (httpStatus === null || httpStatus < 400 || httpStatus >= 500) return false;
+  return httpStatus !== 408 && httpStatus !== 429;
 }
 
 function isApiErrorBody(value: unknown): value is ApiErrorBody {
