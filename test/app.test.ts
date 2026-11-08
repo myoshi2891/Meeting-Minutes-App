@@ -12,6 +12,8 @@ class FakeController implements SessionController {
   memoryBacklogCount = 0;
   drainCount = 0;
   drainError: Error | null = null;
+  /** drainMemoryBacklog の成功時の副作用（直接送信でメモリ待機が空になる等） */
+  drainEffect: (() => void) | null = null;
   audioFrameCount = 0;
   constructor(
     readonly deps: RecordingControllerDeps,
@@ -36,6 +38,7 @@ class FakeController implements SessionController {
   async drainMemoryBacklog(): Promise<number> {
     this.drainCount++;
     if (this.drainError !== null) throw this.drainError;
+    this.drainEffect?.();
     return 0;
   }
   exportMemoryBacklog(): MemoryBacklogFile[] {
@@ -138,6 +141,12 @@ function registerOnServer(server: FakeLocalServer, r: AudioChunkRecord): void {
 
 function startInput(meetingId: string) {
   return { audioContext: {} as AudioContext, mediaStream: {} as MediaStream, meetingId, title: "定例", consentConfirmedAt: 1 };
+}
+
+/** Monitor の初回 HEALTHY 通知を済ませる。遅れて届くと onBackendAvailable が別経路で確定を再試行し、検証対象の経路を隠す */
+async function settleMonitor(s: Setup): Promise<void> {
+  await s.app.monitor.checkOnce();
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function stubPageGlobals(): EventTarget & { hide: () => void } {
@@ -472,6 +481,102 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(await restarted.retryFinalize(id)).toMatchObject({ ok: false, stage: "verify" });
   });
 
+  /** 指定した URL の応答を release まで止める fetch を用意する */
+  function holdRequest(match: (url: string, init?: RequestInit) => boolean) {
+    let release!: () => void;
+    let reached!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const started = new Promise<void>((r) => { reached = r; });
+    const wrapFetch = (fetchImpl: typeof fetch): typeof fetch => async (input, init) => {
+      if (match(String(input), init)) { reached(); await gate; }
+      return fetchImpl(input, init);
+    };
+    return { wrapFetch, started, release };
+  }
+  const isRegistration = (url: string, init?: RequestInit) => url.endsWith("/v1/meetings") && init?.method === "POST";
+
+  it("会議登録の待機中に中止が完了したら Scheduler の PUT を始めず、音声を残す", async () => {
+    // Arrange：SAVING に進み、会議登録の応答待ちで止まっている
+    stubPageGlobals();
+    const hold = holdRequest(isRegistration);
+    const s = await setup({ wrapFetch: hold.wrapFetch });
+    await s.app.monitor.checkOnce();
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const r = await seedChunk(s.db, id, 0, "IDB_STORED");
+    await s.app.scheduler.enqueue(r.chunkKey);
+    await hold.started;
+    await session.stop();
+    // Act
+    await s.app.abandonFinalize(id, true);
+    hold.release();
+    await vi.waitFor(async () => expect(await s.status(r.chunkKey)).toBe("LOCAL_SAVE_FAILED"));
+    // Assert
+    expect(s.server.putCount).toBe(0);
+    expect((await s.app.chunkStore.getChunk(r.chunkKey))?.wav).not.toBeNull();
+    expect(s.app.monitor.state.unauthorized).toBe(false);
+    expect(s.app.monitor.state.status).toBe("HEALTHY");
+  });
+
+  it("会議登録の待機中に中止が完了したら直接送信の PUT を始めない", async () => {
+    // Arrange
+    stubPageGlobals();
+    const hold = holdRequest(isRegistration);
+    const s = await setup({ wrapFetch: hold.wrapFetch });
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    s.controllers[0].memoryBacklogCount = 1;
+    const sending = s.controllers[0].deps.directSaver?.put(await makeChunkRecord(id, 0, 160));
+    await hold.started;
+    await session.stop();
+    // Act
+    await s.app.abandonFinalize(id, true);
+    hold.release();
+    const outcome = await sending;
+    // Assert：失敗にするので drainMemoryBacklog は Chunk をメモリ待機に残す
+    expect(outcome).toMatchObject({ ok: false, retryable: false });
+    expect(s.server.putCount).toBe(0);
+  });
+
+  it("開始済みの PUT は中止後も完了を記録する", async () => {
+    // Arrange
+    stubPageGlobals();
+    const hold = holdRequest((url, init) => init?.method === "PUT" && url.includes("/chunks/"));
+    const s = await setup({ wrapFetch: hold.wrapFetch });
+    await s.app.monitor.checkOnce();
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const r = await seedChunk(s.db, id, 0, "IDB_STORED");
+    await s.app.scheduler.enqueue(r.chunkKey);
+    await hold.started;
+    await session.stop();
+    // Act
+    await s.app.abandonFinalize(id, true);
+    hold.release();
+    // Assert
+    await vi.waitFor(async () => expect(await s.status(r.chunkKey)).toBe("DB_REGISTERED"));
+    expect((await s.app.meetingStore.get(id))?.status).toBe("abandoned");
+  });
+
+  it("古いトークンの確定が 401 で終わったら、現在のトークンで確定し直す", async () => {
+    // Arrange：一覧取得の応答待ち中に setToken される
+    stubPageGlobals();
+    const hold = holdRequest((url, init) => url.endsWith("/chunks") && new Headers(init?.headers).get("Authorization") === "Bearer stale");
+    const s = await setup({ token: "stale", wrapFetch: hold.wrapFetch });
+    const session = await s.app.startRecording(startInput(nextMeetingId()));
+    const stopping = session.stop();
+    await hold.started;
+    await s.app.setToken(TOKEN);
+    // Act
+    hold.release();
+    const result = await stopping;
+    // Assert
+    expect(result).toMatchObject({ ok: true });
+    expect((await s.app.meetingStore.get(session.meetingId))?.status).toBe("finalized");
+    expect(s.app.monitor.state.unauthorized).toBe(false);
+    expect(s.events.filter((e) => e.type === "finalize_pending")).toEqual([]);
+  });
+
   it("確認なし・録音中・別タブロック中は確定中止しない", async () => {
     stubPageGlobals();
     const s = await setup({ serverUp: false });
@@ -644,6 +749,57 @@ describe("RecordingSession.stop", () => {
     await vi.waitFor(async () => expect((await s.app.meetingStore.get(meetingId))?.status).toBe("finalized"));
     expect(s.events.filter((e) => e.type === "finalized" && e.meetingId === meetingId)).toHaveLength(1);
     expect(await s.app.listPendingFinalize()).toEqual([]);
+  });
+
+  it("直接送信でメモリ待機が空になったら、停止後の確定を再試行する", async () => {
+    // Arrange：末尾がメモリ待機のまま停止し、Barrier で止まっている
+    stubPageGlobals();
+    const s = await setup();
+    await settleMonitor(s);
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    controller.memoryBacklogCount = 1;
+    expect(await session.stop()).toMatchObject({ ok: false, stage: "waiting_local_save" });
+    // Act：直接送信は Scheduler を通らないので onChunkSaved が来ない
+    controller.drainEffect = () => { controller.memoryBacklogCount = 0; };
+    s.app.health.degradedReasons = ["IDB_WRITE_FAILED"];
+    controller.deps.onError(new Error("idb write failed"));
+    // Assert
+    await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
+  });
+
+  it("drain 後もメモリ待機が残っていれば確定を再試行しない", async () => {
+    // Arrange
+    stubPageGlobals();
+    const s = await setup();
+    await settleMonitor(s);
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    controller.memoryBacklogCount = 2;
+    await session.stop();
+    const retry = vi.spyOn(s.app, "retryFinalize");
+    s.app.health.degradedReasons = ["IDB_WRITE_FAILED"];
+    // Act
+    controller.deps.onError(new Error("idb write failed"));
+    await vi.waitFor(() => expect(controller.drainCount).toBe(1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Assert
+    expect(retry).not.toHaveBeenCalled();
+  });
+
+  it("直接送信で DB 登録まで済んだ件数を会議ごとに返す", async () => {
+    // Arrange
+    stubPageGlobals();
+    const s = await setup();
+    const id = nextMeetingId();
+    await s.app.startRecording(startInput(id));
+    // Act
+    await s.controllers[0].deps.directSaver?.put(await makeChunkRecord(id, 0, 160));
+    // Assert
+    expect(s.app.directRegisteredCount(id)).toBe(1);
+    expect(s.app.directRegisteredCount("other")).toBe(0);
   });
 
   it("録音中の Chunk 保存完了では自動確定しない", async () => {

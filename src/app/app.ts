@@ -1,7 +1,7 @@
 // src/app/app.ts
 import { BackendHealthMonitor } from "../api/backend-health-monitor";
 import { LocalSaver } from "../api/local-saver";
-import { MeetingRegistrar } from "../api/meeting-registrar";
+import { MeetingRegistrar, type RegistrationOutcome } from "../api/meeting-registrar";
 import { finalizeMeeting, type FinalizeResult } from "../recording/finalizer";
 import { LocalSaveScheduler } from "../recording/local-save-scheduler";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "../recording/meeting-lock";
@@ -96,6 +96,10 @@ export class App {
   private disposed = false;
   private readonly finalizing = new Map<string, Promise<FinalizeResult>>();
   private readonly finalizeRequested = new Set<string>();
+  /** 実行中の Barrier が古いトークンで 401/403 を受けた会議。ロックを持ったまま現在のトークンでやり直す */
+  private readonly finalizeTokenChanged = new Set<string>();
+  /** 直接送信で DB 登録まで済んだ件数。IDB に残らないので、確定待ちの件数表示に足す */
+  private readonly directRegistered = new Map<string, number>();
   private readonly waitingForSave = new Set<string>();
   private readonly finalizeIssues = new Map<string, Extract<FinalizeResult, { ok: false }>>();
 
@@ -196,6 +200,8 @@ export class App {
       draining = true;
       try {
         await controller.drainMemoryBacklog();
+        // 直接送信は Scheduler を通らず onChunkSaved が来ない。空になったら停止後の Barrier を再開させる
+        if (controller.memoryBacklogCount === 0) void this.onChunkSaved(meetingId);
       } catch (error) {
         this.deps.onEvent({ type: "memory_backlog_export_required", meetingId, error });
       } finally {
@@ -243,9 +249,12 @@ export class App {
       onMeetingCreated: (meeting) => this.meetingFallbacks.set(meeting.meetingId, meeting),
       // 送るたびに現在の saver を引く。録音中に setToken しても、開始時のトークン（未設定・失効）で送り続けない
       directSaver: {
-        put: async (record) =>
-          this.saver?.put(record) ??
-          { ok: false, retryable: false, error: { kind: "UNAUTHORIZED", message: "backend token is not set", httpStatus: null, at: (this.deps.now ?? Date.now)() } },
+        put: async (record) => {
+          const outcome = (await this.saver?.put(record)) ??
+            { ok: false, retryable: false, error: { kind: "UNAUTHORIZED", message: "backend token is not set", httpStatus: null, at: (this.deps.now ?? Date.now)() } };
+          if (outcome.ok && outcome.registered) this.directRegistered.set(meetingId, this.directRegisteredCount(meetingId) + 1);
+          return outcome;
+        },
       },
     });
 
@@ -301,6 +310,11 @@ export class App {
     return [...this.controllers.values()].reduce((sum, c) => sum + c.memoryBacklogCount, 0);
   }
 
+  /** このタブが直接送信で登録した件数。再読み込みで失われるので、0 は「直接送信なし」を保証しない */
+  directRegisteredCount(meetingId: string): number {
+    return this.directRegistered.get(meetingId) ?? 0;
+  }
+
   exportMemoryBacklog(meetingId: string): MemoryBacklogFile[] {
     return this.controllers.get(meetingId)?.exportMemoryBacklog() ?? [];
   }
@@ -339,7 +353,21 @@ export class App {
   }
 
   private createSaver(token: string): LocalSaver {
-    return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch, (id) => this.registrar.ensure(id));
+    return new LocalSaver({ baseUrl: this.deps.baseUrl, token, requestTimeoutMs: PUT_TIMEOUT_MS }, this.deps.fetchImpl ?? fetch, (id) => this.prepareChunkPut(id));
+  }
+
+  /**
+   * PUT の直前処理。Scheduler と直接送信の両方がここを通る。
+   * 登録を待つ間に確定中止された会議には新しい PUT を始めない（開始済みの PUT は完了させる）。
+   * 再送しても結果が変わらないので non-retryable で返し、音声は IDB またはメモリ待機に残す。
+   */
+  private async prepareChunkPut(meetingId: string): Promise<RegistrationOutcome> {
+    const registration = await this.registrar.ensure(meetingId);
+    if (!registration.ok) return registration;
+    // IDB が読めないときこそ直接送信が必要で、同じ障害で中止も書けないので送信を止めない
+    const meeting = await this.meetingStore.get(meetingId).catch(() => undefined);
+    if (meeting?.status !== "abandoned") return registration;
+    return { ok: false, retryable: false, error: { kind: "VALIDATION", message: "meeting abandoned", httpStatus: null, at: (this.deps.now ?? Date.now)() } };
   }
 
   private async onChunkSaved(meetingId: string): Promise<void> {
@@ -368,10 +396,11 @@ export class App {
       let result: FinalizeResult;
       do {
         this.finalizeRequested.delete(meetingId);
+        this.finalizeTokenChanged.delete(meetingId);
         result = await this.finalizeOnce(meetingId);
         if (!result.ok && result.stage === "waiting_local_save") this.waitingForSave.add(meetingId);
         else this.waitingForSave.delete(meetingId);
-      } while (this.waitingForSave.has(meetingId) && !this.disposed && this.finalizeRequested.has(meetingId));
+      } while (!this.disposed && (this.finalizeTokenChanged.has(meetingId) || (this.waitingForSave.has(meetingId) && this.finalizeRequested.has(meetingId))));
       if (result.ok) this.finalizeIssues.delete(meetingId);
       else {
         const previous = this.finalizeIssues.get(meetingId);
@@ -385,6 +414,7 @@ export class App {
     const promise = run().finally(() => {
       this.finalizing.delete(meetingId);
       this.finalizeRequested.delete(meetingId);
+      this.finalizeTokenChanged.delete(meetingId);
     });
     this.finalizing.set(meetingId, promise);
     return promise;
@@ -405,6 +435,8 @@ export class App {
         unpersistedChunkCount: () => controller?.memoryBacklogCount ?? 0,
         onBackendUnauthorized: () => {
           if (this.token === token) this.monitor.reportUnauthorized();
+          // setToken からの再試行は実行中のロックに阻まれているので、この Barrier が終わったら自分でやり直す
+          else this.finalizeTokenChanged.add(meetingId);
         },
       },
       meetingId,
