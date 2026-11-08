@@ -148,6 +148,8 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
 }
 
 describe("makeChunkKey / sha256Hex", () => {
+
+
   it("chunkKey は sequenceNo を 6 桁ゼロ埋めし文字列順 = 番号順になる", () => {
     expect(makeChunkKey("m", "mic", 7)).toBe("m:mic:000007");
     expect(makeChunkKey("m", "mic", 10) > makeChunkKey("m", "mic", 9)).toBe(true);
@@ -160,6 +162,19 @@ describe("makeChunkKey / sha256Hex", () => {
 });
 
 describe("RecordingController", () => {
+  it.each(["manual", "mic_ended"] as const)("停止理由 %s と検出時刻を最終フレーム数とともに永続化する", async (reason) => {
+    // Arrange
+    const s = await setup();
+    await s.controller.start("stop-metadata", "停止理由", 1);
+    // Act
+    await s.controller.stop(reason, 123456);
+    await s.controller.stop("manual", 999999);
+    // Assert: 二度目の停止で最初の記録を変えない
+    expect(await s.meetingStore.get("stop-metadata")).toMatchObject({
+      status: "stop_requested", stopReason: reason, stopDetectedAtEpochMs: 123456,
+      sessionClock: { audioFrameCount: 1600 },
+    });
+  });
   beforeEach(() => {
     vi.unstubAllGlobals();
   });
@@ -310,6 +325,60 @@ describe("RecordingController", () => {
     expect(s.track.stop).toHaveBeenCalled();
     expect(s.nodePort.onmessage).toBeNull();
     expect(s.locks.held.size).toBe(0);
+  });
+
+  it("stop_requested の保存に失敗しても Worklet の末尾を Chunk にしてから解放し、元の例外を返す", async () => {
+    // Arrange
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    vi.spyOn(s.meetingStore, "put").mockRejectedValueOnce(new Error("put failed"));
+    // Act
+    await expect(s.controller.stop()).rejects.toThrow("put failed");
+    // Assert：切り離す前に stop を送り、部分 Chunk を IDB に残す
+    expect(s.worklet.commands.some((c) => c.type === "stop")).toBe(true);
+    expect(s.enqueued).toEqual(["m1:mic:000000"]);
+    expect((await s.chunkStore.getChunk("m1:mic:000000"))?.meta.sampleCount).toBe(1600);
+  });
+
+  it("メモリ待機を残して stop したら会議ロックを保持し続け、drain で空になったら解放する", async () => {
+    // Arrange：IDB に書けず、直接送信も最初は失敗する
+    let serverUp = false;
+    const s = await setup(closedStore, {
+      put: async () => serverUp
+        ? { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false }
+        : { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } },
+    });
+    await s.controller.start("m1", "定例", 1);
+    // Act
+    await s.controller.stop();
+    const heldAfterStop = s.locks.held.has(meetingLockName("m1"));
+    serverUp = true;
+    await s.controller.drainMemoryBacklog();
+    // Assert：別タブが末尾をメモリに残したまま確定しないよう、空になるまでロックを渡さない
+    expect(heldAfterStop).toBe(true);
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(false);
+  });
+
+  it("stop 後に保持したロックは takeMeetingLock で呼び出し元へ渡し、以後 drain では解放しない", async () => {
+    // Arrange
+    let serverUp = false;
+    const s = await setup(closedStore, {
+      put: async () => serverUp
+        ? { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false }
+        : { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } },
+    });
+    await s.controller.start("m1", "定例", 1);
+    await s.controller.stop();
+    // Act
+    const release = s.controller.takeMeetingLock();
+    serverUp = true;
+    await s.controller.drainMemoryBacklog();
+    // Assert
+    expect(release).not.toBeNull();
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(true);
+    release?.();
+    await vi.waitFor(() => expect(s.locks.held.has(meetingLockName("m1"))).toBe(false));
+    expect(s.controller.takeMeetingLock()).toBeNull();
   });
 
   it("同じインスタンスで stop 後に別の会議を start すると、Chunk の連番は 0 から始まる", async () => {

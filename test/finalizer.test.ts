@@ -73,6 +73,23 @@ function deps(h: Harness, fetchImpl: typeof fetch = h.server.fetch): FinalizerDe
 }
 
 describe("finalizeMeeting（Finalization Barrier）", () => {
+  it("再読み取りした停止理由と検出時刻を確定APIへ渡す", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 0);
+    const m = (await h.meetingStore.get(MEETING_ID))!;
+    await h.meetingStore.put({ ...m, stopReason: "mic_ended", stopDetectedAtEpochMs: 123456 });
+    const posted: unknown[] = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      if (init?.method === "POST") posted.push(JSON.parse(String(init.body)));
+      return h.server.fetch(input, init);
+    };
+    // Act
+    expect(await finalizeMeeting(deps(h, fetchImpl), MEETING_ID)).toEqual({ ok: true });
+    // Assert
+    expect(posted).toEqual([expect.objectContaining({ stopReason: "mic_ended", stopDetectedAtEpochMs: 123456 })]);
+  });
+
   it.each([401, 403])("確定 POST の %s を通知し、stop_requested に戻す", async (status) => {
     const h = await createHarness();
     await recordAndSave(h, 0);

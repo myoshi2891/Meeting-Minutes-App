@@ -7,6 +7,7 @@ import {
   type ChunkTimingMetadata,
   type MeetingRecord,
   type RecordingHealth,
+  type RecordingStopReason,
   type SessionClock,
   type WorkletCommand,
   type WorkletEvent,
@@ -79,7 +80,7 @@ export class RecordingController {
   /** requestId → flushed 待機。応答は要求 ID で対応付ける（タイムアウト後の遅れた応答が別の要求を解放しないように） */
   private readonly flushWaiters = new Map<number, () => void>();
   private nextRequestId = 0;
-  /** 会議ロックの解放。start で取得し、stop の完了で解放する */
+  /** 会議ロックの解放。start で取得し、stop の完了（メモリ待機が残れば drain で空になるか takeMeetingLock で渡すまで）で解放する */
   private releaseLock: (() => void) | null = null;
   /** トラックの ended リスナーの解除用。同じ mediaStream で録り直したときにリスナーが蓄積しないよう stop で abort する */
   private trackListeners: AbortController | null = null;
@@ -212,18 +213,30 @@ export class RecordingController {
   }
 
   /** stop_requested → 最終 Chunk 生成 → IDB 書き込み完了まで待つ。Finalization Barrier は §22。 */
-  async stop(): Promise<void> {
+  async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<void> {
     if (this.node === null || this.meeting === null) return;
     const meeting = this.meeting;
     try {
+      // Worklet の応答待ちより前に保存する。停止が重なっても最初の観測を保持する。
+      if (meeting.stopReason === undefined) {
+        meeting.stopReason = reason;
+        meeting.stopDetectedAtEpochMs = detectedAtEpochMs;
+      }
       meeting.status = "stop_requested";
-      await this.deps.meetingStore.put(meeting);
+      // 保存に失敗しても Worklet を切り離す前に末尾を Chunk にする（IDB かメモリ待機に残り、WAV で書き出せる）
+      let statusError: { readonly error: unknown } | null = null;
+      try {
+        await this.deps.meetingStore.put(meeting);
+      } catch (error) {
+        statusError = { error };
+      }
 
       await this.requestFlush("stop");
       await this.chunkQueue;
       // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
       meeting.updatedAt = Date.now();
       await this.deps.meetingStore.put(meeting);
+      if (statusError !== null) throw statusError.error;
     } finally {
       // 途中で reject してもマイクと Worklet を解放する
       this.sourceNode?.disconnect();
@@ -232,8 +245,17 @@ export class RecordingController {
       this.trackListeners?.abort();
       this.trackListeners = null;
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
-      this.unlock();
+      // メモリ待機が残るうちはロックを持ち続ける。別タブの Barrier はこのタブのメモリ待機を数えられない（§22）
+      if (this.memoryBacklog.length === 0) this.unlock();
     }
+  }
+
+  /** stop 後もメモリ待機のために保持しているロックを呼び出し元へ渡す。以後の解放は呼び出し元が行う。保持していなければ null */
+  takeMeetingLock(): (() => void) | null {
+    if (this.node !== null) return null;
+    const release = this.releaseLock;
+    this.releaseLock = null;
+    return release;
   }
 
   private unlock(): void {
@@ -270,6 +292,8 @@ export class RecordingController {
       this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
         (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
       );
+      // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する
+      if (this.node === null) this.unlock();
     }
     return drained;
   }

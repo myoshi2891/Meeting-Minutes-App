@@ -150,6 +150,8 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     expectedChunkCounts: { mic: chunkCount, system: 0 },
     endedAtEpochMs: meeting.endedAt,
     totalAudioFrames: meeting.sessionClock.audioFrameCount,
+    stopReason: meeting.stopReason,
+    stopDetectedAtEpochMs: meeting.stopDetectedAtEpochMs,
   };
   const finUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/finalize`, deps.baseUrl);
   assertLocalHost(finUrl);

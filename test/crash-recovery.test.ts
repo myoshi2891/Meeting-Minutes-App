@@ -1,5 +1,6 @@
 // test/crash-recovery.test.ts
 import { describe, expect, it, vi } from "vitest";
+import { IDBFactory } from "fake-indexeddb";
 import { createHarness, makeChunkRecord, type Harness } from "./harness";
 import { recoverOnStartup } from "../src/recording/recovery";
 import { tryAcquireMeetingLock } from "../src/recording/meeting-lock";
@@ -40,6 +41,27 @@ async function seedUnfinishedChunks(h: Harness, meetingId: string): Promise<{ sa
 }
 
 describe("ブラウザクラッシュ後の復旧", () => {
+  it("復旧は保存済みの停止理由を保持し、未記録の中断理由を推測しない", async () => {
+    // Arrange
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    try {
+      const h = await createHarness();
+      await h.meetingStore.put({ ...meetingOf("stop-recovery-known", "stop_requested"), stopReason: "mic_ended", stopDetectedAtEpochMs: 123456 });
+      await h.meetingStore.put(meetingOf("stop-recovery-unknown", "recording"));
+      // Act
+      await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+      // Assert
+      expect(await h.meetingStore.get("stop-recovery-known")).toMatchObject({ stopReason: "mic_ended", stopDetectedAtEpochMs: 123456 });
+      const unknown = await h.meetingStore.get("stop-recovery-unknown");
+      expect(unknown?.status).toBe("stop_requested");
+      expect(unknown?.stopReason).toBeUndefined();
+      expect(unknown?.stopDetectedAtEpochMs).toBeUndefined();
+      h.db.close();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("recording 中に落ちた会議は stop_requested になり、SAVING で止まった Chunk も再送される", async () => {
     // --- クラッシュ前の状態を IDB に作る ---
     const before = await createHarness();
