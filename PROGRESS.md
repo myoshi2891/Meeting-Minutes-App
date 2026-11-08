@@ -20,11 +20,14 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 T4-D〜G 合格（2026-10-03・10-07）、H は一部確認 | **未**：H の既存 Chunk の Chrome 再生（書き出した WAV の再生と外部通信なしは確認済み）。観察 4 件を T12 に起票（不合格扱いにはしない） |
 | 1-g | 60 分実録音 | ⏸ 保留（2026-11-08 利用者指示・再開指示待ち） | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: Python 7 件、TypeScript 23 ファイル / 331 件がすべて通過。`npm run typecheck`・`npm run build` も通過（2026-11-08）。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
+- 自動テスト: Python 7 件、TypeScript 23 ファイル / 352 件がすべて通過。`npm run typecheck`・`npm run build` も通過（2026-11-08）。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
 ### 今回の変更と残課題
+
+- 2026-11-08（未コミット）：T10/T12 差分のレビュー指摘を対応。トークン更新中の会議登録・確定の 401 の扱い、確定中止と PUT の競合（`prepareChunkPut()`）、直接送信完了後の確定再試行、マイク切断の録音ごとの判定と登録前終了の検出、復旧中に別タブが状態を進めた会議の除外、確定待ちの内訳（`SAVED`・直接送信・不完全表示）、次の録音の停止ボタンを修正。変更は `src/api/meeting-registrar.ts`・`src/app/app.ts`・`src/main.ts`・`src/recording/recording-controller.ts`・`src/recording/recovery.ts`・`src/ui/recording-view.ts`、対応テスト、設計書 Phase 1 / Phase 2 client。
+- 残課題（2026-11-08 レビュー対応から）: `src/main.ts` の停止ボタンは Vitest 対象外。「録音 A を停止 → 確定待ちの間に録音 B を開始 → B の停止ボタンが押せる」を手動確認する。停止後の Scheduler は会議ロックを持たないため、別タブの送信中 `SAVING` を復旧が重複再送しうる（冪等 PUT で吸収）。再読み込み後の直接送信件数は復元できず、不完全表示にとどまる。
 
 - 2026-11-08：T10 を TDD で修正。T12-a〜d と共通通知・件数表示を TDD で実装済み。専用 Chrome プロファイルでの模擬 API・合成マイクによる画面検証も通過。実マイクと既存会議での確認は未実施。1-g は利用者指示で保留。着手時からあった本ファイルの T4-H などの訂正は保持した。
 
