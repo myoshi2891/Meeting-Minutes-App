@@ -543,12 +543,35 @@ describe("RecordingController", () => {
     });
     // Act
     await expect(s.controller.stop()).rejects.toThrow("quota");
-    // Assert：別タブが古い audioFrameCount のまま確定しないよう、ロックを手放さない
+    // Assert：別タブが古い audioFrameCount のまま確定しないよう、ロックを手放さない（メモリ待機が空の drain でも解放しない）
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(true);
+    await s.controller.drainMemoryBacklog();
     expect(s.locks.held.has(meetingLockName("m1"))).toBe(true);
     const release = s.controller.takeMeetingLock();
     expect(release).not.toBeNull();
     release?.();
     await vi.waitFor(() => expect(s.locks.held.has(meetingLockName("m1"))).toBe(false));
+  });
+
+  it("最終保存に失敗して保持したロックを呼び出し元が受け取るまでは、同じインスタンスで次の録音を始めない", async () => {
+    // Arrange：メモリ待機は空だが、最終保存の失敗で m1 のロックを保持している
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    const put = s.meetingStore.put.bind(s.meetingStore);
+    let puts = 0;
+    vi.spyOn(s.meetingStore, "put").mockImplementation(async (meeting) => {
+      if (++puts === 2) throw new DOMException("quota", "QuotaExceededError");
+      return put(meeting);
+    });
+    await expect(s.controller.stop()).rejects.toThrow("quota");
+    // Act / Assert：解放手段を上書きして m1 のロックを取り残さない
+    await expect(s.controller.start("m2", "定例2", 2)).rejects.toThrow("meeting lock");
+    expect(s.locks.held.has(meetingLockName("m2"))).toBe(false);
+    // 受け取った後は再利用できる
+    const release = s.controller.takeMeetingLock();
+    release?.();
+    await s.controller.start("m3", "定例3", 3);
+    expect(s.locks.held.has(meetingLockName("m3"))).toBe(true);
   });
 
   it("QuotaExceeded 以外の保存エラーは onError に通知しつつ、Chunk をメモリ待機に残して欠番を作らない", async () => {

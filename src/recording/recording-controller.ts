@@ -82,8 +82,13 @@ export class RecordingController {
   /** requestId → flushed 待機。応答は要求 ID で対応付ける（タイムアウト後の遅れた応答が別の要求を解放しないように） */
   private readonly flushWaiters = new Map<number, () => void>();
   private nextRequestId = 0;
-  /** 会議ロックの解放。start で取得し、stop の完了（メモリ待機が残れば drain で空になるか takeMeetingLock で渡すまで）で解放する */
+  /**
+   * 会議ロックの解放。start で取得し、stop の完了で解放する。メモリ待機が残れば drain で空になるか takeMeetingLock で渡すまで、
+   * 最終保存に失敗したら takeMeetingLock で渡すまで保持する
+   */
   private releaseLock: (() => void) | null = null;
+  /** stop の最終保存（最終の audioFrameCount）に失敗したか。drain で空になってもロックを解放しない */
+  private finalStopUnsaved = false;
   /** トラックの ended リスナーの解除用。同じ mediaStream で録り直したときにリスナーが蓄積しないよう stop で abort する */
   private trackListeners: AbortController | null = null;
   /** この録音で切断を処理済みか。health は録音をまたいで共有されるので、degradedReasons では判定しない */
@@ -99,6 +104,8 @@ export class RecordingController {
     const { audioContext, mediaStream, workletModuleUrl } = this.deps;
     // 前の録音のメモリ待機が残るうちは始めない。保持中のロックの解放手段を上書きし、別会議の Chunk も混ざるため
     if (this.memoryBacklog.length > 0) throw new Error("memory backlog from the previous recording remains");
+    // 最終保存の失敗で保持したロックも、呼び出し元が takeMeetingLock で受け取るまでは上書きしない
+    if (this.releaseLock !== null) throw new Error("meeting lock from the previous recording is still held");
 
     // recording を書く前にロックを取る。先に書くと、別タブの復旧がロックのない recording を中断扱いにできてしまう
     const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
@@ -255,6 +262,7 @@ export class RecordingController {
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
       // メモリ待機が残るうち、または最終保存に失敗したときはロックを持ち続ける。
       // 別タブの Barrier はこのタブのメモリ待機も、保存できなかった最終の audioFrameCount も知らない（§22）
+      this.finalStopUnsaved = !finalSaved;
       if (this.memoryBacklog.length === 0 && finalSaved) this.unlock();
     }
   }
@@ -264,6 +272,7 @@ export class RecordingController {
     if (this.node !== null) return null;
     const release = this.releaseLock;
     this.releaseLock = null;
+    this.finalStopUnsaved = false;
     return release;
   }
 
@@ -310,8 +319,9 @@ export class RecordingController {
           (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
         );
       }
-      // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する
-      if (this.node === null) this.unlock();
+      // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する。
+      // 最終保存に失敗していれば、書き直す呼び出し元が takeMeetingLock で受け取るまで保持する
+      if (this.node === null && !this.finalStopUnsaved) this.unlock();
     }
     return drained;
   }
