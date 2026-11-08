@@ -687,6 +687,8 @@ export class RecordingController {
   }
 
   async start(meetingId: string, title: string, consentConfirmedAt: number, options: StartOptions = {}): Promise<void> {
+    // 前の録音のメモリ待機が残るうちは始めない（Phase 1 §15。保持中のロックの解放手段を上書きし、別会議の Chunk も混ざる）
+    if (this.memoryBacklog.length > 0) throw new Error("memory backlog from the previous recording remains");
     if (options.registerMeeting !== false) {
       // recording を書く前にロックを取る（Phase 1 §15）。System 側は Mic のロックに乗る
       const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
@@ -816,7 +818,8 @@ export class RecordingController {
 
   async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<void> {
     if (this.node === null || this.meetingId === null) return;
-    let statusError: { readonly error: unknown } | null = null;
+    let statusError: unknown = null;
+    let finalSaved = false;
     try {
       if (this.source === "mic") {
         const meeting = await this.deps.meetingStore.get(this.meetingId);
@@ -830,7 +833,7 @@ export class RecordingController {
           try {
             await this.deps.meetingStore.put(meeting);
           } catch (error) {
-            statusError = { error };
+            statusError = error;
           }
         }
       }
@@ -842,9 +845,12 @@ export class RecordingController {
         const meeting = await this.deps.meetingStore.get(this.meetingId);
         if (meeting !== undefined) {
           await this.deps.meetingStore.put({ ...meeting, sessionClock: { ...this.clock }, updatedAt: Date.now() });
+          finalSaved = true;
         }
       }
-      if (statusError !== null) throw statusError.error;
+      // 最終保存で stop_requested も書けていれば停止は完了。最初の失敗は通知だけにし、App を確定へ進める（Phase 1 §15）
+      if (statusError !== null && finalSaved) this.deps.onError(statusError instanceof Error ? statusError : new Error(String(statusError)));
+      else if (statusError !== null) throw statusError;
     } finally {
       // 途中で reject してもマイク／画面共有トラックと Worklet を解放する（Phase 1 §15 と同じ）
       this.sourceNode?.disconnect();

@@ -3698,7 +3698,7 @@ class FinalizeRequest(BaseModel):
     endedAtEpochMs: int = Field(ge=0)
     totalAudioFrames: int = Field(ge=0)
     stopReason: Literal["manual", "mic_ended"] | None = None
-    stopDetectedAtEpochMs: int | None = Field(default=None, ge=0, strict=True)
+    stopDetectedAtEpochMs: int | None = Field(default=None, ge=0, le=2**63 - 1, strict=True)  # SQLite INTEGER の上限（Phase 1 §12）
 
     @model_validator(mode="after")
     def validate_stop_observation(self) -> "FinalizeRequest":
@@ -3871,11 +3871,20 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
             repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames,
                                 stop_reason=req.stopReason, stop_detected_at=req.stopDetectedAtEpochMs)
             pipeline.on_finalized(conn, meeting_id)
+        snapshot = repo.get_meeting(conn, meeting_id)
+    # コミット後に確定値から書き、meeting.json が DB より先行しないようにする。再送でも毎回書き直す（Phase 1 §12）
+    if snapshot is not None:
+        write_atomic(ctx.settings.data_dir, f"recordings/{meeting_id}/meeting.json", json.dumps({
+            "meetingId": meeting_id, "title": snapshot.title, "sessionStartEpochMs": snapshot.session_start_epoch_ms,
+            "nativeSampleRate": snapshot.native_sample_rate, "consentConfirmedAt": snapshot.consent_confirmed_at,
+            "endedAtEpochMs": snapshot.ended_at, "totalAudioFrames": snapshot.total_audio_frames,
+            "stopReason": snapshot.stop_reason, "stopDetectedAtEpochMs": snapshot.stop_detected_at,
+        }, ensure_ascii=False).encode())
     ctx.events.publish(meeting_id, {"type": "meeting_status", "status": "transcribing"})
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 ```
 
-`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を返す。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。
+`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を返す。`meeting.json` は書き込みトランザクションのコミット後に、DB に残った確定値（停止理由・検出時刻を含む）から書き出す。再送を含む成功した finalize のたびに書き直すので、書き出しに失敗しても再送で回復する（Phase 1 §12。Phase 3 §20.2 は Chunk 一覧も加えて同じ位置で書く）。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。
 
 ## 21.3 Phase 2 ルート `api/routes_meetings.py`
 

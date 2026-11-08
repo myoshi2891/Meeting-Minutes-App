@@ -2287,7 +2287,7 @@ class FinalizeRequest(BaseModel):
     endedAtEpochMs: int = Field(ge=0)
     totalAudioFrames: int = Field(ge=0)
     stopReason: Literal["manual", "mic_ended"] | None = None
-    stopDetectedAtEpochMs: int | None = Field(default=None, ge=0, strict=True)
+    stopDetectedAtEpochMs: int | None = Field(default=None, ge=0, le=2**63 - 1, strict=True)  # SQLite INTEGER の上限（Phase 1 §12）
 
     @model_validator(mode="after")
     def validate_stop_observation(self) -> "FinalizeRequest":
