@@ -58,16 +58,17 @@ export async function recoverOnStartup(
           active.add(m.meetingId);
           continue;
         }
-        const originalStatus = m.status;
+        const originalStatus = current.status;
         const chunks = await chunkStore.listByMeeting(m.meetingId, "mic");
         // Finalizer が totalAudioFrames として送る値。既に大きい値があれば維持する。
         // stop_requested でも、flush 後の最終保存の前に落ちた会議は値が古いので補う（書き直しを持つ App のメモリは再読み込みで失われる）
+        // 一覧の m はロック前の値。一覧取得後に停止処理が書いた audioFrameCount などを巻き戻さないよう、ロック後に読み直した current を書く
         const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
-        if (m.status === "recording" || (m.status === "stop_requested" && lastEndFrame > m.sessionClock.audioFrameCount)) {
-          m.sessionClock.audioFrameCount = Math.max(m.sessionClock.audioFrameCount, lastEndFrame);
-          m.status = "stop_requested";
-          m.updatedAt = Date.now();
-          await meetingStore.put(m);
+        if (current.status === "recording" || (current.status === "stop_requested" && lastEndFrame > current.sessionClock.audioFrameCount)) {
+          current.sessionClock.audioFrameCount = Math.max(current.sessionClock.audioFrameCount, lastEndFrame);
+          current.status = "stop_requested";
+          current.updatedAt = Date.now();
+          await meetingStore.put(current);
         }
         interrupted.push({ meetingId: m.meetingId, status: originalStatus, chunkCount: chunks.length });
       } finally {

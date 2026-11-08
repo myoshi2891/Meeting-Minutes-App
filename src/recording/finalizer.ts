@@ -28,7 +28,11 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 export type FinalizeResult =
   /** missingTailMs：末尾の Chunk が欠けたまま確定した長さ（ms）。欠けがなければ省く（T1-e） */
   | { readonly ok: true; readonly missingTailMs?: number }
-  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string };
+  /**
+   * reason：失敗の分類。"unauthorized" はトークン未設定・サーバーの 401/403 で、UI はトークンの確認を案内する。
+   * detail はサーバー由来の文字列を含みうるので、分類には使わない
+   */
+  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string; readonly reason?: "unauthorized" };
 
 /**
  * Finalization Barrier：
@@ -81,7 +85,10 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   // 再試行でも毎回通す。登録に失敗したら一覧を取らない（401/403 は MeetingRegistrar が Monitor へ報告済み）
   if (deps.ensureMeeting !== undefined) {
     const registration = await deps.ensureMeeting(meetingId);
-    if (!registration.ok) return { ok: false, stage: "verify", detail: `meeting registration failed: ${registration.error.message}` };
+    if (!registration.ok) {
+      const reason = registration.error.kind === "UNAUTHORIZED" ? { reason: "unauthorized" as const } : {};
+      return { ok: false, stage: "verify", detail: `meeting registration failed: ${registration.error.message}`, ...reason };
+    }
   }
 
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
@@ -100,7 +107,10 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   } finally {
     clearTimeout(listTimer);
   }
-  if (listRes.status === 401 || listRes.status === 403) deps.onBackendUnauthorized?.();
+  if (listRes.status === 401 || listRes.status === 403) {
+    deps.onBackendUnauthorized?.();
+    return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}`, reason: "unauthorized" };
+  }
   if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
   // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
@@ -185,10 +195,11 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   } finally {
     clearTimeout(finTimer);
   }
-  if (finRes.status === 401 || finRes.status === 403) deps.onBackendUnauthorized?.();
+  const finUnauthorized = finRes.status === 401 || finRes.status === 403;
+  if (finUnauthorized) deps.onBackendUnauthorized?.();
   if (!finRes.ok) {
     await restore();
-    return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}` };
+    return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}`, ...(finUnauthorized ? { reason: "unauthorized" as const } : {}) };
   }
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);

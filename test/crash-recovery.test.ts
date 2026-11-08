@@ -192,6 +192,31 @@ describe("ブラウザクラッシュ後の復旧", () => {
     expect(m).toMatchObject({ status: "stop_requested", stopReason: "manual", stopDetectedAtEpochMs: 1 });
   });
 
+  it("一覧取得後に停止処理が最終保存した audioFrameCount を、一覧時点の古い値で巻き戻さない", async () => {
+    // Arrange：stop_requested（audioFrameCount 0）として一覧に載った直後、停止中のタブが最終保存で 999_999 を書く
+    const h = await createHarness();
+    const meetingId = "m-crash-stop-frames-after-list";
+    const listed: MeetingRecord = { ...meetingOf(meetingId, "stop_requested"), stopReason: "manual", stopDetectedAtEpochMs: 1 };
+    await h.meetingStore.put(listed);
+    for (let seq = 0; seq < 2; seq++) {
+      const r = await makeChunkRecord(meetingId, seq, 1600);
+      r.save.status = "DB_REGISTERED";
+      await h.chunkStore.putChunk(r);
+    }
+    const list = h.meetingStore.listByStatus.bind(h.meetingStore);
+    vi.spyOn(h.meetingStore, "listByStatus").mockImplementation(async (status) => {
+      const meetings = await list(status);
+      if (status === "stop_requested") {
+        await h.meetingStore.put({ ...listed, sessionClock: { ...listed.sessionClock, audioFrameCount: 999_999 }, updatedAt: 2 });
+      }
+      return meetings;
+    });
+    // Act
+    await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    // Assert
+    expect(await h.meetingStore.get(meetingId)).toMatchObject({ status: "stop_requested", updatedAt: 2, sessionClock: { audioFrameCount: 999_999 } });
+  });
+
   it("finalizing の会議は中断扱いで列挙し、created / finalized は対象外", async () => {
     const h = await createHarness();
     const base = (meetingId: string, status: MeetingRecord["status"]): MeetingRecord => ({

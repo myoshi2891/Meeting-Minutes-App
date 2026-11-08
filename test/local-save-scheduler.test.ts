@@ -412,4 +412,61 @@ describe("LocalSaveScheduler", () => {
     expect((await s.status(0))?.status).toBe("DB_REGISTERED");
     expect(s.backend.unauthorized).toBe(false);
   });
+
+  it("トークン変更で送れなかった回は試行回数に数えない", async () => {
+    // Arrange：1 回目の put の間だけトークンが替わり続ける
+    const r = await makeChunkRecord("m", 0, 160);
+    r.save.attempts = 2;
+    let changes = 0;
+    let saver: LocalSaver | null = null;
+    saver = new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, async () => {
+      if (changes >= 2) return okResponse(r);
+      saver?.setToken(`tok-${++changes}`);
+      return new Response("{}", { status: 401 });
+    });
+    const s = await setup((x) => okResponse(x), "HEALTHY", { saver: () => saver });
+    await s.chunkStore.putChunk(r);
+    // Act
+    await s.scheduler.enqueue(r.chunkKey);
+    await s.advance(0);
+    // Assert：トークン変更の回（3）を戻し、成功した送り直しの 1 回だけを数える
+    expect(await s.status(0)).toMatchObject({ status: "DB_REGISTERED", attempts: 3 });
+  });
+
+  it("中止判定を待つ間に別タブが送信を始めた Chunk は、送らず状態も書き換えない", async () => {
+    // Arrange：中止判定の読み取り中に、別タブが SAVING を確保する
+    let store: ChunkStore | undefined;
+    const s = await setup((r) => okResponse(r), "HEALTHY", {
+      isMeetingAbandoned: async () => {
+        await store?.updateSaveState("m:mic:000000", (r) => { r.save.status = "SAVING"; r.save.attempts = 5; });
+        return false;
+      },
+    });
+    store = s.chunkStore;
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert
+    expect(s.stats().putCount).toBe(0);
+    expect(await s.status(0)).toMatchObject({ status: "SAVING", attempts: 5 });
+  });
+
+  it("送信中に別タブが確保し直した Chunk の失敗は、そのタブの SAVING を書き換えず再試行も予約しない", async () => {
+    // Arrange：PUT の応答待ちの間に、別タブの復旧が書き戻して送り直しを始める。このタブの PUT は 500 で失敗する
+    let store: ChunkStore | undefined;
+    const s = await setup(() => new Response("{}", { status: 500 }), "HEALTHY", {
+      isMeetingAbandoned: async () => false,
+      saver: () => new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, async () => {
+        await store?.updateSaveState("m:mic:000000", (r) => { r.save.status = "SAVING"; r.save.attempts += 1; });
+        return new Response("{}", { status: 500 });
+      }),
+    });
+    store = s.chunkStore;
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert
+    expect(await s.status(0)).toMatchObject({ status: "SAVING", attempts: 2 });
+    expect(s.timers).toHaveLength(0);
+  });
 });

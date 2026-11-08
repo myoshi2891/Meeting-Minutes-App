@@ -32,6 +32,8 @@ export class LocalSaveScheduler {
   private pumpRequested = false;
   /** BACKEND_UNAVAILABLE を書き込み済みの pending キー。backend 停止中の enqueue ごとに全件を書き直さないために使う。 */
   private readonly markedUnavailable = new Set<string>();
+  /** 送信中の chunkKey → このタブが SAVING を確保したときの attempts。失敗の書き戻しは、この確保が残っているときだけ行う */
+  private readonly claims = new Map<string, number>();
 
   constructor(private readonly deps: SchedulerDeps) {}
 
@@ -129,8 +131,9 @@ export class LocalSaveScheduler {
         this.markedUnavailable.delete(chunkKey);
         this.inFlight.add(chunkKey);
         void this.runOne(chunkKey, saver)
-          .catch((error: unknown) => this.recoverFailedRun(chunkKey, error))
+          .catch((error: unknown) => this.recoverFailedRun(chunkKey, error, this.claims.get(chunkKey)))
           .finally(() => {
+            this.claims.delete(chunkKey);
             this.inFlight.delete(chunkKey);
             this.deps.health.pendingChunkCount = this.pendingCount;
             void this.pump();
@@ -186,7 +189,7 @@ export class LocalSaveScheduler {
    * runOne が例外（IDB の書き込み失敗など）で終わった Chunk を再開可能な状態に戻す。
    * SAVING のまま残すと runOne が「送信中」とみなして永久に送らないため、RETRYING に戻してバックオフ後に再投入する。
    */
-  private async recoverFailedRun(chunkKey: string, error: unknown): Promise<void> {
+  private async recoverFailedRun(chunkKey: string, error: unknown, claim: number | undefined): Promise<void> {
     const at = this.deps.now();
     // nextRetryAt より前にタイマーが発火すると runOne が再投入だけして空回りするため、遅延は 1 回だけ決める
     let delay = backoffMs(1);
@@ -195,8 +198,8 @@ export class LocalSaveScheduler {
       await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
         const attempts = Math.max(r.save.attempts, 1);
         delay = backoffMs(attempts);
-        // 例外より前に保存が終わっていた・別経路で状態が進んでいた場合は書き戻さない
-        if (r.save.status !== "SAVING") return;
+        // 例外より前に保存が終わっていた・別経路で状態が進んでいた・このタブが確保した SAVING でない場合は書き戻さない
+        if (r.save.status !== "SAVING" || r.save.attempts !== claim) return;
         exhausted = attempts >= MAX_SAVE_ATTEMPTS;
         r.save.status = exhausted ? "LOCAL_SAVE_FAILED" : "RETRYING";
         r.save.lastError = { kind: "UNKNOWN", message: errorMessage(error), httpStatus: null, at };
@@ -204,7 +207,7 @@ export class LocalSaveScheduler {
       });
     } catch (restoreError: unknown) {
       // 状態も書き戻せない（IDB が使えない）。バックオフ後に復旧処理ごとやり直す
-      this.deps.setTimer(() => void this.recoverFailedRun(chunkKey, restoreError), delay);
+      this.deps.setTimer(() => void this.recoverFailedRun(chunkKey, restoreError, claim), delay);
       return;
     }
     if (exhausted) return;
@@ -229,18 +232,28 @@ export class LocalSaveScheduler {
       return;
     }
     if (abandoned === true) return;
-    // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
-    // SAVED（ファイル保存済み・DB 未登録）の登録確認は Finalizer のサーバー一覧照合に任せる
-    if (record.save.status === "DB_REGISTERED" || record.save.status === "SAVED" || record.save.status === "SAVING") return;
-    if (record.save.status === "RETRYING" && record.save.nextRetryAt !== null && record.save.nextRetryAt > this.deps.now()) {
+    // 読み込み・中止判定を待つ間に別タブが送信を始めていることがある。古い record ではなく、
+    // 同じトランザクションで現在の状態を確かめてから SAVING を確保する
+    const claim: { attempts: number | null; notYet: boolean } = { attempts: null, notYet: false };
+    await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+      // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
+      // SAVED（ファイル保存済み・DB 未登録）の登録確認は Finalizer のサーバー一覧照合に任せる
+      if (r.save.status === "DB_REGISTERED" || r.save.status === "SAVED" || r.save.status === "SAVING") return;
+      if (r.save.status === "RETRYING" && r.save.nextRetryAt !== null && r.save.nextRetryAt > this.deps.now()) {
+        claim.notYet = true;
+        return;
+      }
+      r.save.status = "SAVING";
+      r.save.attempts += 1;
+      claim.attempts = r.save.attempts;
+    });
+    if (claim.notYet) {
       this.insertSorted(chunkKey);
       return;
     }
-
-    await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
-      r.save.status = "SAVING";
-      r.save.attempts += 1;
-    });
+    const attempts = claim.attempts;
+    if (attempts === null) return;
+    this.claims.set(chunkKey, attempts);
 
     const outcome = await saver.put(record);
 
@@ -262,7 +275,7 @@ export class LocalSaveScheduler {
       // Monitor が unauthorized を知らないままだと再投入 → 即 401 の連打になる。通知して resumeAll() まで待機させる
       // 会議登録の 401/403 は MeetingRegistrar が報告済み。同じ要求を二重に数えない
       if (outcome.unauthorizedReported !== true) this.deps.onBackendUnauthorized();
-      await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+      await this.updateClaimed(chunkKey, attempts, (r) => {
         r.save.status = "BACKEND_UNAVAILABLE";
         r.save.lastError = error;
       });
@@ -272,34 +285,36 @@ export class LocalSaveScheduler {
       // ポーリングを待たず即座に UNREACHABLE 扱いにする（§3.6）。BackendHealthMonitor 側も同じ判定を行う。
       // backend() が HEALTHY のままだと再投入 → 即 pump → 再失敗の連打になるため、先に Monitor へ通知する。
       this.deps.onBackendUnreachable();
-      await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+      const owned = await this.updateClaimed(chunkKey, attempts, (r) => {
         r.save.status = "BACKEND_UNAVAILABLE";
         r.save.lastError = error;
       });
-      this.insertSorted(chunkKey);
+      if (owned) this.insertSorted(chunkKey);
       return;
     }
 
     if (outcome.tokenChanged === true) {
       // 送信中にトークンが替わり続けただけでサーバーは拒否していない。上限の回でも LOCAL_SAVE_FAILED に残さず、新しいトークンですぐ送り直す
       // （setToken の resumeAll は送信中のキーを拾えず、ここで止めると次のヘルス状態の変化まで送られない）
-      await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+      // 確保時に足した試行回数も戻し、トークン変更の回を以後の上限判定に数えない
+      const owned = await this.updateClaimed(chunkKey, attempts, (r) => {
         r.save.status = "RETRYING";
+        r.save.attempts = Math.max(0, r.save.attempts - 1);
         r.save.lastError = error;
         r.save.nextRetryAt = null;
       });
-      this.insertSorted(chunkKey);
+      if (owned) this.insertSorted(chunkKey);
       return;
     }
 
-    const attempts = record.save.attempts + 1;
     if (retryable && attempts < MAX_SAVE_ATTEMPTS) {
       const delay = backoffMs(attempts);
-      await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+      const owned = await this.updateClaimed(chunkKey, attempts, (r) => {
         r.save.status = "RETRYING";
         r.save.lastError = error;
         r.save.nextRetryAt = this.deps.now() + delay;
       });
+      if (!owned) return;
       this.deps.setTimer(() => {
         this.insertSorted(chunkKey);
         void this.pump();
@@ -307,11 +322,24 @@ export class LocalSaveScheduler {
       return;
     }
 
-    await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+    await this.updateClaimed(chunkKey, attempts, (r) => {
       r.save.status = "LOCAL_SAVE_FAILED";
       r.save.lastError = error;
       r.save.nextRetryAt = null;
     });
+  }
+
+  /**
+   * 失敗の書き戻し。このタブが確保した SAVING（attempts が確保時の値）のままのときだけ mutate を適用し、適用したかを返す。
+   * 送信中に別タブの復旧が書き戻して送り直した・保存を終えた Chunk の状態は上書きしない（再投入もそのタブに任せる）。
+   */
+  private async updateClaimed(chunkKey: string, attempts: number, mutate: (record: AudioChunkRecord) => void): Promise<boolean> {
+    const result = { owned: false };
+    await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+      result.owned = r.save.status === "SAVING" && r.save.attempts === attempts;
+      if (result.owned) mutate(r);
+    });
+    return result.owned;
   }
 }
 

@@ -96,7 +96,7 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     const unauthorized = vi.fn();
     const fetchImpl: typeof fetch = (input, init) => init?.method === "POST"
       ? Promise.resolve(new Response(null, { status })) : h.server.fetch(input, init);
-    expect(await finalizeMeeting({ ...deps(h, fetchImpl), onBackendUnauthorized: unauthorized }, MEETING_ID)).toMatchObject({ ok: false, stage: "finalize" });
+    expect(await finalizeMeeting({ ...deps(h, fetchImpl), onBackendUnauthorized: unauthorized }, MEETING_ID)).toMatchObject({ ok: false, stage: "finalize", reason: "unauthorized" });
     expect(unauthorized).toHaveBeenCalledOnce();
     expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
   });
@@ -330,6 +330,34 @@ describe("finalizeMeeting（Barrier の追加条件）", () => {
     // Assert
     expect(result).toEqual({ ok: true });
     expect((await h.chunkStore.getChunk(first.chunkKey))?.save.status).toBe("DB_REGISTERED");
+  });
+
+  it.each([401, 403])("GET /chunks の %s は認証エラーとして分類する", async (status) => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 0);
+    const fetchImpl: typeof fetch = (input, init) => String(input).endsWith("/chunks")
+      ? Promise.resolve(new Response(null, { status })) : h.server.fetch(input, init);
+    // Act
+    const result = await finalizeMeeting(deps(h, fetchImpl), MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: false, stage: "verify", detail: `list HTTP ${status}`, reason: "unauthorized" });
+  });
+
+  it("一覧の meetingId が \"HTTP 403\" で終わる別会議でも、認証エラーに分類しない", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 0);
+    const otherMeeting: typeof fetch = async (input, init) => {
+      const res = await h.server.fetch(input, init);
+      if (!String(input).endsWith("/chunks")) return res;
+      const body: unknown = await res.json();
+      return new Response(JSON.stringify({ ...(body as object), meetingId: "other HTTP 403" }), { status: 200 });
+    };
+    // Act
+    const result = await finalizeMeeting(deps(h, otherMeeting), MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: false, stage: "verify", detail: "list meetingId mismatch: other HTTP 403" });
   });
 
   it("GET /chunks の応答が別会議の一覧なら verify で失敗し、SAVED の Chunk を DB_REGISTERED にしない", async () => {
