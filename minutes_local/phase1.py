@@ -32,6 +32,8 @@ SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 # finalize 前の状態。これ以外の会議には新しい Chunk を足さず、確定値も書き換えない
 OPEN_STATUSES = ("created", "recording", "finalizing")
+# SQLite INTEGER（符号付き 64 bit）の上限。超える値は登録時に OverflowError となり 500 になるため 422 で弾く
+SQLITE_INT_MAX = 2**63 - 1
 
 
 class StorageFullError(Exception):
@@ -125,7 +127,7 @@ class FinalizeRequest(BaseModel):
     endedAtEpochMs: int = Field(ge=0)
     totalAudioFrames: int = Field(ge=0)
     stopReason: Literal["manual", "mic_ended"] | None = None
-    stopDetectedAtEpochMs: int | None = Field(default=None, ge=0, strict=True)
+    stopDetectedAtEpochMs: int | None = Field(default=None, ge=0, le=SQLITE_INT_MAX, strict=True)
 
     @model_validator(mode="after")
     def validate_stop_observation(self) -> "FinalizeRequest":

@@ -247,7 +247,8 @@ def test_invalid_stop_metadata_is_rejected_and_legacy_request_stays_unknown(tmp_
         for invalid in [{"stopReason": "manual"}, {"stopDetectedAtEpochMs": 1800},
                         {"stopReason": "cable_unplugged", "stopDetectedAtEpochMs": 1800},
                         {"stopReason": "manual", "stopDetectedAtEpochMs": -1},
-                        {"stopReason": "manual", "stopDetectedAtEpochMs": True}]:
+                        {"stopReason": "manual", "stopDetectedAtEpochMs": True},
+                        {"stopReason": "manual", "stopDetectedAtEpochMs": 2**63}]:
             assert client.post("/v1/meetings/m-1/finalize", json={**base, **invalid}, headers=auth).status_code == 422
         assert client.post("/v1/meetings/m-1/finalize", json=base, headers=auth).status_code == 200
         # 旧クライアントで確定済みの理由を後から推定して埋めない
