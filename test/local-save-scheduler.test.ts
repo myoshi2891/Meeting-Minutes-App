@@ -5,6 +5,7 @@ import { LocalSaveScheduler, type SchedulerDeps } from "../src/recording/local-s
 import { createInitialHealth } from "../src/recording/recording-health-monitor";
 import { ChunkStore, openDatabase } from "../src/storage/idb";
 import type { AudioChunkRecord, LocalBackendHealth } from "../src/types/recording";
+import { MAX_SAVE_ATTEMPTS } from "../src/recording/backoff";
 import { BASE_URL, makeChunkRecord, TOKEN } from "./harness";
 
 type Responder = (record: { sequenceNo: number; attempt: number }) => Response | "network-error";
@@ -14,7 +15,7 @@ function okResponse(r: AudioChunkRecord, registered = true): Response {
   return new Response(JSON.stringify({ meetingId, source, sequenceNo, sha256, sizeBytes, path: `p/${sequenceNo}`, registered }), { status: 201 });
 }
 
-async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response | "network-error", backendStatus: LocalBackendHealth["status"] = "HEALTHY", extra: Pick<SchedulerDeps, "isMeetingAbandoned"> = {}) {
+async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response | "network-error", backendStatus: LocalBackendHealth["status"] = "HEALTHY", extra: Pick<SchedulerDeps, "isMeetingAbandoned"> & Partial<Pick<SchedulerDeps, "saver">> = {}) {
   const chunkStore = new ChunkStore(await openDatabase(new IDBFactory()));
   const backend: LocalBackendHealth = { status: backendStatus, lastCheckedAt: 0, lastHealthyAt: 0, latencyMs: 5, consecutiveFailures: 0, capabilities: null, unauthorized: false };
   const health = createInitialHealth("running");
@@ -390,5 +391,25 @@ describe("LocalSaveScheduler", () => {
     await s.advance(0);
     // Assert
     expect(s.scheduler.pendingCount).toBe(1);
+  });
+  it("上限の回にトークン変更で送れなかった Chunk は、LOCAL_SAVE_FAILED に残さず新しいトークンですぐ送り直す", async () => {
+    // Arrange：上限直前まで失敗した Chunk。1 回目の put の間だけトークンが替わり続ける（setToken の再投入は送信中で拾えない）
+    const r = await makeChunkRecord("m", 0, 160);
+    r.save.attempts = MAX_SAVE_ATTEMPTS - 1;
+    let changes = 0;
+    let saver: LocalSaver | null = null;
+    saver = new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, async () => {
+      if (changes >= 2) return okResponse(r);
+      saver?.setToken(`tok-${++changes}`);
+      return new Response("{}", { status: 401 });
+    });
+    const s = await setup((x) => okResponse(x), "HEALTHY", { saver: () => saver });
+    await s.chunkStore.putChunk(r);
+    // Act
+    await s.scheduler.enqueue(r.chunkKey);
+    await s.advance(0);
+    // Assert：失効として通知せず、resumeAll を待たずに保存を終える
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    expect(s.backend.unauthorized).toBe(false);
   });
 });

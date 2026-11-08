@@ -159,6 +159,39 @@ describe("ブラウザクラッシュ後の復旧", () => {
     expect((await h.meetingStore.get(meetingId))?.sessionClock.audioFrameCount).toBe(999_999);
   });
 
+  it.each([
+    ["stop_requested の最終保存に失敗して落ちた会議は、保存済み Chunk の最大 endFrame まで audioFrameCount を補う", 0, 481600],
+    ["stop_requested の会議でも、保存済みの audioFrameCount が大きければ維持する", 999_999, 999_999],
+  ])("%s", async (_name, stored, expected) => {
+    // Arrange：stop() の最初の保存（stop_requested）だけ成功し、flush 後の最終保存の前に落ちた
+    const h = await createHarness();
+    const meetingId = `m-crash-stop-frames-${stored}`;
+    await h.meetingStore.put({
+      meetingId,
+      title: "frames",
+      status: "stop_requested",
+      stopReason: "manual",
+      stopDetectedAtEpochMs: 1,
+      sessionClock: { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: 0, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: stored },
+      consentConfirmedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      endedAt: null,
+      finalChunkCount: null,
+    });
+    for (let seq = 0; seq < 2; seq++) {
+      const r = await makeChunkRecord(meetingId, seq, 1600);
+      r.save.status = "DB_REGISTERED";
+      await h.chunkStore.putChunk(r);
+    }
+    // Act
+    await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    // Assert：停止理由と状態は変えない
+    const m = await h.meetingStore.get(meetingId);
+    expect(m?.sessionClock.audioFrameCount).toBe(expected);
+    expect(m).toMatchObject({ status: "stop_requested", stopReason: "manual", stopDetectedAtEpochMs: 1 });
+  });
+
   it("finalizing の会議は中断扱いで列挙し、created / finalized は対象外", async () => {
     const h = await createHarness();
     const base = (meetingId: string, status: MeetingRecord["status"]): MeetingRecord => ({

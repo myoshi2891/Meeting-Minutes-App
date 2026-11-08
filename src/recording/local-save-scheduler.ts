@@ -280,6 +280,18 @@ export class LocalSaveScheduler {
       return;
     }
 
+    if (outcome.tokenChanged === true) {
+      // 送信中にトークンが替わり続けただけでサーバーは拒否していない。上限の回でも LOCAL_SAVE_FAILED に残さず、新しいトークンですぐ送り直す
+      // （setToken の resumeAll は送信中のキーを拾えず、ここで止めると次のヘルス状態の変化まで送られない）
+      await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+        r.save.status = "RETRYING";
+        r.save.lastError = error;
+        r.save.nextRetryAt = null;
+      });
+      this.insertSorted(chunkKey);
+      return;
+    }
+
     const attempts = record.save.attempts + 1;
     if (retryable && attempts < MAX_SAVE_ATTEMPTS) {
       const delay = backoffMs(attempts);

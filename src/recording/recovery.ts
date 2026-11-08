@@ -19,6 +19,7 @@ export interface RecoveryReport {
  *   non-retryable の LOCAL_SAVE_FAILED は resumeAll の判定に任せ、SAVED は Finalizer のサーバー一覧照合に任せる
  * - recording のまま残っていた会議は stop_requested に落とす（音声はもう来ない）
  *   audioFrameCount は stop() でしか永続化されないため、保存済み Chunk の最大 endFrame から復元する
+ * - stop_requested でも audioFrameCount が保存済み Chunk の最大 endFrame より小さければ補う（flush 後の最終保存の前に落ちた会議）
  * - 会議ロック（§15）が保持中の会議は別タブで録音中なので、会議も Chunk も触らない
  */
 export async function recoverOnStartup(
@@ -59,9 +60,10 @@ export async function recoverOnStartup(
         }
         const originalStatus = m.status;
         const chunks = await chunkStore.listByMeeting(m.meetingId, "mic");
-        if (m.status === "recording") {
-          // Finalizer が totalAudioFrames として送る値。既に大きい値があれば維持する
-          const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
+        // Finalizer が totalAudioFrames として送る値。既に大きい値があれば維持する。
+        // stop_requested でも、flush 後の最終保存の前に落ちた会議は値が古いので補う（書き直しを持つ App のメモリは再読み込みで失われる）
+        const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
+        if (m.status === "recording" || (m.status === "stop_requested" && lastEndFrame > m.sessionClock.audioFrameCount)) {
           m.sessionClock.audioFrameCount = Math.max(m.sessionClock.audioFrameCount, lastEndFrame);
           m.status = "stop_requested";
           m.updatedAt = Date.now();
