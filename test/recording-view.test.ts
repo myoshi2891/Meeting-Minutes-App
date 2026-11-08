@@ -60,6 +60,13 @@ describe("warningsFor", () => {
     expect(warningsFor({ reasons: ["BACKEND_UNREACHABLE", "BACKEND_DEGRADED", "BACKEND_UNAUTHORIZED"] })).toEqual([]);
   });
 
+  it("マイク切断の警告は保存を約束せず、確定待ちの会議で保存状況を確かめるよう案内する", () => {
+    // 保存できない音声がメモリ待機に残ることもあるため、「保存します」とは言い切らない
+    const [text] = warningsFor({ reasons: ["MIC_TRACK_ENDED"] });
+    expect(text).not.toContain("保存して");
+    expect(text).toContain("確定待ちの会議");
+  });
+
   it("同じ理由が重なっても 1 回だけ出す", () => {
     expect(warningsFor({ reasons: ["MIC_TRACK_ENDED", "MIC_TRACK_ENDED"] })).toHaveLength(1);
   });
@@ -213,6 +220,18 @@ describe("pendingCountsText", () => {
     const text = pendingCountsText({ chunks, audioFrameCount: 200, directRegistered: 0, memoryCount: 1 });
     // Assert
     expect(text).not.toContain(INCOMPLETE_COUNT_NOTE);
+  });
+
+  it.each([
+    ["IDB 外の連番が欠番を埋めていない（IDB に 0・2、メモリに 3）", [3], 1, 0, true],
+    ["IDB 外の連番が欠番を埋めている（IDB に 0・2、直接送信 1・メモリ 3）", [1, 3], 1, 1, false],
+  ])("IDB 外の連番が分かるときは件数でなく連番で欠けを判定する（%s）", (_name, offIdbSequenceNos, memoryCount, directRegistered, incomplete) => {
+    // Arrange：末尾は 400 フレームまで届いているので、末尾の網羅では欠けを検出できない
+    const chunks = [chunk(0, "DB_REGISTERED"), chunk(2, "DB_REGISTERED")];
+    // Act
+    const text = pendingCountsText({ chunks, audioFrameCount: 400, directRegistered, memoryCount, offIdbEndFrame: 400, offIdbSequenceNos });
+    // Assert
+    expect(text.includes(INCOMPLETE_COUNT_NOTE)).toBe(incomplete);
   });
 
   it.each([

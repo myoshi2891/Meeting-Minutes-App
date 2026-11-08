@@ -30,7 +30,7 @@ const WARNING_TEXT: ReadonlyArray<readonly [DegradedReason, string]> = [
   // §3.4 段階3：メモリ待機はクラッシュで失われるため最上位
   ["IDB_QUOTA_EXHAUSTED", "保存領域が不足しています。サーバーを起動するかエクスポートしてください"],
   ["IDB_WRITE_FAILED", "ブラウザ内に保存できない音声があります。サーバーを起動するか、WAV を書き出してください"],
-  ["MIC_TRACK_ENDED", "マイクが切断されました。取得済みの音声を保存して停止します。マイクを確認し、新しい録音を開始してください"],
+  ["MIC_TRACK_ENDED", "マイクが切断されたため録音を停止します。保存状況は「確定待ちの会議」で確認し、マイクを確かめてから新しい録音を開始してください"],
   ["NO_AUDIO_FRAMES", "音声が届いていません（5 秒以上）"],
   ["AUDIO_CONTEXT_CLOSED", "音声処理が停止しました。録音を止めてやり直してください"],
   ["AUDIO_CONTEXT_SUSPENDED", "音声処理が一時停止しています（画面ロックなど）"],
@@ -105,21 +105,32 @@ export interface PendingCounts {
   readonly memoryCount: number;
   /** IDB に残らない Chunk（このタブの直接送信・メモリ待機）の最大 endFrame。なければ 0 */
   readonly offIdbEndFrame?: number;
+  /** IDB に残らない Chunk（このタブの直接送信・メモリ待機）の連番。あれば件数でなく連番で欠けを判定する（再読み込み後は空） */
+  readonly offIdbSequenceNos?: ReadonlyArray<number>;
 }
 
 /**
  * 確定待ちの内訳。IDB の Chunk・直接送信・メモリ待機で説明できない音声があれば、登録件数を不完全と明示する
  * （再読み込み後の直接送信はサーバーに問い合わせないと数えられない）。
  */
-export function pendingCountsText({ chunks, audioFrameCount, directRegistered, memoryCount, offIdbEndFrame = 0 }: PendingCounts): string {
+export function pendingCountsText({ chunks, audioFrameCount, directRegistered, memoryCount, offIdbEndFrame = 0, offIdbSequenceNos }: PendingCounts): string {
   const registered = chunks.filter((c) => c.save.status === "DB_REGISTERED").length;
   const saved = chunks.filter((c) => c.save.status === "SAVED").length;
-  const accounted = chunks.length + directRegistered + memoryCount;
-  const hasGap = Math.max(-1, ...chunks.map((c) => c.meta.sequenceNo)) + 1 > accounted;
+  const hasGap = offIdbSequenceNos === undefined
+    ? Math.max(-1, ...chunks.map((c) => c.meta.sequenceNo)) + 1 > chunks.length + directRegistered + memoryCount
+    : hasSequenceGap([...chunks.map((c) => c.meta.sequenceNo), ...offIdbSequenceNos]);
   // 件数が合っていても末尾まで届いているとは限らない。把握している Chunk の最大 endFrame で網羅を確かめる
   const hasUnknownTail = audioFrameCount > Math.max(0, offIdbEndFrame, ...chunks.map((c) => c.meta.endFrame));
   const note = hasGap || hasUnknownTail ? INCOMPLETE_COUNT_NOTE : "";
   return `サーバー登録確認済み ${registered + directRegistered} 件${note}／サーバー保存済み・登録未確認 ${saved} 件／ブラウザ保存済み・未送信 ${chunks.length - registered - saved} 件／メモリ内未保存 ${memoryCount} 件`;
+}
+
+/** 0 から最大の連番までに抜けがあるか。件数で比べると、メモリ待機の連番が IDB の最大より後ろにあるとき欠番を見逃す */
+function hasSequenceGap(sequenceNos: ReadonlyArray<number>): boolean {
+  const known = new Set(sequenceNos);
+  const max = Math.max(-1, ...known);
+  for (let i = 0; i <= max; i++) if (!known.has(i)) return true;
+  return false;
 }
 
 export function elapsedText(ms: number): string {
