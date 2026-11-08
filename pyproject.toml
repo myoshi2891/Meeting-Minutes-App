@@ -2,7 +2,8 @@
 name = "minutes-local-phase1"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
+# phase1.py は model_validator と Field(strict=) を使うため pydantic v2 が必須（FastAPI は v1 も許すので明示する）
+dependencies = ["fastapi>=0.115,<1", "pydantic>=2.7,<3", "uvicorn>=0.30,<1"]
 
 [project.optional-dependencies]
 test = ["httpx>=0.27,<1", "pytest>=8,<10"]
