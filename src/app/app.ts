@@ -116,6 +116,8 @@ export class App {
   private readonly abandoned = new Set<string>();
   /** 停止状態（stop_requested・停止理由）を IDB に書けなかった会議。確定待ちに残し、確定・中止の前に書き直す */
   private readonly unsavedStops = new Map<string, MeetingRecord>();
+  /** 停止後もメモリ待機が残る会議のページライフサイクル（離脱確認）。空になったら外す */
+  private readonly lifecycles = new Map<string, { readonly detach: () => void }>();
 
   constructor(
     private readonly deps: AppDeps,
@@ -165,6 +167,9 @@ export class App {
   async init(): Promise<void> {
     const report = await recoverOnStartup(this.meetingStore, this.chunkStore, this.scheduler, this.deps.locks);
     this.deps.onEvent({ type: "recovered", report });
+    if (report.unreadMeetingIds.length > 0) {
+      this.deps.onEvent({ type: "error", error: new Error(`起動時の復旧で会議を読めませんでした（${report.unreadMeetingIds.join(", ")}）。再読み込みで再試行します`) });
+    }
     this.unsubscribeMonitor = this.monitor.onChange((state) => {
       if (isUsable(state)) void this.onBackendAvailable();
     });
@@ -218,6 +223,8 @@ export class App {
         // 直接送信は Scheduler を通らず onChunkSaved が来ない。空になったら停止後の Barrier を再開させる
         if (controller.memoryBacklogCount === 0) {
           this.releaseHeldLockIfDrained(meetingId);
+          this.lifecycles.get(meetingId)?.detach();
+          this.lifecycles.delete(meetingId);
           if (notify) void this.onChunkSaved(meetingId);
         }
       } catch (error) {
@@ -299,7 +306,8 @@ export class App {
     this.controllers.set(meetingId, controller);
     this.drains.set(meetingId, drain);
     let recording = true;
-    const lifecycle = attachPageLifecycle(controller, () => recording, input.onHidden ?? (() => undefined));
+    // 停止後もメモリ待機が残る間は、タブを閉じると音声が失われるので離脱確認を続ける（pagehide の flush は停止後は何もしない）
+    const lifecycle = attachPageLifecycle(controller, () => recording || controller.memoryBacklogCount > 0, input.onHidden ?? (() => undefined));
     let stopping: Promise<FinalizeResult> | undefined;
     const stopOnce = async (reason: RecordingStopReason, detectedAtEpochMs: number): Promise<FinalizeResult> => {
       try {
@@ -315,7 +323,8 @@ export class App {
         recording = false;
         const held = controller.takeMeetingLock();
         if (held !== null) this.heldLocks.set(meetingId, held);
-        lifecycle.detach();
+        if (controller.memoryBacklogCount > 0) this.lifecycles.set(meetingId, lifecycle);
+        else lifecycle.detach();
         this.session = null;
         this.deps.onEvent({ type: "recording_stopped", meetingId, reason });
         if (controller.memoryBacklogCount > 0) {
@@ -458,10 +467,10 @@ export class App {
     };
   }
 
-  /** メモリ待機が空になり、借用中でなければ保持していたロックを解放する */
+  /** メモリ待機が空になり、停止状態も書き直せていて、借用中でなければ保持していたロックを解放する */
   private releaseHeldLockIfDrained(meetingId: string): void {
     const release = this.heldLocks.get(meetingId);
-    if (release === undefined || this.heldLockBusy.has(meetingId) || this.memoryBacklogCount(meetingId) > 0) return;
+    if (release === undefined || this.heldLockBusy.has(meetingId) || this.memoryBacklogCount(meetingId) > 0 || this.unsavedStops.has(meetingId)) return;
     this.heldLocks.delete(meetingId);
     release();
   }

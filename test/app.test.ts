@@ -37,6 +37,7 @@ class FakeController implements SessionController {
   }
   /** 本物と同じ順序：stop_requested と停止理由を書く（失敗しても続ける）→ flush で audioFrameCount が進む → 最終保存（失敗は reject） */
   async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = 0): Promise<void> {
+    let finalSaved = false;
     try {
       const meeting = this.meeting;
       if (meeting !== null) {
@@ -50,9 +51,10 @@ class FakeController implements SessionController {
         meeting.updatedAt = Date.now();
         await this.deps.meetingStore.put(meeting);
       }
+      finalSaved = true;
     } finally {
-      // 本物と同じく、保存に失敗しても、メモリ待機が残れば会議ロックを持ったまま止まり、空なら解放する
-      if (this.memoryBacklogCount > 0) this.heldLock = this.lock;
+      // 本物と同じく、メモリ待機が残るか最終保存に失敗したら会議ロックを持ったまま止まり、そうでなければ解放する
+      if (this.memoryBacklogCount > 0 || !finalSaved) this.heldLock = this.lock;
       else this.lock?.();
       this.lock = null;
       this.log.push("stop");
@@ -205,20 +207,24 @@ afterEach(() => {
 describe("createApp（起動時の配線）", () => {
   it.each([401, 403])("Chunk がなくても一覧の %s を認証エラーとして表示し、トークン修正後に回復する", async (status) => {
     stubPageGlobals();
-    const s = await setup({ token: "stale", wrapFetch: (fetchImpl) => async (input, init) => {
+    // 会議登録は古いトークンでも通し、一覧だけが %s で弾かれる（一覧の認証エラーを単独で確かめる）
+    const staleLists: string[] = [];
+    const s = await setup({ token: "stale", wrapFetch: (fetchImpl) => acceptStaleRegistration(async (input, init) => {
       const auth = new Headers(init?.headers).get("Authorization");
-      // 確定は一覧の前に会議を登録する。古いトークンの登録も %s で弾く
-      const url = String(input);
-      if ((url.endsWith("/chunks") || url.endsWith("/v1/meetings")) && auth !== `Bearer ${TOKEN}`) return new Response(null, { status });
+      if (String(input).endsWith("/chunks") && auth !== `Bearer ${TOKEN}`) {
+        staleLists.push(String(input));
+        return new Response(null, { status });
+      }
       if (String(input).endsWith("/health") && auth === `Bearer ${TOKEN}`) {
         return new Response(JSON.stringify({ status: "ok", service: "minutes-local", capabilities: { localSave: true, localTranscribe: false, localSummarize: false } }));
       }
       return fetchImpl(input, init);
-    } });
+    }) });
     // 実サーバーと同じく、未登録の会議の一覧・確定は 404 にする
     s.server.requireMeetingRegistration = true;
     const session = await s.app.startRecording(startInput(nextMeetingId()));
     await session.stop();
+    expect(staleLists).toHaveLength(1);
     expect(s.app.monitor.state.unauthorized).toBe(true);
     await s.app.setToken(TOKEN);
     await vi.waitFor(async () => expect((await s.app.meetingStore.get(session.meetingId))?.status).toBe("finalized"));
@@ -328,6 +334,32 @@ describe("createApp（起動時の配線）", () => {
     // Assert
     await vi.waitFor(async () => expect(await s.status(key)).toBe("RETRYING"));
     expect(s.server.putCount).toBe(0);
+  });
+
+  it("起動時復旧でロック後の会議の読み取りに失敗しても、起動を止めず他の会議を復旧し、失敗を通知する", async () => {
+    // Arrange：録音中のまま落ちた会議が 2 件。片方の読み直しだけ失敗する
+    const [a, b] = [nextMeetingId(), nextMeetingId()];
+    const get = MeetingStore.prototype.get;
+    let failed: string | null = null;
+    vi.spyOn(MeetingStore.prototype, "get").mockImplementation(async function (this: MeetingStore, meetingId) {
+      if (failed === null && (meetingId === a || meetingId === b)) {
+        failed = meetingId;
+        throw new Error("IDB read failed");
+      }
+      return get.call(this, meetingId);
+    });
+    // Act
+    const s = await setup({ seed: async (db) => {
+      await seedMeeting(db, makeMeeting(a, "recording"));
+      await seedMeeting(db, makeMeeting(b, "recording"));
+    } });
+    // Assert：読めた会議だけを復旧し、読めなかった会議は検証済みとして扱わない
+    const recovered = s.events.find((e) => e.type === "recovered");
+    const ok = failed === a ? b : a;
+    expect(recovered?.type === "recovered" && recovered.report.interruptedMeetings.map((m) => m.meetingId)).toEqual([ok]);
+    expect(recovered?.type === "recovered" && recovered.report.unreadMeetingIds).toEqual([failed]);
+    expect((await s.app.meetingStore.get(failed!))?.status).toBe("recording");
+    expect(s.events.some((e) => e.type === "error")).toBe(true);
   });
 
   it("未登録会議は登録してから PUT し、起動時復旧にも同じ順序を使う", async () => {
@@ -859,6 +891,35 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(meeting?.stopReason).toBe("manual");
   });
 
+  it("最終の音声フレーム数を保存できないうちは、別タブから確定させず、自タブで書き直してからロックを解放する", async () => {
+    // Arrange：stop_requested は書けたが、最終保存とその直後の書き直しにも失敗した
+    stubPageGlobals();
+    const s = await setup();
+    await settleMonitor(s);
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    s.controllers[0].audioFrameCount = 1_600;
+    const put = s.app.meetingStore.put.bind(s.app.meetingStore);
+    let puts = 0;
+    const spy = vi.spyOn(s.app.meetingStore, "put").mockImplementation(async (meeting) => {
+      if (++puts >= 2) throw new DOMException("quota", "QuotaExceededError");
+      return put(meeting);
+    });
+    expect(await session.stop()).toMatchObject({ ok: false });
+    spy.mockRestore();
+    const other = await createApp({ db: s.db, baseUrl: BASE_URL, workletModuleUrl: "/worklet.js", locks: s.locks,
+      onEvent: () => undefined, setTimer: () => undefined,
+      fetchImpl: async (input, init) => String(input).endsWith("/health") ? new Response(null, { status: 503 }) : s.server.fetch(input, init) });
+    apps.push(other);
+    // Act
+    const fromOther = await other.retryFinalize(id);
+    // Assert：古い audioFrameCount のまま別タブが確定しない
+    expect(fromOther).toMatchObject({ ok: false, stage: "verify" });
+    expect(await s.app.retryFinalize(id)).toMatchObject({ ok: true });
+    expect((await s.app.meetingStore.get(id))?.sessionClock.audioFrameCount).toBe(1_600);
+    await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
+  });
+
   it("停止状態を書き直す前に別タブが会議を進めていたら、上書きしない", async () => {
     // Arrange：保存できないまま止めた後、別タブの起動時復旧などが会議を確定済みにした
     stubPageGlobals();
@@ -1192,6 +1253,24 @@ describe("RecordingSession.stop", () => {
     // Assert：IDB に頼らない直接送信は進める
     await vi.waitFor(sentTail);
     expect(controller.memoryBacklogCount).toBe(0);
+  });
+
+  it("停止後もメモリ待機が残る間はタブを閉じる前に確認を求め、送り終えたら求めない", async () => {
+    // Arrange：末尾をメモリ待機に残したまま止めた
+    const { s, controller } = await stopWithMemoryTail(false);
+    const leave = () => {
+      const event = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    // Assert：失われうる音声があるので離脱確認を残す
+    expect(leave()).toBe(true);
+    // Act：サーバー復帰で末尾を送り終える
+    s.server.up = true;
+    await s.app.monitor.checkOnce();
+    await vi.waitFor(() => expect(controller.memoryBacklogCount).toBe(0));
+    // Assert
+    expect(leave()).toBe(false);
   });
 
   it("drain 後もメモリ待機が残っていれば確定を再試行しない", async () => {

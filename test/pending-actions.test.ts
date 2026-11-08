@@ -16,7 +16,13 @@ describe("確定中止の確認", () => {
     const result = await confirmAbandon(meeting, 2, { confirm, exportWav: () => { order.push("export"); }, abandon });
     expect(result).toBe("abandoned");
     expect(order).toEqual(["confirm", "export", "confirm", "abandon"]);
+    // 最初の確認：対象と未保存件数を示して書き出しを促す
+    expect(confirm.mock.calls[0][0]).toContain(meeting.title);
+    expect(confirm.mock.calls[0][0]).toContain("2 件");
+    // 最後の確認：対象を ID まで示し、書き出しの確認とデータを消さないことを伝える
+    expect(confirm.mock.calls[1][0]).toContain(meeting.title);
     expect(confirm.mock.calls[1][0]).toContain(meeting.meetingId);
+    expect(confirm.mock.calls[1][0]).toContain("書き出した WAV");
     expect(confirm.mock.calls[1][0]).toContain("削除しません");
     expect(abandon).toHaveBeenCalledWith(meeting.meetingId, true);
   });
