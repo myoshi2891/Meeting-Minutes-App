@@ -111,6 +111,8 @@ export class App {
   /** 直接送信で DB 登録まで済んだ Chunk の連番。確定待ちの欠番判定に使う */
   private readonly directRegisteredSeqs = new Map<string, Set<number>>();
   private readonly waitingForSave = new Set<string>();
+  /** サーバー照合の不一致による送り直しの後、保存完了で確認し直す機会を使った会議。確定できたら外す */
+  private readonly mismatchRechecked = new Set<string>();
   private readonly finalizeIssues = new Map<string, Extract<FinalizeResult, { ok: false }>>();
   /** このタブで確定中止した会議。IDB が読めなくなっても、中止済みの会議に PUT を始めないために使う */
   private readonly abandoned = new Set<string>();
@@ -347,9 +349,15 @@ export class App {
 
   /** 停止したが確定していない会議。自動再試行に加えて UI からの手動再試行も用意する */
   async listPendingFinalize(): Promise<MeetingRecord[]> {
-    const stopped = await this.meetingStore.listByStatus("stop_requested");
-    const finalizing = await this.meetingStore.listByStatus("finalizing");
-    const listed = [...stopped, ...finalizing];
+    let listed: MeetingRecord[] = [];
+    try {
+      const stopped = await this.meetingStore.listByStatus("stop_requested");
+      const finalizing = await this.meetingStore.listByStatus("finalizing");
+      listed = [...stopped, ...finalizing];
+    } catch (error) {
+      // IDB が読めないときこそ、停止状態を書けずにメモリで保持している会議の再試行を出す必要がある
+      this.deps.onEvent({ type: "error", error });
+    }
     // IDB にはまだ recording のまま残っている会議も、停止済みとして並べる
     const unsaved = [...this.unsavedStops.values()].filter((m) => !listed.some((l) => l.meetingId === m.meetingId));
     return [...listed, ...unsaved];
@@ -408,6 +416,7 @@ export class App {
       this.waitingForSave.delete(meetingId);
       this.finalizeRequested.delete(meetingId);
       this.finalizeIssues.delete(meetingId);
+      this.mismatchRechecked.delete(meetingId);
       this.deps.onEvent({ type: "finalize_abandoned", meetingId });
     } finally {
       release();
@@ -494,6 +503,8 @@ export class App {
     try {
       meeting = await this.meetingStore.get(meetingId);
     } catch (error) {
+      // 読み取りを待つ間にこのタブで中止されたかもしれない。ロック保持中の送信可否より先に確かめる
+      if (this.abandoned.has(meetingId)) return abandoned;
       // IDB が読めないときこそ直接送信が必要。このタブが会議ロックを持つ間（録音中・メモリ待機の保持中）は
       // 中止できるのもこのタブだけなので、上のこのタブの中止記録で判定済みとして送る
       if (this.session?.meetingId === meetingId || this.heldLocks.has(meetingId)) return registration;
@@ -510,7 +521,7 @@ export class App {
       this.finalizeRequested.add(meetingId);
       return;
     }
-    // 照合不一致による再送は、成功 PUT → 不一致 → 再送のループにしない。
+    // 照合不一致による再送は 1 回だけ確認し直し（finalize の mismatchRechecked）、成功 PUT → 不一致 → 再送のループにしない。
     if (!this.waitingForSave.has(meetingId)) return;
     try {
       const meeting = await this.meetingStore.get(meetingId);
@@ -532,10 +543,16 @@ export class App {
         this.finalizeTokenChanged.delete(meetingId);
         result = await this.finalizeOnce(meetingId);
         if (!result.ok && result.stage === "waiting_local_save") this.waitingForSave.add(meetingId);
-        else this.waitingForSave.delete(meetingId);
+        // 照合不一致で送り直した Chunk の保存完了で 1 回だけ確認し直す。再び不一致なら待たず、送信ループにしない
+        else if (!result.ok && result.detail.startsWith("server mismatch") && !this.mismatchRechecked.has(meetingId)) {
+          this.mismatchRechecked.add(meetingId);
+          this.waitingForSave.add(meetingId);
+        } else this.waitingForSave.delete(meetingId);
       } while (!this.disposed && (this.finalizeTokenChanged.has(meetingId) || (this.waitingForSave.has(meetingId) && this.finalizeRequested.has(meetingId))));
-      if (result.ok) this.finalizeIssues.delete(meetingId);
-      else {
+      if (result.ok) {
+        this.finalizeIssues.delete(meetingId);
+        this.mismatchRechecked.delete(meetingId);
+      } else {
         const previous = this.finalizeIssues.get(meetingId);
         this.finalizeIssues.set(meetingId, result);
         if (previous?.stage !== result.stage || previous.detail !== result.detail) {
@@ -594,8 +611,9 @@ export class App {
   private async onBackendAvailable(): Promise<void> {
     // stop 後もメモリ待機が残る会議（このタブがロックを保持）は、確定の前に末尾を送る。送れなければロックを持ったまま残す。
     // 直接送信は IDB を使わないので、IDB の一覧取得・再投入より先に行い、IDB の障害で止めない（drain は自分で失敗を通知する）
+    // 確定中止した会議は送らない（送信は prepareChunkPut が拒否するので、書き出し用にメモリ待機へ残す）
     for (const [id, drain] of this.drains) {
-      if (id !== this.session?.meetingId && this.memoryBacklogCount(id) > 0) await drain(false);
+      if (id !== this.session?.meetingId && !this.abandoned.has(id) && this.memoryBacklogCount(id) > 0) await drain(false);
     }
     try {
       const recording = await this.meetingStore.listByStatus("recording");

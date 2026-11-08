@@ -117,7 +117,13 @@ async function refreshPending(app: App): Promise<void> {
   const generation = ++pendingGeneration;
   const meetings = await app.listPendingFinalize();
   const details = await Promise.all(meetings.map(async (m) => {
-    const chunks = await app.chunkStore.listByMeeting(m.meetingId, "mic");
+    let chunks: Awaited<ReturnType<typeof app.chunkStore.listByMeeting>>;
+    try {
+      chunks = await app.chunkStore.listByMeeting(m.meetingId, "mic");
+    } catch (error) {
+      // 内訳が読めなくても行（再試行・中止）は出す。IDB が読めないときこそ保持中の会議の再試行が要る
+      return `内訳を読み込めませんでした（${noticeFor({ type: "error", error }) ?? ""}）`;
+    }
     return pendingCountsText({
       chunks,
       audioFrameCount: m.sessionClock.audioFrameCount,
@@ -138,7 +144,8 @@ async function refreshPending(app: App): Promise<void> {
       retry.textContent = "再試行";
       retry.disabled = pendingBusy.has(m.meetingId);
       retry.addEventListener("click", () => {
-        retry.disabled = true;
+        // 再試行中は確定中止も押せないようにする（会議ロックの取り合いで「使用中」になるだけのため）
+        retry.disabled = abandon.disabled = true;
         pendingBusy.add(m.meetingId);
         void app
           .retryFinalize(m.meetingId)

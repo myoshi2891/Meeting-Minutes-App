@@ -758,6 +758,62 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(s.server.putCount).toBe(putsBefore);
   });
 
+  it("IDB の読み取りを待つ間にこのタブで確定中止されたら、ロックを保持していても直接送信の PUT を始めない", async () => {
+    // Arrange：メモリ待機を残して止め（ロックを保持）、会議登録は済ませておく
+    stubPageGlobals();
+    const s = await setup();
+    await settleMonitor(s);
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    s.controllers[0].memoryBacklogCount = 1;
+    await session.stop();
+    const put = s.controllers[0].deps.directSaver?.put;
+    expect(await put?.(await makeChunkRecord(id, 0, 160))).toMatchObject({ ok: true });
+    const putsBefore = s.server.putCount;
+    // 次の送信で、会議登録の読み取り（1 回目）の後の中止判定の読み取りだけ、中止の完了まで待たせてから失敗させる
+    const get = s.app.meetingStore.get.bind(s.app.meetingStore);
+    let reads = 0;
+    let reading!: () => void;
+    const readStarted = new Promise<void>((r) => { reading = r; });
+    let fail!: () => void;
+    const gate = new Promise<void>((r) => { fail = r; });
+    vi.spyOn(s.app.meetingStore, "get").mockImplementation(async (meetingId) => {
+      if (++reads !== 2) return get(meetingId);
+      reading();
+      await gate;
+      throw new Error("IDB unavailable");
+    });
+    const sending = put?.(await makeChunkRecord(id, 1, 160));
+    await readStarted;
+    // Act
+    await s.app.abandonFinalize(id, true);
+    fail();
+    // Assert
+    expect(await sending).toMatchObject({ ok: false, retryable: false });
+    expect(s.server.putCount).toBe(putsBefore);
+  });
+
+  it("確定中止した会議のメモリ待機は、サーバー復帰時に自動で drain しない（書き出し用に残す）", async () => {
+    // Arrange：サーバー停止中にメモリ待機を残して止め、確定を中止した
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    controller.memoryBacklogCount = 1;
+    await session.stop();
+    await s.app.abandonFinalize(id, true);
+    const drainsBefore = controller.drainCount;
+    const eventsBefore = s.events.length;
+    // Act：サーバーが使えるようになる
+    s.server.up = true;
+    await s.app.setToken(TOKEN);
+    // Assert
+    expect(controller.drainCount).toBe(drainsBefore);
+    expect(controller.memoryBacklogCount).toBe(1);
+    expect(s.events.slice(eventsBefore).filter((e) => e.type === "memory_backlog_export_required")).toHaveLength(0);
+  });
+
   it("開始済みの PUT は中止後も完了を記録する", async () => {
     // Arrange・Act：PUT の応答待ちの間に確定を中止する
     const { s, id, r, release } = await abandonWhileRequestHeld((url, init) => init?.method === "PUT" && url.includes("/chunks/"));
@@ -850,7 +906,8 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
   it("停止状態を IDB に書けなかった会議は確定待ちに残し、書けるようになったら停止理由ごと書き直して確定する", async () => {
     // Arrange
     stubPageGlobals();
-    const s = await setup();
+    // サーバー停止中に始め、Monitor の復帰通知による自動再試行が書き直しを先に済ませて検証対象の retryFinalize を隠さないようにする
+    const s = await setup({ serverUp: false });
     const id = nextMeetingId();
     // Act：停止は reject せず、確定できなかった結果を返す
     const result = await stopWhileMeetingWritesFail(s, id);
@@ -858,8 +915,9 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(result).toMatchObject({ ok: false });
     expect((await s.app.meetingStore.get(id))?.status).toBe("recording");
     expect((await s.app.listPendingFinalize()).map((m) => m.meetingId)).toContain(id);
-    await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
+    s.server.up = true;
     expect(await s.app.retryFinalize(id)).toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
     const meeting = await s.app.meetingStore.get(id);
     expect(meeting?.status).toBe("finalized");
     expect(meeting?.stopReason).toBe("manual");
@@ -870,6 +928,7 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     // Arrange：stop_requested は書けたが、末尾の Chunk 化でクォータを使い切り、最終保存（audioFrameCount）に失敗した
     stubPageGlobals();
     const s = await setup();
+    await settleMonitor(s);
     const id = nextMeetingId();
     const session = await s.app.startRecording(startInput(id));
     s.controllers[0].audioFrameCount = 1_600;
@@ -881,11 +940,11 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     });
     await session.stop();
     spy.mockRestore();
-    await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
     // Act
     const result = await s.app.retryFinalize(id);
     // Assert
     expect(result).toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
     const meeting = await s.app.meetingStore.get(id);
     expect(meeting?.sessionClock.audioFrameCount).toBe(1_600);
     expect(meeting?.stopReason).toBe("manual");
@@ -923,18 +982,34 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
   it("停止状態を書き直す前に別タブが会議を進めていたら、上書きしない", async () => {
     // Arrange：保存できないまま止めた後、別タブの起動時復旧などが会議を確定済みにした
     stubPageGlobals();
-    const s = await setup();
+    // サーバー停止中にして、Monitor の復帰通知による自動再試行が先に stop_requested を書かないようにする
+    const s = await setup({ serverUp: false });
     const id = nextMeetingId();
     await stopWhileMeetingWritesFail(s, id);
     const meeting = await s.app.meetingStore.get(id);
     await s.app.meetingStore.put({ ...meeting!, status: "finalized" });
-    await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
     // Act
     await s.app.retryFinalize(id);
+    await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
     // Assert：stop_requested に戻して確定を送り直さない
     expect((await s.app.meetingStore.get(id))?.status).toBe("finalized");
     expect(s.server.requests.filter((r) => r === `FINALIZE:${id}`)).toHaveLength(0);
     expect(await s.app.listPendingFinalize()).toEqual([]);
+  });
+
+  it("確定待ちの一覧を IDB から読めなくても、停止状態を書けずに保持している会議は返し、失敗を通知する", async () => {
+    // Arrange：サーバー停止中に、停止状態を IDB に書けないまま止めた
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    await stopWhileMeetingWritesFail(s, id);
+    const error = new Error("IDB read failed");
+    vi.spyOn(s.app.meetingStore, "listByStatus").mockRejectedValue(error);
+    // Act
+    const pending = await s.app.listPendingFinalize();
+    // Assert：再試行ボタンを出せるよう、メモリに保持した会議は返す
+    expect(pending.map((m) => m.meetingId)).toEqual([id]);
+    expect(s.events).toContainEqual({ type: "error", error });
   });
 
   it("stop_requested と finalizing の会議だけを確定待ちとして返す", async () => {
@@ -1081,7 +1156,8 @@ describe("RecordingSession.stop", () => {
       expect(s.server.putCount).toBeGreaterThan(0);
       expect(s.app.scheduler.pendingCount).toBe(0);
     });
-    expect(reads).toBe(1);
+    // 送り直しの完了で 1 回だけ確認し直し、再び不一致なら止まる
+    expect(reads).toBe(2);
     expect((await s.app.meetingStore.get(meetingId))?.status).toBe("stop_requested");
   });
 
@@ -1140,6 +1216,46 @@ describe("RecordingSession.stop", () => {
     controller.deps.onError(new Error("idb write failed"));
     // Assert
     await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
+  });
+
+  it("サーバー照合の不一致で送り直した Chunk の保存が終わったら、確定を再試行する", async () => {
+    // Arrange：IDB では登録済みだが、サーバーには届いていない
+    stubPageGlobals();
+    const id = nextMeetingId();
+    const s = await setup({ seed: async (db) => {
+      await seedChunk(db, id, 0, "DB_REGISTERED");
+      await seedMeeting(db, makeMeeting(id, "stop_requested", 160));
+    } });
+    // Act：起動時の確定が不一致で送り直す
+    await settleMonitor(s);
+    // Assert
+    await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
+  });
+
+  it("送り直しても照合が一致しなければ、再確認は 1 回で止め、送信を繰り返さない", async () => {
+    // Arrange：サーバー一覧が常に別のハッシュを返す
+    stubPageGlobals();
+    const id = nextMeetingId();
+    const s = await setup({
+      seed: async (db) => {
+        await seedChunk(db, id, 0, "DB_REGISTERED");
+        await seedMeeting(db, makeMeeting(id, "stop_requested", 160));
+      },
+      wrapFetch: (fetchImpl) => async (input, init) => {
+        const res = await fetchImpl(input, init);
+        if (!String(input).endsWith("/chunks") || init?.method !== undefined) return res;
+        const body = (await res.json()) as { meetingId: string; chunks: Array<Record<string, unknown>> };
+        return new Response(JSON.stringify({ ...body, chunks: body.chunks.map((c) => ({ ...c, sha256: "0".repeat(64) })) }), { status: 200 });
+      },
+    });
+    // Act
+    await settleMonitor(s);
+    await vi.waitFor(() => expect(s.server.putCount).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Assert：最初の照合 + 送り直し後の再確認 1 回
+    expect(s.server.putCount).toBe(2);
+    expect(s.server.requests.filter((r) => r === `LIST:${id}`)).toHaveLength(2);
+    expect((await s.app.meetingStore.get(id))?.status).toBe("stop_requested");
   });
 
   it("停止処理（末尾の flush）が終わるまでは、別タブから確定も確定中止もできない", async () => {
