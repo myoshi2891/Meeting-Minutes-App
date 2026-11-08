@@ -61,7 +61,8 @@ describe("MeetingRegistrar", () => {
     const outcome = await registrar.ensure(meeting.meetingId);
     // Assert
     expect(onBackendUnauthorized).toHaveBeenCalledOnce();
-    expect(outcome).toMatchObject({ ok: false, retryable: false, error: { kind: "UNAUTHORIZED" } });
+    // Scheduler・直接送信が同じ 401/403 を Monitor へ二重に報告しないよう、報告済みの印を付ける
+    expect(outcome).toMatchObject({ ok: false, retryable: false, unauthorizedReported: true, error: { kind: "UNAUTHORIZED" } });
   });
 
   it("ブラウザの fetch を渡してもメソッド呼び出しにせず POST を送る（Illegal invocation にならない）", async () => {
