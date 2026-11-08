@@ -570,7 +570,7 @@ export function jobFromServerRow(row: Record<string, unknown>): JobSummary | nul
 
 # 4. `src/recording/recording-controller.ts` の変更
 
-変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出し、`stop_requested` の保存に失敗しても末尾を Chunk にしてから Worklet を切り離すこと、メモリ待機が残る間は stop 後も会議ロックを保持し `takeMeetingLock()` で App へ渡すことを含む）。会議ロックは Mic の Controller だけが持つ。そこで Mic または System のどちらかのメモリ待機が残る間は、Mic の stop 後もロックを持ち続け、両方が空になってから解放する。Mic のメモリ待機だけを見ると、Mic が空で System に末尾が残るときに Mic の `stop()` がロックを手放し、別タブの Barrier が System の末尾を数えられないまま確定しうるためである。配線は次のとおり。
+変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出し、`stop_requested` の保存に失敗しても末尾を Chunk にしてから Worklet を切り離すこと、メモリ待機が残る間と Mic の最終保存に失敗したときは stop 後も会議ロックを保持し `takeMeetingLock()` で App へ渡すこと（最終保存の失敗で保持したロックは drain で空になっても解放せず、渡すまで同じインスタンスの `start()` を拒否する）を含む）。会議ロックは Mic の Controller だけが持つ。そこで Mic または System のどちらかのメモリ待機が残る間は、Mic の stop 後もロックを持ち続け、両方が空になってから解放する。Mic のメモリ待機だけを見ると、Mic が空で System に末尾が残るときに Mic の `stop()` がロックを手放し、別タブの Barrier が System の末尾を数えられないまま確定しうるためである。配線は次のとおり。
 
 1. Mic の Controller にだけ `otherSourceBacklogCount: () => systemController.memoryBacklogCount` を渡す。Mic の `stop()` の最後と `drainMemoryBacklog()` が空になったときの解放は、自身のメモリ待機に加えてこの値も 0 のときだけロックを解放する。
 2. 停止は `DualRecorder.stop()`（§6）のとおり System を先に止め、完了してから Mic を止める。System の末尾 Chunk がメモリ待機に入るか確定した後で、Mic がロックを手放すか決めるためである。録音中に `dropSystem()` で System だけ止めた場合も、App はその System Controller を保持し続け、`otherSourceBacklogCount` と合計件数に数える（null にした後もメモリ待機は残りうる）。
@@ -680,6 +680,8 @@ export class RecordingController {
   private nextRequestId = 0;
   /** 会議ロックの解放。registerMeeting の start で取得し、stop の完了で解放する（Phase 1 §15 と同じ） */
   private releaseLock: (() => void) | null = null;
+  /** Mic の stop の最終保存に失敗したか。drain で空になってもロックを解放せず、takeMeetingLock で渡すまで持つ（Phase 1 §15 と同じ） */
+  private finalStopUnsaved = false;
   /** この録音で切断を処理済みか。health は録音をまたいで共有されるので、degradedReasons では判定しない（Phase 1 §15 と同じ） */
   private trackEndedHandled = false;
   /** トラックの ended リスナーの解除用。stop で abort する（Phase 1 §15 と同じ） */
@@ -698,6 +700,8 @@ export class RecordingController {
   async start(meetingId: string, title: string, consentConfirmedAt: number, options: StartOptions = {}): Promise<void> {
     // 前の録音のメモリ待機が残るうちは始めない（Phase 1 §15。保持中のロックの解放手段を上書きし、別会議の Chunk も混ざる）
     if (this.memoryBacklog.length > 0) throw new Error("memory backlog from the previous recording remains");
+    // 最終保存の失敗で保持したロックも、呼び出し元が takeMeetingLock で受け取るまでは上書きしない（Phase 1 §15）
+    if (this.releaseLock !== null) throw new Error("meeting lock from the previous recording is still held");
     if (options.registerMeeting !== false) {
       // recording を書く前にロックを取る（Phase 1 §15）。System 側は Mic のロックに乗る
       const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
@@ -878,7 +882,8 @@ export class RecordingController {
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
       // メモリ待機が残るうちはロックを持ち続ける（Phase 1 §15。別タブの Barrier はこのタブのメモリ待機を数えられない）。System 側の分も数える
       // Mic の最終保存（最終の audioFrameCount）に失敗したときも、別タブが古い値で確定しないよう保持する（Phase 1 §15）
-      if (this.memoryBacklog.length === 0 && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0 && (this.source !== "mic" || finalSaved)) this.unlock();
+      this.finalStopUnsaved = this.source === "mic" && !finalSaved;
+      if (this.memoryBacklog.length === 0 && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0 && !this.finalStopUnsaved) this.unlock();
     }
   }
 
@@ -887,6 +892,7 @@ export class RecordingController {
     if (this.node !== null) return null;
     const release = this.releaseLock;
     this.releaseLock = null;
+    this.finalStopUnsaved = false;
     return release;
   }
 
@@ -927,8 +933,9 @@ export class RecordingController {
           (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
         );
       }
-      // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する。System 側のメモリ待機が残るうちは持ち続ける
-      if (this.node === null && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0) this.unlock();
+      // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する。System 側のメモリ待機が残るうち、
+      // また Mic の最終保存に失敗したときは持ち続ける（Phase 1 §15）
+      if (this.node === null && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0 && !this.finalStopUnsaved) this.unlock();
     }
     return drained;
   }
@@ -2337,13 +2344,16 @@ class FakeController implements SourceController {
   chunkCount = 0;
   readonly calls: string[] = [];
   registerMeeting: boolean | null = null;
+  /** stop に渡された引数。省略時は空配列のまま記録する */
+  readonly stopArgs: unknown[][] = [];
   constructor(readonly source: AudioSource, private readonly startPerf: number) {}
   async start(_m: string, _t: string, _c: number, options: { registerMeeting: boolean }): Promise<void> {
     this.registerMeeting = options.registerMeeting;
     this.sessionClock = { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: this.startPerf, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 0 };
     this.calls.push("start");
   }
-  async stop(): Promise<void> {
+  async stop(...args: unknown[]): Promise<void> {
+    this.stopArgs.push(args);
     this.calls.push("stop");
   }
   async flush(): Promise<void> {
@@ -2398,6 +2408,17 @@ describe("MultiSourceRecorder", () => {
     }
     expect(await rec.stop()).toEqual({ mic: 3, system: 2 });
     expect(stopOrder).toEqual(["system", "mic"]);
+  });
+
+  it("停止理由と検出時刻を Mic の Controller へそのまま渡し、System には渡さない", async () => {
+    // Arrange
+    const { rec, controllers } = build(true);
+    await rec.start("m", "t", 1);
+    // Act
+    await rec.stop("mic_ended", 123456);
+    // Assert
+    expect(controllers[0].stopArgs).toEqual([["mic_ended", 123456]]);
+    expect(controllers[1].stopArgs).toEqual([[]]);
   });
 
   it("ドリフト差は mic − system で記録され、P95/P99 を返す", async () => {
