@@ -108,10 +108,14 @@ export class App {
   private readonly directRegistered = new Map<string, number>();
   /** 直接送信で DB 登録まで済んだ Chunk の最大 endFrame。確定待ちの末尾の網羅確認に使う */
   private readonly directRegisteredEndFrame = new Map<string, number>();
+  /** 直接送信で DB 登録まで済んだ Chunk の連番。確定待ちの欠番判定に使う */
+  private readonly directRegisteredSeqs = new Map<string, Set<number>>();
   private readonly waitingForSave = new Set<string>();
   private readonly finalizeIssues = new Map<string, Extract<FinalizeResult, { ok: false }>>();
   /** このタブで確定中止した会議。IDB が読めなくなっても、中止済みの会議に PUT を始めないために使う */
   private readonly abandoned = new Set<string>();
+  /** 停止状態（stop_requested・停止理由）を IDB に書けなかった会議。確定待ちに残し、確定・中止の前に書き直す */
+  private readonly unsavedStops = new Map<string, MeetingRecord>();
 
   constructor(
     private readonly deps: AppDeps,
@@ -263,6 +267,8 @@ export class App {
         stopForMic?.();
       },
       onMeetingCreated: (meeting) => this.meetingFallbacks.set(meeting.meetingId, meeting),
+      // 別の会議（停止後もメモリ待機が残る）の分。この controller は開始完了まで controllers にないので、同一性で除く
+      otherMeetingsBacklogCount: () => [...this.controllers.values()].filter((c) => c !== controller).reduce((sum, c) => sum + c.memoryBacklogCount, 0),
       // 送るたびに現在の saver を引く。録音中に setToken しても、開始時のトークン（未設定・失効）で送り続けない
       directSaver: {
         put: async (record) => {
@@ -276,6 +282,8 @@ export class App {
           if (outcome.ok && outcome.registered) {
             this.directRegistered.set(meetingId, this.directRegisteredCount(meetingId) + 1);
             this.directRegisteredEndFrame.set(meetingId, Math.max(this.directRegisteredEndFrame.get(meetingId) ?? 0, record.meta.endFrame));
+            const seqs = this.directRegisteredSeqs.get(meetingId) ?? new Set<number>();
+            this.directRegisteredSeqs.set(meetingId, seqs.add(record.meta.sequenceNo));
           }
           return outcome;
         },
@@ -296,6 +304,13 @@ export class App {
     const stopOnce = async (reason: RecordingStopReason, detectedAtEpochMs: number): Promise<FinalizeResult> => {
       try {
         await controller.stop(reason, detectedAtEpochMs);
+      } catch (error) {
+        // 停止状態を IDB に書けなかった。録音は止まっているので、会議を確定待ちに残して確定の前に書き直す
+        const meeting = this.meetingFallbacks.get(meetingId);
+        if (meeting === undefined) throw error;
+        const firstStop = meeting.stopReason === undefined ? { stopReason: reason, stopDetectedAtEpochMs: detectedAtEpochMs } : {};
+        this.unsavedStops.set(meetingId, { ...meeting, ...firstStop, status: "stop_requested", updatedAt: (this.deps.now ?? Date.now)() });
+        this.deps.onEvent({ type: "error", error });
       } finally {
         recording = false;
         const held = controller.takeMeetingLock();
@@ -325,7 +340,10 @@ export class App {
   async listPendingFinalize(): Promise<MeetingRecord[]> {
     const stopped = await this.meetingStore.listByStatus("stop_requested");
     const finalizing = await this.meetingStore.listByStatus("finalizing");
-    return [...stopped, ...finalizing];
+    const listed = [...stopped, ...finalizing];
+    // IDB にはまだ recording のまま残っている会議も、停止済みとして並べる
+    const unsaved = [...this.unsavedStops.values()].filter((m) => !listed.some((l) => l.meetingId === m.meetingId));
+    return [...listed, ...unsaved];
   }
 
   getFinalizeIssue(meetingId: string): Extract<FinalizeResult, { ok: false }> | undefined {
@@ -348,6 +366,12 @@ export class App {
     return Math.max(this.directRegisteredEndFrame.get(meetingId) ?? 0, ...memory);
   }
 
+  /** IDB に残らない Chunk（このタブの直接送信・メモリ待機）の連番。再読み込みで失われる */
+  offIdbSequenceNos(meetingId: string): number[] {
+    const memory = this.exportMemoryBacklog(meetingId).map((f) => f.meta.sequenceNo);
+    return [...new Set([...(this.directRegisteredSeqs.get(meetingId) ?? []), ...memory])];
+  }
+
   exportMemoryBacklog(meetingId: string): MemoryBacklogFile[] {
     return this.controllers.get(meetingId)?.exportMemoryBacklog() ?? [];
   }
@@ -359,6 +383,8 @@ export class App {
     const release = await this.acquireMeetingLock(meetingId);
     if (release === null) throw new Error("別の処理がこの会議を使用中です。完了後にやり直してください");
     try {
+      const unsaved = await this.saveUnsavedStop(meetingId);
+      if (unsaved !== null) throw new Error(`停止状態を保存できていないため中止できません（${unsaved.detail}）`);
       const meeting = await this.meetingStore.get(meetingId);
       if (meeting?.status === "abandoned") {
         this.abandoned.add(meetingId);
@@ -384,9 +410,40 @@ export class App {
     const release = await this.acquireMeetingLock(meetingId);
     if (release === null) return { ok: false, stage: "verify", detail: "meeting is locked by another tab" };
     try {
+      const unsaved = await this.saveUnsavedStop(meetingId);
+      if (unsaved !== null) return unsaved;
+      // メモリ待機が残る会議は、Barrier の前に末尾を直接送信する（送れなければ Barrier が waiting_local_save を返す）。
+      // サーバーが使えない間は送れないので試さない（停止時に memory_backlog_export_required を重ねて通知しない）
+      const drain = this.drains.get(meetingId);
+      if (drain !== undefined && this.session?.meetingId !== meetingId && this.memoryBacklogCount(meetingId) > 0 && isUsable(this.monitor.state)) {
+        await drain(false);
+      }
       return await this.finalize(meetingId);
     } finally {
       release();
+    }
+  }
+
+  /**
+   * 停止時に書けなかった停止状態を書き直す。会議ロックを持って呼ぶ。書けたか、書く必要がなければ null。
+   * recording なら丸ごと書く。stop_requested（最初の保存だけ成功し、flush 後の最終保存に失敗）なら、
+   * Controller が持つ最終の音声フレーム数と未記録の停止理由だけを載せる（他タブの確定 POST の失敗で残った値は保つ）。
+   * ロックは stop 後に一度手放しているので、別タブが先に進めた会議（finalizing・finalized・abandoned）は上書きしない。
+   */
+  private async saveUnsavedStop(meetingId: string): Promise<Extract<FinalizeResult, { ok: false }> | null> {
+    const pending = this.unsavedStops.get(meetingId);
+    if (pending === undefined) return null;
+    try {
+      const current = await this.meetingStore.get(meetingId);
+      if (current === undefined || current.status === "recording") await this.meetingStore.put(pending);
+      else if (current.status === "stop_requested") {
+        const firstStop = current.stopReason === undefined ? { stopReason: pending.stopReason, stopDetectedAtEpochMs: pending.stopDetectedAtEpochMs } : {};
+        await this.meetingStore.put({ ...current, ...firstStop, sessionClock: { ...pending.sessionClock }, updatedAt: pending.updatedAt });
+      }
+      this.unsavedStops.delete(meetingId);
+      return null;
+    } catch (error) {
+      return { ok: false, stage: "verify", detail: `stop state not saved: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
 
@@ -500,7 +557,12 @@ export class App {
         token,
         fetchImpl: this.deps.fetchImpl,
         unpersistedChunkCount: () => controller?.memoryBacklogCount ?? 0,
-        ensureMeeting: (id) => this.registrar.ensure(id),
+        ensureMeeting: async (id) => {
+          const registration = await this.registrar.ensure(id);
+          // 登録の途中でトークンが変わった失敗は、この Barrier が終わったら現在のトークンでやり直す（onBackendUnauthorized と同じ）
+          if (!registration.ok && this.token !== token) this.finalizeTokenChanged.add(meetingId);
+          return registration;
+        },
         onBackendUnauthorized: () => {
           if (this.token === token) this.monitor.reportUnauthorized();
           // setToken からの再試行は実行中のロックに阻まれているので、この Barrier が終わったら自分でやり直す
@@ -521,6 +583,11 @@ export class App {
    * 別タブが録音中（会議ロック保持中）の会議には触らない（§23 と同じ）。
    */
   private async onBackendAvailable(): Promise<void> {
+    // stop 後もメモリ待機が残る会議（このタブがロックを保持）は、確定の前に末尾を送る。送れなければロックを持ったまま残す。
+    // 直接送信は IDB を使わないので、IDB の一覧取得・再投入より先に行い、IDB の障害で止めない（drain は自分で失敗を通知する）
+    for (const [id, drain] of this.drains) {
+      if (id !== this.session?.meetingId && this.memoryBacklogCount(id) > 0) await drain(false);
+    }
     try {
       const recording = await this.meetingStore.listByStatus("recording");
       const lockedElsewhere = new Set<string>();
@@ -531,11 +598,6 @@ export class App {
         else release();
       }
       await this.scheduler.resumeAll(lockedElsewhere);
-      // stop 後もメモリ待機が残る会議（このタブがロックを保持）は、確定の前に末尾を送る。送れなければロックを持ったまま残す
-      for (const [id, drain] of this.drains) {
-        if (id !== this.session?.meetingId && this.memoryBacklogCount(id) > 0) await drain(false);
-      }
-
       for (const m of await this.listPendingFinalize()) await this.retryFinalize(m.meetingId);
     } catch (error) {
       this.deps.onEvent({ type: "error", error });

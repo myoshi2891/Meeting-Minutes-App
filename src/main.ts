@@ -124,6 +124,7 @@ async function refreshPending(app: App): Promise<void> {
       directRegistered: app.directRegisteredCount(m.meetingId),
       memoryCount: app.memoryBacklogCount(m.meetingId),
       offIdbEndFrame: app.offIdbEndFrame(m.meetingId),
+      offIdbSequenceNos: app.offIdbSequenceNos(m.meetingId),
     });
   }));
   if (generation !== pendingGeneration) return;
