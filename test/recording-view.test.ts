@@ -95,21 +95,21 @@ describe("missingTailText", () => {
 describe("noticeFor", () => {
   it("通常停止の確定待ちは中断と呼ばず、混在時は件数を分ける", () => {
     const stopped = { meetingId: "a", status: "stop_requested" as const, chunkCount: 1 };
-    const notice = noticeFor({ type: "recovered", report: { interruptedMeetings: [stopped], requeuedChunks: 0 } });
+    const notice = noticeFor({ type: "recovered", report: { interruptedMeetings: [stopped], requeuedChunks: 0, unreadMeetingIds: [] } });
     expect(notice).toContain("確定待ちの会議が 1 件");
     expect(notice).not.toContain("中断");
-    const mixed = noticeFor({ type: "recovered", report: { interruptedMeetings: [stopped, { ...stopped, meetingId: "b", status: "recording" }], requeuedChunks: 0 } });
+    const mixed = noticeFor({ type: "recovered", report: { interruptedMeetings: [stopped, { ...stopped, meetingId: "b", status: "recording" }], requeuedChunks: 0, unreadMeetingIds: [] } });
     expect(mixed).toContain("中断された会議が 1 件");
     expect(mixed).toContain("確定待ちの会議が 1 件");
     expect(mixed).toContain("確定待ちの会議」");
   });
 
   it("中断された会議が 0 件なら何も知らせない", () => {
-    expect(noticeFor({ type: "recovered", report: { interruptedMeetings: [], requeuedChunks: 0 } })).toBeNull();
+    expect(noticeFor({ type: "recovered", report: { interruptedMeetings: [], requeuedChunks: 0, unreadMeetingIds: [] } })).toBeNull();
   });
 
   it("中断された会議があれば件数を知らせる", () => {
-    const notice = noticeFor({ type: "recovered", report: { interruptedMeetings: [{ meetingId: "a", status: "stop_requested", chunkCount: 2 }], requeuedChunks: 2 } });
+    const notice = noticeFor({ type: "recovered", report: { interruptedMeetings: [{ meetingId: "a", status: "stop_requested", chunkCount: 2 }], requeuedChunks: 2, unreadMeetingIds: [] } });
     expect(notice).toContain("1 件");
   });
 

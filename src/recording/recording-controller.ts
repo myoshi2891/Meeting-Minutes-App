@@ -220,6 +220,8 @@ export class RecordingController {
   async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<void> {
     if (this.node === null || this.meeting === null) return;
     const meeting = this.meeting;
+    /** 最終の audioFrameCount を保存できたか。できなければ別タブが古い値で確定しないよう、ロックを保持して呼び出し元へ渡す */
+    let finalSaved = false;
     try {
       // Worklet の応答待ちより前に保存する。停止が重なっても最初の観測を保持する。
       if (meeting.stopReason === undefined) {
@@ -240,6 +242,7 @@ export class RecordingController {
       // flush 後の最終 audioFrameCount を永続化する（Finalizer が totalAudioFrames として送る値）
       meeting.updatedAt = Date.now();
       await this.deps.meetingStore.put(meeting);
+      finalSaved = true;
       // 最終保存で stop_requested も書けたので停止は完了している。最初の失敗は通知だけにし、呼び出し元を確定へ進める
       if (statusError !== null) this.deps.onError(statusError instanceof Error ? statusError : new Error(String(statusError)));
     } finally {
@@ -250,8 +253,9 @@ export class RecordingController {
       this.trackListeners?.abort();
       this.trackListeners = null;
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
-      // メモリ待機が残るうちはロックを持ち続ける。別タブの Barrier はこのタブのメモリ待機を数えられない（§22）
-      if (this.memoryBacklog.length === 0) this.unlock();
+      // メモリ待機が残るうち、または最終保存に失敗したときはロックを持ち続ける。
+      // 別タブの Barrier はこのタブのメモリ待機も、保存できなかった最終の audioFrameCount も知らない（§22）
+      if (this.memoryBacklog.length === 0 && finalSaved) this.unlock();
     }
   }
 
@@ -281,7 +285,13 @@ export class RecordingController {
       try {
         await this.deps.chunkStore.putChunk(record);
       } catch (error) {
-        if (isQuotaExceeded(error)) break;
+        // クォータ超過は空きを待つ（失敗にしない）。ただし停止後は空きを作る保存が続かないので、サーバーに登録できれば直接送る
+        if (isQuotaExceeded(error)) {
+          if (!(await this.sendDirect(record))) break;
+          this.memoryBacklog.shift();
+          drained++;
+          continue;
+        }
         if (!(await this.sendDirect(record))) throw error;
         this.memoryBacklog.shift();
         drained++;

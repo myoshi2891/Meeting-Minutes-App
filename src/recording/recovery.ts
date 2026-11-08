@@ -8,6 +8,8 @@ export interface RecoveryReport {
   /** status は復旧前の値。recording と通常停止後の確定待ちを UI で区別する。 */
   readonly interruptedMeetings: ReadonlyArray<{ readonly meetingId: string; readonly status: MeetingRecord["status"]; readonly chunkCount: number }>;
   readonly requeuedChunks: number;
+  /** ロック後の読み直しに失敗した会議。状態を確かめられないので触らず（Chunk も再投入しない）、次回の起動・サーバー復帰時の再投入に任せる */
+  readonly unreadMeetingIds: ReadonlyArray<string>;
 }
 
 /**
@@ -26,6 +28,7 @@ export async function recoverOnStartup(
   locks: MeetingLockManager,
 ): Promise<RecoveryReport> {
   const interrupted: Array<{ meetingId: string; status: MeetingRecord["status"]; chunkCount: number }> = [];
+  const unread: string[] = [];
   const seen = new Set<string>();
   const active = new Set((await meetingStore.listByStatus("abandoned")).map((m) => m.meetingId));
   for (const status of ["recording", "stop_requested", "finalizing"] as const) {
@@ -41,7 +44,15 @@ export async function recoverOnStartup(
       }
       try {
         // 一覧取得後に別タブが停止・確定・中止した会議を巻き戻さない。Chunk の再送もそのタブに任せる。
-        const current = await meetingStore.get(m.meetingId);
+        let current: MeetingRecord | undefined;
+        try {
+          current = await meetingStore.get(m.meetingId);
+        } catch {
+          // 読めなければ検証済みとして扱わない。録音タブと同じく触らずに残し、起動と他の会議の復旧は続ける
+          unread.push(m.meetingId);
+          active.add(m.meetingId);
+          continue;
+        }
         if (current?.status !== status) {
           active.add(m.meetingId);
           continue;
@@ -82,7 +93,7 @@ export async function recoverOnStartup(
   }
   // 録音中の会議の Chunk は録音タブのスケジューラが送る。ここで再投入すると二重に PUT する
   await scheduler.resumeAll(active);
-  return { interruptedMeetings: interrupted, requeuedChunks: requeued };
+  return { interruptedMeetings: interrupted, requeuedChunks: requeued, unreadMeetingIds: unread };
 }
 
 /** IDB 書き込み直後（GENERATED）や PUT 中（SAVING）に落ちた Chunk。どの経路からも再開されないため復旧で書き戻す。 */

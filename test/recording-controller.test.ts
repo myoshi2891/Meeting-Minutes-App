@@ -315,7 +315,7 @@ describe("RecordingController", () => {
     expect((await s.meetingStore.get("m1"))?.sessionClock.audioFrameCount).toBe(481600);
   });
 
-  it("stop 中に会議の保存が失敗し続けたら reject し、トラック停止・onmessage の解除・会議ロックの解放を行う", async () => {
+  it("stop 中に会議の保存が失敗し続けたら reject し、トラック停止・onmessage の解除を行い、会議ロックは呼び出し元へ渡すまで保持する", async () => {
     // Arrange
     const s = await setup();
     await s.controller.start("m1", "定例", 1);
@@ -325,7 +325,9 @@ describe("RecordingController", () => {
     // Assert
     expect(s.track.stop).toHaveBeenCalled();
     expect(s.nodePort.onmessage).toBeNull();
-    expect(s.locks.held.size).toBe(0);
+    // 停止状態を保存できていないので、別タブに確定させない（App が takeMeetingLock で受け取り、書き直してから解放する）
+    expect(s.locks.held.size).toBe(1);
+    expect(s.controller.takeMeetingLock()).not.toBeNull();
   });
 
   it("最初の stop_requested の保存に失敗しても、末尾の Chunk 化と最終保存が済めば停止を完了し、失敗は onError に通知する", async () => {
@@ -494,6 +496,59 @@ describe("RecordingController", () => {
     expect(await s.controller.drainMemoryBacklog()).toBe(1);
     expect(s.controller.memoryBacklogCount).toBe(0);
     expect(s.enqueued).toContain("m1:mic:000000");
+  });
+
+  /** IDB への Chunk の書き込みが常にクォータ超過で失敗する ChunkStore */
+  const fullStore = (db: IDBDatabase): ChunkStore =>
+    new (class extends ChunkStore {
+      override async putChunk(): Promise<void> {
+        throw new DOMException("full", "QuotaExceededError");
+      }
+    })(db);
+
+  it("クォータを使い切ったまま止めた末尾は、drain でサーバーへ直接送り、登録できなければメモリ待機に残す", async () => {
+    // Arrange：IDB の空きが戻らないまま停止し、末尾がメモリ待機に残っている
+    let registered = false;
+    const sent: string[] = [];
+    const s = await setup(fullStore, {
+      put: async (record) => {
+        sent.push(record.chunkKey);
+        return { ok: true, registered, serverPath: "recordings/x.wav", idempotent: false };
+      },
+    });
+    await s.controller.start("m1", "定例", 1);
+    await s.controller.stop();
+    expect(s.controller.memoryBacklogCount).toBe(1);
+    // Act・Assert：DB 未登録なら外さない
+    await s.controller.drainMemoryBacklog();
+    expect(s.controller.memoryBacklogCount).toBe(1);
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(true);
+    // DB 登録まで済めば外し、ロックも解放する
+    registered = true;
+    expect(await s.controller.drainMemoryBacklog()).toBe(1);
+    expect(s.controller.memoryBacklogCount).toBe(0);
+    expect(sent).toEqual(["m1:mic:000000", "m1:mic:000000"]);
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(false);
+  });
+
+  it("flush 後の最終保存に失敗したら停止を reject し、最終の音声フレーム数が書けるまで会議ロックを保持して呼び出し元へ渡す", async () => {
+    // Arrange：stop_requested の保存は通り、最終保存だけ失敗する
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    const put = s.meetingStore.put.bind(s.meetingStore);
+    let puts = 0;
+    vi.spyOn(s.meetingStore, "put").mockImplementation(async (meeting) => {
+      if (++puts === 2) throw new DOMException("quota", "QuotaExceededError");
+      return put(meeting);
+    });
+    // Act
+    await expect(s.controller.stop()).rejects.toThrow("quota");
+    // Assert：別タブが古い audioFrameCount のまま確定しないよう、ロックを手放さない
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(true);
+    const release = s.controller.takeMeetingLock();
+    expect(release).not.toBeNull();
+    release?.();
+    await vi.waitFor(() => expect(s.locks.held.has(meetingLockName("m1"))).toBe(false));
   });
 
   it("QuotaExceeded 以外の保存エラーは onError に通知しつつ、Chunk をメモリ待機に残して欠番を作らない", async () => {
