@@ -86,6 +86,8 @@ export class FakeLocalServer {
 
     const listMatch = url.pathname.match(/^\/v1\/meetings\/([^/]+)\/chunks$/);
     if (listMatch !== null) {
+      this.requests.push(`LIST:${listMatch[1]}`);
+      if (this.requireMeetingRegistration && !this.meetings.has(listMatch[1])) return new Response(JSON.stringify({ error: "meeting not found", code: "NOT_FOUND" }), { status: 404 });
       const chunks = [...this.stored.entries()]
         .filter(([k]) => k.startsWith(`${listMatch[1]}:`))
         .map(([k, v]) => {
@@ -96,7 +98,10 @@ export class FakeLocalServer {
       return new Response(JSON.stringify(res), { status: 200 });
     }
 
-    if (url.pathname.endsWith("/finalize") && init?.method === "POST") {
+    const finalizeMatch = url.pathname.match(/^\/v1\/meetings\/([^/]+)\/finalize$/);
+    if (finalizeMatch !== null && init?.method === "POST") {
+      this.requests.push(`FINALIZE:${finalizeMatch[1]}`);
+      if (this.requireMeetingRegistration && !this.meetings.has(finalizeMatch[1])) return new Response(JSON.stringify({ error: "meeting not found", code: "NOT_FOUND" }), { status: 404 });
       return new Response(JSON.stringify({ meetingId: "x", status: "finalized", registeredChunkCounts: { mic: this.stored.size, system: 0 } }), { status: 200 });
     }
     return new Response("not found", { status: 404 });

@@ -268,6 +268,11 @@ export class App {
         put: async (record) => {
           const outcome = (await this.saver?.put(record)) ??
             { ok: false, retryable: false, error: { kind: "UNAUTHORIZED", message: "backend token is not set", httpStatus: null, at: (this.deps.now ?? Date.now)() } };
+          // Scheduler を通らないので、PUT の 401/403 はここで Monitor へ伝える（会議登録の分は MeetingRegistrar が報告済み）
+          if (!outcome.ok && outcome.error.kind === "UNAUTHORIZED" && outcome.unauthorizedReported !== true &&
+            (outcome.error.httpStatus === 401 || outcome.error.httpStatus === 403)) {
+            this.monitor.reportUnauthorized();
+          }
           if (outcome.ok && outcome.registered) {
             this.directRegistered.set(meetingId, this.directRegisteredCount(meetingId) + 1);
             this.directRegisteredEndFrame.set(meetingId, Math.max(this.directRegisteredEndFrame.get(meetingId) ?? 0, record.meta.endFrame));
@@ -416,12 +421,20 @@ export class App {
   private async prepareChunkPut(meetingId: string): Promise<RegistrationOutcome> {
     const registration = await this.registrar.ensure(meetingId);
     if (!registration.ok) return registration;
-    // IDB が読めないときこそ直接送信が必要なので、読めないだけでは送信を止めない。
-    // 直接送信はこのタブが会議ロックを持つ間（録音中・メモリ待機の保持中）に限られ、その間に中止できるのはこのタブだけなので、
-    // 読めないときはこのタブの中止記録で判定する
-    const meeting = await this.meetingStore.get(meetingId).catch(() => undefined);
-    if (meeting?.status !== "abandoned" && !this.abandoned.has(meetingId)) return registration;
-    return { ok: false, retryable: false, error: { kind: "VALIDATION", message: "meeting abandoned", httpStatus: null, at: (this.deps.now ?? Date.now)() } };
+    const at = (this.deps.now ?? Date.now)();
+    const abandoned = { ok: false, retryable: false, error: { kind: "VALIDATION", message: "meeting abandoned", httpStatus: null, at } } as const;
+    if (this.abandoned.has(meetingId)) return abandoned;
+    let meeting: MeetingRecord | undefined;
+    try {
+      meeting = await this.meetingStore.get(meetingId);
+    } catch (error) {
+      // IDB が読めないときこそ直接送信が必要。このタブが会議ロックを持つ間（録音中・メモリ待機の保持中）は
+      // 中止できるのもこのタブだけなので、上のこのタブの中止記録で判定済みとして送る
+      if (this.session?.meetingId === meetingId || this.heldLocks.has(meetingId)) return registration;
+      // ロックがなければ別タブが中止したかもしれない。中止と断定せず、再試行できる失敗で PUT を始めない
+      return { ok: false, retryable: true, error: { kind: "UNKNOWN", message: `meeting status read failed: ${error instanceof Error ? error.message : String(error)}`, httpStatus: null, at } };
+    }
+    return meeting?.status === "abandoned" ? abandoned : registration;
   }
 
   private async onChunkSaved(meetingId: string): Promise<void> {
@@ -487,6 +500,7 @@ export class App {
         token,
         fetchImpl: this.deps.fetchImpl,
         unpersistedChunkCount: () => controller?.memoryBacklogCount ?? 0,
+        ensureMeeting: (id) => this.registrar.ensure(id),
         onBackendUnauthorized: () => {
           if (this.token === token) this.monitor.reportUnauthorized();
           // setToken からの再試行は実行中のロックに阻まれているので、この Barrier が終わったら自分でやり直す

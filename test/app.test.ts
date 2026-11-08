@@ -191,18 +191,25 @@ describe("createApp（起動時の配線）", () => {
     stubPageGlobals();
     const s = await setup({ token: "stale", wrapFetch: (fetchImpl) => async (input, init) => {
       const auth = new Headers(init?.headers).get("Authorization");
-      if (String(input).endsWith("/chunks") && auth !== `Bearer ${TOKEN}`) return new Response(null, { status });
+      // 確定は一覧の前に会議を登録する。古いトークンの登録も %s で弾く
+      const url = String(input);
+      if ((url.endsWith("/chunks") || url.endsWith("/v1/meetings")) && auth !== `Bearer ${TOKEN}`) return new Response(null, { status });
       if (String(input).endsWith("/health") && auth === `Bearer ${TOKEN}`) {
         return new Response(JSON.stringify({ status: "ok", service: "minutes-local", capabilities: { localSave: true, localTranscribe: false, localSummarize: false } }));
       }
       return fetchImpl(input, init);
     } });
+    // 実サーバーと同じく、未登録の会議の一覧・確定は 404 にする
+    s.server.requireMeetingRegistration = true;
     const session = await s.app.startRecording(startInput(nextMeetingId()));
     await session.stop();
     expect(s.app.monitor.state.unauthorized).toBe(true);
     await s.app.setToken(TOKEN);
     await vi.waitFor(async () => expect((await s.app.meetingStore.get(session.meetingId))?.status).toBe("finalized"));
     expect(s.app.monitor.state.unauthorized).toBe(false);
+    const id = session.meetingId;
+    expect(s.server.requests.indexOf(`POST:${id}`)).toBeLessThan(s.server.requests.indexOf(`LIST:${id}`));
+    expect(s.server.requests.filter((r) => r === `LIST:${id}` || r === `FINALIZE:${id}`).length).toBeGreaterThan(0);
   });
 
 
@@ -214,6 +221,97 @@ describe("createApp（起動時の配線）", () => {
     await s.app.startRecording(startInput(id));
     await s.controllers[0].deps.directSaver!.put(await makeChunkRecord(id, 0, 160));
     expect(s.app.monitor.state.unauthorized).toBe(true);
+  });
+
+  /** 会議登録だけは古いトークンでも通す（登録後に失効した状況） */
+  const acceptStaleRegistration = (fetchImpl: typeof fetch): typeof fetch => async (input, init) => {
+    if (!(String(input).endsWith("/v1/meetings") && init?.method === "POST")) return fetchImpl(input, init);
+    const headers = new Headers(init?.headers);
+    headers.set("Authorization", `Bearer ${TOKEN}`);
+    return fetchImpl(input, { ...init, headers });
+  };
+
+  it.each([401, 403])("直接送信の PUT が %s なら Monitor に伝える", async (status) => {
+    // Arrange：会議登録は通り、PUT だけが失効で弾かれる
+    stubPageGlobals();
+    const s = await setup({ token: "stale", wrapFetch: (fetchImpl) => acceptStaleRegistration(async (input, init) => {
+      if (init?.method === "PUT") return new Response(null, { status });
+      return fetchImpl(input, init);
+    }) });
+    const id = nextMeetingId();
+    await s.app.startRecording(startInput(id));
+    // Act
+    const outcome = await s.controllers[0].deps.directSaver?.put(await makeChunkRecord(id, 0, 160));
+    // Assert
+    expect(outcome).toMatchObject({ ok: false, error: { kind: "UNAUTHORIZED", httpStatus: status } });
+    expect(s.app.monitor.state.unauthorized).toBe(true);
+  });
+
+  it("トークン未設定の直接送信は失効として Monitor に伝えない", async () => {
+    stubPageGlobals();
+    const s = await setup({ token: null });
+    const id = nextMeetingId();
+    await s.app.startRecording(startInput(id));
+    const outcome = await s.controllers[0].deps.directSaver?.put(await makeChunkRecord(id, 0, 160));
+    expect(outcome).toMatchObject({ ok: false, error: { kind: "UNAUTHORIZED" } });
+    expect(s.app.monitor.state.unauthorized).toBe(false);
+  });
+
+  it("古いトークンの PUT が setToken 後に 401 を返しても失効扱いにせず、新しいトークンで送る", async () => {
+    // Arrange：古いトークンの PUT の応答待ち中に正しいトークンへ差し替える
+    const id = nextMeetingId();
+    let release!: () => void;
+    let reached!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const held = new Promise<void>((r) => { reached = r; });
+    const s = await setup({
+      token: "stale",
+      seed: async (db) => {
+        await seedMeeting(db, makeMeeting(id, "finalized"));
+        await seedChunk(db, id, 0, "DB_REGISTERED");
+      },
+      wrapFetch: (fetchImpl) => acceptStaleRegistration(async (input, init) => {
+        const auth = new Headers(init?.headers).get("Authorization");
+        if (init?.method === "PUT" && auth === "Bearer stale") { reached(); await gate; }
+        if (String(input).endsWith("/health") && auth === `Bearer ${TOKEN}`) {
+          return new Response(JSON.stringify({ status: "ok", service: "minutes-local", capabilities: { localSave: true, localTranscribe: false, localSummarize: false } }));
+        }
+        return fetchImpl(input, init);
+      }),
+    });
+    await settleMonitor(s);
+    const key = `${id}:mic:000000`;
+    await s.app.scheduler.enqueue(key);
+    await held;
+    await s.app.setToken(TOKEN);
+    // Act
+    release();
+    // Assert
+    await vi.waitFor(async () => expect(await s.status(key)).toBe("DB_REGISTERED"));
+    expect(s.app.monitor.state.unauthorized).toBe(false);
+  });
+
+  it("ロックを持たない会議の中止判定が PUT 直前に読めなければ、PUT を始めず再試行にする", async () => {
+    // Arrange：このタブで録音していない会議（別タブが中止しうる）
+    const id = nextMeetingId();
+    const s = await setup({ seed: async (db) => {
+      await seedMeeting(db, makeMeeting(id, "finalized"));
+      await seedChunk(db, id, 0, "DB_REGISTERED");
+    } });
+    await settleMonitor(s);
+    const get = s.app.meetingStore.get.bind(s.app.meetingStore);
+    let reads = 0;
+    // 1: Scheduler の中止判定、2: 会議登録、3: PUT 直前の中止判定
+    vi.spyOn(s.app.meetingStore, "get").mockImplementation(async (meetingId) => {
+      if (++reads >= 3) throw new Error("IDB unavailable");
+      return get(meetingId);
+    });
+    const key = `${id}:mic:000000`;
+    // Act
+    await s.app.scheduler.enqueue(key);
+    // Assert
+    await vi.waitFor(async () => expect(await s.status(key)).toBe("RETRYING"));
+    expect(s.server.putCount).toBe(0);
   });
 
   it("未登録会議は登録してから PUT し、起動時復旧にも同じ順序を使う", async () => {
@@ -631,7 +729,13 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     // Arrange：一覧取得の応答待ち中に setToken される
     stubPageGlobals();
     const hold = holdRequest((url, init) => url.endsWith("/chunks") && new Headers(init?.headers).get("Authorization") === "Bearer stale");
-    const s = await setup({ token: "stale", wrapFetch: hold.wrapFetch });
+    // 会議登録までは古いトークンも通り、一覧の応答待ち中に失効した状況にする
+    const s = await setup({ token: "stale", wrapFetch: (fetchImpl) => hold.wrapFetch(async (input, init) => {
+      if (!isRegistration(String(input), init)) return fetchImpl(input, init);
+      const headers = new Headers(init?.headers);
+      headers.set("Authorization", `Bearer ${TOKEN}`);
+      return fetchImpl(input, { ...init, headers });
+    }) });
     const session = await s.app.startRecording(startInput(nextMeetingId()));
     const stopping = session.stop();
     await hold.started;
