@@ -105,8 +105,9 @@ export class BackendHealthMonitor {
         this.transition("UNREACHABLE", latency, null);
         return this.state;
       }
-      // 応答待ちの間に失効が報告された。報告前の要求の成功で unauthorized を解除しない（報告後のチェックに任せる）
-      if (this.unauthorizedReports !== reportsAtStart) return this.state;
+      // 応答待ちの間に失効が報告された、またはトークンが差し替わった。古い要求の成功で unauthorized を解除せず、
+      // 状態も変えない（backend 復帰の通知も出さない）。報告後・差し替え後のチェックに任せる
+      if (this.unauthorizedReports !== reportsAtStart || this.config.token() !== token) return this.state;
       // capabilities は認証済みのときだけ返る（§12）。認証なしの応答ではトークンの正しさを判断できないので unauthorized を解除しない
       if (body.capabilities !== undefined) this.state.unauthorized = false;
       const status = body.status === "degraded" || latency > this.config.degradedLatencyMs ? "DEGRADED" : "HEALTHY";

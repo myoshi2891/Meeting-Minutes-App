@@ -259,6 +259,26 @@ describe("BackendHealthMonitor.checkOnce", () => {
     expect(state.status).toBe("HEALTHY");
   });
 
+  it("応答待ちの間にトークンが差し替わったら、古いトークンの成功応答で unauthorized を解除しない", async () => {
+    // Arrange：失効中に古いトークンのチェックを止めている間、利用者が別のトークンを保存する
+    let token = "old";
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const m = new BackendHealthMonitor({ ...CONFIG, token: () => token }, createInitialHealth("running"), async (_input, init) => {
+      if (new Headers(init?.headers).get("Authorization") === "Bearer old") await gate;
+      return json({ status: "ok", service: "minutes-local", capabilities: CAPS });
+    });
+    m.reportUnauthorized();
+    const stale = m.checkOnce();
+    token = "new";
+    // Act
+    release();
+    await stale;
+    // Assert：新しいトークンの正しさはこの応答では分からない
+    expect(m.state.unauthorized).toBe(true);
+    expect((await m.checkOnce()).unauthorized).toBe(false);
+  });
+
   it("401 応答で UNREACHABLE になったときは latencyMs と capabilities を持たない", async () => {
     // Arrange：認証済みで HEALTHY（capabilities あり）にしてから 401 を返す
     let authorized = true;
