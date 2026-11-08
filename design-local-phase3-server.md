@@ -8,6 +8,8 @@
 
 ---
 
+停止理由の追加契約（Phase 1 §12）を継承する。`stopReason` / `stopDetectedAtEpochMs` は対で省略可能、既存会議は未記録のまま保持し、最初の確定値を上書きしない。`mic_ended` は音声トラック終了の観測であり物理切断の断定ではない。
+
 # 1. 目的と範囲、Phase 2 からの変更一覧
 
 | 区分 | ファイル | 内容 |
@@ -442,6 +444,8 @@ class Meeting(BaseModel):
     consent_confirmed_at: int
     ended_at: int | None = None
     total_audio_frames: int | None = None
+    stop_reason: Literal["manual", "mic_ended"] | None = None
+    stop_detected_at: int | None = None
     transcript_version: int = 0
     stt_model_used: str | None = None
     llm_model_used: str | None = None
@@ -1949,6 +1953,7 @@ def write_meeting_json(data_dir: Path, meeting: Meeting, chunks: list[AudioChunk
         "sessionStartEpochMs": meeting.session_start_epoch_ms, "nativeSampleRate": meeting.native_sample_rate,
         "consentConfirmedAt": meeting.consent_confirmed_at, "endedAt": meeting.ended_at,
         "totalAudioFrames": meeting.total_audio_frames,
+        "stopReason": meeting.stop_reason, "stopDetectedAtEpochMs": meeting.stop_detected_at,
         "chunks": [{"source": c.source, "sequenceNo": c.sequence_no, "startOffsetMs": c.start_offset_ms,
                     "endOffsetMs": c.end_offset_ms, "sampleCount": c.sample_count, "sha256": c.sha256,
                     "vadScore": c.vad_score, "hasVoice": c.has_voice} for c in chunks],
@@ -1999,6 +2004,7 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
                 status="finalized", session_start_epoch_ms=int(meta.get("sessionStartEpochMs", 0)),
                 native_sample_rate=int(meta.get("nativeSampleRate", 0)), consent_confirmed_at=int(meta.get("consentConfirmedAt", 0)),
                 ended_at=meta.get("endedAt"), total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
+                stop_reason=meta.get("stopReason"), stop_detected_at=meta.get("stopDetectedAtEpochMs"),
             ))
             report.meetings_created += 1
         meta_chunks = {(c["source"], int(c["sequenceNo"])): c for c in meta.get("chunks", []) if "source" in c and "sequenceNo" in c}
@@ -2251,11 +2257,11 @@ from __future__ import annotations
 import base64
 import errno
 import json
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import Field, model_validator, BaseModel
 
 from ..db import repo
 from ..db.connection import now_ms
@@ -2278,8 +2284,16 @@ class CreateMeetingRequest(BaseModel):
 
 class FinalizeRequest(BaseModel):
     expectedChunkCounts: dict[str, int]
-    endedAtEpochMs: int
-    totalAudioFrames: int
+    endedAtEpochMs: int = Field(ge=0)
+    totalAudioFrames: int = Field(ge=0)
+    stopReason: Literal["manual", "mic_ended"] | None = None
+    stopDetectedAtEpochMs: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="after")
+    def validate_stop_observation(self) -> "FinalizeRequest":
+        if (self.stopReason is None) != (self.stopDetectedAtEpochMs is None):
+            raise ValueError("stopReason and stopDetectedAtEpochMs must be supplied together")
+        return self
 
 
 def _capabilities(request: Request) -> dict[str, Any]:
@@ -2452,7 +2466,8 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
         if current is not None and current.status in ("created", "recording", "finalizing"):
             if len(repo.list_chunks(conn, meeting_id)) != len(chunks):
                 return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "chunks changed during finalize"), status_code=409)
-            repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames)
+            repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames,
+                                stop_reason=req.stopReason, stop_detected_at=req.stopDetectedAtEpochMs)
             pipeline.on_finalized(conn, meeting_id)
         snapshot = repo.get_meeting(conn, meeting_id)
         chunks_now = repo.list_chunks(conn, meeting_id)

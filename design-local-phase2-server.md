@@ -8,6 +8,8 @@
 
 ---
 
+停止理由の追加契約（Phase 1 §12）を継承する。`stopReason` / `stopDetectedAtEpochMs` は対で省略可能、既存会議は未記録のまま保持し、最初の確定値を上書きしない。`mic_ended` は音声トラック終了の観測であり物理切断の断定ではない。
+
 # 1. 目的と範囲
 
 基本設計 §1 のゴール「finalize 済み会議が、外部への通信なしに、利用者のマシン上だけで確定 transcript と AI 議事録になる」を、サーバー側で実装着手可能な粒度に落とす。
@@ -339,6 +341,8 @@ CREATE TABLE IF NOT EXISTS meetings (
   consent_confirmed_at   INTEGER NOT NULL,
   ended_at               INTEGER,
   total_audio_frames     INTEGER,
+  stop_reason            TEXT,
+  stop_detected_at        INTEGER,
   transcript_version     INTEGER NOT NULL DEFAULT 0,
   stt_model_used         TEXT,
   llm_model_used         TEXT,
@@ -496,6 +500,8 @@ REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
         "local_user_id": "TEXT NOT NULL DEFAULT 'local'",
         "native_sample_rate": "INTEGER NOT NULL DEFAULT 48000",
         "total_audio_frames": "INTEGER",
+        "stop_reason": "TEXT",
+        "stop_detected_at": "INTEGER",
         "transcript_version": "INTEGER NOT NULL DEFAULT 0",
         "stt_model_used": "TEXT",
         "llm_model_used": "TEXT",
@@ -610,6 +616,8 @@ class Meeting(BaseModel):
     consent_confirmed_at: int
     ended_at: int | None = None
     total_audio_frames: int | None = None
+    stop_reason: Literal["manual", "mic_ended"] | None = None
+    stop_detected_at: int | None = None
     transcript_version: int = 0
     stt_model_used: str | None = None
     llm_model_used: str | None = None
@@ -737,11 +745,11 @@ def insert_meeting(conn: sqlite3.Connection, m: Meeting) -> bool:
     cur = conn.execute(
         """INSERT OR IGNORE INTO meetings
            (id, local_user_id, title, status, session_start_epoch_ms, native_sample_rate,
-            consent_confirmed_at, ended_at, total_audio_frames, transcript_version,
+            consent_confirmed_at, ended_at, total_audio_frames, stop_reason, stop_detected_at, transcript_version,
             stt_model_used, llm_model_used, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (m.id, m.local_user_id, m.title, m.status, m.session_start_epoch_ms, m.native_sample_rate,
-         m.consent_confirmed_at, m.ended_at, m.total_audio_frames, m.transcript_version,
+         m.consent_confirmed_at, m.ended_at, m.total_audio_frames, m.stop_reason, m.stop_detected_at, m.transcript_version,
          m.stt_model_used, m.llm_model_used, m.created_at, m.updated_at),
     )
     return cur.rowcount == 1
@@ -3661,11 +3669,11 @@ import base64
 import errno
 import json
 import math
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Header, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ValidationError
+from pydantic import Field, model_validator, BaseModel, ValidationError
 
 from ..db import repo
 from ..db.connection import now_ms
@@ -3687,8 +3695,16 @@ class CreateMeetingRequest(BaseModel):
 
 class FinalizeRequest(BaseModel):
     expectedChunkCounts: dict[str, int]
-    endedAtEpochMs: int
-    totalAudioFrames: int
+    endedAtEpochMs: int = Field(ge=0)
+    totalAudioFrames: int = Field(ge=0)
+    stopReason: Literal["manual", "mic_ended"] | None = None
+    stopDetectedAtEpochMs: int | None = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="after")
+    def validate_stop_observation(self) -> "FinalizeRequest":
+        if (self.stopReason is None) != (self.stopDetectedAtEpochMs is None):
+            raise ValueError("stopReason and stopDetectedAtEpochMs must be supplied together")
+        return self
 
 
 def _capabilities(request: Request) -> dict[str, Any]:
@@ -3852,7 +3868,8 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
         if current is not None and current.status in ("created", "recording", "finalizing"):
             if len(repo.list_chunks(conn, meeting_id)) != len(chunks):
                 return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "chunks changed during finalize"), status_code=409)
-            repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames)
+            repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames,
+                                stop_reason=req.stopReason, stop_detected_at=req.stopDetectedAtEpochMs)
             pipeline.on_finalized(conn, meeting_id)
     ctx.events.publish(meeting_id, {"type": "meeting_status", "status": "transcribing"})
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
