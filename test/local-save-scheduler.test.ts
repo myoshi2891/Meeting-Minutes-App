@@ -1,7 +1,7 @@
 import { IDBFactory } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
 import { LocalSaver } from "../src/api/local-saver";
-import { LocalSaveScheduler } from "../src/recording/local-save-scheduler";
+import { LocalSaveScheduler, type SchedulerDeps } from "../src/recording/local-save-scheduler";
 import { createInitialHealth } from "../src/recording/recording-health-monitor";
 import { ChunkStore, openDatabase } from "../src/storage/idb";
 import type { AudioChunkRecord, LocalBackendHealth } from "../src/types/recording";
@@ -14,7 +14,7 @@ function okResponse(r: AudioChunkRecord, registered = true): Response {
   return new Response(JSON.stringify({ meetingId, source, sequenceNo, sha256, sizeBytes, path: `p/${sequenceNo}`, registered }), { status: 201 });
 }
 
-async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response | "network-error", backendStatus: LocalBackendHealth["status"] = "HEALTHY") {
+async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response | "network-error", backendStatus: LocalBackendHealth["status"] = "HEALTHY", extra: Pick<SchedulerDeps, "isMeetingAbandoned"> = {}) {
   const chunkStore = new ChunkStore(await openDatabase(new IDBFactory()));
   const backend: LocalBackendHealth = { status: backendStatus, lastCheckedAt: 0, lastHealthyAt: 0, latencyMs: 5, consecutiveFailures: 0, capabilities: null, unauthorized: false };
   const health = createInitialHealth("running");
@@ -52,6 +52,7 @@ async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response
     onBackendUnauthorized: () => {
       backend.unauthorized = true;
     },
+    ...extra,
   });
   const add = async (seq: number) => {
     const r = await makeChunkRecord("m", seq, 160);
@@ -321,5 +322,73 @@ describe("LocalSaveScheduler", () => {
     // Assert：RETRYING のまま放置せず、停止中の待機状態を書き直す
     expect((await s.status(0))?.status).toBe("BACKEND_UNAVAILABLE");
     expect(s.stats().putCount).toBe(1);
+  });
+  it("送信前の中止判定が読めなければ、別経路が送信中の SAVING を書き換えず、後で読み直す", async () => {
+    // Arrange：中止判定の読み取り中に別タブが SAVING に進め、読み取りは失敗する
+    let reads = 0;
+    let store: ChunkStore | undefined;
+    const s = await setup((r) => okResponse(r), "HEALTHY", {
+      isMeetingAbandoned: async () => {
+        if (++reads > 1) return false;
+        await store?.updateSaveState("m:mic:000000", (r) => { r.save.status = "SAVING"; });
+        throw new Error("IDB read failed");
+      },
+    });
+    store = s.chunkStore;
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert：RETRYING に書き戻さず、タイマーで読み直す（読み直し後も SAVING なので送らない）
+    expect((await s.status(0))?.status).toBe("SAVING");
+    await s.advance(60_000);
+    expect(reads).toBeGreaterThan(1);
+    expect((await s.status(0))?.status).toBe("SAVING");
+    expect(s.stats().putCount).toBe(0);
+  });
+
+  it("resumeAll で中止判定が読めない会議があっても、他の会議の Chunk は再投入して送る", async () => {
+    // Arrange：会議 a の判定だけ失敗する。どちらも backend 停止中に待機した
+    const s = await setup((r) => okResponse(r), "UNREACHABLE", {
+      isMeetingAbandoned: async (id) => {
+        if (id === "a") throw new Error("IDB read failed");
+        return false;
+      },
+    });
+    const a = await makeChunkRecord("a", 0, 160);
+    a.save.status = "BACKEND_UNAVAILABLE";
+    await s.chunkStore.putChunk(a);
+    await s.add(0);
+    await s.advance(0);
+    s.backend.status = "HEALTHY";
+    // Act
+    await expect(s.scheduler.resumeAll()).resolves.toBeUndefined();
+    await s.advance(0);
+    // Assert：a は状態を変えずに次の resumeAll へ残す
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    expect((await s.chunkStore.getChunk(a.chunkKey))?.save.status).toBe("BACKEND_UNAVAILABLE");
+    expect(s.stats().putCount).toBe(1);
+  });
+
+  it("backend 停止中の書き込み待ちの間に外されたキーを外し直すとき、別会議のキーを消さない", async () => {
+    // Arrange：z を待機させた後、m の BACKEND_UNAVAILABLE 書き込み中に m が保存済みになり、discardMeeting で外される
+    const s = await setup((r) => okResponse(r), "UNREACHABLE");
+    const z = await makeChunkRecord("z", 0, 160);
+    await s.chunkStore.putChunk(z);
+    await s.scheduler.enqueue(z.chunkKey);
+    await s.advance(0);
+    const original = s.chunkStore.updateSaveState.bind(s.chunkStore);
+    let calls = 0;
+    s.chunkStore.updateSaveState = async (key, mutate) => {
+      if (key === "m:mic:000000" && ++calls === 2) {
+        await original(key, (r) => { r.save.status = "DB_REGISTERED"; });
+        s.scheduler.discardMeeting("m");
+      }
+      return original(key, mutate);
+    };
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert
+    expect(s.scheduler.pendingCount).toBe(1);
   });
 });

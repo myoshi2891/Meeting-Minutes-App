@@ -3,6 +3,7 @@ import type { ChunkStore, MeetingStore } from "../storage/idb";
 import type { LocalSaveScheduler } from "./local-save-scheduler";
 import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
+import type { RegistrationOutcome } from "../api/meeting-registrar";
 import type { AudioChunkRecord } from "../types/recording";
 import { frameToOffsetMs } from "./session-clock";
 
@@ -18,6 +19,8 @@ export interface FinalizerDeps {
   readonly onBackendUnauthorized?: () => void;
   /** IDB に書けずメモリ待機中の Chunk 数（RecordingController.memoryBacklogCount）。0 でない限り Barrier を通さない。 */
   readonly unpersistedChunkCount: () => number;
+  /** 照合の前に会議をサーバーへ登録する（MeetingRegistrar.ensure）。Chunk を 1 件も PUT できていない会議は一覧・確定が 404 になるため */
+  readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -31,9 +34,10 @@ export type FinalizeResult =
  * Finalization Barrier：
  *   1. 最終 Chunk が IDB にある（呼び出し前提：RecordingController.stop() 完了）かつメモリ待機中の Chunk がない
  *   2. IDB 上の全 Chunk が DB_REGISTERED（SAVED はサーバー一覧で登録確認できれば DB_REGISTERED に進める）
- *   3. サーバーの一覧と件数・sha256 が一致（IDB にない連番は、サーバーに登録済みなら揃っているとみなす）
- *   4. POST /finalize
- * 1〜3 を満たさない限り finalizing へ遷移しない。
+ *   3. 会議がサーバーに登録済み（ensureMeeting。再試行のたびに通し、失敗したら一覧を取らない）
+ *   4. サーバーの一覧と件数・sha256 が一致（IDB にない連番は、サーバーに登録済みなら揃っているとみなす）
+ *   5. POST /finalize
+ * 1〜4 を満たさない限り finalizing へ遷移しない。
  */
 export function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
   // 同じ会議への呼び出しが重なると、両方が stop_requested を読んで二重に POST し、
@@ -72,6 +76,12 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   if (notRegistered.length > 0) {
     await deps.scheduler.resumeAll();
     return { ok: false, stage: "waiting_local_save", detail: `${notRegistered.length} chunks not registered` };
+  }
+
+  // 再試行でも毎回通す。登録に失敗したら一覧を取らない（401/403 は MeetingRegistrar が Monitor へ報告済み）
+  if (deps.ensureMeeting !== undefined) {
+    const registration = await deps.ensureMeeting(meetingId);
+    if (!registration.ok) return { ok: false, stage: "verify", detail: `meeting registration failed: ${registration.error.message}` };
   }
 
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);

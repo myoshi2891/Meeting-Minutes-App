@@ -52,8 +52,16 @@ export class LocalSaveScheduler {
    */
   async resumeAll(skipMeetingIds: ReadonlySet<string> = new Set()): Promise<void> {
     const unfinished = await this.deps.chunkStore.listUnfinished();
+    /** 会議ごとの中止判定。null は読み取り失敗で、その会議の Chunk は今回送らず次の resumeAll で読み直す */
+    const abandoned = new Map<string, boolean | null>();
     for (const r of unfinished) {
-      if (skipMeetingIds.has(r.meta.meetingId) || await this.deps.isMeetingAbandoned?.(r.meta.meetingId)) continue;
+      const meetingId = r.meta.meetingId;
+      if (skipMeetingIds.has(meetingId)) continue;
+      if (this.deps.isMeetingAbandoned !== undefined && !abandoned.has(meetingId)) {
+        abandoned.set(meetingId, await this.deps.isMeetingAbandoned(meetingId).catch(() => null));
+      }
+      const state = abandoned.get(meetingId);
+      if (state === true || state === null) continue;
       if (isResumable(r) && !this.pending.includes(r.chunkKey) && !this.inFlight.has(r.chunkKey)) {
         await this.deps.chunkStore.updateSaveState(r.chunkKey, (x) => {
           // 一覧取得後に別経路で保存が進んでいたら書き戻さない
@@ -163,7 +171,9 @@ export class LocalSaveScheduler {
         r.save.status = "BACKEND_UNAVAILABLE";
       });
       if (settled) {
-        this.pending.splice(this.pending.indexOf(key), 1);
+        // 書き込みを待つ間に discardMeeting などで外れていれば何もしない（-1 で末尾を消さない）
+        const index = this.pending.indexOf(key);
+        if (index !== -1) this.pending.splice(index, 1);
         continue;
       }
       this.markedUnavailable.add(key);
@@ -206,7 +216,19 @@ export class LocalSaveScheduler {
 
   private async runOne(chunkKey: string, saver: LocalSaver): Promise<void> {
     const record = await this.deps.chunkStore.getChunk(chunkKey);
-    if (record === undefined || await this.deps.isMeetingAbandoned?.(record.meta.meetingId)) return;
+    if (record === undefined) return;
+    let abandoned: boolean | undefined;
+    try {
+      abandoned = await this.deps.isMeetingAbandoned?.(record.meta.meetingId);
+    } catch {
+      // 中止か分からないまま送らない。recoverFailedRun に回すと別タブが送信中の SAVING を書き換えるため、状態に触れず読み直す
+      this.deps.setTimer(() => {
+        this.insertSorted(chunkKey);
+        void this.pump();
+      }, backoffMs(1));
+      return;
+    }
+    if (abandoned === true) return;
     // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
     // SAVED（ファイル保存済み・DB 未登録）の登録確認は Finalizer のサーバー一覧照合に任せる
     if (record.save.status === "DB_REGISTERED" || record.save.status === "SAVED" || record.save.status === "SAVING") return;
