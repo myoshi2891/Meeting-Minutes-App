@@ -9,6 +9,7 @@ import {
   finalizeResultText,
   LOCAL_DATA_NOTICE,
   noticeFor,
+  pendingCountsText,
   storageUsageText,
   TAB_CLOSE_HELP,
   warningsFor,
@@ -117,8 +118,12 @@ async function refreshPending(app: App): Promise<void> {
   const meetings = await app.listPendingFinalize();
   const details = await Promise.all(meetings.map(async (m) => {
     const chunks = await app.chunkStore.listByMeeting(m.meetingId, "mic");
-    const registered = chunks.filter((c) => c.save.status === "DB_REGISTERED").length;
-    return `サーバー登録確認済み ${registered} 件／ブラウザ保存済み・未送信 ${chunks.length - registered} 件／メモリ内未保存 ${app.memoryBacklogCount(m.meetingId)} 件`;
+    return pendingCountsText({
+      chunks,
+      audioFrameCount: m.sessionClock.audioFrameCount,
+      directRegistered: app.directRegisteredCount(m.meetingId),
+      memoryCount: app.memoryBacklogCount(m.meetingId),
+    });
   }));
   if (generation !== pendingGeneration) return;
   ui.pending.replaceChildren(
@@ -210,6 +215,8 @@ function releaseRecording(meetingId: string): void {
   if (recording?.session.meetingId !== meetingId) return;
   const current = recording;
   recording = null;
+  // 確定の完了を待たずに次の録音を始められるので、停止ボタンは録音の解放時点で戻す
+  ui.stop.disabled = false;
   if (current.session.controller.memoryBacklogCount > 0) stoppedWithBacklog.add(current.session.controller);
   current.detachAudioMonitor();
   void current.audioContext.close().catch(() => undefined);
@@ -226,7 +233,6 @@ async function stopRecording(app: App): Promise<void> {
     notify(noticeFor({ type: "error", error }) ?? "");
   } finally {
     releaseRecording(current.session.meetingId);
-    ui.stop.disabled = false;
     await refreshPending(app);
   }
 }

@@ -2,7 +2,7 @@
 import type { AppEvent } from "../app/app";
 import type { FinalizeResult } from "../recording/finalizer";
 import type { HealthAssessment } from "../recording/recording-health-monitor";
-import type { DegradedReason, LocalBackendHealth, RecordingHealth } from "../types/recording";
+import type { ChunkTimingMetadata, DegradedReason, LocalBackendHealth, LocalSaveStatus, RecordingHealth } from "../types/recording";
 
 /** §3.9：録音開始ボタン押下時に確認する。スキップするオプションは設けない */
 export const CONSENT_QUESTION = "この会議の参加者に録音の同意を得ましたか？";
@@ -95,6 +95,30 @@ export function finalizeResultText(result: FinalizeResult): string {
 }
 
 /** 録音の経過時間。1 時間未満は mm:ss、以上は h:mm:ss */
+export const INCOMPLETE_COUNT_NOTE = "（ブラウザに記録のない音声があり、実際はこれより多い可能性があります）";
+
+export interface PendingCounts {
+  readonly chunks: ReadonlyArray<{ readonly meta: Pick<ChunkTimingMetadata, "sequenceNo" | "endFrame">; readonly save: { readonly status: LocalSaveStatus } }>;
+  readonly audioFrameCount: number;
+  /** このタブの直接送信で登録した件数（IDB に残らない）。再読み込みすると 0 に戻る */
+  readonly directRegistered: number;
+  readonly memoryCount: number;
+}
+
+/**
+ * 確定待ちの内訳。IDB の Chunk・直接送信・メモリ待機で説明できない音声があれば、登録件数を不完全と明示する
+ * （再読み込み後の直接送信はサーバーに問い合わせないと数えられない）。
+ */
+export function pendingCountsText({ chunks, audioFrameCount, directRegistered, memoryCount }: PendingCounts): string {
+  const registered = chunks.filter((c) => c.save.status === "DB_REGISTERED").length;
+  const saved = chunks.filter((c) => c.save.status === "SAVED").length;
+  const accounted = chunks.length + directRegistered + memoryCount;
+  const hasGap = Math.max(-1, ...chunks.map((c) => c.meta.sequenceNo)) + 1 > accounted;
+  const hasUnknownTail = accounted === chunks.length && audioFrameCount > Math.max(0, ...chunks.map((c) => c.meta.endFrame));
+  const note = hasGap || hasUnknownTail ? INCOMPLETE_COUNT_NOTE : "";
+  return `サーバー登録確認済み ${registered + directRegistered} 件${note}／サーバー保存済み・登録未確認 ${saved} 件／ブラウザ保存済み・未送信 ${chunks.length - registered - saved} 件／メモリ内未保存 ${memoryCount} 件`;
+}
+
 export function elapsedText(ms: number): string {
   const total = Math.floor(ms / 1000);
   const h = Math.floor(total / 3600);

@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { DegradedReason, LocalBackendHealth } from "../src/types/recording";
+import type { DegradedReason, LocalBackendHealth, LocalSaveStatus } from "../src/types/recording";
 import {
   backendBanner,
   elapsedText,
   finalizeResultText,
+  INCOMPLETE_COUNT_NOTE,
   missingTailText,
   noticeFor,
+  pendingCountsText,
   storageUsageText,
   TAB_CLOSE_HELP,
   warningsFor,
@@ -166,5 +168,50 @@ describe("elapsedText", () => {
 describe("固定文言", () => {
   it("タブを閉じたときの損失上限は §20 の文言どおり", () => {
     expect(TAB_CLOSE_HELP).toBe("タブを閉じる・リロードすると、直近最大 30 秒の音声が失われる可能性があります。録音停止ボタンで終了してください");
+  });
+});
+
+describe("pendingCountsText", () => {
+  const chunk = (sequenceNo: number, status: LocalSaveStatus): Parameters<typeof pendingCountsText>[0]["chunks"][number] => ({
+    meta: { sequenceNo, endFrame: (sequenceNo + 1) * 100 },
+    save: { status },
+  });
+
+  it("SAVED は未送信に数えず、サーバー保存済み・登録未確認として分ける", () => {
+    // Arrange
+    const chunks = [chunk(0, "DB_REGISTERED"), chunk(1, "SAVED"), chunk(2, "BACKEND_UNAVAILABLE")];
+    // Act
+    const text = pendingCountsText({ chunks, audioFrameCount: 300, directRegistered: 0, memoryCount: 1 });
+    // Assert
+    expect(text).toBe("サーバー登録確認済み 1 件／サーバー保存済み・登録未確認 1 件／ブラウザ保存済み・未送信 1 件／メモリ内未保存 1 件");
+  });
+
+  it("直接送信で登録済みの Chunk を登録確認済みに含める", () => {
+    // Arrange：seq 0 は IDB に残らずサーバーへ直接送った
+    const chunks = [chunk(1, "DB_REGISTERED")];
+    // Act
+    const text = pendingCountsText({ chunks, audioFrameCount: 200, directRegistered: 1, memoryCount: 0 });
+    // Assert
+    expect(text).toBe("サーバー登録確認済み 2 件／サーバー保存済み・登録未確認 0 件／ブラウザ保存済み・未送信 0 件／メモリ内未保存 0 件");
+  });
+
+  it.each([
+    ["連番に説明のつかない欠けがある", [chunk(1, "DB_REGISTERED")], 200],
+    ["Chunk が 1 件もないのに音声が進んでいる（再読み込み後の直接送信など）", [], 100],
+    ["末尾の Chunk より音声が進んでいる", [chunk(0, "DB_REGISTERED")], 200],
+  ])("%s場合は登録件数が不完全だと示す", (_name, chunks, audioFrameCount) => {
+    // Act
+    const text = pendingCountsText({ chunks, audioFrameCount, directRegistered: 0, memoryCount: 0 });
+    // Assert
+    expect(text).toContain(`サーバー登録確認済み ${chunks.length} 件${INCOMPLETE_COUNT_NOTE}／`);
+  });
+
+  it("メモリ待機で説明できる欠番は不完全として扱わない", () => {
+    // Arrange
+    const chunks = [chunk(1, "DB_REGISTERED")];
+    // Act
+    const text = pendingCountsText({ chunks, audioFrameCount: 200, directRegistered: 0, memoryCount: 1 });
+    // Assert
+    expect(text).not.toContain(INCOMPLETE_COUNT_NOTE);
   });
 });
