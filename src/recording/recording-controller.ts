@@ -53,6 +53,8 @@ export interface RecordingControllerDeps {
   readonly directSaver?: DirectChunkSaver;
   /** IDB 障害時の直接送信用に、開始時の会議情報をメモリにも保持する。 */
   readonly onMeetingCreated?: (meeting: MeetingRecord) => void;
+  /** このタブの他の会議（停止後もメモリ待機が残る Controller）のメモリ待機件数。health は共有なので、0 になるまで IDB の保存警告を外さない */
+  readonly otherMeetingsBacklogCount?: () => number;
 }
 
 /** Worklet が flush / stop に応答しない（AudioContext が閉じられた等）ときに待機を打ち切るまでの時間 */
@@ -291,10 +293,13 @@ export class RecordingController {
       drained++;
     }
     if (this.memoryBacklog.length === 0) {
-      // IDB の劣化理由は「メモリ待機がクラッシュで失われうる」ことの警告。空になったら外す（次に書けなければ persistChunk が付け直す）
-      this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
-        (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
-      );
+      // IDB の劣化理由は「メモリ待機がクラッシュで失われうる」ことの警告。このタブの全会議のメモリ待機が空になったら外す
+      // （次に書けなければ persistChunk が付け直す）
+      if ((this.deps.otherMeetingsBacklogCount?.() ?? 0) === 0) {
+        this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
+          (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
+        );
+      }
       // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する
       if (this.node === null) this.unlock();
     }

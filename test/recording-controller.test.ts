@@ -91,7 +91,7 @@ interface Setup {
   untilCommand: (type: WorkletCommand["type"]) => Promise<void>;
 }
 
-async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, directSaver?: DirectChunkSaver, onMicEnded?: () => void): Promise<Setup> {
+async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, directSaver?: DirectChunkSaver, onMicEnded?: () => void, otherMeetingsBacklogCount?: () => number): Promise<Setup> {
   const db = await openDatabase(new IDBFactory());
   const chunkStore = chunkStoreOverride?.(db) ?? new ChunkStore(db);
   const meetingStore = new MeetingStore(db);
@@ -138,6 +138,7 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
     locks,
     directSaver,
     onMicEnded,
+    otherMeetingsBacklogCount,
   });
   const fireTimers = () => {
     for (const fn of timers.splice(0)) fn();
@@ -356,6 +357,23 @@ describe("RecordingController", () => {
     expect(s.locks.held.has(meetingLockName("m1"))).toBe(false);
   });
 
+  it("自分のメモリ待機が空になっても、他の会議のメモリ待機が残る間は IDB の保存警告を消さない", async () => {
+    // Arrange：IDB に書けず末尾がメモリ待機に残る。このタブの別の会議にもメモリ待機がある
+    let others = 1;
+    const { s, bringServerUp } = await startWithUnsavableBacklog(() => others);
+    await s.controller.stop();
+    expect(s.health.degradedReasons).toContain("IDB_WRITE_FAILED");
+    bringServerUp();
+    // Act
+    await s.controller.drainMemoryBacklog();
+    // Assert：共有の警告は全会議のメモリ待機が空になってから外す
+    expect(s.controller.memoryBacklogCount).toBe(0);
+    expect(s.health.degradedReasons).toContain("IDB_WRITE_FAILED");
+    others = 0;
+    await s.controller.drainMemoryBacklog();
+    expect(s.health.degradedReasons).not.toContain("IDB_WRITE_FAILED");
+  });
+
   it("stop 後に保持したロックは takeMeetingLock で呼び出し元へ渡し、以後 drain では解放しない", async () => {
     // Arrange
     const { s, bringServerUp } = await startWithUnsavableBacklog();
@@ -517,13 +535,13 @@ describe("RecordingController", () => {
     })(db);
 
   /** IDB に書けず、直接送信も bringServerUp() までは失敗する状態で m1 の録音を始める（末尾がメモリ待機に残る） */
-  async function startWithUnsavableBacklog(): Promise<{ s: Setup; bringServerUp: () => void }> {
+  async function startWithUnsavableBacklog(otherMeetingsBacklogCount?: () => number): Promise<{ s: Setup; bringServerUp: () => void }> {
     let serverUp = false;
     const s = await setup(closedStore, {
       put: async () => serverUp
         ? { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false }
         : { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } },
-    });
+    }, undefined, otherMeetingsBacklogCount);
     await s.controller.start("m1", "定例", 1);
     return { s, bringServerUp: () => { serverUp = true; } };
   }
