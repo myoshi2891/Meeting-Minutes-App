@@ -14,6 +14,8 @@ class FakeController implements SessionController {
   drainError: Error | null = null;
   /** drainMemoryBacklog の成功時の副作用（直接送信でメモリ待機が空になる等） */
   drainEffect: (() => void) | null = null;
+  /** 実データのメモリ待機。空でなければ drainMemoryBacklog は本物と同じく directSaver で直接送る */
+  readonly backlog: AudioChunkRecord[] = [];
   audioFrameCount = 0;
   private heldLock: (() => void) | null = null;
   constructor(
@@ -46,6 +48,12 @@ class FakeController implements SessionController {
   async drainMemoryBacklog(): Promise<number> {
     this.drainCount++;
     if (this.drainError !== null) throw this.drainError;
+    while (this.backlog.length > 0) {
+      const outcome = await this.deps.directSaver?.put(this.backlog[0]);
+      if (outcome?.ok !== true || !outcome.registered) throw new Error("direct save failed");
+      this.backlog.shift();
+      this.memoryBacklogCount = this.backlog.length;
+    }
     this.drainEffect?.();
     if (this.memoryBacklogCount === 0) this.takeMeetingLock()?.();
     return 0;
@@ -283,6 +291,19 @@ describe("createApp（起動時の配線）", () => {
     // Assert
     await vi.waitFor(() => expect(s.app.monitor.state.unauthorized).toBe(true));
     expect(s.app.health.degradedReasons).toContain("BACKEND_UNAUTHORIZED");
+  });
+
+  it("Scheduler の PUT 前の会議登録が 401 なら、失効の報告は 1 リクエストにつき 1 回だけ", async () => {
+    // Arrange：保存済みのトークンが古く、会議登録で 401 になる
+    const meetingId = nextMeetingId();
+    const s = await setup({ token: "stale", seed: (db) => seedChunk(db, meetingId, 0, "LOCAL_SAVE_PENDING").then(() => undefined) });
+    const report = vi.spyOn(s.app.monitor, "reportUnauthorized");
+    // Act
+    await vi.waitFor(() => expect(s.app.monitor.state.unauthorized).toBe(true));
+    await vi.waitFor(async () => expect(await s.status(`${meetingId}:mic:000000`)).toBe("BACKEND_UNAVAILABLE"));
+    // Assert
+    expect(s.server.requests.filter((r) => r === `POST:${meetingId}`)).toHaveLength(0);
+    expect(report).toHaveBeenCalledOnce();
   });
 
   it("ヘルス復帰時に stop_requested の会議の finalize を再試行し、別タブがロックを持つ会議には触らない", async () => {
@@ -547,6 +568,43 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     // Assert：失敗にするので drainMemoryBacklog は Chunk をメモリ待機に残す
     expect(outcome).toMatchObject({ ok: false, retryable: false });
     expect(s.server.putCount).toBe(0);
+  });
+
+  it("サーバー停止中に確定中止した会議の Chunk は、送信待ちの件数から外す", async () => {
+    // Arrange：サーバー停止中に Chunk が待機したまま止めた
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const r = await seedChunk(s.db, id, 0, "IDB_STORED");
+    await s.app.scheduler.enqueue(r.chunkKey);
+    await vi.waitFor(async () => expect(await s.status(r.chunkKey)).toBe("BACKEND_UNAVAILABLE"));
+    await session.stop();
+    expect(s.app.health.pendingChunkCount).toBe(1);
+    // Act
+    await s.app.abandonFinalize(id, true);
+    // Assert：音声は IDB に残す
+    expect(s.app.scheduler.pendingCount).toBe(0);
+    expect(s.app.health.pendingChunkCount).toBe(0);
+    expect((await s.app.chunkStore.getChunk(r.chunkKey))?.wav).not.toBeNull();
+  });
+
+  it("このタブで確定中止した会議は、IDB の読み取りに失敗しても直接送信の PUT を始めない", async () => {
+    // Arrange：メモリ待機を残して止め、確定を中止した後に IDB が読めなくなる
+    stubPageGlobals();
+    const s = await setup();
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    s.controllers[0].memoryBacklogCount = 1;
+    await session.stop();
+    await s.app.abandonFinalize(id, true);
+    const putsBefore = s.server.putCount;
+    vi.spyOn(s.app.meetingStore, "get").mockRejectedValue(new Error("IDB unavailable"));
+    // Act
+    const outcome = await s.controllers[0].deps.directSaver?.put(await makeChunkRecord(id, 0, 160));
+    // Assert
+    expect(outcome).toMatchObject({ ok: false, retryable: false });
+    expect(s.server.putCount).toBe(putsBefore);
   });
 
   it("開始済みの PUT は中止後も完了を記録する", async () => {
@@ -841,6 +899,30 @@ describe("RecordingSession.stop", () => {
     s.app.health.degradedReasons = ["IDB_WRITE_FAILED"];
     controller.deps.onError(new Error("idb write failed"));
     await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
+    await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
+  });
+
+  it("サーバー停止中にメモリ待機を残して止めた会議は、サーバー復帰で末尾を直接送信してから一度だけ確定する", async () => {
+    // Arrange：末尾 Chunk が IDB にもサーバーにもなく、メモリ待機に残ったまま停止した
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    const tail = await makeChunkRecord(id, 0, 160);
+    controller.backlog.push(tail);
+    controller.memoryBacklogCount = 1;
+    controller.audioFrameCount = tail.meta.endFrame;
+    expect(await session.stop()).toMatchObject({ ok: false, stage: "waiting_local_save" });
+    // Act
+    s.server.up = true;
+    await s.app.monitor.checkOnce();
+    // Assert：実際に PUT された内容がサーバーに残り、確定は 1 回だけ
+    await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
+    expect(s.server.stored.get(`${id}:mic:0`)).toEqual({ sha256: tail.meta.sha256, sizeBytes: tail.meta.sizeBytes });
+    expect(s.events.filter((e) => e.type === "finalized" && e.meetingId === id)).toHaveLength(1);
+    expect(s.events.filter((e) => e.type === "finalize_pending" && e.meetingId === id)).toHaveLength(1);
+    expect(controller.memoryBacklogCount).toBe(0);
     await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
   });
 

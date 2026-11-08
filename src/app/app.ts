@@ -96,6 +96,8 @@ export class App {
   private readonly heldLocks = new Map<string, () => void>();
   /** heldLocks を借りて確定・中止を実行中の会議。借用中は同じタブの別処理にも貸さない */
   private readonly heldLockBusy = new Set<string>();
+  /** 会議ごとのメモリ待機の drain。stop 後に残った末尾を、サーバー復帰時に確定より先に送る */
+  private readonly drains = new Map<string, (notify: boolean) => Promise<void>>();
   private unsubscribeMonitor: () => void = () => undefined;
   private disposed = false;
   private readonly finalizing = new Map<string, Promise<FinalizeResult>>();
@@ -108,6 +110,8 @@ export class App {
   private readonly directRegisteredEndFrame = new Map<string, number>();
   private readonly waitingForSave = new Set<string>();
   private readonly finalizeIssues = new Map<string, Extract<FinalizeResult, { ok: false }>>();
+  /** このタブで確定中止した会議。IDB が読めなくなっても、中止済みの会議に PUT を始めないために使う */
+  private readonly abandoned = new Set<string>();
 
   constructor(
     private readonly deps: AppDeps,
@@ -201,7 +205,8 @@ export class App {
 
     let quotaCheck: Promise<void> = Promise.resolve();
     let draining = false;
-    const drain = async (): Promise<void> => {
+    /** notify：空になったら確定を再開させる。onBackendAvailable は自分で確定するので false で呼ぶ */
+    const drain = async (notify = true): Promise<void> => {
       if (draining) return;
       draining = true;
       try {
@@ -209,7 +214,7 @@ export class App {
         // 直接送信は Scheduler を通らず onChunkSaved が来ない。空になったら停止後の Barrier を再開させる
         if (controller.memoryBacklogCount === 0) {
           this.releaseHeldLockIfDrained(meetingId);
-          void this.onChunkSaved(meetingId);
+          if (notify) void this.onChunkSaved(meetingId);
         }
       } catch (error) {
         this.deps.onEvent({ type: "memory_backlog_export_required", meetingId, error });
@@ -279,6 +284,7 @@ export class App {
       if (startedMeeting !== undefined) this.meetingFallbacks.set(meetingId, startedMeeting);
     }
     this.controllers.set(meetingId, controller);
+    this.drains.set(meetingId, drain);
     let recording = true;
     const lifecycle = attachPageLifecycle(controller, () => recording, input.onHidden ?? (() => undefined));
     let stopping: Promise<FinalizeResult> | undefined;
@@ -349,11 +355,16 @@ export class App {
     if (release === null) throw new Error("別の処理がこの会議を使用中です。完了後にやり直してください");
     try {
       const meeting = await this.meetingStore.get(meetingId);
-      if (meeting?.status === "abandoned") return;
+      if (meeting?.status === "abandoned") {
+        this.abandoned.add(meetingId);
+        return;
+      }
       if (meeting?.status !== "stop_requested" && meeting?.status !== "finalizing") throw new Error("確定待ちの会議だけ中止できます");
       meeting.status = "abandoned";
       meeting.updatedAt = (this.deps.now ?? Date.now)();
       await this.meetingStore.put(meeting);
+      this.abandoned.add(meetingId);
+      this.scheduler.discardMeeting(meetingId);
       this.waitingForSave.delete(meetingId);
       this.finalizeRequested.delete(meetingId);
       this.finalizeIssues.delete(meetingId);
@@ -405,9 +416,11 @@ export class App {
   private async prepareChunkPut(meetingId: string): Promise<RegistrationOutcome> {
     const registration = await this.registrar.ensure(meetingId);
     if (!registration.ok) return registration;
-    // IDB が読めないときこそ直接送信が必要で、同じ障害で中止も書けないので送信を止めない
+    // IDB が読めないときこそ直接送信が必要なので、読めないだけでは送信を止めない。
+    // 直接送信はこのタブが会議ロックを持つ間（録音中・メモリ待機の保持中）に限られ、その間に中止できるのはこのタブだけなので、
+    // 読めないときはこのタブの中止記録で判定する
     const meeting = await this.meetingStore.get(meetingId).catch(() => undefined);
-    if (meeting?.status !== "abandoned") return registration;
+    if (meeting?.status !== "abandoned" && !this.abandoned.has(meetingId)) return registration;
     return { ok: false, retryable: false, error: { kind: "VALIDATION", message: "meeting abandoned", httpStatus: null, at: (this.deps.now ?? Date.now)() } };
   }
 
@@ -504,6 +517,10 @@ export class App {
         else release();
       }
       await this.scheduler.resumeAll(lockedElsewhere);
+      // stop 後もメモリ待機が残る会議（このタブがロックを保持）は、確定の前に末尾を送る。送れなければロックを持ったまま残す
+      for (const [id, drain] of this.drains) {
+        if (id !== this.session?.meetingId && this.memoryBacklogCount(id) > 0) await drain(false);
+      }
 
       for (const m of await this.listPendingFinalize()) await this.retryFinalize(m.meetingId);
     } catch (error) {
