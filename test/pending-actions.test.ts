@@ -41,6 +41,40 @@ describe("確定中止の確認", () => {
     expect(exportWav).toHaveBeenCalledOnce();
     expect(abandon).not.toHaveBeenCalled();
   });
+  it("メモリ待機がある会議は中止後に WAV の保存を確かめ、OK ならメモリ待機を破棄する", async () => {
+    // Arrange
+    const order: string[] = [];
+    const confirm = vi.fn((_text: string) => { order.push("confirm"); return true; });
+    const abandon = vi.fn(async () => { order.push("abandon"); });
+    const discardBacklog = vi.fn(async () => { order.push("discard"); });
+    // Act
+    const result = await confirmAbandon(meeting, 2, { confirm, exportWav: () => { order.push("export"); }, abandon, discardBacklog });
+    // Assert
+    expect(result).toBe("abandoned");
+    expect(order).toEqual(["confirm", "export", "confirm", "abandon", "confirm", "discard"]);
+    expect(confirm.mock.calls[2][0]).toContain("2 件");
+    expect(confirm.mock.calls[2][0]).toContain("保存できた");
+    expect(discardBacklog).toHaveBeenCalledWith(meeting.meetingId);
+  });
+  it("破棄の確認を断ったら中止だけ行い、メモリ待機は残す", async () => {
+    // Arrange：書き出し・中止の確認は受け、破棄の確認は断る
+    const confirm = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValueOnce(false);
+    const abandon = vi.fn(async () => undefined);
+    const discardBacklog = vi.fn(async () => undefined);
+    // Act
+    const result = await confirmAbandon(meeting, 1, { confirm, exportWav: vi.fn(), abandon, discardBacklog });
+    // Assert
+    expect(result).toBe("abandoned");
+    expect(abandon).toHaveBeenCalledOnce();
+    expect(discardBacklog).not.toHaveBeenCalled();
+  });
+  it("メモリ待機がなければ破棄の確認を出さない", async () => {
+    const confirm = vi.fn(() => true);
+    const discardBacklog = vi.fn(async () => undefined);
+    expect(await confirmAbandon(meeting, 0, { confirm, exportWav: vi.fn(), abandon: vi.fn(async () => undefined), discardBacklog })).toBe("abandoned");
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(discardBacklog).not.toHaveBeenCalled();
+  });
   it("書き出しを断った場合や書き出し失敗では中止しない", async () => {
     const abandon = vi.fn();
     const exportWav = vi.fn();
