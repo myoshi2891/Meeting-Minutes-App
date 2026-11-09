@@ -188,6 +188,20 @@ describe("RecordingController", () => {
       sessionClock: { audioFrameCount: 1600 },
     });
   });
+  it.each(["manual", "mic_ended"] as const)("停止 %s の完了前に別の理由で停止が重なっても、最初の停止理由と検出時刻を保つ", async (reason) => {
+    // Arrange：Worklet が応答せず、最初の停止が完了しない
+    const s = await setup();
+    await s.controller.start(`stop-overlap-${reason}`, "停止理由", 1);
+    s.worklet.silent = true;
+    const first = s.controller.stop(reason, 123456);
+    // Act：最初の停止の待機中に、別の理由・時刻で停止する
+    const second = s.controller.stop(reason === "manual" ? "mic_ended" : "manual", 999999);
+    await s.until(() => s.worklet.commands.filter((c) => c.type === "stop").length >= 2);
+    s.fireTimers();
+    await Promise.all([first, second]);
+    // Assert
+    expect(await s.meetingStore.get(`stop-overlap-${reason}`)).toMatchObject({ status: "stop_requested", stopReason: reason, stopDetectedAtEpochMs: 123456 });
+  });
   beforeEach(() => {
     vi.unstubAllGlobals();
   });
