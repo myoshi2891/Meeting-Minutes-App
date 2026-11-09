@@ -1437,6 +1437,30 @@ describe("RecordingSession.stop", () => {
     expect(s.events.filter((e) => e.type === "memory_backlog_export_required" && e.meetingId === id)).toHaveLength(1);
   });
 
+  it("サーバー停止中の確定再試行が IDB への書き戻しを試す間にサーバーが戻ったら、その再試行の中で直接送信して確定する", async () => {
+    // Arrange：サーバー停止中にメモリ待機を残して止め、手動再試行の drain が IDB への書き戻しを試している
+    const { s, id, controller, sentTail } = await stopWithMemoryTail(false);
+    const original = controller.drainMemoryBacklog.bind(controller);
+    let resumeDrain = (): void => undefined;
+    const drainStarted = new Promise<void>((started) => {
+      vi.spyOn(controller, "drainMemoryBacklog").mockImplementationOnce(async () => {
+        started();
+        await new Promise<void>((r) => { resumeDrain = r; });
+        return original();
+      });
+    });
+    const retry = s.app.retryFinalize(id);
+    await drainStarted;
+    // Act：その間にサーバーが戻る（復帰時の drain と確定は、実行中の drain と借用中のロックに弾かれる）
+    s.server.up = true;
+    await s.app.monitor.checkOnce();
+    resumeDrain();
+    // Assert：復帰のイベントや手動再試行を待たずに、この再試行が末尾を送って確定する
+    expect(await retry).toMatchObject({ ok: true });
+    sentTail();
+    expect(controller.memoryBacklogCount).toBe(0);
+  });
+
   it("サーバー復帰時に IDB の会議一覧が読めなくても、停止後のメモリ待機は直接送信する", async () => {
     // Arrange：末尾をメモリ待機に残してサーバー停止中に止め、その後 IDB の一覧取得が失敗するようになる
     const { s, controller, sentTail } = await stopWithMemoryTail(false);

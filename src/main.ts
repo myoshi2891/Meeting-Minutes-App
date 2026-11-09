@@ -111,10 +111,33 @@ function onHidden(app: App): void {
   hiddenTimer = setInterval(() => render(app), HIDDEN_RENDER_INTERVAL_MS);
 }
 
-let pendingGeneration = 0;
 const pendingBusy = new Set<string>();
-async function refreshPending(app: App): Promise<void> {
-  const generation = ++pendingGeneration;
+let pendingRefresh: Promise<void> | null = null;
+let pendingRefreshRequested = false;
+/**
+ * 確定待ち一覧の再描画。1 本ずつ順に実行し、実行中の要求は終わった後の 1 回にまとめる。
+ * 世代番号で古い結果を捨てる方式では、読み込みが更新間隔より遅いと毎回新しい要求に捨てられて一度も描画されない
+ */
+function refreshPending(app: App): Promise<void> {
+  if (pendingRefresh !== null) {
+    pendingRefreshRequested = true;
+    return pendingRefresh;
+  }
+  const run = async (): Promise<void> => {
+    try {
+      do {
+        pendingRefreshRequested = false;
+        await renderPending(app);
+      } while (pendingRefreshRequested);
+    } finally {
+      pendingRefresh = null;
+    }
+  };
+  pendingRefresh = run();
+  return pendingRefresh;
+}
+
+async function renderPending(app: App): Promise<void> {
   const meetings = await app.listPendingFinalize();
   const details = await Promise.all(meetings.map(async (m) => {
     let chunks: Awaited<ReturnType<typeof app.chunkStore.listByMeeting>>;
@@ -133,7 +156,6 @@ async function refreshPending(app: App): Promise<void> {
       offIdbSequenceNos: app.offIdbSequenceNos(m.meetingId),
     });
   }));
-  if (generation !== pendingGeneration) return;
   ui.pending.replaceChildren(
     ...meetings.map((m, index) => {
       const li = document.createElement("li");

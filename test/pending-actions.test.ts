@@ -26,6 +26,18 @@ describe("確定中止の確認", () => {
     expect(confirm.mock.calls[1][0]).toContain("削除しません");
     expect(abandon).toHaveBeenCalledWith(meeting.meetingId, true);
   });
+  it("メモリ待機を書き出した後に最後の確認を断ったら中止しない", async () => {
+    // Arrange：書き出しの確認は受け、最後の確認は断る
+    const abandon = vi.fn();
+    const exportWav = vi.fn();
+    const confirm = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(false);
+    // Act
+    const result = await confirmAbandon(meeting, 1, { confirm, exportWav, abandon });
+    // Assert
+    expect(result).toBe("cancelled");
+    expect(exportWav).toHaveBeenCalledOnce();
+    expect(abandon).not.toHaveBeenCalled();
+  });
   it("書き出しを断った場合や書き出し失敗では中止しない", async () => {
     const abandon = vi.fn();
     expect(await confirmAbandon(meeting, 1, { confirm: () => false, exportWav: vi.fn(), abandon })).toBe("cancelled");

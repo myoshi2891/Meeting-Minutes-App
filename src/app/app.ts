@@ -223,10 +223,18 @@ export class App {
     let directAllowed = true;
     /** 実行中の drain の直接送信が、送信中のトークン変更で送れなかったか */
     let tokenChangedDuringDrain = false;
+    /** 直接送信を試さない drain の実行中に、直接送信する drain（サーバー復帰）が要求されたか */
+    let directRequestedDuringDrain = false;
     /** notify：空になったら確定を再開させる。onBackendAvailable は自分で確定するので false で呼ぶ */
     const drain = async (notify = true, direct = true): Promise<void> => {
-      if (draining) return;
+      if (draining) {
+        // サーバー停止中の確定再試行（IDB への書き戻しだけ）がロックを借りている間にサーバーが戻ると、
+        // onBackendAvailable の drain も確定もここで弾かれる。終わってから直接送信で送り直す
+        if (direct && !directAllowed) directRequestedDuringDrain = true;
+        return;
+      }
       draining = true;
+      directRequestedDuringDrain = false;
       directAllowed = direct;
       tokenChangedDuringDrain = false;
       try {
@@ -245,9 +253,12 @@ export class App {
         draining = false;
         directAllowed = true;
       }
-      // setToken からの drain は実行中の drain に弾かれているので、終わってから新しいトークンで送り直す。
+      // setToken・サーバー復帰からの drain は実行中の drain に弾かれているので、終わってから現在のトークンで送り直す。
       // draining を戻した直後に同期的に呼ぶので、別の drain と並行しない。空になれば notify に従って確定を再開する
-      if (tokenChangedDuringDrain && controller.memoryBacklogCount > 0) await drain(notify, direct);
+      // （確定再試行の中なら、その再試行が続けて確定する）
+      const directRequested = directRequestedDuringDrain;
+      directRequestedDuringDrain = false;
+      if ((tokenChangedDuringDrain || directRequested) && controller.memoryBacklogCount > 0) await drain(notify, direct || directRequested);
     };
     const enqueuer: ChunkEnqueuer = {
       enqueue: async (chunkKey) => {
