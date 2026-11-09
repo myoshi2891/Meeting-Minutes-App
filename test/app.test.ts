@@ -354,6 +354,31 @@ describe("createApp（起動時の配線）", () => {
     expect(s.server.putCount).toBe(0);
   });
 
+  it("起動時復旧で音声フレーム数の補いを書けなかった会議は、起動を止めず、古いフレーム数のまま確定しない", async () => {
+    // Arrange：最終保存の前に落ちた確定待ちの会議（保存済み Chunk の endFrame より audioFrameCount が小さい）。補いの書き込みが失敗する
+    const id = nextMeetingId();
+    const put = MeetingStore.prototype.put;
+    const spy = vi.spyOn(MeetingStore.prototype, "put").mockImplementation(async function (this: MeetingStore, meeting) {
+      if (meeting.meetingId === id && meeting.updatedAt !== 0) throw new Error("IDB write failed");
+      return put.call(this, meeting);
+    });
+    const s = await setup({ seed: async (db, server) => {
+      const r = await seedChunk(db, id, 0, "DB_REGISTERED");
+      registerOnServer(server, r);
+      await seedMeeting(db, makeMeeting(id, "stop_requested", 0));
+    } });
+    spy.mockRestore();
+    await settleMonitor(s);
+    // Act
+    const result = await s.app.retryFinalize(id);
+    // Assert：再読み込みで復旧をやり直すまで確定しない（古い totalAudioFrames を送らない）
+    expect(result).toMatchObject({ ok: false, stage: "verify" });
+    expect((await s.app.meetingStore.get(id))?.status).toBe("stop_requested");
+    expect(s.server.requests).not.toContain(`FINALIZE:${id}`);
+    const recovered = s.events.find((e) => e.type === "recovered");
+    expect(recovered?.type === "recovered" && recovered.report.unreadMeetingIds).toEqual([id]);
+  });
+
   it("起動時復旧でロック後の会議の読み取りに失敗しても、起動を止めず他の会議を復旧し、失敗を通知する", async () => {
     // Arrange：録音中のまま落ちた会議が 2 件。片方の読み直しだけ失敗する
     const [a, b] = [nextMeetingId(), nextMeetingId()];
@@ -940,6 +965,27 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     // Act
     const result = await session.stop();
     // Assert
+    expect(result).toMatchObject({ ok: true });
+    expect((await s.app.meetingStore.get(session.meetingId))?.status).toBe("finalized");
+  });
+
+  it("確定の会議登録中にトークンが替わって元に戻り（A → B → A）、送り直しでも登録できなければ、現在のトークンで確定し直す", async () => {
+    // Arrange：1 回目の登録の応答待ちで mid に、2 回目の応答待ちで元のトークンに戻る。どちらの応答も 401
+    stubPageGlobals();
+    let app: App | undefined;
+    let cycle = 0;
+    const s = await setup({ wrapFetch: (fetchImpl) => async (input, init) => {
+      if (!isRegistration(String(input), init) || cycle >= 2) return fetchImpl(input, init);
+      cycle++;
+      await app?.setToken(cycle === 1 ? "mid" : TOKEN);
+      return new Response(JSON.stringify({ error: "unauthorized", code: "UNAUTHORIZED" }), { status: 401 });
+    } });
+    app = s.app;
+    const session = await s.app.startRecording(startInput(nextMeetingId()));
+    // Act
+    const result = await session.stop();
+    // Assert：確定開始時と同じトークンに戻っていても、送り直しの途中で替わった失敗は失効扱いにせずやり直す
+    expect(cycle).toBe(2);
     expect(result).toMatchObject({ ok: true });
     expect((await s.app.meetingStore.get(session.meetingId))?.status).toBe("finalized");
   });
@@ -1844,10 +1890,21 @@ describe("RecordingSession.stop", () => {
     const retry = vi.spyOn(s.app, "retryFinalize");
     s.app.health.degradedReasons = ["IDB_WRITE_FAILED"];
     // 停止時の確定もサーバーが使えれば drain する。onError による drain はその次の 1 回
-    const drainsBefore = controller.drainCount;
+    // drainCount は drain の開始で増えるので、drain の完了（Promise の決着）を待つ
+    const original = controller.drainMemoryBacklog.bind(controller);
+    let drained: Promise<unknown> | undefined;
+    vi.spyOn(controller, "drainMemoryBacklog").mockImplementation(() => {
+      const run = original();
+      drained = run;
+      return run;
+    });
     // Act
     controller.deps.onError(new Error("idb write failed"));
-    await vi.waitFor(() => expect(controller.drainCount).toBe(drainsBefore + 1));
+    await vi.waitFor(() => expect(drained).toBeDefined());
+    await drained?.catch(() => undefined);
+    // drain の後続（空なら onChunkSaved → 会議の IDB 読み取り → retryFinalize）も済ませる。IDB の要求は順に処理されるので、
+    // 後から出した読み取りの完了で、先に出た読み取りの完了も確かめられる
+    await s.app.meetingStore.get(id);
     await new Promise((resolve) => setTimeout(resolve, 0));
     // Assert
     expect(retry).not.toHaveBeenCalled();

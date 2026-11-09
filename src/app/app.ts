@@ -137,6 +137,8 @@ export class App {
   private readonly networkRetryAttempts = new Map<string, number>();
   /** 停止後もメモリ待機が残る会議のページライフサイクル（離脱確認）。空になったら外す */
   private readonly lifecycles = new Map<string, { readonly detach: () => void }>();
+  /** 起動時の復旧で読み直し・書き直しに失敗した会議。補う前の値で確定しないよう、再読み込みで復旧をやり直すまで確定しない */
+  private readonly unrecovered = new Set<string>();
 
   constructor(
     private readonly deps: AppDeps,
@@ -191,8 +193,9 @@ export class App {
   async init(): Promise<void> {
     const report = await recoverOnStartup(this.meetingStore, this.chunkStore, this.scheduler, this.deps.locks);
     this.deps.onEvent({ type: "recovered", report });
+    for (const id of report.unreadMeetingIds) this.unrecovered.add(id);
     if (report.unreadMeetingIds.length > 0) {
-      this.deps.onEvent({ type: "error", error: new Error(`起動時の復旧で会議を読めませんでした（${report.unreadMeetingIds.join(", ")}）。再読み込みで再試行します`) });
+      this.deps.onEvent({ type: "error", error: new Error(`起動時の復旧で会議を読み書きできませんでした（${report.unreadMeetingIds.join(", ")}）。再読み込みで再試行します`) });
     }
     this.unsubscribeMonitor = this.monitor.onChange((state) => {
       if (!isUsable(state)) return;
@@ -506,6 +509,8 @@ export class App {
 
   /** 会議ロックを取って Barrier を再試行する。別タブが録音・確定中の会議には触らない（§23 と同じ） */
   async retryFinalize(meetingId: string): Promise<FinalizeResult> {
+    // 起動時の復旧が書けなかった会議は、補う前の値（古い audioFrameCount など）のまま確定しない
+    if (this.unrecovered.has(meetingId)) return { ok: false, stage: "verify", detail: "startup recovery not saved; reload to retry" };
     const lock = await this.acquireMeetingLock(meetingId);
     if (!lock.ok) return { ok: false, stage: "verify", detail: lock.heldBy === "this_tab" ? "meeting is busy in this tab" : "meeting is locked by another tab" };
     const { release } = lock;
@@ -742,8 +747,9 @@ export class App {
         offIdbEndFrame: (sequenceNo) => this.directRegisteredEndFrames.get(meetingId)?.get(sequenceNo),
         ensureMeeting: async (id) => {
           const registration = await this.registrar.ensure(id);
-          // 登録の途中でトークンが変わった失敗は、この Barrier が終わったら現在のトークンでやり直す（onBackendUnauthorized と同じ）
-          if (!registration.ok && this.token !== token) this.finalizeTokenChanged.add(meetingId);
+          // 登録の途中でトークンが変わった失敗は、この Barrier が終わったら現在のトークンでやり直す（onBackendUnauthorized と同じ）。
+          // 送り直しの間に替わり続けた失敗（tokenChanged）は、A → B → A と元のトークンに戻って値が一致していてもやり直す
+          if (!registration.ok && (this.token !== token || registration.tokenChanged === true)) this.finalizeTokenChanged.add(meetingId);
           return registration;
         },
         onBackendUnauthorized: () => {
