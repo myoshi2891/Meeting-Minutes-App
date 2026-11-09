@@ -686,6 +686,8 @@ export class RecordingController {
   private trackEndedHandled = false;
   /** drainMemoryBacklog の直列化 */
   private drainQueue: Promise<unknown> = Promise.resolve();
+  /** 実行中の stop。重なった stop はこれを待ち、完了までは次の録音を始めない（Phase 1 §15 と同じ） */
+  private stopping: Promise<void> | null = null;
   /** トラックの ended リスナーの解除用。stop で abort する（Phase 1 §15 と同じ） */
   private trackListeners: AbortController | null = null;
 
@@ -700,6 +702,7 @@ export class RecordingController {
   }
 
   async start(meetingId: string, title: string, consentConfirmedAt: number, options: StartOptions = {}): Promise<void> {
+    if (this.stopping !== null) throw new Error("previous recording is still stopping");
     // 前の録音のメモリ待機が残るうちは始めない（Phase 1 §15。保持中のロックの解放手段を上書きし、別会議の Chunk も混ざる）
     if (this.memoryBacklog.length > 0) throw new Error("memory backlog from the previous recording remains");
     // 最終保存の失敗で保持したロックも、呼び出し元が takeMeetingLock で受け取るまでは上書きしない（Phase 1 §15）
@@ -831,7 +834,18 @@ export class RecordingController {
     await this.chunkQueue;
   }
 
-  async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<void> {
+  /** 重なった呼び出しは実行中の停止を共有する（Phase 1 §15 と同じ） */
+  stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<void> {
+    if (this.stopping !== null) return this.stopping;
+    if (this.node === null || this.meetingId === null) return Promise.resolve();
+    const run = this.stopOnce(reason, detectedAtEpochMs).finally(() => {
+      this.stopping = null;
+    });
+    this.stopping = run;
+    return run;
+  }
+
+  private async stopOnce(reason: RecordingStopReason, detectedAtEpochMs: number): Promise<void> {
     if (this.node === null || this.meetingId === null) return;
     let statusError: unknown = null;
     let finalSaved = false;
@@ -1383,8 +1397,11 @@ function describeFetchError(error: unknown, timeoutMs: number): string {
 export type FinalizeResult =
   /** missingTailMs：Mic の末尾の Chunk が欠けたまま確定した長さ（ms）。欠けがなければ省く（Phase 1 §22） */
   | { readonly ok: true; readonly counts: Readonly<Record<AudioSource, number>>; readonly missingTailMs?: number }
-  /** reason：トークン未設定・401/403 なら "unauthorized"。UI は detail の文字列でなくこれでトークン案内を出す（Phase 1 §22） */
-  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string; readonly reason?: "unauthorized" };
+  /**
+   * reason：トークン未設定・401/403 なら "unauthorized"。UI は detail の文字列でなくこれでトークン案内を出す（Phase 1 §22）。
+   * 応答を得られなかった（接続失敗・タイムアウト）なら "network"。App が時間をおいて確定を再試行する（Phase 1 §22）
+   */
+  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string; readonly reason?: "unauthorized" | "network" };
 
 const SOURCES: ReadonlyArray<AudioSource> = ["mic", "system"];
 
@@ -1437,7 +1454,8 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   if (deps.ensureMeeting !== undefined) {
     const registration = await deps.ensureMeeting(meetingId);
     if (!registration.ok) {
-      const reason = registration.error.kind === "UNAUTHORIZED" ? { reason: "unauthorized" as const } : {};
+      const kind = registration.error.kind;
+      const reason = kind === "UNAUTHORIZED" ? { reason: "unauthorized" as const } : kind === "NETWORK" || kind === "TIMEOUT" ? { reason: "network" as const } : {};
       return { ok: false, stage: "verify", detail: `meeting registration failed: ${registration.error.message}`, ...reason };
     }
   }
@@ -1456,7 +1474,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
       (res): Promise<unknown> => (res.ok ? res.json().catch(() => null) : Promise.resolve(null)),
     ));
   } catch (error) {
-    return { ok: false, stage: "verify", detail: `list failed: ${describeFetchError(error, timeoutMs)}` };
+    return { ok: false, stage: "verify", detail: `list failed: ${describeFetchError(error, timeoutMs)}`, reason: "network" };
   }
   if (listRes.status === 401 || listRes.status === 403) {
     deps.onBackendUnauthorized?.();
@@ -1546,7 +1564,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     }, timeoutMs, async () => null));
   } catch (error) {
     await restore();
-    return { ok: false, stage: "finalize", detail: `finalize failed: ${describeFetchError(error, timeoutMs)}` };
+    return { ok: false, stage: "finalize", detail: `finalize failed: ${describeFetchError(error, timeoutMs)}`, reason: "network" };
   }
   const finUnauthorized = finRes.status === 401 || finRes.status === 403;
   if (finUnauthorized) deps.onBackendUnauthorized?.();
