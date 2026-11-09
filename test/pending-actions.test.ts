@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { confirmAbandon } from "../src/ui/pending-actions";
+import { confirmAbandon, manualRetryNeedsNotice } from "../src/ui/pending-actions";
+import type { FinalizeResult } from "../src/recording/finalizer";
 
 const meeting = { meetingId: "meeting-1", title: "定例" };
 describe("確定中止の確認", () => {
@@ -19,6 +20,8 @@ describe("確定中止の確認", () => {
     // 最初の確認：対象と未保存件数を示して書き出しを促す
     expect(confirm.mock.calls[0][0]).toContain(meeting.title);
     expect(confirm.mock.calls[0][0]).toContain("2 件");
+    // 書き出しを断ると中止も取りやめになることを伝える
+    expect(confirm.mock.calls[0][0]).toContain("確定の中止も取りやめます");
     // 最後の確認：対象を ID まで示し、書き出しの確認とデータを消さないことを伝える
     expect(confirm.mock.calls[1][0]).toContain(meeting.title);
     expect(confirm.mock.calls[1][0]).toContain(meeting.meetingId);
@@ -46,5 +49,26 @@ describe("確定中止の確認", () => {
     expect(abandon).not.toHaveBeenCalled();
     await expect(confirmAbandon(meeting, 1, { confirm: () => true, exportWav: () => { throw new Error("export failed"); }, abandon })).rejects.toThrow();
     expect(abandon).not.toHaveBeenCalled();
+  });
+});
+
+describe("手動再試行の通知", () => {
+  type Failure = Extract<FinalizeResult, { ok: false }>;
+  const failure = (detail: string): Failure => ({ ok: false, stage: "verify", detail });
+  it("前回と同じ理由で失敗したら（自動通知が出ないので）手動の結果として通知する", () => {
+    // Arrange：前回の理由と同じ失敗が記録された
+    const before = failure("server unreachable");
+    const result = failure("server unreachable");
+    // Act / Assert
+    expect(manualRetryNeedsNotice(before, result, result)).toBe(true);
+  });
+  it("理由が変わった失敗は自動通知（finalize_pending）が出るので重ねない", () => {
+    const result = failure("new reason");
+    expect(manualRetryNeedsNotice(failure("old reason"), result, result)).toBe(false);
+    expect(manualRetryNeedsNotice(undefined, result, result)).toBe(false);
+  });
+  it("記録されない失敗（別タブがロック中など）は通知し、成功は通知しない", () => {
+    expect(manualRetryNeedsNotice(undefined, undefined, failure("meeting is locked by another tab"))).toBe(true);
+    expect(manualRetryNeedsNotice(failure("x"), undefined, { ok: true })).toBe(false);
   });
 });
