@@ -32,9 +32,10 @@ export type FinalizeResult =
   | { readonly ok: true; readonly missingTailMs?: number }
   /**
    * reason：失敗の分類。"unauthorized" はトークン未設定・サーバーの 401/403 で、UI はトークンの確認を案内する。
+   * "network" はサーバーへの要求が応答を得られなかった（接続失敗・タイムアウト）。ヘルス状態が変わらないこともあるので、呼び出し元が時間をおいて再試行する。
    * detail はサーバー由来の文字列を含みうるので、分類には使わない
    */
-  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string; readonly reason?: "unauthorized" };
+  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string; readonly reason?: "unauthorized" | "network" };
 
 /**
  * Finalization Barrier：
@@ -88,7 +89,8 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   if (deps.ensureMeeting !== undefined) {
     const registration = await deps.ensureMeeting(meetingId);
     if (!registration.ok) {
-      const reason = registration.error.kind === "UNAUTHORIZED" ? { reason: "unauthorized" as const } : {};
+      const kind = registration.error.kind;
+      const reason = kind === "UNAUTHORIZED" ? { reason: "unauthorized" as const } : kind === "NETWORK" || kind === "TIMEOUT" ? { reason: "network" as const } : {};
       return { ok: false, stage: "verify", detail: `meeting registration failed: ${registration.error.message}`, ...reason };
     }
   }
@@ -105,7 +107,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
     list = listRes.ok ? await listRes.json().catch(() => null) : null;
   } catch (error) {
-    return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}` };
+    return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}`, reason: "network" };
   } finally {
     clearTimeout(listTimer);
   }
@@ -193,7 +195,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   } catch (error) {
     // finalizing のまま残さない。次回の Barrier 再試行は stop_requested から行う
     await restore();
-    return { ok: false, stage: "finalize", detail: `finalize request failed: ${errorMessage(error)}` };
+    return { ok: false, stage: "finalize", detail: `finalize request failed: ${errorMessage(error)}`, reason: "network" };
   } finally {
     clearTimeout(finTimer);
   }
