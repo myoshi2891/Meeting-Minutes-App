@@ -97,6 +97,8 @@ export class RecordingController {
   private drainQueue: Promise<unknown> = Promise.resolve();
   /** 実行中の stop。重なった stop はこれを待つ。完了までは次の録音を始めない（後から終わる stop の後始末が次の録音を壊すため） */
   private stopping: Promise<void> | null = null;
+  /** start の準備中か。node はまだ null なので、この間に drain・破棄が空で終わっても会議ロックを解放しない */
+  private starting = false;
 
   constructor(private readonly deps: RecordingControllerDeps) {}
 
@@ -116,11 +118,14 @@ export class RecordingController {
     const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
     if (release === null) throw new Error(`meeting ${meetingId} is already being recorded`);
     this.releaseLock = release;
+    this.starting = true;
     try {
       await this.setUp(meetingId, title, consentConfirmedAt);
     } catch (error) {
       this.unlock();
       throw error;
+    } finally {
+      this.starting = false;
     }
   }
 
@@ -362,8 +367,8 @@ export class RecordingController {
       );
     }
     // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する。
-    // 最終保存に失敗していれば、書き直す呼び出し元が takeMeetingLock で受け取るまで保持する
-    if (this.node === null && !this.finalStopUnsaved) this.unlock();
+    // 最終保存に失敗していれば、書き直す呼び出し元が takeMeetingLock で受け取るまで保持する。start の準備中（node はまだ null）は録音を始める会議のロックなので外さない
+    if (this.node === null && !this.starting && !this.finalStopUnsaved) this.unlock();
   }
 
   get memoryBacklogCount(): number {

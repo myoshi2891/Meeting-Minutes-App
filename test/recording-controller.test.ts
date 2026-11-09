@@ -785,6 +785,28 @@ describe("RecordingController", () => {
     expect(s.locks.held.has(meetingLockName("m-discard"))).toBe(false);
   });
 
+  it("start の準備中に drain・破棄が走っても会議ロックを解放しない", async () => {
+    // Arrange：addModule の完了を止め、start を準備中のままにする
+    const s = await setup();
+    let finishAddModule = (): void => undefined;
+    vi.mocked(s.audioContext.audioWorklet.addModule).mockImplementationOnce(
+      () => new Promise<void>((resolve) => { finishAddModule = resolve; }),
+    );
+    const starting = s.controller.start("m-start-drain", "定例", 1);
+    for (let i = 0; i < 100 && vi.mocked(s.audioContext.audioWorklet.addModule).mock.calls.length === 0; i++) await Promise.resolve();
+    expect(s.locks.held.has(meetingLockName("m-start-drain"))).toBe(true);
+    // Act：サーバー復帰の drain と破棄が準備中に走る（メモリ待機は空）
+    await s.controller.drainMemoryBacklog();
+    await s.controller.discardMemoryBacklog();
+    // Assert：録音を始める会議のロックは保持したまま
+    expect(s.locks.held.has(meetingLockName("m-start-drain"))).toBe(true);
+    finishAddModule();
+    await starting;
+    expect(s.locks.held.has(meetingLockName("m-start-drain"))).toBe(true);
+    await s.controller.stop();
+    expect(s.locks.held.has(meetingLockName("m-start-drain"))).toBe(false);
+  });
+
   it("録音中はメモリ待機を破棄しない", async () => {
     // Arrange
     const failing = (db: IDBDatabase) => {
