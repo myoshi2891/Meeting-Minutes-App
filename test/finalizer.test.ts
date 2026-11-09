@@ -453,6 +453,21 @@ describe("finalizeMeeting（IDB を経由せずサーバーへ直接送った Ch
     expect(result).toEqual({ ok: true });
     expect((await h.meetingStore.get(MEETING_ID))?.finalChunkCount).toBe(2);
   });
+
+  it("末尾の Chunk がサーバーにだけあっても、IDB 外で控えた終わりの位置があれば末尾の欠けを missingTailMs で返す", async () => {
+    // Arrange：seq 1（終わり 481600）を直接送った後、Worklet の stop 無応答で 1 秒ぶんの Chunk が届かなかった
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    await putDirectly(h, 1);
+    const m = await h.meetingStore.get(MEETING_ID);
+    if (m === undefined) throw new Error("meeting not found");
+    await h.meetingStore.put({ ...m, sessionClock: { ...m.sessionClock, audioFrameCount: 481600 + 16000 } });
+    const offIdbEndFrame = (seq: number) => (seq === 1 ? 481600 : undefined);
+    // Act
+    const result = await finalizeMeeting({ ...deps(h), offIdbEndFrame }, MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: true, missingTailMs: 1000 });
+  });
 });
 
 describe("finalizeMeeting（会議の状態による前提条件）", () => {

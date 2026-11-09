@@ -21,6 +21,8 @@ export interface FinalizerDeps {
   readonly unpersistedChunkCount: () => number;
   /** 照合の前に会議をサーバーへ登録する（MeetingRegistrar.ensure）。Chunk を 1 件も PUT できていない会議は一覧・確定が 404 になるため */
   readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>;
+  /** IDB にない Chunk（このタブが直接送信した分）の endFrame。末尾を直接送ったときも末尾の欠けを測るために使う */
+  readonly offIdbEndFrame?: (sequenceNo: number) => number | undefined;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -204,7 +206,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);
   // 欠けた音声は取り戻せないので確定は止めず、UI が警告できるよう長さを返す（T1-e）
-  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, chunks, chunkCount);
+  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, chunks, chunkCount, deps.offIdbEndFrame);
   return missingTailMs > 0 ? { ok: true, missingTailMs } : { ok: true };
 }
 
@@ -212,12 +214,19 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
  * 末尾の欠け（ms）。stop() が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま会議が確定する。
  * audioFrameCount は heartbeat（1 秒ごと）でも進むので、最後の Chunk の endFrame より大きければ末尾が欠けている
  * （最後の heartbeat より後の 1 秒未満の欠けは検出できない）。
- * 最後の連番が IDB にない（サーバーへ直接送った）ときは endFrame が分からないので 0 を返す。
+ * 最後の連番が IDB にない（サーバーへ直接送った）ときは offIdbEndFrame の値を使い、それも分からなければ 0 を返す。
  */
-export function measureMissingTailMs(audioFrameCount: number, chunks: ReadonlyArray<AudioChunkRecord>, chunkCount: number): number {
+export function measureMissingTailMs(
+  audioFrameCount: number,
+  chunks: ReadonlyArray<AudioChunkRecord>,
+  chunkCount: number,
+  offIdbEndFrame?: (sequenceNo: number) => number | undefined,
+): number {
+  const lastSeq = chunkCount - 1;
   const last = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
-  if (last === undefined || last.meta.sequenceNo !== chunkCount - 1) return 0;
-  return frameToOffsetMs(Math.max(0, audioFrameCount - last.meta.endFrame));
+  const endFrame = last?.meta.sequenceNo === lastSeq ? last.meta.endFrame : offIdbEndFrame?.(lastSeq);
+  if (endFrame === undefined) return 0;
+  return frameToOffsetMs(Math.max(0, audioFrameCount - endFrame));
 }
 
 function errorMessage(error: unknown): string {
