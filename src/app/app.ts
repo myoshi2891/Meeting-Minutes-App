@@ -97,6 +97,8 @@ export class App {
   private readonly heldLocks = new Map<string, () => void>();
   /** heldLocks を借りて確定・中止を実行中の会議。借用中は同じタブの別処理にも貸さない */
   private readonly heldLockBusy = new Set<string>();
+  /** acquireMeetingLock で取得して確定・中止を実行中の会議。取れなかったとき、このタブの使用中か別タブかを区別する */
+  private readonly acquiredLocks = new Set<string>();
   /**
    * 会議ごとのメモリ待機の drain。stop 後に残った末尾を、サーバー復帰時に確定より先に送る。
    * direct：false ならサーバーへの直接送信を試さず、IDB への書き戻しだけ行う（失敗も通知しない）
@@ -242,14 +244,14 @@ export class App {
     let directAllowed = true;
     /** 実行中の drain の直接送信が、送信中のトークン変更で送れなかったか */
     let tokenChangedDuringDrain = false;
-    /** 直接送信を試さない drain の実行中に、直接送信する drain（サーバー復帰）が要求されたか */
+    /** drain の実行中に、直接送信する drain（サーバー復帰・setToken）が要求されたか */
     let directRequestedDuringDrain = false;
     /** notify：空になったら確定を再開させる。onBackendAvailable は自分で確定するので false で呼ぶ */
     const drain = async (notify = true, direct = true): Promise<void> => {
       if (draining) {
-        // サーバー停止中の確定再試行（IDB への書き戻しだけ）がロックを借りている間にサーバーが戻ると、
-        // onBackendAvailable の drain も確定もここで弾かれる。終わってから直接送信で送り直す
-        if (direct && !directAllowed) directRequestedDuringDrain = true;
+        // 確定再試行がロックを借りて drain している間に来たサーバー復帰・setToken の drain と確定は、ここと借用中のロックに弾かれる。
+        // 実行中の drain が IDB への書き戻しだけでも、直接送信の PUT が失敗しても、終わってから直接送信で送り直す
+        if (direct) directRequestedDuringDrain = true;
         return;
       }
       draining = true;
@@ -473,8 +475,9 @@ export class App {
   async abandonFinalize(meetingId: string, confirmed: boolean): Promise<void> {
     if (!confirmed) throw new Error("確定の中止には確認が必要です");
     if (this.session?.meetingId === meetingId) throw new Error("録音中の会議は中止できません");
-    const release = await this.acquireMeetingLock(meetingId);
-    if (release === null) throw new Error("別の処理がこの会議を使用中です。完了後にやり直してください");
+    const lock = await this.acquireMeetingLock(meetingId);
+    if (!lock.ok) throw new Error("別の処理がこの会議を使用中です。完了後にやり直してください");
+    const { release } = lock;
     try {
       const unsaved = await this.saveUnsavedStop(meetingId);
       if (unsaved !== null) throw new Error(`停止状態を保存できていないため中止できません（${unsaved.detail}）`);
@@ -503,8 +506,9 @@ export class App {
 
   /** 会議ロックを取って Barrier を再試行する。別タブが録音・確定中の会議には触らない（§23 と同じ） */
   async retryFinalize(meetingId: string): Promise<FinalizeResult> {
-    const release = await this.acquireMeetingLock(meetingId);
-    if (release === null) return { ok: false, stage: "verify", detail: "meeting is locked by another tab" };
+    const lock = await this.acquireMeetingLock(meetingId);
+    if (!lock.ok) return { ok: false, stage: "verify", detail: lock.heldBy === "this_tab" ? "meeting is busy in this tab" : "meeting is locked by another tab" };
+    const { release } = lock;
     try {
       // メモリ待機が残る会議は、Barrier の前に末尾を IDB へ書き戻すか直接送信する（残れば Barrier が waiting_local_save を返す）。
       // 停止状態を書けていなくても音声は先に送る（IDB が書けないときこそメモリ待機しか残っていない）。確定は下で止める。
@@ -549,14 +553,33 @@ export class App {
     }
   }
 
-  /** 自タブが stop 後も保持しているロックがあれば借り、なければ取りにいく。取れなければ null */
-  private async acquireMeetingLock(meetingId: string): Promise<(() => void) | null> {
-    if (!this.heldLocks.has(meetingId)) return tryAcquireMeetingLock(this.deps.locks, meetingId);
-    if (this.heldLockBusy.has(meetingId)) return null;
-    this.heldLockBusy.add(meetingId);
-    return () => {
-      this.heldLockBusy.delete(meetingId);
-      this.releaseHeldLockIfDrained(meetingId);
+  /**
+   * 自タブが stop 後も保持しているロックがあれば借り、なければ取りにいく。
+   * 取れなければ、このタブの別の処理が使用中（this_tab）か、別タブが保持中（other_tab）かを返す
+   */
+  private async acquireMeetingLock(meetingId: string): Promise<MeetingLockResult> {
+    if (this.heldLocks.has(meetingId)) {
+      if (this.heldLockBusy.has(meetingId)) return { ok: false, heldBy: "this_tab" };
+      this.heldLockBusy.add(meetingId);
+      return {
+        ok: true,
+        release: () => {
+          this.heldLockBusy.delete(meetingId);
+          this.releaseHeldLockIfDrained(meetingId);
+        },
+      };
+    }
+    // 取得を待つ間にこのタブの別の処理が取った場合も、取得失敗の直後にこのタブの使用中と判定する
+    if (this.acquiredLocks.has(meetingId)) return { ok: false, heldBy: "this_tab" };
+    const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
+    if (release === null) return { ok: false, heldBy: this.acquiredLocks.has(meetingId) ? "this_tab" : "other_tab" };
+    this.acquiredLocks.add(meetingId);
+    return {
+      ok: true,
+      release: () => {
+        this.acquiredLocks.delete(meetingId);
+        release();
+      },
     };
   }
 
@@ -771,6 +794,10 @@ export class App {
     }
   }
 }
+
+type MeetingLockResult =
+  | { readonly ok: true; readonly release: () => void }
+  | { readonly ok: false; readonly heldBy: "this_tab" | "other_tab" };
 
 function isUsable(state: LocalBackendHealth): boolean {
   return (state.status === "HEALTHY" || state.status === "DEGRADED") && !state.unauthorized;

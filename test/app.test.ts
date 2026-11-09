@@ -460,12 +460,22 @@ describe("createApp（起動時の配線）", () => {
   it("Scheduler の PUT 前の会議登録が 401 なら、失効の報告は 1 リクエストにつき 1 回だけ", async () => {
     // Arrange：保存済みのトークンが古く、会議登録で 401 になる
     const meetingId = nextMeetingId();
-    const s = await setup({ token: "stale", seed: (db) => seedChunk(db, meetingId, 0, "LOCAL_SAVE_PENDING").then(() => undefined) });
+    // FakeLocalServer は認証で弾いた要求を記録しないので、認証より前で会議登録の POST を数える
+    let posts = 0;
+    const s = await setup({
+      token: "stale",
+      seed: (db) => seedChunk(db, meetingId, 0, "LOCAL_SAVE_PENDING").then(() => undefined),
+      wrapFetch: (fetchImpl) => async (input, init) => {
+        if (String(input).endsWith("/v1/meetings") && init?.method === "POST" && String(init.body).includes(meetingId)) posts++;
+        return fetchImpl(input, init);
+      },
+    });
     const report = vi.spyOn(s.app.monitor, "reportUnauthorized");
     // Act
     await vi.waitFor(() => expect(s.app.monitor.state.unauthorized).toBe(true));
     await vi.waitFor(async () => expect(await s.status(`${meetingId}:mic:000000`)).toBe("BACKEND_UNAVAILABLE"));
     // Assert
+    expect(posts).toBe(1);
     expect(s.server.requests.filter((r) => r === `POST:${meetingId}`)).toHaveLength(0);
     expect(report).toHaveBeenCalledOnce();
   });
@@ -1699,6 +1709,72 @@ describe("RecordingSession.stop", () => {
     sentTail();
     expect(controller.memoryBacklogCount).toBe(0);
     expect(s.events.filter((e) => e.type === "memory_backlog_export_required" && e.meetingId === id)).toHaveLength(1);
+  });
+
+  it("確定前の直接送信の PUT 中に setToken が来て、その PUT が接続失敗したら、drain を終えてから送り直して確定する", async () => {
+    // Arrange：サーバーは HEALTHY。停止後の drain の 1 回目の PUT を止め、接続失敗で返す（tokenChanged ではない）
+    let failPut = (): void => undefined;
+    const putStarted = new Promise<void>((started) => {
+      vi.spyOn(LocalSaver.prototype, "put").mockImplementationOnce(async () => {
+        started();
+        await new Promise<void>((r) => { failPut = r; });
+        return { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } };
+      });
+    });
+    stubPageGlobals();
+    const s = await setup();
+    await settleMonitor(s);
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    const tail = await makeChunkRecord(id, 0, 160);
+    controller.backlog.push(tail);
+    controller.memoryBacklogCount = 1;
+    controller.audioFrameCount = tail.meta.endFrame;
+    const stopped = session.stop();
+    await putStarted;
+    // Act：PUT の応答待ちの間にトークンを保存し直す（復旧の drain は実行中の drain に弾かれる）
+    await s.app.setToken(TOKEN);
+    failPut();
+    // Assert：弾かれた復旧の drain を、確定の前に送り直す
+    expect(await stopped).toMatchObject({ ok: true });
+    expect(s.server.stored.get(`${id}:mic:0`)).toEqual({ sha256: tail.meta.sha256, sizeBytes: tail.meta.sizeBytes });
+    expect(controller.memoryBacklogCount).toBe(0);
+  });
+
+  it("このタブの別の処理がロックを借りている間の確定再試行は、別タブではなくこのタブの使用中として返す", async () => {
+    // Arrange：メモリ待機を残して止めた会議（このタブがロックを保持）の確定再試行が drain を待っている
+    const { s, id, controller } = await stopWithMemoryTail(false);
+    let resumeDrain = (): void => undefined;
+    const drainStarted = new Promise<void>((started) => {
+      vi.spyOn(controller, "drainMemoryBacklog").mockImplementationOnce(async () => {
+        started();
+        await new Promise<void>((r) => { resumeDrain = r; });
+        return 0;
+      });
+    });
+    s.app.monitor.reportUnreachable();
+    const first = s.app.retryFinalize(id);
+    await drainStarted;
+    // Act
+    const second = await s.app.retryFinalize(id);
+    resumeDrain();
+    await first;
+    // Assert
+    expect(second).toEqual({ ok: false, stage: "verify", detail: "meeting is busy in this tab" });
+  });
+
+  it("別タブがロックを持つ会議の確定再試行は、別タブの使用中として返す", async () => {
+    // Arrange
+    const id = nextMeetingId();
+    const s = await setup({ seed: async (db, _server, locks) => {
+      await seedMeeting(db, makeMeeting(id, "stop_requested"));
+      await tryAcquireMeetingLock(locks, id);
+    } });
+    // Act
+    const result = await s.app.retryFinalize(id);
+    // Assert
+    expect(result).toEqual({ ok: false, stage: "verify", detail: "meeting is locked by another tab" });
   });
 
   it("サーバー停止中の確定再試行が IDB への書き戻しを試す間にサーバーが戻ったら、その再試行の中で直接送信して確定する", async () => {
