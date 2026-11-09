@@ -577,7 +577,7 @@ export function jobFromServerRow(row: Record<string, unknown>): JobSummary | nul
 3. App は Mic の `stop()` の直後に `takeMeetingLock()` でロックを受け取り（Phase 1 §31 の `heldLocks`）、`memoryBacklogCount(meetingId)` と `releaseHeldLockIfDrained()` は Mic と System の件数の合計で判定する。合計が 0 になるまでロックを解放しない。
 4. System 側の drain も Mic 側と同じく App の drain 関数で包む。空になったら `releaseHeldLockIfDrained()` を呼び、確定の再試行（`onChunkSaved`）を起こす。サーバー復帰時（`onBackendAvailable`）は Mic と System の両方を drain してから確定を再試行する。Finalizer の `unpersistedChunkCount` も両方の合計を渡す（§7）。`retryFinalize()` が Barrier の前に行う drain（サーバーが使えなければ IDB への書き戻しだけ。送信中のトークン変更で送れなければ drain を終えてから送り直す。Phase 1 §31）も、Mic と System の両方を対象にする。共有の IDB 保存警告を外す判定（`otherMeetingsBacklogCount`）には、他の会議に加えて同じ会議のもう一方の source の Controller も数える。Phase 1 で追加した `onMeetingCreated` は Mic 側で維持し、IDB 障害時の直接送信用の会議情報を保持する。System 側は既存の Mic 会議を使う。
 
-`stop()` の最後の会議レコード保存だけは Phase 1 と形が違う。Phase 1 は Controller が会議レコードを保持し、その `sessionClock` が Controller の時計と同じオブジェクトなので、保存し直すだけで最終 `audioFrameCount` が残る。Phase 2 は `registerMeeting` のため会議レコードを IndexedDB から読み直すので、別オブジェクトになる。そこで Mic 側は、最終 Chunk の書き込み完了後に会議レコードを読み直し、Controller の `SessionClock` を写した新しいオブジェクトとして保存する。`sessionClock` は `readonly` なので、書き換えずに置き換える。最初の読み取り（`meetingStore.get`）に失敗した場合も書き込み失敗と同じく扱い、`requestFlush("stop")` で末尾を Chunk にしてから Worklet を切り離す。最後の保存では `status: "stop_requested"` と、未記録なら最初の停止理由・検出時刻も書く。最初の読み書きに失敗したまま会議が `recording` で残り、停止が完了したことにならないようにするためである。最初の読み取りも最後の読み取りも、エラーなしで会議を見つけられなかった場合は、停止状態を書く先がないので `stop()` を reject する（読み書きの失敗は従来どおり `statusError` で扱い、会議の欠落とは区別する）。完了として返すと、App が停止状態のないまま確定へ進むためである。System 側は会議レコードを持たないので何もしない。
+`stop()` の最後の会議レコード保存だけは Phase 1 と形が違う。Phase 1 は Controller が会議レコードを保持し、その `sessionClock` が Controller の時計と同じオブジェクトなので、保存し直すだけで最終 `audioFrameCount` が残る。Phase 2 は `registerMeeting` のため会議レコードを IndexedDB から読み直すので、別オブジェクトになる。そこで Mic 側は、最終 Chunk の書き込み完了後に会議レコードを読み直し、Controller の `SessionClock` を写した新しいオブジェクトとして保存する。`sessionClock` は `readonly` なので、書き換えずに置き換える。最初の読み取り（`meetingStore.get`）に失敗した場合も書き込み失敗と同じく扱い、`requestFlush("stop")` で末尾を Chunk にしてから Worklet を切り離す。最後の保存では `status: "stop_requested"` と、未記録なら最初の停止理由・検出時刻も書く。最初の読み書きに失敗したまま会議が `recording` で残り、停止が完了したことにならないようにするためである。最後の読み取りがエラーなしで会議を見つけられなかった場合は、最初の読み書きが成功していても、最終の `audioFrameCount` と停止状態を書く先がないので `stop()` を reject する（読み書きの失敗は従来どおり `statusError` で扱い、会議の欠落とは区別する）。完了として返すと、App が最終の停止状態のないまま確定へ進むためである。System 側は会議レコードを持たないので何もしない。
 
 ```typescript
 // src/recording/recording-controller.ts
@@ -835,8 +835,7 @@ export class RecordingController {
     if (this.node === null || this.meetingId === null) return;
     let statusError: unknown = null;
     let finalSaved = false;
-    /** 最初の読み取りも最終の読み取りも、エラーなしで会議を見つけられなかった（stop_requested を書く先がない） */
-    let firstMissing = false;
+    /** 最終の読み取りがエラーなしで会議を見つけられなかった（最終の audioFrameCount と stop_requested を書く先がない） */
     let finalMissing = false;
     try {
       if (this.source === "mic") {
@@ -847,7 +846,6 @@ export class RecordingController {
         } catch (error) {
           statusError = error;
         }
-        if (meeting === undefined && statusError === null) firstMissing = true;
         if (meeting !== undefined) {
           if (meeting.stopReason === undefined) {
             meeting.stopReason = reason;
@@ -878,9 +876,9 @@ export class RecordingController {
       // 最終保存で stop_requested も書けていれば停止は完了。最初の失敗は通知だけにし、App を確定へ進める（Phase 1 §15）
       if (statusError !== null && finalSaved) this.deps.onError(statusError instanceof Error ? statusError : new Error(String(statusError)));
       else if (statusError !== null) throw statusError;
-      // どちらの読み取りでも会議がない。停止状態を保存できていないので、完了として App を確定へ進めない
+      // 最終の読み取りで会議がない。最初の保存が済んでいても最終の停止状態は保存できていないので、完了として App を確定へ進めない
       // （読み取り・書き込みの失敗は上の statusError で扱い、ここでは会議の欠落だけを判定する）
-      else if (firstMissing && finalMissing) throw new Error(`meeting ${this.meetingId} not found; stop state not saved`);
+      else if (finalMissing) throw new Error(`meeting ${this.meetingId} not found; stop state not saved`);
     } finally {
       // 途中で reject してもマイク／画面共有トラックと Worklet を解放する（Phase 1 §15 と同じ）
       this.sourceNode?.disconnect();

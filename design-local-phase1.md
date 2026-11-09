@@ -5152,6 +5152,11 @@ export class App {
         this.deps.onEvent({ type: "error", error });
       }
     }
+    // 最終保存に失敗した会議は IDB の音声フレーム数が古い。状態は IDB のまま、フレーム数は保持中の値を使う
+    for (const [id, pending] of this.unsavedStops) {
+      const stored = listed.get(id);
+      if (stored !== undefined) listed.set(id, { ...stored, sessionClock: { ...pending.sessionClock } });
+    }
     // IDB にはまだ recording のまま残っている会議も、停止済みとして並べる
     const unsaved = [...this.unsavedStops.values()].filter((m) => !listed.has(m.meetingId));
     return [...listed.values(), ...unsaved];
@@ -5429,6 +5434,7 @@ export class App {
     for (const [id, drain] of this.drains) {
       if (id !== this.session?.meetingId && !this.abandoned.has(id) && this.memoryBacklogCount(id) > 0) await drain(false);
     }
+    // 再投入と確定の再試行は別々に失敗させる。IDB の一覧が読めないときこそ、停止状態をメモリで保持する会議の確定が要る
     try {
       const recording = await this.meetingStore.listByStatus("recording");
       const lockedElsewhere = new Set<string>();
@@ -5438,7 +5444,12 @@ export class App {
         if (release === null) lockedElsewhere.add(m.meetingId);
         else release();
       }
+      // 別タブで録音中の会議が分からなければ再投入しない（その会議の Chunk を二重に PUT する）
       await this.scheduler.resumeAll(lockedElsewhere);
+    } catch (error) {
+      this.deps.onEvent({ type: "error", error });
+    }
+    try {
       for (const m of await this.listPendingFinalize()) await this.retryFinalize(m.meetingId);
     } catch (error) {
       this.deps.onEvent({ type: "error", error });
@@ -5457,7 +5468,7 @@ T12：会議ごとに確定の失敗理由と、サーバー登録確認済み�
 
 「確定を中止」は対象のタイトル・ID と音声欠落の可能性を示して確認し、メモリ待機があれば先に WAV を書き出す。会議ロック下で `abandoned` に更新するだけで、音声・会議情報・サーバーデータは削除しない。確定処理中・録音中には中止できない。再読み込み後も一覧から除外し、Scheduler は再投入時と送信前に中止状態を確認する。さらに Scheduler と直接送信の両方が通る `prepareChunkPut()` が、会議登録の完了後・PUT の直前に中止状態を確認する。IDB が読めないときは、読み取りを待つ間にこのタブで中止されていないかを `abandoned` で確かめ直す。そのうえで、このタブが会議ロックを持つ間（録音中、または stop 後もメモリ待機のためにロックを保持中）は送信を止めず、このタブの中止記録（`abandoned`）で判定する。その間に中止できるのはこのタブだけだからである。ロックを持たない会議（Scheduler の PUT）は別タブが中止しうるので、読めなければ中止とも未中止とも断定せず、再試行できる失敗（`UNKNOWN`）で返して PUT を始めない。直接送信の PUT が 401/403 を受けたときは、Scheduler を通らないため App が Monitor へ報告する（会議登録の分は `MeetingRegistrar` が報告済みなので重ねない。トークン未設定の失敗は報告しない）。中止時は Scheduler の待機キーからもその会議を外し（`discardMeeting()`）、backend 停止中でも待機件数に数えない。中止済みなら PUT を始めず non-retryable の失敗を返すので、Scheduler の Chunk は Blob を保持したまま `LOCAL_SAVE_FAILED` になり、直接送信の Chunk はメモリ待機に残って `drainMemoryBacklog()` も止まる。既に送信中の PUT は取り消さず、保存済みの音声も取り消さない。中止を元に戻す操作と WAV の取り込みは今回の範囲外。
 
-停止時に `controller.stop()` が停止状態（`stop_requested`・停止理由）を IDB に書けずに reject した場合も、録音は止まっている。App は開始時に受け取った会議情報（`onMeetingCreated`）に停止状態を載せて `unsavedStops` に残し、`listPendingFinalize()` に `stop_requested` として並べる。`session.stop()` は reject せず、確定できなかった結果を返す。`listPendingFinalize()` は IDB の一覧取得に失敗しても `AppEvent.error` を通知したうえでこの会議を返し、再試行ボタンを出せるようにする。`retryFinalize()` と `abandonFinalize()` は会議ロックを取った後、この停止状態を書き直す。`retryFinalize()` は書き直しより前に、メモリ待機の末尾を drain する（サーバーが使えれば直接送信も試す。IDB が書けないときこそ音声はメモリ待機にしか残らず、書き直しの失敗で止めると次のヘルス状態の変化まで送られない）。IDB を読み直し、`recording` のままなら丸ごと書く。`stop_requested`（最初の保存だけ成功し、flush 後の最終保存がクォータ不足などで失敗した場合）なら、Controller が持つ最終の `sessionClock`（`audioFrameCount`）と、未記録の停止理由だけを載せて書く。最終フレーム数が欠けたまま `totalAudioFrames` を送らず、他タブの確定 POST の失敗で残った値も保つためである。ロックは stop 後に一度手放しているので、別タブが先に進めた会議（`finalizing`・`finalized`・`abandoned`）は上書きしない。書けなければ確定・中止に進まない。`retryFinalize()` は書き直しの失敗も確定の失敗と同じく `finalizeIssues` に記録し、`finalize_pending` で通知する（同じ stage/detail は繰り返さない）。`listPendingFinalize()` は `stop_requested` と `finalizing` の一覧取得を別々に試み、片方だけに失敗しても読めたほうの会議は返す（失敗はそれぞれ `AppEvent.error` で通知する）。2 つの取得の間に `stop_requested` から `finalizing` へ進んだ会議は両方に載るので、会議 ID で 1 行にまとめる（後の取得を残す）。UI は同じ会議の行が重複しない前提に加え、再試行・確定中止のクリック時に `pendingBusy` を確かめ、同じ会議の操作が実行中なら何もしない。Controller は最終保存に失敗するとロックを保持したまま止まり（§15）、App は `takeMeetingLock()` で受け取ったロックを、停止状態を書き直せるまで解放しない。別タブが古い `audioFrameCount` のまま確定しないためである。停止後もメモリ待機が残る会議と、停止状態を書けていない会議は、ページライフサイクルを外さずに残し、`beforeunload` の離脱確認を続ける（タブを閉じると音声、または停止理由と最終の音声フレーム数が失われるため）。メモリ待機が空になり、停止状態も書き直せたら外す。
+停止時に `controller.stop()` が停止状態（`stop_requested`・停止理由）を IDB に書けずに reject した場合も、録音は止まっている。App は開始時に受け取った会議情報（`onMeetingCreated`）に停止状態を載せて `unsavedStops` に残し、`listPendingFinalize()` に `stop_requested` として並べる。`session.stop()` は reject せず、確定できなかった結果を返す。`listPendingFinalize()` は IDB の一覧取得に失敗しても `AppEvent.error` を通知したうえでこの会議を返し、再試行ボタンを出せるようにする。`retryFinalize()` と `abandonFinalize()` は会議ロックを取った後、この停止状態を書き直す。`retryFinalize()` は書き直しより前に、メモリ待機の末尾を drain する（サーバーが使えれば直接送信も試す。IDB が書けないときこそ音声はメモリ待機にしか残らず、書き直しの失敗で止めると次のヘルス状態の変化まで送られない）。IDB を読み直し、`recording` のままなら丸ごと書く。`stop_requested`（最初の保存だけ成功し、flush 後の最終保存がクォータ不足などで失敗した場合）なら、Controller が持つ最終の `sessionClock`（`audioFrameCount`）と、未記録の停止理由だけを載せて書く。最終フレーム数が欠けたまま `totalAudioFrames` を送らず、他タブの確定 POST の失敗で残った値も保つためである。ロックは stop 後に一度手放しているので、別タブが先に進めた会議（`finalizing`・`finalized`・`abandoned`）は上書きしない。書けなければ確定・中止に進まない。`retryFinalize()` は書き直しの失敗も確定の失敗と同じく `finalizeIssues` に記録し、`finalize_pending` で通知する（同じ stage/detail は繰り返さない）。`listPendingFinalize()` は `stop_requested` と `finalizing` の一覧取得を別々に試み、片方だけに失敗しても読めたほうの会議は返す（失敗はそれぞれ `AppEvent.error` で通知する）。2 つの取得の間に `stop_requested` から `finalizing` へ進んだ会議は両方に載るので、会議 ID で 1 行にまとめる（後の取得を残す）。最終保存に失敗して `unsavedStops` に残る会議が IDB にもある（最初の `stop_requested` だけ書けた）場合は、状態は IDB の値のまま、`sessionClock` だけ保持中の値（最終の `audioFrameCount`）に置き換えて返す。内訳の末尾の網羅確認を古いフレーム数で行わないためである。サーバー復帰時（`onBackendAvailable()`）の Chunk の再投入と確定の再試行は、別々に失敗させる。`recording` の一覧が読めないと別タブで録音中の会議が分からないので再投入はしない（二重 PUT を避ける）が、確定待ちの会議の確定は続けて再試行する。UI は同じ会議の行が重複しない前提に加え、再試行・確定中止のクリック時に `pendingBusy` を確かめ、同じ会議の操作が実行中なら何もしない。Controller は最終保存に失敗するとロックを保持したまま止まり（§15）、App は `takeMeetingLock()` で受け取ったロックを、停止状態を書き直せるまで解放しない。別タブが古い `audioFrameCount` のまま確定しないためである。停止後もメモリ待機が残る会議と、停止状態を書けていない会議は、ページライフサイクルを外さずに残し、`beforeunload` の離脱確認を続ける（タブを閉じると音声、または停止理由と最終の音声フレーム数が失われるため）。メモリ待機が空になり、停止状態も書き直せたら外す。
 
 `retryFinalize()` は、メモリ待機が残る会議（録音中を除く）について、Barrier の前に drain する。停止直後や「再試行」ボタンでも、サーバー復帰の通知を待たずに末尾を IDB へ書き戻す・送るためである。サーバーが使えない（`HEALTHY` / `DEGRADED` かつ未失効でない）ときは IDB への書き戻しだけ試し、直接送信は試さない（`directSaver` が送信前に失敗を返す）。この失敗では停止時の `memory_backlog_export_required` を重ねて通知しない。drain の直接送信が送信中のトークン変更（`tokenChanged`）で送れなかったときは通知せず、drain を終えた直後に同じ引数で drain し直す（`setToken` からの drain は実行中の drain に弾かれているため）。並行はしない。同じく、サーバーが使えない間の確定再試行が IDB への書き戻しだけを試している最中にサーバーが戻ると、`onBackendAvailable()` の drain は実行中の drain に、確定は借用中の会議ロックに弾かれる。そこで直接送信を試さない drain の実行中に直接送信の drain が要求されたら記録し、drain を終えた直後に直接送信で drain し直す。確定再試行の中なら、その再試行が続けて Barrier を通すので、次の復帰イベントや手動再試行を待たない。確定待ちの内訳（`pendingCountsText`）には、このタブの直接送信とメモリ待機の連番（`App.offIdbSequenceNos()`）も渡し、件数ではなく連番で欠番を判定する。メモリ待機の連番が IDB の最大の連番より後ろにあると、件数の比較では欠番を見逃すためである。再読み込み後は直接送信の連番が分からないので、IDB の連番だけで判定し、欠けがあれば「実際はこれより多い可能性」と示す。
 
