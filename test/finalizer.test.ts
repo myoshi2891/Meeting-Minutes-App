@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { finalizeMeeting, type FinalizerDeps } from "../src/recording/finalizer";
+import { finalizeMeeting, measureMissingTailMs, type FinalizerDeps } from "../src/recording/finalizer";
 import type { MeetingRecord } from "../src/types/recording";
 import { LocalSaver } from "../src/api/local-saver";
 import { BASE_URL, createHarness, makeChunkRecord, TOKEN, type Harness } from "./harness";
@@ -28,7 +28,7 @@ function meeting(): MeetingRecord {
 /** seq 0..n-1 を保存し、Scheduler 経由でサーバーへ送り切る。録音した長さは stop() の flush 後と同じく最後の Chunk の終わりに揃える */
 async function recordAndSave(h: Harness, n: number): Promise<void> {
   const m = meeting();
-  if (n > 0) m.sessionClock.audioFrameCount = (n - 1) * 480000 + 1600;
+  m.sessionClock.audioFrameCount = n > 0 ? (n - 1) * 480000 + 1600 : 0;
   await h.meetingStore.put(m);
   for (let seq = 0; seq < n; seq++) {
     const r = await makeChunkRecord(MEETING_ID, seq, 1600);
@@ -407,6 +407,20 @@ describe("finalizeMeeting（末尾の欠けの検出、T1-e）", () => {
     await h.meetingStore.put({ ...m, sessionClock: { ...m.sessionClock, audioFrameCount: 481600 } });
     // Act / Assert
     expect(await finalizeMeeting(deps(h), MEETING_ID)).toEqual({ ok: true });
+  });
+
+  it("Chunk が 1 件もなく録音した長さがあれば、全体を末尾の欠けとして返す", () => {
+    // Arrange：stop() が Worklet の応答を待てず、最初の Chunk も届かなかった（2 秒分）
+    const audioFrameCount = 2 * 16000;
+    // Act
+    const missing = measureMissingTailMs(audioFrameCount, [], 0, () => undefined);
+    // Assert
+    expect(missing).toBe(2000);
+  });
+
+  it("Chunk が 1 件もなく録音した長さもなければ欠けは 0", () => {
+    // Act / Assert
+    expect(measureMissingTailMs(0, [], 0)).toBe(0);
   });
 });
 

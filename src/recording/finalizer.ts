@@ -217,6 +217,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
  * audioFrameCount は heartbeat（1 秒ごと）でも進むので、最後の Chunk の endFrame より大きければ末尾が欠けている
  * （最後の heartbeat より後の 1 秒未満の欠けは検出できない）。
  * 最後の連番が IDB にない（サーバーへ直接送った）ときは offIdbEndFrame の値を使い、それも分からなければ 0 を返す。
+ * Chunk が 1 件もなければ（chunkCount === 0）終わりを 0 とし、audioFrameCount 全体を欠けとして返す。
  */
 export function measureMissingTailMs(
   audioFrameCount: number,
@@ -226,7 +227,8 @@ export function measureMissingTailMs(
 ): number {
   const lastSeq = chunkCount - 1;
   const last = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
-  const endFrame = last?.meta.sequenceNo === lastSeq ? last.meta.endFrame : offIdbEndFrame?.(lastSeq);
+  // Chunk が 1 件もなければ録音した長さ全体が欠けている
+  const endFrame = chunkCount === 0 ? 0 : last?.meta.sequenceNo === lastSeq ? last.meta.endFrame : offIdbEndFrame?.(lastSeq);
   if (endFrame === undefined) return 0;
   return frameToOffsetMs(Math.max(0, audioFrameCount - endFrame));
 }
