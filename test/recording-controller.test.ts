@@ -716,7 +716,9 @@ describe("RecordingController", () => {
     // Act
     await Promise.allSettled([s.controller.drainMemoryBacklog(), s.controller.drainMemoryBacklog()]);
     // Assert：外した Chunk はすべてサーバーに登録済み（送れなかった 2 件目を取りこぼさない）
-    expect(registered.size + s.controller.memoryBacklogCount).toBe(2);
+    const retained = s.controller.exportMemoryBacklog().map((f) => makeChunkKey(f.meta.meetingId, f.meta.source, f.meta.sequenceNo));
+    expect(registered.size + retained.length).toBe(2);
+    expect(new Set([...registered, ...retained])).toEqual(new Set(["m1:mic:000000", "m1:mic:000001"]));
     expect(registered.has("m1:mic:000000")).toBe(true);
   });
 

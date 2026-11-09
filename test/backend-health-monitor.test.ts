@@ -249,14 +249,15 @@ describe("BackendHealthMonitor.checkOnce", () => {
     });
     const stale = m.checkOnce();
     token = "new";
-    const fresh = m.checkOnce();
-    // Act：古いチェックの 401 が先に届く
-    releaseStale();
-    await stale;
-    const state = await fresh;
-    // Assert
+    // Act：新しいトークンのチェックが終わってから、古いチェックの 401 が遅れて届く
+    const state = await m.checkOnce();
     expect(state.unauthorized).toBe(false);
     expect(state.status).toBe("HEALTHY");
+    releaseStale();
+    await stale;
+    // Assert
+    expect(m.state.unauthorized).toBe(false);
+    expect(m.state.status).toBe("HEALTHY");
   });
 
   it("応答待ちの間にトークンが差し替わったら、古いトークンの成功応答で unauthorized を解除しない", async () => {
