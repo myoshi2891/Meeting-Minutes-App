@@ -225,6 +225,8 @@ def test_stop_metadata_persists_across_restart_and_first_finalize_wins(tmp_path)
         client.post("/v1/meetings", json=meeting(), headers=auth)
         # Act
         assert client.post("/v1/meetings/m-1/finalize", json=body, headers=auth).status_code == 200
+        # 再試行で snapshot を書き直すことを確かめるため、最初の確定の snapshot を消しておく
+        (tmp_path / "recordings/m-1/meeting.json").unlink()
         changed = {**body, "stopReason": "manual", "stopDetectedAtEpochMs": 1900}
         assert client.post("/v1/meetings/m-1/finalize", json=changed, headers=auth).status_code == 200
     # Assert
