@@ -180,6 +180,10 @@ export class MeetingStore {
   constructor(private readonly db: IDBDatabase) {}
 
   async put(record: MeetingRecord): Promise<void> {
+    // 停止理由と検出時刻は組で保存する（両方省略は旧データ・未観測）。片方だけの会議はサーバーの確定が 422 で止まる
+    if ((record.stopReason === undefined) !== (record.stopDetectedAtEpochMs === undefined)) {
+      throw new Error(`meeting ${record.meetingId}: stopReason and stopDetectedAtEpochMs must be saved together`);
+    }
     const tx = this.db.transaction(STORE_MEETINGS, "readwrite");
     tx.objectStore(STORE_MEETINGS).put(record);
     await transactionDone(tx);
