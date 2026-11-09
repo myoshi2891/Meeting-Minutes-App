@@ -462,6 +462,7 @@ export class App {
       this.finalizeRequested.delete(meetingId);
       this.finalizeIssues.delete(meetingId);
       this.mismatchRechecked.delete(meetingId);
+      this.releaseSettledMeeting(meetingId);
       this.deps.onEvent({ type: "finalize_abandoned", meetingId });
     } finally {
       release();
@@ -540,6 +541,17 @@ export class App {
     if (this.memoryBacklogCount(meetingId) > 0 || this.unsavedStops.has(meetingId)) return;
     this.lifecycles.get(meetingId)?.detach();
     this.lifecycles.delete(meetingId);
+  }
+
+  /**
+   * 確定・確定中止した会議の controller・drain・会議の控えを手放す。毎フレームのメモリ待機の集計に残さない。
+   * メモリ待機（書き出しに使う）や書けていない停止状態が残る間は、復旧と書き出しに要るので保つ
+   */
+  private releaseSettledMeeting(meetingId: string): void {
+    if (this.session?.meetingId === meetingId || this.memoryBacklogCount(meetingId) > 0 || this.unsavedStops.has(meetingId)) return;
+    this.controllers.delete(meetingId);
+    this.drains.delete(meetingId);
+    this.meetingFallbacks.delete(meetingId);
   }
 
   /** 確定できなかった理由を記録し、前回と変わったときだけ finalize_pending を通知する */
@@ -622,6 +634,7 @@ export class App {
         // 確定待ちの内訳と末尾の欠けの計測（finalizeOnce 内で済み）にしか使わないので、確定したら消す
         this.directRegistered.delete(meetingId);
         this.directRegisteredEndFrames.delete(meetingId);
+        this.releaseSettledMeeting(meetingId);
       } else this.recordFinalizeIssue(meetingId, result);
       return result;
     };

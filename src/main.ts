@@ -14,7 +14,8 @@ import {
   TAB_CLOSE_HELP,
   warningsFor,
 } from "./ui/recording-view";
-import { confirmAbandon } from "./ui/pending-actions";
+import { confirmAbandon, manualRetryNeedsNotice } from "./ui/pending-actions";
+import { buildStoredZip } from "./export/zip";
 import type { MemoryBacklogFile } from "./recording/recording-controller";
 import workletModuleUrl from "./worklet/pcm-chunker.worklet.ts?worker&url";
 
@@ -171,10 +172,12 @@ async function renderPending(app: App): Promise<void> {
         // 再試行中は確定中止も押せないようにする（会議ロックの取り合いで「使用中」になるだけのため）
         retry.disabled = abandon.disabled = true;
         pendingBusy.add(m.meetingId);
+        const before = app.getFinalizeIssue(m.meetingId);
         void app
           .retryFinalize(m.meetingId)
           .then((result) => {
-            if (!result.ok && app.getFinalizeIssue(m.meetingId) !== result) notify(`${m.title}: ${finalizeResultText(result)}`);
+            // 前回と同じ理由の失敗は自動通知が出ないので、押した結果が分かるようにここで出す
+            if (!result.ok && manualRetryNeedsNotice(before, app.getFinalizeIssue(m.meetingId), result)) notify(`${m.title}: ${finalizeResultText(result)}`);
           })
           .catch((error: unknown) => notify(noticeFor({ type: "error", error }) ?? ""))
           .finally(() => { pendingBusy.delete(m.meetingId); void refreshPending(app); });
@@ -277,26 +280,34 @@ async function stopRecording(app: App): Promise<void> {
 }
 
 /** §15：メモリ待機中の Chunk を利用者の手元へ書き出す（メモリ待機からは外さない） */
-function exportMemoryBacklog(): void {
+async function exportMemoryBacklog(): Promise<void> {
   // 空になった controller は外す（drainMemoryBacklog でサーバーへ送れた場合など）
   for (const controller of stoppedWithBacklog) {
     if (controller.memoryBacklogCount === 0) stoppedWithBacklog.delete(controller);
   }
   const controllers = recording === null ? [...stoppedWithBacklog] : [recording.session.controller, ...stoppedWithBacklog];
-  for (const controller of controllers) {
-    downloadWavs(controller.exportMemoryBacklog());
-  }
+  await downloadWavs(controllers.flatMap((controller) => controller.exportMemoryBacklog()));
 }
 
-function downloadWavs(files: readonly MemoryBacklogFile[]): void {
-  for (const file of files) {
-    const url = URL.createObjectURL(file.wav);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = file.fileName;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 0);
-  }
+/** ダウンロードの開始後、URL を破棄するまでの猶予。すぐ破棄すると保存先の確認中に失敗することがある */
+const DOWNLOAD_URL_TTL_MS = 60_000;
+
+/**
+ * WAV を 1 回のダウンロードで渡す。複数あれば無圧縮 ZIP にまとめる（Chrome は連続した自動ダウンロードを確認なしに止めることがある）。
+ * 入れたファイル名を通知欄に出し、利用者が保存したファイルの中身と照らせるようにする
+ */
+async function downloadWavs(files: readonly MemoryBacklogFile[]): Promise<void> {
+  if (files.length === 0) return;
+  const single = files.length === 1 ? files[0] : undefined;
+  const fileName = single?.fileName ?? `memory-backlog_${new Date().toISOString().replace(/[:.]/g, "-")}.zip`;
+  const blob = single?.wav ?? await buildStoredZip(files.map((f) => ({ name: f.fileName, data: f.wav })), new Date());
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), DOWNLOAD_URL_TTL_MS);
+  notify(single !== undefined ? `書き出し: ${fileName}` : `書き出し: ${fileName}（${files.length} 件: ${files.map((f) => f.fileName).join(", ")}）`);
 }
 
 function onEvent(event: AppEvent): void {
@@ -336,7 +347,9 @@ async function main(): Promise<void> {
 
   ui.start.addEventListener("click", () => void startRecording(app));
   ui.stop.addEventListener("click", () => void stopRecording(app));
-  ui.exportButton.addEventListener("click", exportMemoryBacklog);
+  ui.exportButton.addEventListener("click", () => {
+    void exportMemoryBacklog().catch((error: unknown) => notify(noticeFor({ type: "error", error }) ?? ""));
+  });
   ui.tokenForm.addEventListener("submit", (e) => {
     e.preventDefault();
     const token = ui.token.value.trim();

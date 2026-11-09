@@ -1507,6 +1507,19 @@ describe("RecordingSession.stop", () => {
     expect(s.app.exportMemoryBacklog(id)).toEqual([{ fileName: `${id}_mic_000000.wav`, wav: tail.wav, meta: tail.meta }]);
   });
 
+  it("確定した会議の controller は保持をやめ、以後のメモリ待機の集計で読まない", async () => {
+    // Arrange：通常どおり録音して確定する
+    stubPageGlobals();
+    const s = await setup();
+    const session = await s.app.startRecording(startInput(nextMeetingId()));
+    expect(await session.stop()).toMatchObject({ ok: true });
+    // Act：確定後の controller の値を変えても
+    s.controllers[0].memoryBacklogCount = 3;
+    // Assert：App はもう数えない（毎フレームの走査に残らない）
+    expect(s.app.memoryBacklogCount()).toBe(0);
+    expect(s.app.memoryBacklogCount(session.meetingId)).toBe(0);
+  });
+
   it("確定を中止した会議も、メモリ待機の末尾を WAV として書き出せる", async () => {
     // Arrange：サーバー停止中に末尾をメモリ待機に残して止めた
     const { s, id, controller } = await stopWithMemoryTail(false);
