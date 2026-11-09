@@ -1076,6 +1076,30 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(s.events).toContainEqual({ type: "error", error });
   });
 
+  it("最終保存に失敗した会議は、IDB の古い音声フレーム数でなく保持中の値で確定待ちに返し、IDB の状態は保つ", async () => {
+    // Arrange：stop_requested は書けたが（フレーム数 0）、最終保存とその後の書き直しに失敗した
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    s.controllers[0].audioFrameCount = 1_600;
+    const put = s.app.meetingStore.put.bind(s.app.meetingStore);
+    let puts = 0;
+    const spy = vi.spyOn(s.app.meetingStore, "put").mockImplementation(async (meeting) => {
+      if (++puts >= 2) throw new DOMException("quota", "QuotaExceededError");
+      return put(meeting);
+    });
+    await session.stop();
+    spy.mockRestore();
+    expect((await s.app.meetingStore.get(id))?.sessionClock.audioFrameCount).toBe(0);
+    // Act
+    const pending = await s.app.listPendingFinalize();
+    // Assert：内訳の末尾の網羅確認は最終のフレーム数で行う
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ meetingId: id, status: "stop_requested" });
+    expect(pending[0].sessionClock.audioFrameCount).toBe(1_600);
+  });
+
   it("2 つの一覧取得の間に状態が進んで両方に載った会議は、確定待ちに 1 行だけ返す", async () => {
     // Arrange：stop_requested の取得後、別タブが finalizing に進めた
     const id = nextMeetingId();
@@ -1155,6 +1179,35 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(result.ok).toBe(true);
     expect((await s.app.meetingStore.get(meetingId))?.status).toBe("finalized");
     expect(s.events).toContainEqual({ type: "finalized", meetingId });
+  });
+
+  it("サーバー復帰時に録音中の会議の一覧取得が失敗しても、確定待ちの会議の確定は再試行する", async () => {
+    // Arrange：サーバー停止中に止めた会議。復帰時の recording 一覧だけ IDB から読めない
+    const meetingId = nextMeetingId();
+    const s = await setup({
+      serverUp: false,
+      seed: async (db, server) => {
+        const r = await seedChunk(db, meetingId, 0, "DB_REGISTERED");
+        registerOnServer(server, r);
+        await seedMeeting(db, makeMeeting(meetingId, "stop_requested", r.meta.endFrame));
+      },
+    });
+    await s.app.whenBackendRecoverySettled();
+    const list = s.app.meetingStore.listByStatus.bind(s.app.meetingStore);
+    const error = new Error("IDB read failed");
+    vi.spyOn(s.app.meetingStore, "listByStatus").mockImplementation(async (status) => {
+      if (status === "recording") throw error;
+      return list(status);
+    });
+    const resume = vi.spyOn(s.app.scheduler, "resumeAll");
+    // Act
+    s.server.up = true;
+    await s.app.monitor.checkOnce();
+    await s.app.whenBackendRecoverySettled();
+    // Assert：別タブで録音中の会議が分からないので再投入はしないが、確定は止めない
+    expect((await s.app.meetingStore.get(meetingId))?.status).toBe("finalized");
+    expect(resume).not.toHaveBeenCalled();
+    expect(s.events).toContainEqual({ type: "error", error });
   });
 
   it("retryFinalize は別タブがロックを持つ会議に触らない", async () => {

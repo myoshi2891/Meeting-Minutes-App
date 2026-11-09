@@ -398,6 +398,11 @@ export class App {
         this.deps.onEvent({ type: "error", error });
       }
     }
+    // 最終保存に失敗した会議は IDB の音声フレーム数が古い。状態は IDB のまま、フレーム数は保持中の値を使う
+    for (const [id, pending] of this.unsavedStops) {
+      const stored = listed.get(id);
+      if (stored !== undefined) listed.set(id, { ...stored, sessionClock: { ...pending.sessionClock } });
+    }
     // IDB にはまだ recording のまま残っている会議も、停止済みとして並べる
     const unsaved = [...this.unsavedStops.values()].filter((m) => !listed.has(m.meetingId));
     return [...listed.values(), ...unsaved];
@@ -675,6 +680,7 @@ export class App {
     for (const [id, drain] of this.drains) {
       if (id !== this.session?.meetingId && !this.abandoned.has(id) && this.memoryBacklogCount(id) > 0) await drain(false);
     }
+    // 再投入と確定の再試行は別々に失敗させる。IDB の一覧が読めないときこそ、停止状態をメモリで保持する会議の確定が要る
     try {
       const recording = await this.meetingStore.listByStatus("recording");
       const lockedElsewhere = new Set<string>();
@@ -684,7 +690,12 @@ export class App {
         if (release === null) lockedElsewhere.add(m.meetingId);
         else release();
       }
+      // 別タブで録音中の会議が分からなければ再投入しない（その会議の Chunk を二重に PUT する）
       await this.scheduler.resumeAll(lockedElsewhere);
+    } catch (error) {
+      this.deps.onEvent({ type: "error", error });
+    }
+    try {
       for (const m of await this.listPendingFinalize()) await this.retryFinalize(m.meetingId);
     } catch (error) {
       this.deps.onEvent({ type: "error", error });
