@@ -239,6 +239,35 @@ describe("ブラウザクラッシュ後の復旧", () => {
     expect(report.requeuedChunks).toBe(0);
   });
 
+  it("停止理由と検出時刻の片方だけが残った会議は両方を外して直し、起動も他の会議の復旧も止めない", async () => {
+    // Arrange：MeetingStore.put は片方だけの会議を拒否するので、壊れた行は IDB へ直接書く
+    const h = await createHarness();
+    const rawPut = (meeting: MeetingRecord & Record<string, unknown>) => new Promise<void>((resolve, reject) => {
+      const tx = h.db.transaction("meetings", "readwrite");
+      tx.objectStore("meetings").put(meeting);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    await rawPut({ ...meetingOf("pair-rec", "recording"), stopReason: "manual" });
+    await rawPut({ ...meetingOf("pair-stop", "stop_requested"), stopDetectedAtEpochMs: 5 });
+    await h.meetingStore.put(meetingOf("pair-ok", "recording"));
+    const r = await makeChunkRecord("pair-rec", 0, 160);
+    await h.chunkStore.putChunk(r);
+    // Act
+    const report = await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    // Assert：音声と停止状態の復旧は残し、確定（put・サーバーの 422）で止まらないよう未観測として扱う
+    const ids = report.interruptedMeetings.map((m) => m.meetingId).filter((id) => id.startsWith("pair-"));
+    expect(ids.sort()).toEqual(["pair-ok", "pair-rec", "pair-stop"]);
+    const rec = await h.meetingStore.get("pair-rec");
+    expect(rec).toMatchObject({ status: "stop_requested", sessionClock: { audioFrameCount: r.meta.endFrame } });
+    expect(rec?.stopReason).toBeUndefined();
+    const stop = await h.meetingStore.get("pair-stop");
+    expect(stop?.status).toBe("stop_requested");
+    expect(stop?.stopDetectedAtEpochMs).toBeUndefined();
+    expect((await h.meetingStore.get("pair-ok"))?.status).toBe("stop_requested");
+    expect(await h.chunkStore.getChunk(r.chunkKey)).toBeDefined();
+  });
+
   it("中断状態（GENERATED / SAVING）だけを書き戻し、non-retryable の LOCAL_SAVE_FAILED と SAVED は再送しない", async () => {
     // Arrange
     const h = await createHarness();

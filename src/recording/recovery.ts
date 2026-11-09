@@ -20,6 +20,7 @@ export interface RecoveryReport {
  * - recording のまま残っていた会議は stop_requested に落とす（音声はもう来ない）
  *   audioFrameCount は stop() でしか永続化されないため、保存済み Chunk の最大 endFrame から復元する
  * - stop_requested でも audioFrameCount が保存済み Chunk の最大 endFrame より小さければ補う（flush 後の最終保存の前に落ちた会議）
+ * - 停止理由と検出時刻の片方だけが残った会議は両方を外して書き直す（put が拒否して起動ごと止まらないように）
  * - 会議ロック（§15）が保持中の会議は別タブで録音中なので、会議も Chunk も触らない
  */
 export async function recoverOnStartup(
@@ -64,9 +65,18 @@ export async function recoverOnStartup(
         // stop_requested でも、flush 後の最終保存の前に落ちた会議は値が古いので補う（書き直しを持つ App のメモリは再読み込みで失われる）
         // 一覧の m はロック前の値。一覧取得後に停止処理が書いた audioFrameCount などを巻き戻さないよう、ロック後に読み直した current を書く
         const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
-        if (current.status === "recording" || (current.status === "stop_requested" && lastEndFrame > current.sessionClock.audioFrameCount)) {
+        // 停止理由と検出時刻の片方だけの行（壊れた行など）は put が拒否して起動ごと止まり、サーバーの確定も 422 になる。両方を外して未観測として扱う
+        const incompleteStop = (current.stopReason === undefined) !== (current.stopDetectedAtEpochMs === undefined);
+        if (incompleteStop) {
+          delete current.stopReason;
+          delete current.stopDetectedAtEpochMs;
+        }
+        const needsFrames = current.status === "recording" || (current.status === "stop_requested" && lastEndFrame > current.sessionClock.audioFrameCount);
+        if (needsFrames) {
           current.sessionClock.audioFrameCount = Math.max(current.sessionClock.audioFrameCount, lastEndFrame);
           current.status = "stop_requested";
+        }
+        if (needsFrames || incompleteStop) {
           current.updatedAt = Date.now();
           await meetingStore.put(current);
         }
