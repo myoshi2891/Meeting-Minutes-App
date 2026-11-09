@@ -234,21 +234,25 @@ export class LocalSaveScheduler {
     if (abandoned === true) return;
     // 読み込み・中止判定を待つ間に別タブが送信を始めていることがある。古い record ではなく、
     // 同じトランザクションで現在の状態を確かめてから SAVING を確保する
-    const claim: { attempts: number | null; notYet: boolean } = { attempts: null, notYet: false };
+    const claim: { attempts: number | null; retryInMs: number | null } = { attempts: null, retryInMs: null };
     await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
       // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
       // SAVED（ファイル保存済み・DB 未登録）の登録確認は Finalizer のサーバー一覧照合に任せる
       if (r.save.status === "DB_REGISTERED" || r.save.status === "SAVED" || r.save.status === "SAVING") return;
       if (r.save.status === "RETRYING" && r.save.nextRetryAt !== null && r.save.nextRetryAt > this.deps.now()) {
-        claim.notYet = true;
+        claim.retryInMs = r.save.nextRetryAt - this.deps.now();
         return;
       }
       r.save.status = "SAVING";
       r.save.attempts += 1;
       claim.attempts = r.save.attempts;
     });
-    if (claim.notYet) {
-      this.insertSorted(chunkKey);
+    if (claim.retryInMs !== null) {
+      // 期限前に再投入された。すぐ戻すと pump が期限まで同じ Chunk を回し続けるので、残り時間だけ待ってから戻す
+      this.deps.setTimer(() => {
+        this.insertSorted(chunkKey);
+        void this.pump();
+      }, claim.retryInMs);
       return;
     }
     const attempts = claim.attempts;
@@ -258,15 +262,16 @@ export class LocalSaveScheduler {
     const outcome = await saver.put(record);
 
     if (outcome.ok) {
-      await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+      this.deps.health.lastSuccessfulLocalSaveAt = this.deps.now();
+      // 送信中に別タブの復旧が新しい試行で確保し直していたら、その試行の状態を上書きしない（結果はその試行が書く）
+      const owned = await this.updateClaimed(chunkKey, attempts, (r) => {
         r.save.status = outcome.registered ? "DB_REGISTERED" : "SAVED";
         r.save.savedVia = "api";
         r.save.serverPath = outcome.serverPath;
         r.save.lastError = null;
         r.save.nextRetryAt = null;
       });
-      this.deps.health.lastSuccessfulLocalSaveAt = this.deps.now();
-      this.deps.onChunkSaved?.(record.meta.meetingId);
+      if (owned) this.deps.onChunkSaved?.(record.meta.meetingId);
       return;
     }
 
@@ -330,7 +335,7 @@ export class LocalSaveScheduler {
   }
 
   /**
-   * 失敗の書き戻し。このタブが確保した SAVING（attempts が確保時の値）のままのときだけ mutate を適用し、適用したかを返す。
+   * 結果の書き戻し。このタブが確保した SAVING（attempts が確保時の値）のままのときだけ mutate を適用し、適用したかを返す。
    * 送信中に別タブの復旧が書き戻して送り直した・保存を終えた Chunk の状態は上書きしない（再投入もそのタブに任せる）。
    */
   private async updateClaimed(chunkKey: string, attempts: number, mutate: (record: AudioChunkRecord) => void): Promise<boolean> {

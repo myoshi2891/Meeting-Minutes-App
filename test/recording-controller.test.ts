@@ -80,6 +80,8 @@ interface Setup {
   errors: Error[];
   locks: FakeLockManager;
   track: EventTarget & { stop: ReturnType<typeof vi.fn>; readyState: MediaStreamTrackState };
+  /** 次の録音用に新しいマイクのトラックへ差し替える（止めたトラックは ended のまま残る） */
+  useFreshTrack: () => Setup["track"];
   audioContext: AudioContext;
   /** コントローラが持つ AudioWorkletNode 側のポート（onmessage の解除を確認する） */
   nodePort: MessagePort;
@@ -104,7 +106,13 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
       readonly port = channel.port1;
     },
   );
-  const track = Object.assign(new EventTarget(), { stop: vi.fn(), readyState: "live" as MediaStreamTrackState });
+  type Track = Setup["track"];
+  /** ブラウザと同じく stop() で ended になるトラック */
+  const makeTrack = (): Track => {
+    const t: Track = Object.assign(new EventTarget(), { stop: vi.fn(() => { t.readyState = "ended"; }), readyState: "live" as MediaStreamTrackState });
+    return t;
+  };
+  let track = makeTrack();
   const audioContext = {
     sampleRate: 48000,
     currentTime: 0,
@@ -112,6 +120,10 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
     createMediaStreamSource: () => ({ connect: vi.fn(), disconnect: vi.fn() }),
   } as unknown as AudioContext;
   const mediaStream = { getAudioTracks: () => [track] } as unknown as MediaStream;
+  const useFreshTrack = (): Track => {
+    track = makeTrack();
+    return track;
+  };
   const enqueued: string[] = [];
   const health = createHealth();
   const errors: Error[] = [];
@@ -145,7 +157,7 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
   };
   const until = (condition: () => boolean) => signal.until(condition);
   const untilCommand = (type: WorkletCommand["type"]) => until(() => worklet.commands.some((c) => c.type === type));
-  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, locks, track, audioContext, nodePort: channel.port1, fireTimers, until, untilCommand };
+  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, locks, track, useFreshTrack, audioContext, nodePort: channel.port1, fireTimers, until, untilCommand };
 }
 
 describe("makeChunkKey / sha256Hex", () => {
@@ -644,6 +656,31 @@ describe("RecordingController", () => {
     expect(s.controller.memoryBacklogCount).toBe(0);
   });
 
+  it("drain が重なっても順に処理し、送れなかった Chunk を別の drain がメモリ待機から外さない", async () => {
+    // Arrange：IDB に書けない Chunk が 2 件メモリ待機にあり、2 件目の直接送信は 1 回目だけ失敗する
+    const registered = new Set<string>();
+    let failSecond = true;
+    const s = await setup(closedStore, {
+      put: async (r) => {
+        if (r.meta.sequenceNo === 1 && failSecond) {
+          failSecond = false;
+          return { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } };
+        }
+        registered.add(r.chunkKey);
+        return { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false };
+      },
+    });
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.sendChunk(1600);
+    s.worklet.sendChunk(1600);
+    await s.until(() => s.errors.length >= 2);
+    // Act
+    await Promise.allSettled([s.controller.drainMemoryBacklog(), s.controller.drainMemoryBacklog()]);
+    // Assert：外した Chunk はすべてサーバーに登録済み（送れなかった 2 件目を取りこぼさない）
+    expect(registered.size + s.controller.memoryBacklogCount).toBe(2);
+    expect(registered.has("m1:mic:000000")).toBe(true);
+  });
+
   it("drain でメモリ待機が空になったら IDB の劣化理由だけを外し、他の劣化理由は残す", async () => {
     // Arrange
     const s = await setup(closedStore, {
@@ -726,10 +763,11 @@ describe("RecordingController", () => {
     await s.controller.start("m1", "定例", 1);
     s.track.dispatchEvent(new Event("ended"));
     await s.controller.stop();
-    // Act
+    // Act：次の録音は新しく取得したトラックで行う
+    const next = s.useFreshTrack();
     await s.controller.start("m2", "定例", 1);
     expect(s.health.degradedReasons).toEqual([]);
-    s.track.dispatchEvent(new Event("ended"));
+    next.dispatchEvent(new Event("ended"));
     // Assert
     expect(ended).toHaveBeenCalledTimes(2);
     expect(s.health.degradedReasons).toEqual(["MIC_TRACK_ENDED"]);

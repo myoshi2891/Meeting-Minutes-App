@@ -1,5 +1,5 @@
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { LocalSaver } from "../src/api/local-saver";
 import { LocalSaveScheduler, type SchedulerDeps } from "../src/recording/local-save-scheduler";
 import { createInitialHealth } from "../src/recording/recording-health-monitor";
@@ -105,6 +105,45 @@ describe("LocalSaveScheduler", () => {
     const done = await s.status(0);
     expect(done?.status).toBe("DB_REGISTERED");
     expect(done?.attempts).toBe(2);
+  });
+
+  it("リトライ期限より前に再投入された Chunk は、期限まで読み直さず、期限後に送る", async () => {
+    // Arrange：1 回目は 5xx で RETRYING（期限付き）になる
+    const s = await setup((r, attempt) => (attempt === 1 ? new Response("{}", { status: 500 }) : okResponse(r)));
+    await s.add(0);
+    await s.advance(0);
+    const deadline = (await s.status(0))?.nextRetryAt ?? 0;
+    const getChunk = vi.spyOn(s.chunkStore, "getChunk");
+    // Act：リトライタイマーを期限前に発火させる
+    const early = s.timers.splice(0);
+    for (const t of early) t.fn();
+    await s.advance(0);
+    // Assert：期限前は 1 回確かめるだけで、残り時間のタイマーで戻す（pump で空回りしない）
+    expect(getChunk).toHaveBeenCalledTimes(1);
+    expect(s.timers.map((t) => t.at)).toEqual([deadline]);
+    expect(s.stats().putCount).toBe(1);
+    await s.advance(deadline);
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+  });
+
+  it("送信中に別の試行が SAVING を確保し直していたら、古い試行の成功で状態を上書きしない", async () => {
+    // Arrange：PUT の応答待ちの間に、別タブの復旧が新しい試行として確保し直す
+    const s = await setup((r) => okResponse(r));
+    const original = LocalSaver.prototype.put;
+    vi.spyOn(LocalSaver.prototype, "put").mockImplementationOnce(async function (this: LocalSaver, record) {
+      const outcome = await original.call(this, record);
+      await s.chunkStore.updateSaveState(record.chunkKey, (x) => {
+        x.save.status = "SAVING";
+        x.save.attempts += 1;
+      });
+      return outcome;
+    });
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert：新しい試行の状態のまま残す
+    expect(await s.status(0)).toMatchObject({ status: "SAVING", attempts: 2 });
+    vi.restoreAllMocks();
   });
 
   it("non-retryable（422）は LOCAL_SAVE_FAILED に留まり、後続 Chunk は詰まらない", async () => {

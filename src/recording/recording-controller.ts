@@ -93,6 +93,8 @@ export class RecordingController {
   private trackListeners: AbortController | null = null;
   /** この録音で切断を処理済みか。health は録音をまたいで共有されるので、degradedReasons では判定しない */
   private micEndedHandled = false;
+  /** drainMemoryBacklog の直列化 */
+  private drainQueue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly deps: RecordingControllerDeps) {}
 
@@ -287,7 +289,14 @@ export class RecordingController {
    * サーバーへ直接送る。直接送った Chunk は IDB に残らないが、Finalizer はサーバーの登録で連番を埋める（§22）。
    * 直接送信も失敗したら元の例外を投げ、Chunk はメモリ待機に残す（exportMemoryBacklog で書き出せる）。
    */
-  async drainMemoryBacklog(): Promise<number> {
+  drainMemoryBacklog(): Promise<number> {
+    // 並行させない。先頭を読んでから外すまでに別の drain が先頭を外すと、送っていない Chunk を外してしまう
+    const run = this.drainQueue.then(() => this.drainSerially());
+    this.drainQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async drainSerially(): Promise<number> {
     let drained = 0;
     while (this.memoryBacklog.length > 0) {
       const record = this.memoryBacklog[0];
