@@ -285,19 +285,22 @@ describe("ブラウザクラッシュ後の復旧", () => {
     await h.meetingStore.put(meetingOf(meetingId, listed));
     const chunks = await seedUnfinishedChunks(h, meetingId);
     changeStatusAfterListing(h, listed, meetingId, next);
-    // Act
-    const report = await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
-    for (let i = 0; i < 5; i++) await h.advance(100);
-    // Assert
-    expect(report.interruptedMeetings.map((m) => m.meetingId)).not.toContain(meetingId);
-    expect(report.requeuedChunks).toBe(0);
-    expect((await h.chunkStore.getChunk(chunks.saving))?.save.status).toBe("SAVING");
-    expect((await h.chunkStore.getChunk(chunks.waiting))?.save.status).toBe("BACKEND_UNAVAILABLE");
-    expect(h.server.putCount).toBe(0);
-    expect((await h.meetingStore.get(meetingId))?.status).toBe(next);
-    // fake-indexeddb は DB を共有するので、後続テストの復旧に拾われないよう片付ける
-    await h.meetingStore.put(meetingOf(meetingId, "finalized"));
-    for (const key of [chunks.saving, chunks.waiting]) await h.chunkStore.updateSaveState(key, (r) => { r.save.status = "DB_REGISTERED"; });
+    try {
+      // Act
+      const report = await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+      for (let i = 0; i < 5; i++) await h.advance(100);
+      // Assert
+      expect(report.interruptedMeetings.map((m) => m.meetingId)).not.toContain(meetingId);
+      expect(report.requeuedChunks).toBe(0);
+      expect((await h.chunkStore.getChunk(chunks.saving))?.save.status).toBe("SAVING");
+      expect((await h.chunkStore.getChunk(chunks.waiting))?.save.status).toBe("BACKEND_UNAVAILABLE");
+      expect(h.server.putCount).toBe(0);
+      expect((await h.meetingStore.get(meetingId))?.status).toBe(next);
+    } finally {
+      // fake-indexeddb は DB を共有するので、Assert が失敗しても後続テストの復旧に拾われないよう片付ける
+      await h.meetingStore.put(meetingOf(meetingId, "finalized"));
+      for (const key of [chunks.saving, chunks.waiting]) await h.chunkStore.updateSaveState(key, (r) => { r.save.status = "DB_REGISTERED"; });
+    }
   });
 
   it("会議ロックが保持中（別タブで録音中）の会議は stop_requested に変えず、Chunk も書き戻さない", async () => {
