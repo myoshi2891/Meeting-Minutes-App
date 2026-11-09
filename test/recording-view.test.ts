@@ -157,6 +157,16 @@ describe("finalizeResultText", () => {
     expect(finalizeResultText({ ok: false, stage: "verify", detail: "list HTTP 401", reason: "unauthorized" })).toBe("サーバーのトークンを設定で確認・保存してください。保存済みの音声は保持しています");
   });
 
+  it("接続失敗・タイムアウトに分類された失敗は、サーバーが使えるようになれば自動で再試行すると案内する", () => {
+    // Arrange
+    const verify = { ok: false, stage: "verify", detail: "list request failed: aborted", reason: "network" } as const;
+    const finalize = { ok: false, stage: "finalize", detail: "finalize request failed: Failed to fetch", reason: "network" } as const;
+    // Act / Assert
+    for (const result of [verify, finalize]) {
+      expect(finalizeResultText(result)).toBe(`確定待ち：サーバーに接続できませんでした。サーバーが使えるようになれば自動で再試行します。保存済みの音声は保持しています（${result.detail}）`);
+    }
+  });
+
   it("detail が HTTP 403 で終わっても、認証エラーに分類されていなければエラーとして出す", () => {
     expect(finalizeResultText({ ok: false, stage: "verify", detail: "list meetingId mismatch: x HTTP 403" })).toBe("確定できませんでした（list meetingId mismatch: x HTTP 403）");
   });
