@@ -111,10 +111,11 @@ export class App {
   private readonly finalizeTokenChanged = new Set<string>();
   /** 直接送信で DB 登録まで済んだ件数。IDB に残らないので、確定待ちの件数表示に足す */
   private readonly directRegistered = new Map<string, number>();
-  /** 直接送信で DB 登録まで済んだ Chunk の最大 endFrame。確定待ちの末尾の網羅確認に使う */
-  private readonly directRegisteredEndFrame = new Map<string, number>();
-  /** 直接送信で DB 登録まで済んだ Chunk の連番。確定待ちの欠番判定に使う */
-  private readonly directRegisteredSeqs = new Map<string, Set<number>>();
+  /**
+   * 直接送信で DB 登録まで済んだ Chunk の連番 → endFrame。確定待ちの欠番判定・末尾の網羅確認と、確定時の末尾の欠けの計測に使う。
+   * directRegistered と合わせて、確定したら消す（確定待ちの間は内訳の表示に使う）
+   */
+  private readonly directRegisteredEndFrames = new Map<string, Map<number, number>>();
   private readonly waitingForSave = new Set<string>();
   /** サーバー照合の不一致による送り直しの後、保存完了で確認し直す機会を使った会議。確定できたら外す */
   private readonly mismatchRechecked = new Set<string>();
@@ -327,9 +328,8 @@ export class App {
           }
           if (outcome.ok && outcome.registered) {
             this.directRegistered.set(meetingId, this.directRegisteredCount(meetingId) + 1);
-            this.directRegisteredEndFrame.set(meetingId, Math.max(this.directRegisteredEndFrame.get(meetingId) ?? 0, record.meta.endFrame));
-            const seqs = this.directRegisteredSeqs.get(meetingId) ?? new Set<number>();
-            this.directRegisteredSeqs.set(meetingId, seqs.add(record.meta.sequenceNo));
+            const endFrames = this.directRegisteredEndFrames.get(meetingId) ?? new Map<number, number>();
+            this.directRegisteredEndFrames.set(meetingId, endFrames.set(record.meta.sequenceNo, record.meta.endFrame));
           }
           return outcome;
         },
@@ -387,18 +387,20 @@ export class App {
 
   /** 停止したが確定していない会議。自動再試行に加えて UI からの手動再試行も用意する */
   async listPendingFinalize(): Promise<MeetingRecord[]> {
-    const listed: MeetingRecord[] = [];
-    try {
-      // finalizing の取得だけ失敗しても、読めた stop_requested は返す
-      listed.push(...await this.meetingStore.listByStatus("stop_requested"));
-      listed.push(...await this.meetingStore.listByStatus("finalizing"));
-    } catch (error) {
-      // IDB が読めないときこそ、停止状態を書けずにメモリで保持している会議の再試行を出す必要がある
-      this.deps.onEvent({ type: "error", error });
+    // 会議 ID で 1 行にまとめる。2 つの取得の間に stop_requested → finalizing へ進んだ会議は両方に載るので、後の取得を残す
+    const listed = new Map<string, MeetingRecord>();
+    // 片方の取得に失敗しても、読めたほうは返す
+    for (const status of ["stop_requested", "finalizing"] as const) {
+      try {
+        for (const m of await this.meetingStore.listByStatus(status)) listed.set(m.meetingId, m);
+      } catch (error) {
+        // IDB が読めないときこそ、停止状態を書けずにメモリで保持している会議の再試行を出す必要がある
+        this.deps.onEvent({ type: "error", error });
+      }
     }
     // IDB にはまだ recording のまま残っている会議も、停止済みとして並べる
-    const unsaved = [...this.unsavedStops.values()].filter((m) => !listed.some((l) => l.meetingId === m.meetingId));
-    return [...listed, ...unsaved];
+    const unsaved = [...this.unsavedStops.values()].filter((m) => !listed.has(m.meetingId));
+    return [...listed.values(), ...unsaved];
   }
 
   getFinalizeIssue(meetingId: string): Extract<FinalizeResult, { ok: false }> | undefined {
@@ -418,13 +420,13 @@ export class App {
   /** IDB に残らない Chunk（このタブの直接送信・メモリ待機）の最大 endFrame。再読み込みで失われる */
   offIdbEndFrame(meetingId: string): number {
     const memory = this.exportMemoryBacklog(meetingId).map((f) => f.meta.endFrame);
-    return Math.max(this.directRegisteredEndFrame.get(meetingId) ?? 0, ...memory);
+    return Math.max(0, ...(this.directRegisteredEndFrames.get(meetingId)?.values() ?? []), ...memory);
   }
 
   /** IDB に残らない Chunk（このタブの直接送信・メモリ待機）の連番。再読み込みで失われる */
   offIdbSequenceNos(meetingId: string): number[] {
     const memory = this.exportMemoryBacklog(meetingId).map((f) => f.meta.sequenceNo);
-    return [...new Set([...(this.directRegisteredSeqs.get(meetingId) ?? []), ...memory])];
+    return [...new Set([...(this.directRegisteredEndFrames.get(meetingId)?.keys() ?? []), ...memory])];
   }
 
   exportMemoryBacklog(meetingId: string): MemoryBacklogFile[] {
@@ -612,6 +614,9 @@ export class App {
       if (result.ok) {
         this.finalizeIssues.delete(meetingId);
         this.mismatchRechecked.delete(meetingId);
+        // 確定待ちの内訳と末尾の欠けの計測（finalizeOnce 内で済み）にしか使わないので、確定したら消す
+        this.directRegistered.delete(meetingId);
+        this.directRegisteredEndFrames.delete(meetingId);
       } else this.recordFinalizeIssue(meetingId, result);
       return result;
     };
@@ -637,6 +642,7 @@ export class App {
         token,
         fetchImpl: this.deps.fetchImpl,
         unpersistedChunkCount: () => controller?.memoryBacklogCount ?? 0,
+        offIdbEndFrame: (sequenceNo) => this.directRegisteredEndFrames.get(meetingId)?.get(sequenceNo),
         ensureMeeting: async (id) => {
           const registration = await this.registrar.ensure(id);
           // 登録の途中でトークンが変わった失敗は、この Barrier が終わったら現在のトークンでやり直す（onBackendUnauthorized と同じ）

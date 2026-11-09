@@ -1059,6 +1059,34 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(s.events).toContainEqual({ type: "error", error });
   });
 
+  it("stop_requested の一覧取得だけに失敗しても、読めた finalizing の会議は確定待ちとして返す", async () => {
+    // Arrange
+    const finalizing = nextMeetingId();
+    const s = await setup({ serverUp: false, seed: async (db) => seedMeeting(db, makeMeeting(finalizing, "finalizing")) });
+    const list = s.app.meetingStore.listByStatus.bind(s.app.meetingStore);
+    const error = new Error("IDB read failed");
+    vi.spyOn(s.app.meetingStore, "listByStatus").mockImplementation(async (status) => {
+      if (status === "stop_requested") throw error;
+      return list(status);
+    });
+    // Act
+    const pending = await s.app.listPendingFinalize();
+    // Assert
+    expect(pending.map((m) => m.meetingId)).toContain(finalizing);
+    expect(s.events).toContainEqual({ type: "error", error });
+  });
+
+  it("2 つの一覧取得の間に状態が進んで両方に載った会議は、確定待ちに 1 行だけ返す", async () => {
+    // Arrange：stop_requested の取得後、別タブが finalizing に進めた
+    const id = nextMeetingId();
+    const s = await setup({ serverUp: false });
+    vi.spyOn(s.app.meetingStore, "listByStatus").mockImplementation(async (status) => [makeMeeting(id, status)]);
+    // Act
+    const pending = await s.app.listPendingFinalize();
+    // Assert：同じ会議の行が 2 つあると、片方の操作中にもう片方のボタンが押せてしまう
+    expect(pending.map((m) => m.meetingId)).toEqual([id]);
+  });
+
   it("停止状態の書き直しに失敗したら確定待ちの理由に記録し、finalize_pending を 1 回だけ通知する", async () => {
     // Arrange：サーバー停止中に、停止状態を IDB に書けないまま止めた（停止時の再試行も書き直しに失敗する）
     stubPageGlobals();
@@ -1606,6 +1634,32 @@ describe("RecordingSession.stop", () => {
     expect(s.app.offIdbEndFrame("other")).toBe(0);
     expect(s.app.offIdbSequenceNos(id)).toEqual([0]);
     expect(s.app.offIdbSequenceNos("other")).toEqual([]);
+  });
+
+  it("直接送信した末尾の終わりの位置で末尾の欠けを通知し、確定待ちの間は件数を保ち、確定後に消す", async () => {
+    // Arrange：末尾 seq 0 を直接送信した後にサーバーが止まり、録音は保存済みより 2 秒長い
+    stubPageGlobals();
+    const s = await setup();
+    await settleMonitor(s);
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const record = await makeChunkRecord(id, 0, 160);
+    await s.controllers[0].deps.directSaver?.put(record);
+    s.controllers[0].audioFrameCount = record.meta.endFrame + 32_000;
+    s.server.up = false;
+    // Act
+    expect((await session.stop()).ok).toBe(false);
+    // Assert：確定待ちの間は内訳の表示に使うので消さない
+    expect(s.app.directRegisteredCount(id)).toBe(1);
+    expect(s.app.offIdbSequenceNos(id)).toEqual([0]);
+    // Act
+    s.server.up = true;
+    expect(await s.app.retryFinalize(id)).toEqual({ ok: true, missingTailMs: 2_000 });
+    // Assert
+    expect(s.events).toContainEqual({ type: "finalized", meetingId: id, missingTailMs: 2_000 });
+    expect(s.app.directRegisteredCount(id)).toBe(0);
+    expect(s.app.offIdbEndFrame(id)).toBe(0);
+    expect(s.app.offIdbSequenceNos(id)).toEqual([]);
   });
 
   it("録音中の Chunk 保存完了では自動確定しない", async () => {
