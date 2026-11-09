@@ -1351,6 +1351,8 @@ export interface FinalizerDeps {
   readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>;
   /** GET /chunks・POST /finalize の 401/403 を Monitor へ伝える（Phase 1 §22。会議登録の分は MeetingRegistrar が報告する） */
   readonly onBackendUnauthorized?: () => void;
+  /** IDB にない Mic の Chunk（このタブが直接送信した分）の endFrame。末尾を直接送ったときも末尾の欠けを測る（Phase 1 §22） */
+  readonly offIdbEndFrame?: (sequenceNo: number) => number | undefined;
 }
 
 /**
@@ -1557,15 +1559,22 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);
   // 末尾の欠けは Mic だけで判定する。totalAudioFrames は Mic の時計で、System の audioFrameCount は会議レコードに残らない（Phase 1 §22）
-  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, bySource.mic, counts.mic);
+  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, bySource.mic, counts.mic, deps.offIdbEndFrame);
   return missingTailMs > 0 ? { ok: true, counts, missingTailMs } : { ok: true, counts };
 }
 
-/** 末尾の欠け（ms）。最後の連番が IDB にない（サーバーへ直接送った）ときは endFrame が分からないので 0（Phase 1 §22 と同じ） */
-export function measureMissingTailMs(audioFrameCount: number, chunks: ReadonlyArray<AudioChunkRecord>, chunkCount: number): number {
+/** 末尾の欠け（ms）。最後の連番が IDB にない（サーバーへ直接送った）ときは offIdbEndFrame を使い、それも分からなければ 0（Phase 1 §22 と同じ） */
+export function measureMissingTailMs(
+  audioFrameCount: number,
+  chunks: ReadonlyArray<AudioChunkRecord>,
+  chunkCount: number,
+  offIdbEndFrame?: (sequenceNo: number) => number | undefined,
+): number {
+  const lastSeq = chunkCount - 1;
   const last = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
-  if (last === undefined || last.meta.sequenceNo !== chunkCount - 1) return 0;
-  return frameToOffsetMs(Math.max(0, audioFrameCount - last.meta.endFrame));
+  const endFrame = last?.meta.sequenceNo === lastSeq ? last.meta.endFrame : offIdbEndFrame?.(lastSeq);
+  if (endFrame === undefined) return 0;
+  return frameToOffsetMs(Math.max(0, audioFrameCount - endFrame));
 }
 ```
 

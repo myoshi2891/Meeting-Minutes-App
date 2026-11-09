@@ -3406,6 +3406,8 @@ export interface FinalizerDeps {
   readonly unpersistedChunkCount: () => number;
   /** 照合の前に会議をサーバーへ登録する（MeetingRegistrar.ensure）。Chunk を 1 件も PUT できていない会議は一覧・確定が 404 になるため */
   readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>;
+  /** IDB にない Chunk（このタブが直接送信した分）の endFrame。末尾を直接送ったときも末尾の欠けを測るために使う */
+  readonly offIdbEndFrame?: (sequenceNo: number) => number | undefined;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -3589,7 +3591,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);
   // 欠けた音声は取り戻せないので確定は止めず、UI が警告できるよう長さを返す（T1-e）
-  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, chunks, chunkCount);
+  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, chunks, chunkCount, deps.offIdbEndFrame);
   return missingTailMs > 0 ? { ok: true, missingTailMs } : { ok: true };
 }
 
@@ -3597,12 +3599,19 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
  * 末尾の欠け（ms）。stop() が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま会議が確定する。
  * audioFrameCount は heartbeat（1 秒ごと）でも進むので、最後の Chunk の endFrame より大きければ末尾が欠けている
  * （最後の heartbeat より後の 1 秒未満の欠けは検出できない）。
- * 最後の連番が IDB にない（サーバーへ直接送った）ときは endFrame が分からないので 0 を返す。
+ * 最後の連番が IDB にない（サーバーへ直接送った）ときは offIdbEndFrame の値を使い、それも分からなければ 0 を返す。
  */
-export function measureMissingTailMs(audioFrameCount: number, chunks: ReadonlyArray<AudioChunkRecord>, chunkCount: number): number {
+export function measureMissingTailMs(
+  audioFrameCount: number,
+  chunks: ReadonlyArray<AudioChunkRecord>,
+  chunkCount: number,
+  offIdbEndFrame?: (sequenceNo: number) => number | undefined,
+): number {
+  const lastSeq = chunkCount - 1;
   const last = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
-  if (last === undefined || last.meta.sequenceNo !== chunkCount - 1) return 0;
-  return frameToOffsetMs(Math.max(0, audioFrameCount - last.meta.endFrame));
+  const endFrame = last?.meta.sequenceNo === lastSeq ? last.meta.endFrame : offIdbEndFrame?.(lastSeq);
+  if (endFrame === undefined) return 0;
+  return frameToOffsetMs(Math.max(0, audioFrameCount - endFrame));
 }
 
 function errorMessage(error: unknown): string {
@@ -3618,7 +3627,7 @@ function errorMessage(error: unknown): string {
 
 連続性検査はサーバー一覧を取得した後に行う。IndexedDB にない `sequenceNo` でも、サーバー一覧に `registered: true` で載っていれば揃っているとみなし、送る件数（`expectedChunkCounts.mic` と `finalChunkCount`）は「IndexedDB とサーバーのどちらかにある最大の `sequenceNo` + 1」とする。IndexedDB に書けずサーバーへ直接送った Chunk（§15 `drainMemoryBacklog()`）は IndexedDB に残らないため、IndexedDB の件数で送るとサーバーが件数不一致の 409 を返し続けるからである。サーバーにだけある Chunk は手元にコピーがないので SHA-256 を照合できないが、サーバーが finalize 時にファイルの SHA-256 を検証する。
 
-確定に成功したら、会議の `sessionClock.audioFrameCount`（`totalAudioFrames`）と最後の Chunk の `endFrame` を比べ、差があれば `{ ok: true, missingTailMs }` を返す（`measureMissingTailMs()`）。`stop()` が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま確定するためである。失った音声は取り戻せないので確定は止めず、UI が「末尾 約◯秒が保存されていません」と警告する。`audioFrameCount` は heartbeat（1 秒ごと）でも進むので、最後の heartbeat より後の 1 秒未満の欠けは検出できない。最後の `sequenceNo` が IndexedDB になくサーバーにだけある場合は `endFrame` が分からないので、欠けなしとして扱う。クラッシュ復旧した会議は `audioFrameCount` を保存済み Chunk の最大 `endFrame` から復元する（§23）ため、欠けとは判定されない。
+確定に成功したら、会議の `sessionClock.audioFrameCount`（`totalAudioFrames`）と最後の Chunk の `endFrame` を比べ、差があれば `{ ok: true, missingTailMs }` を返す（`measureMissingTailMs()`）。`stop()` が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま確定するためである。失った音声は取り戻せないので確定は止めず、UI が「末尾 約◯秒が保存されていません」と警告する。`audioFrameCount` は heartbeat（1 秒ごと）でも進むので、最後の heartbeat より後の 1 秒未満の欠けは検出できない。最後の `sequenceNo` が IndexedDB になくサーバーにだけある場合（IDB に書けず直接送信した末尾）は、`offIdbEndFrame`（App はこのタブが直接送信で DB 登録まで済んだ Chunk の連番→`endFrame` を渡す）でその `endFrame` を引いて比べる。それでも分からない場合（再読み込み後や別タブが送った場合）は、欠けなしとして扱う。App はこの対応表と直接送信の件数を確定待ちの内訳表示にも使い、確定に成功したら消す。クラッシュ復旧した会議は `audioFrameCount` を保存済み Chunk の最大 `endFrame` から復元する（§23）ため、欠けとは判定されない。
 
 `finalizeMeeting` は失敗を例外ではなく `FinalizeResult` で返す。`GET /chunks` の応答は外部入力なので `isChunkListResponse` で検証し、契約に合わなければ `verify` の失敗とする。応答の `meetingId` が要求した会議と異なる場合も `verify` の失敗とし、ローカルの Chunk を `DB_REGISTERED` にしない（無音など同一内容の Chunk は別会議でも SHA-256 が一致しうるため）。`GET /chunks` と `POST /finalize` にはそれぞれ `timeoutMs`（既定 30 秒）の `AbortController` を付ける。応答しないサーバーに対しても、接続失敗と同じ経路で失敗結果を返す。`POST /finalize` が失敗した場合（HTTP エラー、接続失敗、タイムアウトのいずれも）は会議を `stop_requested` に戻し、`finalizing` のまま残さない。`finalChunkCount` も POST 前の値へ戻す（失敗した POST の件数を記録として残さない）。
 
@@ -4856,10 +4865,11 @@ export class App {
   private readonly finalizeTokenChanged = new Set<string>();
   /** 直接送信で DB 登録まで済んだ件数。IDB に残らないので、確定待ちの件数表示に足す */
   private readonly directRegistered = new Map<string, number>();
-  /** 直接送信で DB 登録まで済んだ Chunk の最大 endFrame。確定待ちの末尾の網羅確認に使う */
-  private readonly directRegisteredEndFrame = new Map<string, number>();
-  /** 直接送信で DB 登録まで済んだ Chunk の連番。確定待ちの欠番判定に使う */
-  private readonly directRegisteredSeqs = new Map<string, Set<number>>();
+  /**
+   * 直接送信で DB 登録まで済んだ Chunk の連番 → endFrame。確定待ちの欠番判定・末尾の網羅確認と、確定時の末尾の欠けの計測に使う。
+   * directRegistered と合わせて、確定したら消す（確定待ちの間は内訳の表示に使う）
+   */
+  private readonly directRegisteredEndFrames = new Map<string, Map<number, number>>();
   private readonly waitingForSave = new Set<string>();
   /** サーバー照合の不一致による送り直しの後、保存完了で確認し直す機会を使った会議。確定できたら外す */
   private readonly mismatchRechecked = new Set<string>();
@@ -5072,9 +5082,8 @@ export class App {
           }
           if (outcome.ok && outcome.registered) {
             this.directRegistered.set(meetingId, this.directRegisteredCount(meetingId) + 1);
-            this.directRegisteredEndFrame.set(meetingId, Math.max(this.directRegisteredEndFrame.get(meetingId) ?? 0, record.meta.endFrame));
-            const seqs = this.directRegisteredSeqs.get(meetingId) ?? new Set<number>();
-            this.directRegisteredSeqs.set(meetingId, seqs.add(record.meta.sequenceNo));
+            const endFrames = this.directRegisteredEndFrames.get(meetingId) ?? new Map<number, number>();
+            this.directRegisteredEndFrames.set(meetingId, endFrames.set(record.meta.sequenceNo, record.meta.endFrame));
           }
           return outcome;
         },
@@ -5132,18 +5141,20 @@ export class App {
 
   /** 停止したが確定していない会議。自動再試行に加えて UI からの手動再試行も用意する */
   async listPendingFinalize(): Promise<MeetingRecord[]> {
-    const listed: MeetingRecord[] = [];
-    try {
-      // finalizing の取得だけ失敗しても、読めた stop_requested は返す
-      listed.push(...await this.meetingStore.listByStatus("stop_requested"));
-      listed.push(...await this.meetingStore.listByStatus("finalizing"));
-    } catch (error) {
-      // IDB が読めないときこそ、停止状態を書けずにメモリで保持している会議の再試行を出す必要がある
-      this.deps.onEvent({ type: "error", error });
+    // 会議 ID で 1 行にまとめる。2 つの取得の間に stop_requested → finalizing へ進んだ会議は両方に載るので、後の取得を残す
+    const listed = new Map<string, MeetingRecord>();
+    // 片方の取得に失敗しても、読めたほうは返す
+    for (const status of ["stop_requested", "finalizing"] as const) {
+      try {
+        for (const m of await this.meetingStore.listByStatus(status)) listed.set(m.meetingId, m);
+      } catch (error) {
+        // IDB が読めないときこそ、停止状態を書けずにメモリで保持している会議の再試行を出す必要がある
+        this.deps.onEvent({ type: "error", error });
+      }
     }
     // IDB にはまだ recording のまま残っている会議も、停止済みとして並べる
-    const unsaved = [...this.unsavedStops.values()].filter((m) => !listed.some((l) => l.meetingId === m.meetingId));
-    return [...listed, ...unsaved];
+    const unsaved = [...this.unsavedStops.values()].filter((m) => !listed.has(m.meetingId));
+    return [...listed.values(), ...unsaved];
   }
 
   getFinalizeIssue(meetingId: string): Extract<FinalizeResult, { ok: false }> | undefined {
@@ -5163,13 +5174,13 @@ export class App {
   /** IDB に残らない Chunk（このタブの直接送信・メモリ待機）の最大 endFrame。再読み込みで失われる */
   offIdbEndFrame(meetingId: string): number {
     const memory = this.exportMemoryBacklog(meetingId).map((f) => f.meta.endFrame);
-    return Math.max(this.directRegisteredEndFrame.get(meetingId) ?? 0, ...memory);
+    return Math.max(0, ...(this.directRegisteredEndFrames.get(meetingId)?.values() ?? []), ...memory);
   }
 
   /** IDB に残らない Chunk（このタブの直接送信・メモリ待機）の連番。再読み込みで失われる */
   offIdbSequenceNos(meetingId: string): number[] {
     const memory = this.exportMemoryBacklog(meetingId).map((f) => f.meta.sequenceNo);
-    return [...new Set([...(this.directRegisteredSeqs.get(meetingId) ?? []), ...memory])];
+    return [...new Set([...(this.directRegisteredEndFrames.get(meetingId)?.keys() ?? []), ...memory])];
   }
 
   exportMemoryBacklog(meetingId: string): MemoryBacklogFile[] {
@@ -5357,6 +5368,9 @@ export class App {
       if (result.ok) {
         this.finalizeIssues.delete(meetingId);
         this.mismatchRechecked.delete(meetingId);
+        // 確定待ちの内訳と末尾の欠けの計測（finalizeOnce 内で済み）にしか使わないので、確定したら消す
+        this.directRegistered.delete(meetingId);
+        this.directRegisteredEndFrames.delete(meetingId);
       } else this.recordFinalizeIssue(meetingId, result);
       return result;
     };
@@ -5382,6 +5396,7 @@ export class App {
         token,
         fetchImpl: this.deps.fetchImpl,
         unpersistedChunkCount: () => controller?.memoryBacklogCount ?? 0,
+        offIdbEndFrame: (sequenceNo) => this.directRegisteredEndFrames.get(meetingId)?.get(sequenceNo),
         ensureMeeting: async (id) => {
           const registration = await this.registrar.ensure(id);
           // 登録の途中でトークンが変わった失敗は、この Barrier が終わったら現在のトークンでやり直す（onBackendUnauthorized と同じ）
@@ -5442,7 +5457,7 @@ T12：会議ごとに確定の失敗理由と、サーバー登録確認済み�
 
 「確定を中止」は対象のタイトル・ID と音声欠落の可能性を示して確認し、メモリ待機があれば先に WAV を書き出す。会議ロック下で `abandoned` に更新するだけで、音声・会議情報・サーバーデータは削除しない。確定処理中・録音中には中止できない。再読み込み後も一覧から除外し、Scheduler は再投入時と送信前に中止状態を確認する。さらに Scheduler と直接送信の両方が通る `prepareChunkPut()` が、会議登録の完了後・PUT の直前に中止状態を確認する。IDB が読めないときは、読み取りを待つ間にこのタブで中止されていないかを `abandoned` で確かめ直す。そのうえで、このタブが会議ロックを持つ間（録音中、または stop 後もメモリ待機のためにロックを保持中）は送信を止めず、このタブの中止記録（`abandoned`）で判定する。その間に中止できるのはこのタブだけだからである。ロックを持たない会議（Scheduler の PUT）は別タブが中止しうるので、読めなければ中止とも未中止とも断定せず、再試行できる失敗（`UNKNOWN`）で返して PUT を始めない。直接送信の PUT が 401/403 を受けたときは、Scheduler を通らないため App が Monitor へ報告する（会議登録の分は `MeetingRegistrar` が報告済みなので重ねない。トークン未設定の失敗は報告しない）。中止時は Scheduler の待機キーからもその会議を外し（`discardMeeting()`）、backend 停止中でも待機件数に数えない。中止済みなら PUT を始めず non-retryable の失敗を返すので、Scheduler の Chunk は Blob を保持したまま `LOCAL_SAVE_FAILED` になり、直接送信の Chunk はメモリ待機に残って `drainMemoryBacklog()` も止まる。既に送信中の PUT は取り消さず、保存済みの音声も取り消さない。中止を元に戻す操作と WAV の取り込みは今回の範囲外。
 
-停止時に `controller.stop()` が停止状態（`stop_requested`・停止理由）を IDB に書けずに reject した場合も、録音は止まっている。App は開始時に受け取った会議情報（`onMeetingCreated`）に停止状態を載せて `unsavedStops` に残し、`listPendingFinalize()` に `stop_requested` として並べる。`session.stop()` は reject せず、確定できなかった結果を返す。`listPendingFinalize()` は IDB の一覧取得に失敗しても `AppEvent.error` を通知したうえでこの会議を返し、再試行ボタンを出せるようにする。`retryFinalize()` と `abandonFinalize()` は会議ロックを取った後、この停止状態を書き直す。`retryFinalize()` は書き直しより前に、メモリ待機の末尾を drain する（サーバーが使えれば直接送信も試す。IDB が書けないときこそ音声はメモリ待機にしか残らず、書き直しの失敗で止めると次のヘルス状態の変化まで送られない）。IDB を読み直し、`recording` のままなら丸ごと書く。`stop_requested`（最初の保存だけ成功し、flush 後の最終保存がクォータ不足などで失敗した場合）なら、Controller が持つ最終の `sessionClock`（`audioFrameCount`）と、未記録の停止理由だけを載せて書く。最終フレーム数が欠けたまま `totalAudioFrames` を送らず、他タブの確定 POST の失敗で残った値も保つためである。ロックは stop 後に一度手放しているので、別タブが先に進めた会議（`finalizing`・`finalized`・`abandoned`）は上書きしない。書けなければ確定・中止に進まない。`retryFinalize()` は書き直しの失敗も確定の失敗と同じく `finalizeIssues` に記録し、`finalize_pending` で通知する（同じ stage/detail は繰り返さない）。`listPendingFinalize()` は `finalizing` の一覧取得だけに失敗しても、読めた `stop_requested` の会議は返す。Controller は最終保存に失敗するとロックを保持したまま止まり（§15）、App は `takeMeetingLock()` で受け取ったロックを、停止状態を書き直せるまで解放しない。別タブが古い `audioFrameCount` のまま確定しないためである。停止後もメモリ待機が残る会議と、停止状態を書けていない会議は、ページライフサイクルを外さずに残し、`beforeunload` の離脱確認を続ける（タブを閉じると音声、または停止理由と最終の音声フレーム数が失われるため）。メモリ待機が空になり、停止状態も書き直せたら外す。
+停止時に `controller.stop()` が停止状態（`stop_requested`・停止理由）を IDB に書けずに reject した場合も、録音は止まっている。App は開始時に受け取った会議情報（`onMeetingCreated`）に停止状態を載せて `unsavedStops` に残し、`listPendingFinalize()` に `stop_requested` として並べる。`session.stop()` は reject せず、確定できなかった結果を返す。`listPendingFinalize()` は IDB の一覧取得に失敗しても `AppEvent.error` を通知したうえでこの会議を返し、再試行ボタンを出せるようにする。`retryFinalize()` と `abandonFinalize()` は会議ロックを取った後、この停止状態を書き直す。`retryFinalize()` は書き直しより前に、メモリ待機の末尾を drain する（サーバーが使えれば直接送信も試す。IDB が書けないときこそ音声はメモリ待機にしか残らず、書き直しの失敗で止めると次のヘルス状態の変化まで送られない）。IDB を読み直し、`recording` のままなら丸ごと書く。`stop_requested`（最初の保存だけ成功し、flush 後の最終保存がクォータ不足などで失敗した場合）なら、Controller が持つ最終の `sessionClock`（`audioFrameCount`）と、未記録の停止理由だけを載せて書く。最終フレーム数が欠けたまま `totalAudioFrames` を送らず、他タブの確定 POST の失敗で残った値も保つためである。ロックは stop 後に一度手放しているので、別タブが先に進めた会議（`finalizing`・`finalized`・`abandoned`）は上書きしない。書けなければ確定・中止に進まない。`retryFinalize()` は書き直しの失敗も確定の失敗と同じく `finalizeIssues` に記録し、`finalize_pending` で通知する（同じ stage/detail は繰り返さない）。`listPendingFinalize()` は `stop_requested` と `finalizing` の一覧取得を別々に試み、片方だけに失敗しても読めたほうの会議は返す（失敗はそれぞれ `AppEvent.error` で通知する）。2 つの取得の間に `stop_requested` から `finalizing` へ進んだ会議は両方に載るので、会議 ID で 1 行にまとめる（後の取得を残す）。UI は同じ会議の行が重複しない前提に加え、再試行・確定中止のクリック時に `pendingBusy` を確かめ、同じ会議の操作が実行中なら何もしない。Controller は最終保存に失敗するとロックを保持したまま止まり（§15）、App は `takeMeetingLock()` で受け取ったロックを、停止状態を書き直せるまで解放しない。別タブが古い `audioFrameCount` のまま確定しないためである。停止後もメモリ待機が残る会議と、停止状態を書けていない会議は、ページライフサイクルを外さずに残し、`beforeunload` の離脱確認を続ける（タブを閉じると音声、または停止理由と最終の音声フレーム数が失われるため）。メモリ待機が空になり、停止状態も書き直せたら外す。
 
 `retryFinalize()` は、メモリ待機が残る会議（録音中を除く）について、Barrier の前に drain する。停止直後や「再試行」ボタンでも、サーバー復帰の通知を待たずに末尾を IDB へ書き戻す・送るためである。サーバーが使えない（`HEALTHY` / `DEGRADED` かつ未失効でない）ときは IDB への書き戻しだけ試し、直接送信は試さない（`directSaver` が送信前に失敗を返す）。この失敗では停止時の `memory_backlog_export_required` を重ねて通知しない。drain の直接送信が送信中のトークン変更（`tokenChanged`）で送れなかったときは通知せず、drain を終えた直後に同じ引数で drain し直す（`setToken` からの drain は実行中の drain に弾かれているため）。並行はしない。同じく、サーバーが使えない間の確定再試行が IDB への書き戻しだけを試している最中にサーバーが戻ると、`onBackendAvailable()` の drain は実行中の drain に、確定は借用中の会議ロックに弾かれる。そこで直接送信を試さない drain の実行中に直接送信の drain が要求されたら記録し、drain を終えた直後に直接送信で drain し直す。確定再試行の中なら、その再試行が続けて Barrier を通すので、次の復帰イベントや手動再試行を待たない。確定待ちの内訳（`pendingCountsText`）には、このタブの直接送信とメモリ待機の連番（`App.offIdbSequenceNos()`）も渡し、件数ではなく連番で欠番を判定する。メモリ待機の連番が IDB の最大の連番より後ろにあると、件数の比較では欠番を見逃すためである。再読み込み後は直接送信の連番が分からないので、IDB の連番だけで判定し、欠けがあれば「実際はこれより多い可能性」と示す。
 
