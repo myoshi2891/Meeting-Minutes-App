@@ -196,9 +196,11 @@ describe("RecordingController", () => {
     const first = s.controller.stop(reason, 123456);
     // Act：最初の停止の待機中に、別の理由・時刻で停止する
     const second = s.controller.stop(reason === "manual" ? "mic_ended" : "manual", 999999);
-    await s.until(() => s.worklet.commands.filter((c) => c.type === "stop").length >= 2);
+    // 重なった停止は最初の停止を共有するので、Worklet への stop は 1 回だけ
+    await s.untilCommand("stop");
     s.fireTimers();
     await Promise.all([first, second]);
+    expect(s.worklet.commands.filter((c) => c.type === "stop")).toHaveLength(1);
     // Assert
     expect(await s.meetingStore.get(`stop-overlap-${reason}`)).toMatchObject({ status: "stop_requested", stopReason: reason, stopDetectedAtEpochMs: 123456 });
   });
@@ -442,6 +444,29 @@ describe("RecordingController", () => {
     await s.controller.stop();
     // Assert
     expect(s.enqueued).toEqual(["m1:mic:000000", "m2:mic:000000"]);
+  });
+
+  it("stop が重なっても 1 回の停止を共有し、完了後に始めた次の録音のマイク・ロックを後から来た stop が外さない", async () => {
+    // Arrange：Worklet は自動では応答しない
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.silent = true;
+    // Act：stop を 2 回呼び、最初に送られた stop にだけ応答する
+    const first = s.controller.stop();
+    const second = s.controller.stop();
+    await s.untilCommand("stop");
+    const stopCmd = s.worklet.commands.find((c) => c.type === "stop");
+    if (stopCmd?.type !== "stop") throw new Error("stop command not sent");
+    s.worklet.sendFlushed(stopCmd.requestId);
+    await first;
+    s.useFreshTrack();
+    await s.controller.start("m2", "定例2", 2);
+    s.fireTimers();
+    await second;
+    // Assert
+    expect(s.worklet.commands.filter((c) => c.type === "stop")).toHaveLength(1);
+    expect(s.locks.held.has(meetingLockName("m2"))).toBe(true);
+    expect(s.nodePort.onmessage).not.toBeNull();
   });
 
   it("Worklet が stop に応答しなくてもタイムアウトで onError を通知し、トラックを解放して stop が終わる", async () => {
@@ -733,6 +758,43 @@ describe("RecordingController", () => {
     await s.until(() => s.errors.length >= 1);
     // Act / Assert
     await expect(s.controller.drainMemoryBacklog()).rejects.toThrow("The database connection is closing.");
+    expect(s.controller.memoryBacklogCount).toBe(1);
+  });
+
+  it("停止後のメモリ待機を破棄すると空になり、IDB の保存警告と保持していたロックを外す", async () => {
+    // Arrange：IDB に書けない末尾をメモリ待機に残して止めた
+    const failing = (db: IDBDatabase) => {
+      const store = new ChunkStore(db);
+      vi.spyOn(store, "putChunk").mockRejectedValue(new Error("IDB closed"));
+      return store;
+    };
+    const s = await setup(failing);
+    await s.controller.start("m-discard", "定例", 1);
+    await s.controller.stop();
+    expect(s.controller.memoryBacklogCount).toBe(1);
+    expect(s.locks.held.has(meetingLockName("m-discard"))).toBe(true);
+    // Act
+    const discarded = await s.controller.discardMemoryBacklog();
+    // Assert
+    expect(discarded).toBe(1);
+    expect(s.controller.memoryBacklogCount).toBe(0);
+    expect(s.controller.exportMemoryBacklog()).toEqual([]);
+    expect(s.health.degradedReasons).not.toContain("IDB_WRITE_FAILED");
+    expect(s.locks.held.has(meetingLockName("m-discard"))).toBe(false);
+  });
+
+  it("録音中はメモリ待機を破棄しない", async () => {
+    // Arrange
+    const failing = (db: IDBDatabase) => {
+      const store = new ChunkStore(db);
+      vi.spyOn(store, "putChunk").mockRejectedValue(new Error("IDB closed"));
+      return store;
+    };
+    const s = await setup(failing);
+    await s.controller.start("m-discard-rec", "定例", 1);
+    await s.controller.flush();
+    // Act / Assert
+    await expect(s.controller.discardMemoryBacklog()).rejects.toThrow("recording");
     expect(s.controller.memoryBacklogCount).toBe(1);
   });
 

@@ -95,6 +95,8 @@ export class RecordingController {
   private micEndedHandled = false;
   /** drainMemoryBacklog の直列化 */
   private drainQueue: Promise<unknown> = Promise.resolve();
+  /** 実行中の stop。重なった stop はこれを待つ。完了までは次の録音を始めない（後から終わる stop の後始末が次の録音を壊すため） */
+  private stopping: Promise<void> | null = null;
 
   constructor(private readonly deps: RecordingControllerDeps) {}
 
@@ -104,6 +106,7 @@ export class RecordingController {
 
   async start(meetingId: string, title: string, consentConfirmedAt: number): Promise<void> {
     const { audioContext, mediaStream, workletModuleUrl } = this.deps;
+    if (this.stopping !== null) throw new Error("previous recording is still stopping");
     // 前の録音のメモリ待機が残るうちは始めない。保持中のロックの解放手段を上書きし、別会議の Chunk も混ざるため
     if (this.memoryBacklog.length > 0) throw new Error("memory backlog from the previous recording remains");
     // 最終保存の失敗で保持したロックも、呼び出し元が takeMeetingLock で受け取るまでは上書きしない
@@ -225,8 +228,18 @@ export class RecordingController {
     await this.chunkQueue;
   }
 
-  /** stop_requested → 最終 Chunk 生成 → IDB 書き込み完了まで待つ。Finalization Barrier は §22。 */
-  async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<void> {
+  /** stop_requested → 最終 Chunk 生成 → IDB 書き込み完了まで待つ。Finalization Barrier は §22。重なった呼び出しは実行中の停止を共有する */
+  stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<void> {
+    if (this.stopping !== null) return this.stopping;
+    if (this.node === null || this.meeting === null) return Promise.resolve();
+    const run = this.stopOnce(reason, detectedAtEpochMs).finally(() => {
+      this.stopping = null;
+    });
+    this.stopping = run;
+    return run;
+  }
+
+  private async stopOnce(reason: RecordingStopReason, detectedAtEpochMs: number): Promise<void> {
     if (this.node === null || this.meeting === null) return;
     const meeting = this.meeting;
     /** 最終の audioFrameCount を保存できたか。できなければ別タブが古い値で確定しないよう、ロックを保持して呼び出し元へ渡す */
@@ -320,19 +333,37 @@ export class RecordingController {
       await this.deps.scheduler.enqueue(record.chunkKey);
       drained++;
     }
-    if (this.memoryBacklog.length === 0) {
-      // IDB の劣化理由は「メモリ待機がクラッシュで失われうる」ことの警告。このタブの全会議のメモリ待機が空になったら外す
-      // （次に書けなければ persistChunk が付け直す）
-      if ((this.deps.otherMeetingsBacklogCount?.() ?? 0) === 0) {
-        this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
-          (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
-        );
-      }
-      // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する。
-      // 最終保存に失敗していれば、書き直す呼び出し元が takeMeetingLock で受け取るまで保持する
-      if (this.node === null && !this.finalStopUnsaved) this.unlock();
-    }
+    if (this.memoryBacklog.length === 0) this.onMemoryBacklogEmptied();
     return drained;
+  }
+
+  /**
+   * 停止後のメモリ待機を捨てる。確定を中止した会議で、利用者が書き出した WAV の保存を確かめた後だけ呼ぶ（呼び出し元が確認する）。
+   * drain と並行させない。録音中は捨てない（採番済みの Chunk を捨てると欠番になる）
+   */
+  discardMemoryBacklog(): Promise<number> {
+    const run = this.drainQueue.then(() => {
+      if (this.node !== null) throw new Error("cannot discard memory backlog while recording");
+      const discarded = this.memoryBacklog.length;
+      this.memoryBacklog.length = 0;
+      this.onMemoryBacklogEmptied();
+      return discarded;
+    });
+    this.drainQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private onMemoryBacklogEmptied(): void {
+    // IDB の劣化理由は「メモリ待機がクラッシュで失われうる」ことの警告。このタブの全会議のメモリ待機が空になったら外す
+    // （次に書けなければ persistChunk が付け直す）
+    if ((this.deps.otherMeetingsBacklogCount?.() ?? 0) === 0) {
+      this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
+        (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
+      );
+    }
+    // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する。
+    // 最終保存に失敗していれば、書き直す呼び出し元が takeMeetingLock で受け取るまで保持する
+    if (this.node === null && !this.finalStopUnsaved) this.unlock();
   }
 
   get memoryBacklogCount(): number {
