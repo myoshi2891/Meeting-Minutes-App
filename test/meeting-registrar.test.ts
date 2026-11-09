@@ -65,6 +65,40 @@ describe("MeetingRegistrar", () => {
     expect(outcome).toMatchObject({ ok: false, retryable: false, unauthorizedReported: true, error: { kind: "UNAUTHORIZED" } });
   });
 
+  it("トークン変更で送り直す POST は、前の POST の待ち時間に関係なく自分のタイムアウトを持つ", async () => {
+    // Arrange：1 回目は 800ms 後に 401（その間にトークン変更）、2 回目は 500ms 後に 201。どちらも単独ではタイムアウト 1000ms 内
+    vi.useFakeTimers();
+    try {
+      let token = "old";
+      let calls = 0;
+      const fetchImpl: typeof fetch = (_input, init) => new Promise<Response>((resolve, reject) => {
+        calls++;
+        const first = calls === 1;
+        const timer = setTimeout(() => {
+          if (first) {
+            token = "new";
+            resolve(new Response(null, { status: 401 }));
+          } else {
+            resolve(new Response(JSON.stringify({ meetingId: meeting.meetingId, status: "recording", dataPath: "recordings/m-registration" }), { status: 201 }));
+          }
+        }, first ? 800 : 500);
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      });
+      const registrar = new MeetingRegistrar({ baseUrl: "http://127.0.0.1:43117", token: () => token,
+        getMeeting: async () => meeting, fetchImpl, timeoutMs: 1000 });
+      // Act
+      const pending = registrar.ensure(meeting.meetingId);
+      await vi.advanceTimersByTimeAsync(2000);
+      // Assert
+      expect(await pending).toEqual({ ok: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("ブラウザの fetch を渡してもメソッド呼び出しにせず POST を送る（Illegal invocation にならない）", async () => {
     // Arrange
     const fetchImpl = browserLikeFetch(async () =>

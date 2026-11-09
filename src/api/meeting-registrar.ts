@@ -55,39 +55,44 @@ export class MeetingRegistrar {
     assertLocalHost(url);
     let token = this.deps.token();
     if (token === null) return this.fail("UNAUTHORIZED", "backend token is not set", null);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.deps.timeoutMs);
     // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
     const { fetchImpl } = this.deps;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
-        const response = await fetchImpl(url, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-          credentials: "omit",
-          redirect: "error",
-          signal: controller.signal,
-        });
-        if (response.status === 200 || response.status === 201) {
-          const value: unknown = await response.json().catch(() => null);
-          if (!isMeetingResponse(value) || value.meetingId !== meetingId) return this.fail("SERVER", "malformed MeetingResponse", response.status);
-          return { ok: true };
+        // 試行ごとにタイムアウトを持つ。前の POST が遅くても、送り直しの待ち時間を食わない
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.deps.timeoutMs);
+        try {
+          const response = await fetchImpl(url, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            credentials: "omit",
+            redirect: "error",
+            signal: controller.signal,
+          });
+          if (response.status === 200 || response.status === 201) {
+            const value: unknown = await response.json().catch(() => null);
+            if (!isMeetingResponse(value) || value.meetingId !== meetingId) return this.fail("SERVER", "malformed MeetingResponse", response.status);
+            return { ok: true };
+          }
+          const latestToken = this.deps.token();
+          // 送信後にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない
+          if ((response.status === 401 || response.status === 403) && latestToken !== null && latestToken !== token) {
+            token = latestToken;
+            continue;
+          }
+          if (response.status === 401 || response.status === 403) {
+            this.deps.onBackendUnauthorized?.();
+            return { ...this.fail("UNAUTHORIZED", `meeting registration HTTP ${response.status}`, response.status), unauthorizedReported: this.deps.onBackendUnauthorized !== undefined };
+          }
+          if (response.status === 409) return this.fail("CONFLICT", "meeting registration conflict", response.status);
+          if (response.status === 400 || response.status === 422) return this.fail("VALIDATION", `meeting registration HTTP ${response.status}`, response.status);
+          if (response.status === 507) return this.fail("STORAGE_FULL", "meeting registration disk full", response.status);
+          return this.fail(response.status >= 500 ? "SERVER" : "UNKNOWN", `meeting registration HTTP ${response.status}`, response.status);
+        } finally {
+          clearTimeout(timer);
         }
-        const latestToken = this.deps.token();
-        // 送信後にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない
-        if ((response.status === 401 || response.status === 403) && latestToken !== null && latestToken !== token) {
-          token = latestToken;
-          continue;
-        }
-        if (response.status === 401 || response.status === 403) {
-          this.deps.onBackendUnauthorized?.();
-          return { ...this.fail("UNAUTHORIZED", `meeting registration HTTP ${response.status}`, response.status), unauthorizedReported: this.deps.onBackendUnauthorized !== undefined };
-        }
-        if (response.status === 409) return this.fail("CONFLICT", "meeting registration conflict", response.status);
-        if (response.status === 400 || response.status === 422) return this.fail("VALIDATION", `meeting registration HTTP ${response.status}`, response.status);
-        if (response.status === 507) return this.fail("STORAGE_FULL", "meeting registration disk full", response.status);
-        return this.fail(response.status >= 500 ? "SERVER" : "UNKNOWN", `meeting registration HTTP ${response.status}`, response.status);
       }
       // 再送中にもトークンが変わった。UNAUTHORIZED にすると Scheduler が失効として通知するため、再試行できる失敗で返す
       return { ...this.fail("UNKNOWN", "meeting registration token changed", null), tokenChanged: true };
@@ -95,8 +100,6 @@ export class MeetingRegistrar {
       if (error instanceof DOMException && error.name === "AbortError") return this.fail("TIMEOUT", "meeting registration timeout", null);
       if (error instanceof TypeError) return this.fail("NETWORK", error.message, null);
       return this.fail("UNKNOWN", error instanceof Error ? error.message : String(error), null);
-    } finally {
-      clearTimeout(timer);
     }
   }
 
