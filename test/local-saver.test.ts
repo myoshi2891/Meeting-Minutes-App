@@ -273,6 +273,33 @@ describe("LocalSaver.put", () => {
     }
   });
 
+  it("トークン変更の送り直しは、会議確認の後に新しいタイムアウトで送る（最初の PUT の期限切れを引き継がない）", async () => {
+    // Arrange：最初の PUT は 401 中にトークンが変わり、送り直し前の会議確認が最初の期限（20ms）より後に終わる
+    const r = await makeChunkRecord("m1", 0, 160);
+    let ensures = 0;
+    let saver: LocalSaver | undefined;
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      if (init?.signal?.aborted === true) throw new DOMException("aborted", "AbortError");
+      if (new Headers(init?.headers).get("Authorization") === "Bearer tok") {
+        saver?.setToken("new-tok");
+        return new Response(JSON.stringify({ error: "unauthorized", code: "UNAUTHORIZED" }), { status: 401 });
+      }
+      return new Response(okBody(r), { status: 201 });
+    };
+    const ensureMeeting = () => (++ensures === 1 ? Promise.resolve({ ok: true } as const) : new Promise<{ ok: true }>((resolve) => setTimeout(() => resolve({ ok: true }), 30)));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      saver = new LocalSaver({ baseUrl: BASE, token: "tok", requestTimeoutMs: 20 }, fetchImpl, ensureMeeting);
+      // Act
+      const pending = saver.put(r);
+      await vi.advanceTimersByTimeAsync(30);
+      // Assert
+      expect(await pending).toMatchObject({ ok: true, registered: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("Blob がクォータ縮退で削除済みなら送信せず VALIDATION", async () => {
     const r = await makeChunkRecord("m1", 0, 160);
     r.wav = null;

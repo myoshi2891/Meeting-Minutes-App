@@ -58,11 +58,11 @@ export class LocalSaver {
     const url = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks/${source}/${sequenceNo}`, this.base);
     assertLocalHost(url);
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
     // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
     const fetchImpl = this.fetchImpl;
     let token = this.token;
+    // タイムアウトは送るたびに張り直す。送り直しが会議確認を待つ間に最初の PUT の期限が切れても、中断済みの signal で送らない
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         if (attempt > 0) {
@@ -74,6 +74,9 @@ export class LocalSaver {
           // 確認を待つ間にもトークンは変わりうる。送り直しは送信直前の最新トークンで送る
           token = this.token;
         }
+        clearTimeout(timer);
+        const controller = new AbortController();
+        timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
         const response = await fetchImpl(url, {
           method: "PUT",
           headers: {
