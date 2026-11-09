@@ -102,6 +102,8 @@ export class App {
    */
   private readonly drains = new Map<string, (notify: boolean, direct?: boolean) => Promise<void>>();
   private unsubscribeMonitor: () => void = () => undefined;
+  /** Monitor の通知で始めた onBackendAvailable がすべて終わると解決する */
+  private backendRecovery: Promise<void> = Promise.resolve();
   private disposed = false;
   private readonly finalizing = new Map<string, Promise<FinalizeResult>>();
   private readonly finalizeRequested = new Set<string>();
@@ -169,6 +171,11 @@ export class App {
     return this.session;
   }
 
+  /** サーバー復帰の通知で始めた復旧（再投入・確定の再試行）がここまでに始まった分すべて終わるまで待つ */
+  whenBackendRecoverySettled(): Promise<void> {
+    return this.backendRecovery;
+  }
+
   async init(): Promise<void> {
     const report = await recoverOnStartup(this.meetingStore, this.chunkStore, this.scheduler, this.deps.locks);
     this.deps.onEvent({ type: "recovered", report });
@@ -176,7 +183,9 @@ export class App {
       this.deps.onEvent({ type: "error", error: new Error(`起動時の復旧で会議を読めませんでした（${report.unreadMeetingIds.join(", ")}）。再読み込みで再試行します`) });
     }
     this.unsubscribeMonitor = this.monitor.onChange((state) => {
-      if (isUsable(state)) void this.onBackendAvailable();
+      if (!isUsable(state)) return;
+      const run = this.onBackendAvailable().catch((error: unknown) => this.deps.onEvent({ type: "error", error }));
+      this.backendRecovery = Promise.all([this.backendRecovery, run]).then(() => undefined);
     });
     this.monitor.start();
   }
@@ -242,8 +251,7 @@ export class App {
         // 直接送信は Scheduler を通らず onChunkSaved が来ない。空になったら停止後の Barrier を再開させる
         if (controller.memoryBacklogCount === 0) {
           this.releaseHeldLockIfDrained(meetingId);
-          this.lifecycles.get(meetingId)?.detach();
-          this.lifecycles.delete(meetingId);
+          this.releaseLifecycleIfSettled(meetingId);
           if (notify) void this.onChunkSaved(meetingId);
         }
       } catch (error) {
@@ -337,8 +345,9 @@ export class App {
     this.controllers.set(meetingId, controller);
     this.drains.set(meetingId, drain);
     let recording = true;
-    // 停止後もメモリ待機が残る間は、タブを閉じると音声が失われるので離脱確認を続ける（pagehide の flush は停止後は何もしない）
-    const lifecycle = attachPageLifecycle(controller, () => recording || controller.memoryBacklogCount > 0, input.onHidden ?? (() => undefined));
+    // 停止後もメモリ待機が残る間は、タブを閉じると音声が失われるので離脱確認を続ける（pagehide の flush は停止後は何もしない）。
+    // 停止状態を書けていない間も、閉じると停止理由と最終の音声フレーム数が失われるので続ける
+    const lifecycle = attachPageLifecycle(controller, () => recording || controller.memoryBacklogCount > 0 || this.unsavedStops.has(meetingId), input.onHidden ?? (() => undefined));
     let stopping: Promise<FinalizeResult> | undefined;
     const stopOnce = async (reason: RecordingStopReason, detectedAtEpochMs: number): Promise<FinalizeResult> => {
       try {
@@ -354,7 +363,7 @@ export class App {
         recording = false;
         const held = controller.takeMeetingLock();
         if (held !== null) this.heldLocks.set(meetingId, held);
-        if (controller.memoryBacklogCount > 0) this.lifecycles.set(meetingId, lifecycle);
+        if (controller.memoryBacklogCount > 0 || this.unsavedStops.has(meetingId)) this.lifecycles.set(meetingId, lifecycle);
         else lifecycle.detach();
         this.session = null;
         this.deps.onEvent({ type: "recording_stopped", meetingId, reason });
@@ -378,11 +387,11 @@ export class App {
 
   /** 停止したが確定していない会議。自動再試行に加えて UI からの手動再試行も用意する */
   async listPendingFinalize(): Promise<MeetingRecord[]> {
-    let listed: MeetingRecord[] = [];
+    const listed: MeetingRecord[] = [];
     try {
-      const stopped = await this.meetingStore.listByStatus("stop_requested");
-      const finalizing = await this.meetingStore.listByStatus("finalizing");
-      listed = [...stopped, ...finalizing];
+      // finalizing の取得だけ失敗しても、読めた stop_requested は返す
+      listed.push(...await this.meetingStore.listByStatus("stop_requested"));
+      listed.push(...await this.meetingStore.listByStatus("finalizing"));
     } catch (error) {
       // IDB が読めないときこそ、停止状態を書けずにメモリで保持している会議の再試行を出す必要がある
       this.deps.onEvent({ type: "error", error });
@@ -465,7 +474,11 @@ export class App {
         await drain(false, isUsable(this.monitor.state));
       }
       const unsaved = await this.saveUnsavedStop(meetingId);
-      if (unsaved !== null) return unsaved;
+      if (unsaved !== null) {
+        // 確定の失敗と同じく、確定待ちの行に理由を出す
+        this.recordFinalizeIssue(meetingId, unsaved);
+        return unsaved;
+      }
       return await this.finalize(meetingId);
     } finally {
       release();
@@ -489,6 +502,7 @@ export class App {
         await this.meetingStore.put({ ...current, ...firstStop, sessionClock: { ...pending.sessionClock }, updatedAt: pending.updatedAt });
       }
       this.unsavedStops.delete(meetingId);
+      this.releaseLifecycleIfSettled(meetingId);
       return null;
     } catch (error) {
       return { ok: false, stage: "verify", detail: `stop state not saved: ${error instanceof Error ? error.message : String(error)}` };
@@ -512,6 +526,22 @@ export class App {
     if (release === undefined || this.heldLockBusy.has(meetingId) || this.memoryBacklogCount(meetingId) > 0 || this.unsavedStops.has(meetingId)) return;
     this.heldLocks.delete(meetingId);
     release();
+  }
+
+  /** メモリ待機が空になり、停止状態も書き直せていれば、停止後に残した離脱確認を外す */
+  private releaseLifecycleIfSettled(meetingId: string): void {
+    if (this.memoryBacklogCount(meetingId) > 0 || this.unsavedStops.has(meetingId)) return;
+    this.lifecycles.get(meetingId)?.detach();
+    this.lifecycles.delete(meetingId);
+  }
+
+  /** 確定できなかった理由を記録し、前回と変わったときだけ finalize_pending を通知する */
+  private recordFinalizeIssue(meetingId: string, result: Extract<FinalizeResult, { ok: false }>): void {
+    const previous = this.finalizeIssues.get(meetingId);
+    this.finalizeIssues.set(meetingId, result);
+    if (previous?.stage !== result.stage || previous.detail !== result.detail) {
+      this.deps.onEvent({ type: "finalize_pending", meetingId, result });
+    }
   }
 
   private createSaver(token: string): LocalSaver {
@@ -582,13 +612,7 @@ export class App {
       if (result.ok) {
         this.finalizeIssues.delete(meetingId);
         this.mismatchRechecked.delete(meetingId);
-      } else {
-        const previous = this.finalizeIssues.get(meetingId);
-        this.finalizeIssues.set(meetingId, result);
-        if (previous?.stage !== result.stage || previous.detail !== result.detail) {
-          this.deps.onEvent({ type: "finalize_pending", meetingId, result });
-        }
-      }
+      } else this.recordFinalizeIssue(meetingId, result);
       return result;
     };
     const promise = run().finally(() => {

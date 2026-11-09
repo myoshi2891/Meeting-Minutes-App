@@ -82,8 +82,13 @@ class FakeController implements SessionController {
     if (this.memoryBacklogCount === 0) this.takeMeetingLock()?.();
     return 0;
   }
+  /** 本物と同じく、WAV のある Chunk を会議・source・連番のファイル名で書き出す（メモリ待機からは外さない） */
   exportMemoryBacklog(): MemoryBacklogFile[] {
-    return [];
+    return this.backlog.flatMap((r) => {
+      if (r.wav === null) return [];
+      const { meetingId, source, sequenceNo } = r.meta;
+      return [{ fileName: `${meetingId}_${source}_${sequenceNo.toString().padStart(6, "0")}.wav`, wav: r.wav, meta: r.meta }];
+    });
   }
 }
 
@@ -182,7 +187,9 @@ function startInput(meetingId: string) {
 /** Monitor の初回 HEALTHY 通知を済ませる。遅れて届くと onBackendAvailable が別経路で確定を再試行し、検証対象の経路を隠す */
 async function settleMonitor(s: Setup): Promise<void> {
   await s.app.monitor.checkOnce();
+  // init の初回チェックの通知が checkOnce より後に届く場合に備えて 1 ターン待ち、始まった復旧の IDB 処理の完了まで待つ
   await new Promise((resolve) => setTimeout(resolve, 0));
+  await s.app.whenBackendRecoverySettled();
 }
 
 function stubPageGlobals(): EventTarget & { hide: () => void } {
@@ -1035,6 +1042,56 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(s.events).toContainEqual({ type: "error", error });
   });
 
+  it("finalizing の一覧取得だけに失敗しても、読めた stop_requested の会議は確定待ちとして返す", async () => {
+    // Arrange
+    const stopped = nextMeetingId();
+    const s = await setup({ serverUp: false, seed: async (db) => seedMeeting(db, makeMeeting(stopped, "stop_requested")) });
+    const list = s.app.meetingStore.listByStatus.bind(s.app.meetingStore);
+    const error = new Error("IDB read failed");
+    vi.spyOn(s.app.meetingStore, "listByStatus").mockImplementation(async (status) => {
+      if (status === "finalizing") throw error;
+      return list(status);
+    });
+    // Act
+    const pending = await s.app.listPendingFinalize();
+    // Assert
+    expect(pending.map((m) => m.meetingId)).toContain(stopped);
+    expect(s.events).toContainEqual({ type: "error", error });
+  });
+
+  it("停止状態の書き直しに失敗したら確定待ちの理由に記録し、finalize_pending を 1 回だけ通知する", async () => {
+    // Arrange：サーバー停止中に、停止状態を IDB に書けないまま止めた（停止時の再試行も書き直しに失敗する）
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    await stopWhileMeetingWritesFail(s, id);
+    // Act：書き直しが失敗し続ける間に再試行を重ねる
+    const put = vi.spyOn(s.app.meetingStore, "put").mockRejectedValue(new Error("IDB write failed"));
+    await s.app.retryFinalize(id);
+    put.mockRestore();
+    // Assert
+    expect(s.app.getFinalizeIssue(id)).toMatchObject({ ok: false, stage: "verify", detail: expect.stringContaining("stop state not saved") });
+    expect(s.events.filter((e) => e.type === "finalize_pending" && e.meetingId === id)).toHaveLength(1);
+  });
+
+  it("メモリ待機が空でも停止状態を書けていない間はタブを閉じる前に確認を求め、書き直したら求めない", async () => {
+    // Arrange
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    const leave = () => {
+      const event = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    // Act
+    await stopWhileMeetingWritesFail(s, id);
+    // Assert：閉じると停止理由と最終の音声フレーム数が失われる
+    expect(leave()).toBe(true);
+    await s.app.retryFinalize(id);
+    expect(leave()).toBe(false);
+  });
+
   it("stop_requested と finalizing の会議だけを確定待ちとして返す", async () => {
     // Arrange
     const [stopped, finalizing, done] = [nextMeetingId(), nextMeetingId(), nextMeetingId()];
@@ -1358,6 +1415,26 @@ describe("RecordingSession.stop", () => {
     const sentTail = () => expect(s.server.stored.get(`${id}:mic:0`)).toEqual({ sha256: tail.meta.sha256, sizeBytes: tail.meta.sizeBytes });
     return { s, id, controller, result, sentTail };
   }
+
+  it("メモリ待機の末尾は IDB 外の連番・最大 endFrame に含まれ、WAV として書き出せる", async () => {
+    // Arrange・Act：サーバー停止中に末尾をメモリ待機に残して止めた
+    const { s, id, controller } = await stopWithMemoryTail(false);
+    const tail = controller.backlog[0];
+    // Assert
+    expect(s.app.offIdbSequenceNos(id)).toEqual([0]);
+    expect(s.app.offIdbEndFrame(id)).toBe(tail.meta.endFrame);
+    expect(s.app.exportMemoryBacklog(id)).toEqual([{ fileName: `${id}_mic_000000.wav`, wav: tail.wav, meta: tail.meta }]);
+  });
+
+  it("確定を中止した会議も、メモリ待機の末尾を WAV として書き出せる", async () => {
+    // Arrange：サーバー停止中に末尾をメモリ待機に残して止めた
+    const { s, id, controller } = await stopWithMemoryTail(false);
+    const tail = controller.backlog[0];
+    // Act
+    await s.app.abandonFinalize(id, true);
+    // Assert：中止はデータを削除しないので、利用者の手元へ残せる
+    expect(s.app.exportMemoryBacklog(id).map((f) => [f.fileName, f.wav])).toEqual([[`${id}_mic_000000.wav`, tail.wav]]);
+  });
 
   it("サーバー停止中にメモリ待機を残して止めた会議は、サーバー復帰で末尾を直接送信してから一度だけ確定する", async () => {
     // Arrange：末尾 Chunk が IDB にもサーバーにもなく、メモリ待機に残ったまま停止した
