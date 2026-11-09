@@ -189,6 +189,7 @@ describe("MeetingStore / SettingsStore", () => {
     await expect(store.put({ ...base, stopDetectedAtEpochMs: 1800 })).rejects.toThrow("together");
     expect(await store.get("stop-pair")).toBeUndefined();
     await store.put(base);
+    expect(await store.get("stop-pair")).toEqual(base);
     await store.put({ ...base, stopReason: "mic_ended", stopDetectedAtEpochMs: 1800 });
     expect(await store.get("stop-pair")).toMatchObject({ stopReason: "mic_ended", stopDetectedAtEpochMs: 1800 });
   });

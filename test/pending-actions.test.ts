@@ -40,7 +40,9 @@ describe("確定中止の確認", () => {
   });
   it("書き出しを断った場合や書き出し失敗では中止しない", async () => {
     const abandon = vi.fn();
-    expect(await confirmAbandon(meeting, 1, { confirm: () => false, exportWav: vi.fn(), abandon })).toBe("cancelled");
+    const exportWav = vi.fn();
+    expect(await confirmAbandon(meeting, 1, { confirm: () => false, exportWav, abandon })).toBe("cancelled");
+    expect(exportWav).not.toHaveBeenCalled();
     expect(abandon).not.toHaveBeenCalled();
     await expect(confirmAbandon(meeting, 1, { confirm: () => true, exportWav: () => { throw new Error("export failed"); }, abandon })).rejects.toThrow();
     expect(abandon).not.toHaveBeenCalled();
