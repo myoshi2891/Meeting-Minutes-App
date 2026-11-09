@@ -542,4 +542,24 @@ describe("LocalSaveScheduler", () => {
     expect(await s.status(0)).toMatchObject({ status: "SAVING", attempts: 2 });
     expect(s.timers).toHaveLength(0);
   });
+
+  it("送信中に別タブが確保し直した Chunk の接続失敗は、Monitor へ到達不能を伝えず、状態も書き換えない", async () => {
+    // Arrange：PUT の応答待ちの間に、別タブの復旧が書き戻して送り直しを始める。このタブの古い PUT は接続失敗で終わる
+    let store: ChunkStore | undefined;
+    const s = await setup(() => "network-error", "HEALTHY", {
+      isMeetingAbandoned: async () => false,
+      saver: () => new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, async () => {
+        await store?.updateSaveState("m:mic:000000", (r) => { r.save.status = "SAVING"; r.save.attempts += 1; });
+        throw new TypeError("Failed to fetch");
+      }),
+    });
+    store = s.chunkStore;
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert：古い試行の失敗でこのタブの送信を止めない（結果は確保し直した試行が書く）
+    expect(s.backend.status).toBe("HEALTHY");
+    expect(await s.status(0)).toMatchObject({ status: "SAVING", attempts: 2 });
+    expect(s.scheduler.pendingCount).toBe(0);
+  });
 });

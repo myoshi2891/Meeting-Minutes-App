@@ -290,13 +290,15 @@ export class LocalSaveScheduler {
     }
     if (error.kind === "NETWORK" || error.kind === "TIMEOUT") {
       // ポーリングを待たず即座に UNREACHABLE 扱いにする（§3.6）。BackendHealthMonitor 側も同じ判定を行う。
-      // backend() が HEALTHY のままだと再投入 → 即 pump → 再失敗の連打になるため、先に Monitor へ通知する。
-      this.deps.onBackendUnreachable();
+      // backend() が HEALTHY のままだと再投入 → 即 pump → 再失敗の連打になるため、再投入より先に Monitor へ通知する。
+      // 送信中に別タブが確保し直していたら、古い試行の失敗（遅いタイムアウトなど）でこのタブの送信を止めない
       const owned = await this.updateClaimed(chunkKey, attempts, (r) => {
         r.save.status = "BACKEND_UNAVAILABLE";
         r.save.lastError = error;
       });
-      if (owned) this.insertSorted(chunkKey);
+      if (!owned) return;
+      this.deps.onBackendUnreachable();
+      this.insertSorted(chunkKey);
       return;
     }
 
