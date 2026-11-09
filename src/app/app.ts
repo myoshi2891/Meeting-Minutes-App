@@ -2,6 +2,7 @@
 import { BackendHealthMonitor } from "../api/backend-health-monitor";
 import { LocalSaver } from "../api/local-saver";
 import { MeetingRegistrar, type RegistrationOutcome } from "../api/meeting-registrar";
+import { backoffMs } from "../recording/backoff";
 import { finalizeMeeting, type FinalizeResult } from "../recording/finalizer";
 import { LocalSaveScheduler } from "../recording/local-save-scheduler";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "../recording/meeting-lock";
@@ -34,7 +35,7 @@ export type AppEvent =
   | { readonly type: "error"; readonly error: unknown };
 
 /** 録音セッションが使う RecordingController の口。テストでは Fake を差し込む */
-export type SessionController = Pick<RecordingController, "start" | "stop" | "flush" | "drainMemoryBacklog" | "exportMemoryBacklog" | "memoryBacklogCount" | "takeMeetingLock">;
+export type SessionController = Pick<RecordingController, "start" | "stop" | "flush" | "drainMemoryBacklog" | "discardMemoryBacklog" | "exportMemoryBacklog" | "memoryBacklogCount" | "takeMeetingLock">;
 
 export interface AppDeps {
   readonly db: IDBDatabase;
@@ -102,7 +103,7 @@ export class App {
    */
   private readonly drains = new Map<string, (notify: boolean, direct?: boolean) => Promise<void>>();
   private unsubscribeMonitor: () => void = () => undefined;
-  /** Monitor の通知で始めた onBackendAvailable がすべて終わると解決する */
+  /** Monitor の通知で始めた onBackendAvailable と、ネットワーク失敗後に予約した確定の再試行がすべて終わると解決する */
   private backendRecovery: Promise<void> = Promise.resolve();
   private disposed = false;
   private readonly finalizing = new Map<string, Promise<FinalizeResult>>();
@@ -124,6 +125,14 @@ export class App {
   private readonly abandoned = new Set<string>();
   /** 停止状態（stop_requested・停止理由）を IDB に書けなかった会議。確定待ちに残し、確定・中止の前に書き直す */
   private readonly unsavedStops = new Map<string, MeetingRecord>();
+  /**
+   * ネットワーク失敗で確定できなかった会議の再試行の予約（会議 ID → 予約の世代）。タイマーは取り消せないので、
+   * 発火時に世代が一致する予約だけ実行する。確定・中止・ネットワーク以外の失敗で消す
+   */
+  private readonly networkRetries = new Map<string, number>();
+  private networkRetryGeneration = 0;
+  /** ネットワーク失敗が続いた回数（再試行の間隔に使う）。確定・中止・ネットワーク以外の失敗で消す */
+  private readonly networkRetryAttempts = new Map<string, number>();
   /** 停止後もメモリ待機が残る会議のページライフサイクル（離脱確認）。空になったら外す */
   private readonly lifecycles = new Map<string, { readonly detach: () => void }>();
 
@@ -172,7 +181,7 @@ export class App {
     return this.session;
   }
 
-  /** サーバー復帰の通知で始めた復旧（再投入・確定の再試行）がここまでに始まった分すべて終わるまで待つ */
+  /** サーバー復帰の通知で始めた復旧（再投入・確定の再試行）と予約した確定の再試行が、ここまでに始まった分すべて終わるまで待つ */
   whenBackendRecoverySettled(): Promise<void> {
     return this.backendRecovery;
   }
@@ -438,6 +447,28 @@ export class App {
     return this.controllers.get(meetingId)?.exportMemoryBacklog() ?? [];
   }
 
+  /** 確定を中止したが、メモリ待機が残る会議（discardMemoryBacklog の対象）。title は表示用 */
+  discardableMemoryBacklog(): Array<{ readonly meetingId: string; readonly title: string; readonly count: number }> {
+    return [...this.controllers]
+      .filter(([id, c]) => this.abandoned.has(id) && c.memoryBacklogCount > 0)
+      .map(([id, c]) => ({ meetingId: id, title: this.meetingFallbacks.get(id)?.title ?? id, count: c.memoryBacklogCount }));
+  }
+
+  /**
+   * 確定を中止した会議のメモリ待機を捨てる。書き出した WAV を利用者が保存できたと確認した場合だけ呼ぶ。
+   * 中止した会議のメモリ待機は送れない（prepareChunkPut が拒否する）ので、捨てるまで離脱確認・会議ロック・未保存の件数表示が残り続ける
+   */
+  async discardMemoryBacklog(meetingId: string, confirmed: boolean): Promise<void> {
+    if (!confirmed) throw new Error("メモリ内の音声の破棄には確認が必要です");
+    if (!this.abandoned.has(meetingId)) throw new Error("確定を中止した会議のメモリ内の音声だけ破棄できます");
+    const controller = this.controllers.get(meetingId);
+    if (controller === undefined) return;
+    await controller.discardMemoryBacklog();
+    this.releaseHeldLockIfDrained(meetingId);
+    this.releaseLifecycleIfSettled(meetingId);
+    this.releaseSettledMeeting(meetingId);
+  }
+
   /** UI で対象・未保存の可能性を説明し、確認した場合だけ呼ぶ。データは削除しない。 */
   async abandonFinalize(meetingId: string, confirmed: boolean): Promise<void> {
     if (!confirmed) throw new Error("確定の中止には確認が必要です");
@@ -462,6 +493,7 @@ export class App {
       this.finalizeRequested.delete(meetingId);
       this.finalizeIssues.delete(meetingId);
       this.mismatchRechecked.delete(meetingId);
+      this.cancelNetworkRetry(meetingId);
       this.releaseSettledMeeting(meetingId);
       this.deps.onEvent({ type: "finalize_abandoned", meetingId });
     } finally {
@@ -636,6 +668,9 @@ export class App {
         this.directRegisteredEndFrames.delete(meetingId);
         this.releaseSettledMeeting(meetingId);
       } else this.recordFinalizeIssue(meetingId, result);
+      // 接続失敗・タイムアウトはヘルス状態が変わらず復帰通知が来ないことがあるので、自分で再試行を予約する
+      if (!result.ok && result.reason === "network" && !this.disposed) this.scheduleNetworkRetry(meetingId);
+      else this.cancelNetworkRetry(meetingId);
       return result;
     };
     const promise = run().finally(() => {
@@ -645,6 +680,27 @@ export class App {
     });
     this.finalizing.set(meetingId, promise);
     return promise;
+  }
+
+  /** ネットワーク失敗の後、バックオフをおいて確定を再試行する。サーバーが使えない状態なら、復帰通知（onBackendAvailable）に任せる */
+  private scheduleNetworkRetry(meetingId: string): void {
+    const attempts = (this.networkRetryAttempts.get(meetingId) ?? 0) + 1;
+    this.networkRetryAttempts.set(meetingId, attempts);
+    const generation = ++this.networkRetryGeneration;
+    this.networkRetries.set(meetingId, generation);
+    const setTimer = this.deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
+    setTimer(() => {
+      if (this.networkRetries.get(meetingId) !== generation) return;
+      this.networkRetries.delete(meetingId);
+      if (this.disposed || this.abandoned.has(meetingId) || !isUsable(this.monitor.state)) return;
+      const run = this.retryFinalize(meetingId).then(() => undefined, (error: unknown) => this.deps.onEvent({ type: "error", error }));
+      this.backendRecovery = Promise.all([this.backendRecovery, run]).then(() => undefined);
+    }, backoffMs(attempts));
+  }
+
+  private cancelNetworkRetry(meetingId: string): void {
+    this.networkRetries.delete(meetingId);
+    this.networkRetryAttempts.delete(meetingId);
   }
 
   private async finalizeOnce(meetingId: string): Promise<FinalizeResult> {

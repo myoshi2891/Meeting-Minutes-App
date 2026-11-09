@@ -82,6 +82,14 @@ class FakeController implements SessionController {
     if (this.memoryBacklogCount === 0) this.takeMeetingLock()?.();
     return 0;
   }
+  /** 本物と同じく、停止後のメモリ待機を空にし、保持していたロックがあれば解放する */
+  async discardMemoryBacklog(): Promise<number> {
+    const discarded = this.backlog.length;
+    this.backlog.length = 0;
+    this.memoryBacklogCount = 0;
+    this.takeMeetingLock()?.();
+    return discarded;
+  }
   /** 本物と同じく、WAV のある Chunk を会議・source・連番のファイル名で書き出す（メモリ待機からは外さない） */
   exportMemoryBacklog(): MemoryBacklogFile[] {
     return this.backlog.flatMap((r) => {
@@ -130,6 +138,8 @@ interface SetupOptions {
   wrapFetch?: (fetchImpl: typeof fetch) => typeof fetch;
   serverUp?: boolean;
   seed?: (db: IDBDatabase, server: FakeLocalServer, locks: FakeLockManager) => Promise<void>;
+  /** 既定は何も発火しないタイマー。再試行の予約を確かめるテストだけ差し替える */
+  setTimer?: (fn: () => void, ms: number) => unknown;
 }
 
 async function setup(options: SetupOptions = {}): Promise<Setup> {
@@ -150,7 +160,7 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
     locks,
     onEvent: (e) => events.push(e),
     fetchImpl: options.wrapFetch?.(server.fetch) ?? server.fetch,
-    setTimer: () => undefined,
+    setTimer: options.setTimer ?? (() => undefined),
     createController: (deps) => {
       const c = new FakeController(deps, log);
       controllers.push(c);
@@ -822,6 +832,53 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(s.events.slice(eventsBefore).filter((e) => e.type === "memory_backlog_export_required")).toHaveLength(0);
   });
 
+  it("確定中止した会議のメモリ待機は、確認して破棄すると離脱確認と会議ロックを外し、件数にも数えない", async () => {
+    // Arrange：サーバー停止中にメモリ待機を残して止め、確定を中止した
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    controller.backlog.push(await makeChunkRecord(id, 0, 160));
+    controller.memoryBacklogCount = 1;
+    await session.stop();
+    await s.app.abandonFinalize(id, true);
+    const leave = () => {
+      const event = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    // 破棄の確認までは安全策を残す
+    expect(leave()).toBe(true);
+    expect(s.locks.held.size).toBe(1);
+    expect(s.app.discardableMemoryBacklog()).toEqual([{ meetingId: id, title: "定例", count: 1 }]);
+    await expect(s.app.discardMemoryBacklog(id, false)).rejects.toThrow("確認");
+    // Act
+    await s.app.discardMemoryBacklog(id, true);
+    // Assert
+    expect(s.app.memoryBacklogCount()).toBe(0);
+    expect(s.app.exportMemoryBacklog(id)).toEqual([]);
+    expect(leave()).toBe(false);
+    expect(s.locks.held.size).toBe(0);
+    expect(s.app.discardableMemoryBacklog()).toEqual([]);
+  });
+
+  it("確定中止していない会議のメモリ待機は破棄できない", async () => {
+    // Arrange：メモリ待機を残して止めたが、確定は中止していない
+    stubPageGlobals();
+    const s = await setup({ serverUp: false });
+    const id = nextMeetingId();
+    const session = await s.app.startRecording(startInput(id));
+    const controller = s.controllers[0];
+    controller.backlog.push(await makeChunkRecord(id, 0, 160));
+    controller.memoryBacklogCount = 1;
+    await session.stop();
+    // Act / Assert
+    await expect(s.app.discardMemoryBacklog(id, true)).rejects.toThrow("確定を中止した会議");
+    expect(controller.memoryBacklogCount).toBe(1);
+    expect(s.app.discardableMemoryBacklog()).toEqual([]);
+  });
+
   it("開始済みの PUT は中止後も完了を記録する", async () => {
     // Arrange・Act：PUT の応答待ちの間に確定を中止する
     const { s, id, r, release } = await abandonWhileRequestHeld((url, init) => init?.method === "PUT" && url.includes("/chunks/"));
@@ -910,6 +967,42 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     put.mockRestore();
     return result;
   }
+
+  it("照合の一覧取得がネットワーク失敗で終わったら、ヘルス状態が変わらなくても時間をおいて確定を再試行する", async () => {
+    // Arrange：Monitor は HEALTHY のまま、一覧の GET だけが 1 回ネットワーク失敗する
+    const timers: Array<{ fn: () => void; ms: number }> = [];
+    let failList = true;
+    const s = await setup({
+      setTimer: (fn, ms) => timers.push({ fn, ms }),
+      wrapFetch: (f) => async (input, init) => {
+        if (failList && init?.method === undefined && String(input).endsWith("/chunks")) {
+          failList = false;
+          throw new TypeError("Failed to fetch");
+        }
+        return f(input, init);
+      },
+    });
+    await settleMonitor(s);
+    timers.length = 0;
+    const id = nextMeetingId();
+    const chunk = await seedChunk(s.db, id, 0, "DB_REGISTERED");
+    registerOnServer(s.server, chunk);
+    await seedMeeting(s.db, makeMeeting(id, "stop_requested"));
+    // Act
+    const first = await s.app.retryFinalize(id);
+    const scheduled = timers.splice(0);
+    for (const t of scheduled) t.fn();
+    // Assert
+    expect(first).toMatchObject({ ok: false, stage: "verify", reason: "network" });
+    expect(scheduled).toHaveLength(1);
+    await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
+    expect(s.events.filter((e) => e.type === "finalized" && e.meetingId === id)).toHaveLength(1);
+    // 成功した確定には再試行を予約しない。古い予約が後から発火しても重ねて確定しない
+    expect(timers).toHaveLength(0);
+    for (const t of scheduled) t.fn();
+    await s.app.whenBackendRecoverySettled();
+    expect(s.events.filter((e) => e.type === "finalized" && e.meetingId === id)).toHaveLength(1);
+  });
 
   it("停止状態を IDB に書けなかった会議は確定待ちに残し、書けるようになったら停止理由ごと書き直して確定する", async () => {
     // Arrange

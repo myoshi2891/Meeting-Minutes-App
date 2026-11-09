@@ -14,7 +14,7 @@ import {
   TAB_CLOSE_HELP,
   warningsFor,
 } from "./ui/recording-view";
-import { confirmAbandon, manualRetryNeedsNotice } from "./ui/pending-actions";
+import { confirmAbandon, discardBacklogQuestion, manualRetryNeedsNotice } from "./ui/pending-actions";
 import { buildStoredZip } from "./export/zip";
 import type { MemoryBacklogFile } from "./recording/recording-controller";
 import workletModuleUrl from "./worklet/pcm-chunker.worklet.ts?worker&url";
@@ -113,6 +113,17 @@ function onHidden(app: App): void {
 }
 
 const pendingBusy = new Set<string>();
+
+/**
+ * 表示中の確定待ちの行のボタンを押せる状態に戻す。操作の待機中に一覧が再描画されると押した行は置き換わっているので、
+ * 押したときのボタンではなく会議 ID で今の行を探す（会議 ID は CSS セレクタに埋め込まない）
+ */
+function enablePendingRow(meetingId: string): void {
+  for (const li of ui.pending.children) {
+    if (!(li instanceof HTMLLIElement) || li.dataset.meetingId !== meetingId) continue;
+    for (const button of li.querySelectorAll("button")) button.disabled = false;
+  }
+}
 let pendingRefresh: Promise<void> | null = null;
 let pendingRefreshRequested = false;
 /**
@@ -160,6 +171,7 @@ async function renderPending(app: App): Promise<void> {
   ui.pending.replaceChildren(
     ...meetings.map((m, index) => {
       const li = document.createElement("li");
+      li.dataset.meetingId = m.meetingId;
       const label = document.createElement("span");
       label.textContent = `${m.title}（${new Date(m.createdAt).toLocaleString()}） `;
       const retry = document.createElement("button");
@@ -194,13 +206,18 @@ async function renderPending(app: App): Promise<void> {
           confirm: (message) => window.confirm(message),
           exportWav: () => downloadWavs(app.exportMemoryBacklog(m.meetingId)),
           abandon: (id, confirmed) => app.abandonFinalize(id, confirmed),
+          discardBacklog: (id) => app.discardMemoryBacklog(id, true),
         }).then((outcome) => {
           // キャンセルは状態を変えないので、一覧の再読込（IDB 読み取り）を待たずにボタンを戻す
           if (outcome !== "cancelled") return;
           pendingBusy.delete(m.meetingId);
-          abandon.disabled = retry.disabled = false;
-        }).catch((error: unknown) => notify(noticeFor({ type: "error", error }) ?? ""))
-          .finally(() => { pendingBusy.delete(m.meetingId); void refreshPending(app); });
+          enablePendingRow(m.meetingId);
+        }).catch((error: unknown) => {
+          // 中止できなかった会議は一覧に残るので、再読込を待たずに今の行のボタンを戻す
+          pendingBusy.delete(m.meetingId);
+          enablePendingRow(m.meetingId);
+          notify(noticeFor({ type: "error", error }) ?? "");
+        }).finally(() => { pendingBusy.delete(m.meetingId); void refreshPending(app); });
       });
       const detail = document.createElement("p");
       const issue = app.getFinalizeIssue(m.meetingId);
@@ -279,14 +296,20 @@ async function stopRecording(app: App): Promise<void> {
   }
 }
 
-/** §15：メモリ待機中の Chunk を利用者の手元へ書き出す（メモリ待機からは外さない） */
-async function exportMemoryBacklog(): Promise<void> {
+/**
+ * §15：メモリ待機中の Chunk を利用者の手元へ書き出す（メモリ待機からは外さない）。
+ * 確定を中止した会議の分は送られないので、書き出した後に保存を確かめて破棄できるようにする（中止時に破棄を見送った場合の経路）
+ */
+async function exportMemoryBacklog(app: App): Promise<void> {
   // 空になった controller は外す（drainMemoryBacklog でサーバーへ送れた場合など）
   for (const controller of stoppedWithBacklog) {
     if (controller.memoryBacklogCount === 0) stoppedWithBacklog.delete(controller);
   }
   const controllers = recording === null ? [...stoppedWithBacklog] : [recording.session.controller, ...stoppedWithBacklog];
   await downloadWavs(controllers.flatMap((controller) => controller.exportMemoryBacklog()));
+  for (const { meetingId, title, count } of app.discardableMemoryBacklog()) {
+    if (window.confirm(discardBacklogQuestion(title, count))) await app.discardMemoryBacklog(meetingId, true);
+  }
 }
 
 /** ダウンロードの開始後、URL を破棄するまでの猶予。すぐ破棄すると保存先の確認中に失敗することがある */
@@ -348,7 +371,7 @@ async function main(): Promise<void> {
   ui.start.addEventListener("click", () => void startRecording(app));
   ui.stop.addEventListener("click", () => void stopRecording(app));
   ui.exportButton.addEventListener("click", () => {
-    void exportMemoryBacklog().catch((error: unknown) => notify(noticeFor({ type: "error", error }) ?? ""));
+    void exportMemoryBacklog(app).catch((error: unknown) => notify(noticeFor({ type: "error", error }) ?? ""));
   });
   ui.tokenForm.addEventListener("submit", (e) => {
     e.preventDefault();
