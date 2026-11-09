@@ -743,7 +743,7 @@ stateDiagram-v2
 | `SAVING → RETRYING`（即時） | 送信中にトークンが替わり続けて送れなかった（`SaveOutcome.tokenChanged`）。サーバーの拒否ではないので `attempts` の上限に数えない | 確保時に足した `attempts` を 1 戻す、`nextRetryAt = null`、すぐ保存キューに戻して新しいトークンで送る（`setToken` の `resumeAll()` は送信中のキーを拾えないため） |
 | `RETRYING → LOCAL_SAVE_PENDING` | `now >= nextRetryAt` | なし |
 
-`SAVING` からの失敗の遷移（`RETRYING` / `LOCAL_SAVE_FAILED` / `BACKEND_UNAVAILABLE`）は、このタブが確保した `SAVING`（`attempts` が確保時の値）のままのときだけ書く。送信中に別タブの復旧が書き戻して送り直した Chunk は、そのタブの状態を上書きせず、再投入・再試行の予約もしない。成功（`SAVED` / `DB_REGISTERED`）はサーバーの事実なので確保に関係なく書く。
+`SAVING` からの失敗の遷移（`RETRYING` / `LOCAL_SAVE_FAILED` / `BACKEND_UNAVAILABLE`）は、このタブが確保した `SAVING`（`attempts` が確保時の値）のままのときだけ書く。送信中に別タブの復旧が書き戻して送り直した Chunk は、そのタブの状態を上書きせず、再投入・再試行の予約もしない。成功（`SAVED` / `DB_REGISTERED`）も同じく自タブの確保が残るときだけ書き、`onChunkSaved` もそのときだけ通知する。復旧したタブは自分で `SAVING` を確保し直して結果を書くので、古い試行の成功を捨てても失われない。確保に関係なく書くと、古い試行の `registered: false` が新しい試行の `DB_REGISTERED` を `SAVED` に戻しうる。`lastSuccessfulLocalSaveAt` はサーバーが保存した事実なので確保に関係なく更新する。`RETRYING` の Chunk が期限（`nextRetryAt`）より前に `runOne()` に来たときは、すぐ再投入せず、残り時間のタイマーで再投入する。すぐ戻すと `pump()` が期限まで同じ Chunk を読み直し続ける。
 | `* → BACKEND_UNAVAILABLE` | `status ∈ {UNREACHABLE}` または `unauthorized` | `degradedReasons` に追加。PUT の NETWORK / TIMEOUT 失敗は `onBackendUnreachable`、401 / 403 は `onBackendUnauthorized` で Monitor へ即時通知する（§18）。401 / 403 の Chunk は保存キューに戻さず、`resumeAll()` まで待機する |
 | `BACKEND_UNAVAILABLE → LOCAL_SAVE_PENDING` | `HEALTHY` 復帰 | `sequenceNo` 昇順で再投入 |
 | `SAVED → DB_REGISTERED` | サーバーが SQLite 登録まで済ませたことを `registered: true` で返す | `serverPath` 確定。クォータ縮退で Blob 削除可能になる |
@@ -983,6 +983,10 @@ export class MeetingStore {
   constructor(private readonly db: IDBDatabase) {}
 
   async put(record: MeetingRecord): Promise<void> {
+    // 停止理由と検出時刻は組で保存する（両方省略は旧データ・未観測）。片方だけの会議はサーバーの確定が 422 で止まる
+    if ((record.stopReason === undefined) !== (record.stopDetectedAtEpochMs === undefined)) {
+      throw new Error(`meeting ${record.meetingId}: stopReason and stopDetectedAtEpochMs must be saved together`);
+    }
     const tx = this.db.transaction(STORE_MEETINGS, "readwrite");
     tx.objectStore(STORE_MEETINGS).put(record);
     await transactionDone(tx);
@@ -1194,7 +1198,7 @@ export function isChunkListResponse(value: unknown): value is ChunkListResponse 
 
 ### 停止理由の記録（2026-11-08）
 
-`stopReason`（`manual` / `mic_ended`）と `stopDetectedAtEpochMs`（非負の整数、epoch ms）を一組で扱う。App は最初の停止要求の理由と検出時刻を確定し、Controller は Worklet の停止応答を待つ前に `stop_requested` とともに IndexedDB に保存する。手動停止と mic ended が競合しても最初の値を維持し、UI 通知もその理由を使う。mic ended が開始処理中に来た場合も、検出時刻を保持して停止へ渡す。
+`stopReason`（`manual` / `mic_ended`）と `stopDetectedAtEpochMs`（非負の整数、epoch ms）を一組で扱う。App は最初の停止要求の理由と検出時刻を確定し、Controller は Worklet の停止応答を待つ前に `stop_requested` とともに IndexedDB に保存する。手動停止と mic ended が競合しても最初の値を維持し、UI 通知もその理由を使う。`MeetingStore.put()` は片方だけを持つ会議を保存せず例外を返す（両方省略の旧データは保存する）。片方だけの会議はサーバーの確定が 422 になり、確定待ちから抜けられないためである。mic ended が開始処理中に来た場合も、検出時刻を保持して停止へ渡す。
 
 Finalizer は保存値を確定 API へ渡す。サーバーは片方だけ指定・未知の理由・不正な時刻（負数・真偽値・SQLite の符号付き 64 bit 整数の上限 `2**63 - 1` 超え）を422で拒否する。SQLite の `meetings.stop_reason` / `stop_detected_at` に保存し、`meeting.json` にも同じ値を含める。最初の確定が優先され、再試行では上書きしない。列の追加は起動時に既存の列を確認して行い、既存会議・旧クライアントの値はNULLとする。IndexedDBは任意フィールド追加のみでDBバージョンを変えない。復旧は既存の値を保持し、停止を観測していない中断には理由や検出時刻を補わない。
 
@@ -1714,6 +1718,8 @@ export class RecordingController {
   private trackListeners: AbortController | null = null;
   /** この録音で切断を処理済みか。health は録音をまたいで共有されるので、degradedReasons では判定しない */
   private micEndedHandled = false;
+  /** drainMemoryBacklog の直列化 */
+  private drainQueue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly deps: RecordingControllerDeps) {}
 
@@ -1908,7 +1914,14 @@ export class RecordingController {
    * サーバーへ直接送る。直接送った Chunk は IDB に残らないが、Finalizer はサーバーの登録で連番を埋める（§22）。
    * 直接送信も失敗したら元の例外を投げ、Chunk はメモリ待機に残す（exportMemoryBacklog で書き出せる）。
    */
-  async drainMemoryBacklog(): Promise<number> {
+  drainMemoryBacklog(): Promise<number> {
+    // 並行させない。先頭を読んでから外すまでに別の drain が先頭を外すと、送っていない Chunk を外してしまう
+    const run = this.drainQueue.then(() => this.drainSerially());
+    this.drainQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async drainSerially(): Promise<number> {
     let drained = 0;
     while (this.memoryBacklog.length > 0) {
       const record = this.memoryBacklog[0];
@@ -2099,7 +2112,7 @@ export class RecordingController {
 
 IndexedDB への書き込みに失敗した Chunk は、失敗の理由を問わずメモリ待機キュー（`memoryBacklog`）に残す。`sequenceNo` は採番済みなので、捨てると欠番になり、Finalization Barrier（§22）の連続性検査を永久に通過できなくなるためである。`QuotaExceededError` は §3.4 段階3として `IDB_QUOTA_EXHAUSTED` を記録し、録音を継続する。`drainMemoryBacklog()` でもクォータ超過は失敗にせず空きを待つが、サーバーへ直接 PUT して DB 登録まで済めばメモリ待機から外す。停止後は空きを作る保存（§21 のクォータ確認）が続かず、空きを待つだけでは末尾が永久に残るためである。登録できなければメモリ待機に残してループを抜ける（同じ先頭を回り続けない）。それ以外のエラー（別タブのアップグレードで接続が閉じられた後の `InvalidStateError` など）は `IDB_WRITE_FAILED` を記録し、`onError` に通知したうえで同じく待機キューに残し、`drainMemoryBacklog()` で再書き込みする。なお、待機キューに残ったのが末尾の Chunk だけだと、IndexedDB 上は欠番なしに見えて連続性検査では検出できない。そのため Finalizer は `memoryBacklogCount` が 0 になるまで Barrier を通さない（§22）。
 
-`drainMemoryBacklog()` は、クォータ以外の理由で再書き込みにも失敗した Chunk を、`directSaver`（本番は `LocalSaver`）でサーバーへ直接 PUT し、DB 登録まで済んだ（`ok` かつ `registered`）ときだけメモリ待機から外す。ファイル保存だけで DB 未登録（`registered: false`）のときは外さない。IndexedDB にもない Chunk を外すと、Finalizer はサーバーに登録済みの連番しか数えないので欠番が埋まらず、再送も書き出しもできなくなるためである（この場合は直接送信の失敗と同じ扱いにする）。別タブが `DB_VERSION` を上げた後は、古いコードで開き直しても `VersionError` になり、このタブは二度と IndexedDB に書けないためである。直接送った Chunk は IndexedDB に残らないが、Finalizer はサーバーに登録済みの連番を「揃っている」とみなす（§22）。直接送信も失敗した場合（サーバー停止中など）は IndexedDB の例外をそのまま投げ、Chunk はメモリ待機に残す。このとき UI は `exportMemoryBacklog()` で WAV を書き出させ、再読み込みやタブを閉じる前に利用者の手元へ残す（ファイル名は `<meetingId>_<source>_<6 桁の sequenceNo>.wav`。書き出してもメモリ待機からは外さない）。書き出したファイルをサーバーへ取り込む経路は Phase 1 の範囲外である。`directSaver` を省略すると直接送信は行わない。`drainMemoryBacklog()` の終了時にメモリ待機が空なら、`degradedReasons` から `IDB_QUOTA_EXHAUSTED` と `IDB_WRITE_FAILED` だけを外す（他の理由は残す）。ただし `health` はこのタブの全会議で共有するので、`otherMeetingsBacklogCount()`（App が渡す、このタブの他の Controller のメモリ待機件数の合計）が 0 のときだけ外す。停止後もメモリ待機が残る会議 A がある間に、次の会議 B の drain で警告が消えないようにするためである。この 2 つは「メモリ待機がクラッシュで失われうる」ことの警告なので、待機が空になれば出し続ける理由がない。IndexedDB が直っていなければ、次の Chunk の書き込み失敗で `persistChunk` が付け直す。
+`drainMemoryBacklog()` は、クォータ以外の理由で再書き込みにも失敗した Chunk を、`directSaver`（本番は `LocalSaver`）でサーバーへ直接 PUT し、DB 登録まで済んだ（`ok` かつ `registered`）ときだけメモリ待機から外す。ファイル保存だけで DB 未登録（`registered: false`）のときは外さない。IndexedDB にもない Chunk を外すと、Finalizer はサーバーに登録済みの連番しか数えないので欠番が埋まらず、再送も書き出しもできなくなるためである（この場合は直接送信の失敗と同じ扱いにする）。別タブが `DB_VERSION` を上げた後は、古いコードで開き直しても `VersionError` になり、このタブは二度と IndexedDB に書けないためである。直接送った Chunk は IndexedDB に残らないが、Finalizer はサーバーに登録済みの連番を「揃っている」とみなす（§22）。直接送信も失敗した場合（サーバー停止中など）は IndexedDB の例外をそのまま投げ、Chunk はメモリ待機に残す。このとき UI は `exportMemoryBacklog()` で WAV を書き出させ、再読み込みやタブを閉じる前に利用者の手元へ残す（ファイル名は `<meetingId>_<source>_<6 桁の sequenceNo>.wav`。書き出してもメモリ待機からは外さない）。書き出したファイルをサーバーへ取り込む経路は Phase 1 の範囲外である。`directSaver` を省略すると直接送信は行わない。`drainMemoryBacklog()` は呼び出しを直列化する。先頭を読んでから外すまでの間に別の drain が先頭を外すと、直接送信に失敗してメモリ待機に残すはずの Chunk を外してしまうためである。`drainMemoryBacklog()` の終了時にメモリ待機が空なら、`degradedReasons` から `IDB_QUOTA_EXHAUSTED` と `IDB_WRITE_FAILED` だけを外す（他の理由は残す）。ただし `health` はこのタブの全会議で共有するので、`otherMeetingsBacklogCount()`（App が渡す、このタブの他の Controller のメモリ待機件数の合計）が 0 のときだけ外す。停止後もメモリ待機が残る会議 A がある間に、次の会議 B の drain で警告が消えないようにするためである。この 2 つは「メモリ待機がクラッシュで失われうる」ことの警告なので、待機が空になれば出し続ける理由がない。IndexedDB が直っていなければ、次の Chunk の書き込み失敗で `persistChunk` が付け直す。
 
 `stop()` は `stop_requested` を先に永続化し、最終 Chunk の書き込み完了を待ってから会議レコードをもう一度保存する。最終 flush で確定した `sessionClock.audioFrameCount` を IndexedDB に残すためで、Finalizer はこの値を `totalAudioFrames` として送る。これらの処理全体を try/finally で包み、途中で IndexedDB 書き込みなどが reject しても、ソースノードの切断・`onmessage` の解除・マイクトラックの停止は必ず行う。
 
@@ -2821,21 +2834,25 @@ export class LocalSaveScheduler {
     if (abandoned === true) return;
     // 読み込み・中止判定を待つ間に別タブが送信を始めていることがある。古い record ではなく、
     // 同じトランザクションで現在の状態を確かめてから SAVING を確保する
-    const claim: { attempts: number | null; notYet: boolean } = { attempts: null, notYet: false };
+    const claim: { attempts: number | null; retryInMs: number | null } = { attempts: null, retryInMs: null };
     await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
       // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
       // SAVED（ファイル保存済み・DB 未登録）の登録確認は Finalizer のサーバー一覧照合に任せる
       if (r.save.status === "DB_REGISTERED" || r.save.status === "SAVED" || r.save.status === "SAVING") return;
       if (r.save.status === "RETRYING" && r.save.nextRetryAt !== null && r.save.nextRetryAt > this.deps.now()) {
-        claim.notYet = true;
+        claim.retryInMs = r.save.nextRetryAt - this.deps.now();
         return;
       }
       r.save.status = "SAVING";
       r.save.attempts += 1;
       claim.attempts = r.save.attempts;
     });
-    if (claim.notYet) {
-      this.insertSorted(chunkKey);
+    if (claim.retryInMs !== null) {
+      // 期限前に再投入された。すぐ戻すと pump が期限まで同じ Chunk を回し続けるので、残り時間だけ待ってから戻す
+      this.deps.setTimer(() => {
+        this.insertSorted(chunkKey);
+        void this.pump();
+      }, claim.retryInMs);
       return;
     }
     const attempts = claim.attempts;
@@ -2845,15 +2862,16 @@ export class LocalSaveScheduler {
     const outcome = await saver.put(record);
 
     if (outcome.ok) {
-      await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
+      this.deps.health.lastSuccessfulLocalSaveAt = this.deps.now();
+      // 送信中に別タブの復旧が新しい試行で確保し直していたら、その試行の状態を上書きしない（結果はその試行が書く）
+      const owned = await this.updateClaimed(chunkKey, attempts, (r) => {
         r.save.status = outcome.registered ? "DB_REGISTERED" : "SAVED";
         r.save.savedVia = "api";
         r.save.serverPath = outcome.serverPath;
         r.save.lastError = null;
         r.save.nextRetryAt = null;
       });
-      this.deps.health.lastSuccessfulLocalSaveAt = this.deps.now();
-      this.deps.onChunkSaved?.(record.meta.meetingId);
+      if (owned) this.deps.onChunkSaved?.(record.meta.meetingId);
       return;
     }
 
@@ -2917,7 +2935,7 @@ export class LocalSaveScheduler {
   }
 
   /**
-   * 失敗の書き戻し。このタブが確保した SAVING（attempts が確保時の値）のままのときだけ mutate を適用し、適用したかを返す。
+   * 結果の書き戻し。このタブが確保した SAVING（attempts が確保時の値）のままのときだけ mutate を適用し、適用したかを返す。
    * 送信中に別タブの復旧が書き戻して送り直した・保存を終えた Chunk の状態は上書きしない（再投入もそのタブに任せる）。
    */
   private async updateClaimed(chunkKey: string, attempts: number, mutate: (record: AudioChunkRecord) => void): Promise<boolean> {
@@ -4950,10 +4968,18 @@ export class App {
     let directAllowed = true;
     /** 実行中の drain の直接送信が、送信中のトークン変更で送れなかったか */
     let tokenChangedDuringDrain = false;
+    /** 直接送信を試さない drain の実行中に、直接送信する drain（サーバー復帰）が要求されたか */
+    let directRequestedDuringDrain = false;
     /** notify：空になったら確定を再開させる。onBackendAvailable は自分で確定するので false で呼ぶ */
     const drain = async (notify = true, direct = true): Promise<void> => {
-      if (draining) return;
+      if (draining) {
+        // サーバー停止中の確定再試行（IDB への書き戻しだけ）がロックを借りている間にサーバーが戻ると、
+        // onBackendAvailable の drain も確定もここで弾かれる。終わってから直接送信で送り直す
+        if (direct && !directAllowed) directRequestedDuringDrain = true;
+        return;
+      }
       draining = true;
+      directRequestedDuringDrain = false;
       directAllowed = direct;
       tokenChangedDuringDrain = false;
       try {
@@ -4972,9 +4998,12 @@ export class App {
         draining = false;
         directAllowed = true;
       }
-      // setToken からの drain は実行中の drain に弾かれているので、終わってから新しいトークンで送り直す。
+      // setToken・サーバー復帰からの drain は実行中の drain に弾かれているので、終わってから現在のトークンで送り直す。
       // draining を戻した直後に同期的に呼ぶので、別の drain と並行しない。空になれば notify に従って確定を再開する
-      if (tokenChangedDuringDrain && controller.memoryBacklogCount > 0) await drain(notify, direct);
+      // （確定再試行の中なら、その再試行が続けて確定する）
+      const directRequested = directRequestedDuringDrain;
+      directRequestedDuringDrain = false;
+      if ((tokenChangedDuringDrain || directRequested) && controller.memoryBacklogCount > 0) await drain(notify, direct || directRequested);
     };
     const enqueuer: ChunkEnqueuer = {
       enqueue: async (chunkKey) => {
@@ -5391,9 +5420,9 @@ T12：会議ごとに確定の失敗理由と、サーバー登録確認済み�
 
 停止時に `controller.stop()` が停止状態（`stop_requested`・停止理由）を IDB に書けずに reject した場合も、録音は止まっている。App は開始時に受け取った会議情報（`onMeetingCreated`）に停止状態を載せて `unsavedStops` に残し、`listPendingFinalize()` に `stop_requested` として並べる。`session.stop()` は reject せず、確定できなかった結果を返す。`listPendingFinalize()` は IDB の一覧取得に失敗しても `AppEvent.error` を通知したうえでこの会議を返し、再試行ボタンを出せるようにする。`retryFinalize()` と `abandonFinalize()` は会議ロックを取った後、この停止状態を書き直す。`retryFinalize()` は書き直しより前に、メモリ待機の末尾を drain する（サーバーが使えれば直接送信も試す。IDB が書けないときこそ音声はメモリ待機にしか残らず、書き直しの失敗で止めると次のヘルス状態の変化まで送られない）。IDB を読み直し、`recording` のままなら丸ごと書く。`stop_requested`（最初の保存だけ成功し、flush 後の最終保存がクォータ不足などで失敗した場合）なら、Controller が持つ最終の `sessionClock`（`audioFrameCount`）と、未記録の停止理由だけを載せて書く。最終フレーム数が欠けたまま `totalAudioFrames` を送らず、他タブの確定 POST の失敗で残った値も保つためである。ロックは stop 後に一度手放しているので、別タブが先に進めた会議（`finalizing`・`finalized`・`abandoned`）は上書きしない。書けなければ確定・中止に進まない。Controller は最終保存に失敗するとロックを保持したまま止まり（§15）、App は `takeMeetingLock()` で受け取ったロックを、停止状態を書き直せるまで解放しない。別タブが古い `audioFrameCount` のまま確定しないためである。停止後もメモリ待機が残る会議は、ページライフサイクルを外さずに残し、`beforeunload` の離脱確認を続ける（タブを閉じると音声が失われるため）。メモリ待機が空になったら外す。
 
-`retryFinalize()` は、メモリ待機が残る会議（録音中を除く）について、Barrier の前に drain する。停止直後や「再試行」ボタンでも、サーバー復帰の通知を待たずに末尾を IDB へ書き戻す・送るためである。サーバーが使えない（`HEALTHY` / `DEGRADED` かつ未失効でない）ときは IDB への書き戻しだけ試し、直接送信は試さない（`directSaver` が送信前に失敗を返す）。この失敗では停止時の `memory_backlog_export_required` を重ねて通知しない。drain の直接送信が送信中のトークン変更（`tokenChanged`）で送れなかったときは通知せず、drain を終えた直後に同じ引数で drain し直す（`setToken` からの drain は実行中の drain に弾かれているため）。並行はしない。確定待ちの内訳（`pendingCountsText`）には、このタブの直接送信とメモリ待機の連番（`App.offIdbSequenceNos()`）も渡し、件数ではなく連番で欠番を判定する。メモリ待機の連番が IDB の最大の連番より後ろにあると、件数の比較では欠番を見逃すためである。再読み込み後は直接送信の連番が分からないので、IDB の連番だけで判定し、欠けがあれば「実際はこれより多い可能性」と示す。
+`retryFinalize()` は、メモリ待機が残る会議（録音中を除く）について、Barrier の前に drain する。停止直後や「再試行」ボタンでも、サーバー復帰の通知を待たずに末尾を IDB へ書き戻す・送るためである。サーバーが使えない（`HEALTHY` / `DEGRADED` かつ未失効でない）ときは IDB への書き戻しだけ試し、直接送信は試さない（`directSaver` が送信前に失敗を返す）。この失敗では停止時の `memory_backlog_export_required` を重ねて通知しない。drain の直接送信が送信中のトークン変更（`tokenChanged`）で送れなかったときは通知せず、drain を終えた直後に同じ引数で drain し直す（`setToken` からの drain は実行中の drain に弾かれているため）。並行はしない。同じく、サーバーが使えない間の確定再試行が IDB への書き戻しだけを試している最中にサーバーが戻ると、`onBackendAvailable()` の drain は実行中の drain に、確定は借用中の会議ロックに弾かれる。そこで直接送信を試さない drain の実行中に直接送信の drain が要求されたら記録し、drain を終えた直後に直接送信で drain し直す。確定再試行の中なら、その再試行が続けて Barrier を通すので、次の復帰イベントや手動再試行を待たない。確定待ちの内訳（`pendingCountsText`）には、このタブの直接送信とメモリ待機の連番（`App.offIdbSequenceNos()`）も渡し、件数ではなく連番で欠番を判定する。メモリ待機の連番が IDB の最大の連番より後ろにあると、件数の比較では欠番を見逃すためである。再読み込み後は直接送信の連番が分からないので、IDB の連番だけで判定し、欠けがあれば「実際はこれより多い可能性」と示す。
 
-`main.ts` は `recording_stopped` を受けて録音 UI と AudioContext を解放し、メモリ待機の controller を保持する。一覧の並行更新には世代番号を使い、古い読み取り結果で中止済みの行を再表示しない。確認操作は §31.5 に分離してテストする。`confirmAbandon()` は `"cancelled"` / `"abandoned"` を返し、キャンセル時は一覧の再読込を待たずにボタンを戻す。
+`main.ts` は `recording_stopped` を受けて録音 UI と AudioContext を解放し、メモリ待機の controller を保持する。一覧の更新（`refreshPending`）は 1 本ずつ順に実行し、実行中に来た要求は終わった後の 1 回にまとめる。古い読み取り結果が新しい結果の後に描画されず、中止済みの行を再表示しない。世代番号で古い結果を捨てる方式は、読み込みが更新間隔（5 秒）より遅いと毎回新しい要求に捨てられ、一覧が一度も描画されないため使わない。確認操作は §31.5 に分離してテストする。`confirmAbandon()` は `"cancelled"` / `"abandoned"` を返し、キャンセル時は一覧の再読込を待たずにボタンを戻す。
 
 UI フレームワークは使わない（ブラウザ標準 API と TypeScript のみ）。表示文言を作る純関数 `src/ui/recording-view.ts` と、DOM を操作する薄い層 `src/main.ts` に分け、前者を Node の Vitest で検証する。後者はブラウザでの手動確認（§28.3）で担保する。ファイル名は Phase 2 の `src/ui/state.ts`（phase2-client §11）と衝突させない。
 

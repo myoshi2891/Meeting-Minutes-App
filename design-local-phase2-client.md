@@ -684,6 +684,8 @@ export class RecordingController {
   private finalStopUnsaved = false;
   /** この録音で切断を処理済みか。health は録音をまたいで共有されるので、degradedReasons では判定しない（Phase 1 §15 と同じ） */
   private trackEndedHandled = false;
+  /** drainMemoryBacklog の直列化 */
+  private drainQueue: Promise<unknown> = Promise.resolve();
   /** トラックの ended リスナーの解除用。stop で abort する（Phase 1 §15 と同じ） */
   private trackListeners: AbortController | null = null;
 
@@ -909,7 +911,14 @@ export class RecordingController {
   }
 
   /** クォータ以外の失敗はサーバーへ直接送る。直接送信も失敗したら元の例外を投げ、メモリ待機に残す（Phase 1 §15 と同じ） */
-  async drainMemoryBacklog(): Promise<number> {
+  drainMemoryBacklog(): Promise<number> {
+    // 並行させない。先頭を読んでから外すまでに別の drain が先頭を外すと、送っていない Chunk を外してしまう（Phase 1 §15 と同じ）
+    const run = this.drainQueue.then(() => this.drainSerially());
+    this.drainQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async drainSerially(): Promise<number> {
     let drained = 0;
     while (this.memoryBacklog.length > 0) {
       const record = this.memoryBacklog[0];
@@ -1283,8 +1292,11 @@ export class MultiSourceRecorder {
     await Promise.all([this.mic?.flush(), this.system?.flush()]);
   }
 
-  /** System を先に止め、最後に Mic を止める（Mic 側が meeting.status を stop_requested にする）。 */
-  async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = this.deps.now()): Promise<{ readonly mic: number; readonly system: number }> {
+  /**
+   * System を先に止め、最後に Mic を止める（Mic 側が meeting.status を stop_requested にする）。
+   * 検出時刻の既定値は epoch ms（Date.now）。deps.now はドリフト計測用の performance 時計なので使わない。
+   */
+  async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<{ readonly mic: number; readonly system: number }> {
     if (this.system !== null) await this.system.stop();
     if (this.mic !== null) await this.mic.stop(reason, detectedAtEpochMs);
     return { mic: this.mic?.chunkCount ?? 0, system: this.system?.chunkCount ?? 0 };
