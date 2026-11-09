@@ -166,6 +166,8 @@ async function renderPending(app: App): Promise<void> {
       retry.textContent = "再試行";
       retry.disabled = pendingBusy.has(m.meetingId);
       retry.addEventListener("click", () => {
+        // 同じ会議の操作が実行中なら、その操作の pendingBusy を書き換えない
+        if (pendingBusy.has(m.meetingId)) return;
         // 再試行中は確定中止も押せないようにする（会議ロックの取り合いで「使用中」になるだけのため）
         retry.disabled = abandon.disabled = true;
         pendingBusy.add(m.meetingId);
@@ -182,6 +184,7 @@ async function renderPending(app: App): Promise<void> {
       abandon.textContent = "確定を中止";
       abandon.disabled = pendingBusy.has(m.meetingId);
       abandon.addEventListener("click", () => {
+        if (pendingBusy.has(m.meetingId)) return;
         pendingBusy.add(m.meetingId);
         abandon.disabled = retry.disabled = true;
         void confirmAbandon(m, app.memoryBacklogCount(m.meetingId), {
