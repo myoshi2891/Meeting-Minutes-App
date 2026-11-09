@@ -255,6 +255,40 @@ describe("LocalSaveScheduler", () => {
     expect(s.health.pendingChunkCount).toBe(0);
   });
 
+  it("再送が 409 で LOCAL_SAVE_FAILED（non-retryable）になった Chunk を、前の試行のリトライタイマーが再送しない", async () => {
+    // Arrange：1 回目は 500 で RETRYING（タイマー予約）、resumeAll による 2 回目は 409
+    const s = await setup((_r, attempt) => new Response("{}", { status: attempt === 1 ? 500 : 409 }));
+    await s.add(0);
+    await s.advance(0);
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+    // Act：1 回目のリトライタイマーが発火する
+    await s.advance(3_000);
+    // Assert
+    expect(s.stats().putCount).toBe(2);
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+  });
+
+  it("non-retryable の LOCAL_SAVE_FAILED を、backend 停止中に発火したリトライタイマーが BACKEND_UNAVAILABLE に書き戻さない", async () => {
+    // Arrange：上と同じく 409 で止まった後に backend が停止する
+    const s = await setup((_r, attempt) => new Response("{}", { status: attempt === 1 ? 500 : 409 }));
+    await s.add(0);
+    await s.advance(0);
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    s.backend.status = "UNREACHABLE";
+    // Act：タイマー発火 → 停止中の書き込み → 復帰後の resumeAll
+    await s.advance(3_000);
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+    s.backend.status = "HEALTHY";
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    // Assert：手動再試行まで送らない
+    expect(s.stats().putCount).toBe(2);
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+  });
+
   it("resumeAll で保存済みになった Chunk を、backend 停止中に発火したリトライタイマーが BACKEND_UNAVAILABLE に書き戻さない", async () => {
     // Arrange：1 回目は 5xx でリトライタイマーが残り、resumeAll による 2 回目で DB_REGISTERED になる
     const s = await setup((r, attempt) => (attempt === 1 ? new Response("{}", { status: 500 }) : okResponse(r)));

@@ -169,7 +169,8 @@ export class LocalSaveScheduler {
       let settled = false;
       await this.deps.chunkStore.updateSaveState(key, (r) => {
         // リトライタイマーが resumeAll 後に遅れて再投入したキーなど、別経路で保存済み・送信中なら書き戻さない
-        settled = r.save.status === "DB_REGISTERED" || r.save.status === "SAVED" || r.save.status === "SAVING";
+        // non-retryable の LOCAL_SAVE_FAILED も書き戻さない（BACKEND_UNAVAILABLE にすると復帰時の resumeAll が再送する）
+        settled = !isResumable(r);
         if (settled) return;
         r.save.status = "BACKEND_UNAVAILABLE";
       });
@@ -236,9 +237,10 @@ export class LocalSaveScheduler {
     // 同じトランザクションで現在の状態を確かめてから SAVING を確保する
     const claim: { attempts: number | null; retryInMs: number | null } = { attempts: null, retryInMs: null };
     await this.deps.chunkStore.updateSaveState(chunkKey, (r) => {
-      // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中なら送らない
+      // リトライタイマーが遅れて発火した場合など、別経路で保存済み・送信中（DB_REGISTERED / SAVED / SAVING）なら送らない
       // SAVED（ファイル保存済み・DB 未登録）の登録確認は Finalizer のサーバー一覧照合に任せる
-      if (r.save.status === "DB_REGISTERED" || r.save.status === "SAVED" || r.save.status === "SAVING") return;
+      // non-retryable の LOCAL_SAVE_FAILED（409・422 など）も、前の試行のリトライタイマーが遅れて再投入しても送らない（手動再試行のみ）
+      if (!isResumable(r)) return;
       if (r.save.status === "RETRYING" && r.save.nextRetryAt !== null && r.save.nextRetryAt > this.deps.now()) {
         claim.retryInMs = r.save.nextRetryAt - this.deps.now();
         return;
