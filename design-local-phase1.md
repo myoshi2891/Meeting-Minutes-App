@@ -1722,6 +1722,8 @@ export class RecordingController {
   private drainQueue: Promise<unknown> = Promise.resolve();
   /** 実行中の stop。重なった stop はこれを待つ。完了までは次の録音を始めない（後から終わる stop の後始末が次の録音を壊すため） */
   private stopping: Promise<void> | null = null;
+  /** start の準備中か。node はまだ null なので、この間に drain・破棄が空で終わっても会議ロックを解放しない */
+  private starting = false;
 
   constructor(private readonly deps: RecordingControllerDeps) {}
 
@@ -1741,11 +1743,14 @@ export class RecordingController {
     const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
     if (release === null) throw new Error(`meeting ${meetingId} is already being recorded`);
     this.releaseLock = release;
+    this.starting = true;
     try {
       await this.setUp(meetingId, title, consentConfirmedAt);
     } catch (error) {
       this.unlock();
       throw error;
+    } finally {
+      this.starting = false;
     }
   }
 
@@ -1987,8 +1992,8 @@ export class RecordingController {
       );
     }
     // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する。
-    // 最終保存に失敗していれば、書き直す呼び出し元が takeMeetingLock で受け取るまで保持する
-    if (this.node === null && !this.finalStopUnsaved) this.unlock();
+    // 最終保存に失敗していれば、書き直す呼び出し元が takeMeetingLock で受け取るまで保持する。start の準備中（node はまだ null）は録音を始める会議のロックなので外さない
+    if (this.node === null && !this.starting && !this.finalStopUnsaved) this.unlock();
   }
 
   get memoryBacklogCount(): number {
@@ -2153,7 +2158,7 @@ Worklet が応答しない場合（AudioContext が閉じられた、Processor �
 
 Scheduler への依存は `enqueue()` だけを持つ `ChunkEnqueuer` インターフェースに絞っている。`LocalSaveScheduler` はこのインターフェースを構造的に満たすため、呼び出し側の配線は変わらない。
 
-録音中の会議は、会議ごとの Web Lock（会議ロック）で示す。Phase 1 は複数タブでの同時録音を許すため、あとから開いたタブの起動時復旧（§23）が、別タブで録音中の `recording` を中断と誤認して `stop_requested` に落とさないようにするためである。`start()` は `recording` を書く**前**にロックを取り（先に書くと、ロックのない `recording` を他タブの復旧が拾える）、取れなければ失敗する。ロックは `stop()` の finally、または `start()` が途中で失敗したときに解放する。ただし `stop()` の時点でメモリ待機（§3.4 段階3）が残っていれば、ロックを持ったまま止まる。別タブの Barrier はこのタブのメモリ待機を数えられず（`unpersistedChunkCount` は 0 になる）、IDB の連番だけで末尾欠けのまま確定しうるためである。flush 後の最終保存（最終の `audioFrameCount`）に失敗して `stop()` が reject した場合も、ロックを保持する。別タブの Barrier が最初に書いた古い `audioFrameCount` のまま確定し、`totalAudioFrames` が短くなるのを防ぐためである。保持したロックは `drainMemoryBacklog()` で空になった時点で解放するか、`takeMeetingLock()` で呼び出し元（App）へ渡す。ただし最終保存に失敗して保持したロックは、`drainMemoryBacklog()` で空になっても解放せず、`takeMeetingLock()` で渡すまで持つ（Controller は最終の `audioFrameCount` を書き直さないため）。App は停止状態を書き直せるまで（`unsavedStops` が空になるまで）ロックを解放しない（§31）。App は受け取ったロックを確定・中止に借用し、メモリ待機が空になって借用が終わった時点で解放する。メモリ待機が残るうち、また保持したロックを `takeMeetingLock()` で渡していないうちは、同じインスタンスの `start()` を拒否する（保持中のロックの解放手段を上書きし、別会議の Chunk が混ざるため）。なお `stop()` は `stop_requested` の保存に失敗しても Worklet に `stop` を送って末尾を Chunk にし（IDB かメモリ待機に残り、WAV で書き出せる）、最終の保存を試みる。最終の保存が成功すれば `stop_requested` も書けているので停止を完了し、最初の失敗は `onError` に通知するだけにする（App はそのまま確定へ進む）。最終の保存も失敗したときだけ例外を返し、App は確定を試みない。先に切り離すと Worklet 内の末尾が Chunk にならず、書き出しもできないためである。`recording` を保存した後に失敗した場合（Worklet ノードの生成失敗など）は、`rollBackStart()` が Worklet を切り離してマイクのトラックを止め、会議を `created` に戻してから例外を返す。`stop()` は Worklet がなければ何もしないため、ここで止めないとマイクを取得したままになる。`recording` を保存する前に失敗した場合（`addModule()` や `meetingStore.put()` の失敗）も、同じ理由でマイクのトラックを止めてから例外を返す（会議は保存されていないので巻き戻しは不要）。`recording` のまま残すと、ロックの解放後に次回起動の復旧（§23）が `stop_requested` に落とし、Chunk のない会議を finalize しうるためである。`created` は復旧の対象外である。タブが閉じたり落ちたりした場合はブラウザが自動で解放するので、クラッシュした会議は従来どおり復旧の対象になる。ロックマネージャは `locks` で依存注入する（本番は `navigator.locks`。`LockManager` は `MeetingLockManager` を構造的に満たす）。
+録音中の会議は、会議ごとの Web Lock（会議ロック）で示す。Phase 1 は複数タブでの同時録音を許すため、あとから開いたタブの起動時復旧（§23）が、別タブで録音中の `recording` を中断と誤認して `stop_requested` に落とさないようにするためである。`start()` は `recording` を書く**前**にロックを取り（先に書くと、ロックのない `recording` を他タブの復旧が拾える）、取れなければ失敗する。ロックは `stop()` の finally、または `start()` が途中で失敗したときに解放する。ただし `stop()` の時点でメモリ待機（§3.4 段階3）が残っていれば、ロックを持ったまま止まる。別タブの Barrier はこのタブのメモリ待機を数えられず（`unpersistedChunkCount` は 0 になる）、IDB の連番だけで末尾欠けのまま確定しうるためである。flush 後の最終保存（最終の `audioFrameCount`）に失敗して `stop()` が reject した場合も、ロックを保持する。別タブの Barrier が最初に書いた古い `audioFrameCount` のまま確定し、`totalAudioFrames` が短くなるのを防ぐためである。保持したロックは `drainMemoryBacklog()` で空になった時点で解放するか、`takeMeetingLock()` で呼び出し元（App）へ渡す。`start()` の準備中（ロック取得後、Worklet ノードの生成前）は `node` がまだ null なので、この間に走った drain・破棄が空で終わってもロックを解放しない（`starting`）。サーバー復帰時の drain が準備中に走ると、録音を始める会議のロックが外れ、別タブの復旧がその `recording` を中断扱いにできてしまうためである。ただし最終保存に失敗して保持したロックは、`drainMemoryBacklog()` で空になっても解放せず、`takeMeetingLock()` で渡すまで持つ（Controller は最終の `audioFrameCount` を書き直さないため）。App は停止状態を書き直せるまで（`unsavedStops` が空になるまで）ロックを解放しない（§31）。App は受け取ったロックを確定・中止に借用し、メモリ待機が空になって借用が終わった時点で解放する。メモリ待機が残るうち、また保持したロックを `takeMeetingLock()` で渡していないうちは、同じインスタンスの `start()` を拒否する（保持中のロックの解放手段を上書きし、別会議の Chunk が混ざるため）。なお `stop()` は `stop_requested` の保存に失敗しても Worklet に `stop` を送って末尾を Chunk にし（IDB かメモリ待機に残り、WAV で書き出せる）、最終の保存を試みる。最終の保存が成功すれば `stop_requested` も書けているので停止を完了し、最初の失敗は `onError` に通知するだけにする（App はそのまま確定へ進む）。最終の保存も失敗したときだけ例外を返し、App は確定を試みない。先に切り離すと Worklet 内の末尾が Chunk にならず、書き出しもできないためである。`recording` を保存した後に失敗した場合（Worklet ノードの生成失敗など）は、`rollBackStart()` が Worklet を切り離してマイクのトラックを止め、会議を `created` に戻してから例外を返す。`stop()` は Worklet がなければ何もしないため、ここで止めないとマイクを取得したままになる。`recording` を保存する前に失敗した場合（`addModule()` や `meetingStore.put()` の失敗）も、同じ理由でマイクのトラックを止めてから例外を返す（会議は保存されていないので巻き戻しは不要）。`recording` のまま残すと、ロックの解放後に次回起動の復旧（§23）が `stop_requested` に落とし、Chunk のない会議を finalize しうるためである。`created` は復旧の対象外である。タブが閉じたり落ちたりした場合はブラウザが自動で解放するので、クラッシュした会議は従来どおり復旧の対象になる。ロックマネージャは `locks` で依存注入する（本番は `navigator.locks`。`LockManager` は `MeetingLockManager` を構造的に満たす）。
 
 ```typescript
 // src/recording/meeting-lock.ts
@@ -3645,6 +3650,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
  * audioFrameCount は heartbeat（1 秒ごと）でも進むので、最後の Chunk の endFrame より大きければ末尾が欠けている
  * （最後の heartbeat より後の 1 秒未満の欠けは検出できない）。
  * 最後の連番が IDB にない（サーバーへ直接送った）ときは offIdbEndFrame の値を使い、それも分からなければ 0 を返す。
+ * Chunk が 1 件もなければ（chunkCount === 0）終わりを 0 とし、audioFrameCount 全体を欠けとして返す。
  */
 export function measureMissingTailMs(
   audioFrameCount: number,
@@ -3654,7 +3660,8 @@ export function measureMissingTailMs(
 ): number {
   const lastSeq = chunkCount - 1;
   const last = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
-  const endFrame = last?.meta.sequenceNo === lastSeq ? last.meta.endFrame : offIdbEndFrame?.(lastSeq);
+  // Chunk が 1 件もなければ録音した長さ全体が欠けている
+  const endFrame = chunkCount === 0 ? 0 : last?.meta.sequenceNo === lastSeq ? last.meta.endFrame : offIdbEndFrame?.(lastSeq);
   if (endFrame === undefined) return 0;
   return frameToOffsetMs(Math.max(0, audioFrameCount - endFrame));
 }
@@ -3664,7 +3671,7 @@ function errorMessage(error: unknown): string {
 }
 ```
 
-サーバー未起動のまま利用者が停止した場合、Meeting は `stop_requested` で IndexedDB に残り、次回起動時の復旧（§23）でサーバーが `HEALTHY` になった時点から自動的に Barrier を再試行する。「最後の Chunk を保存する前に finalizing へ遷移してはいけない」（v4.0 §43）は、`finalizeMeeting` が `RecordingController.stop()` の完了後にしか呼ばれない呼び出し規約、会議の `status` が `stop_requested`（または POST 中に中断された `finalizing`）でなければ `verify` で失敗させる検査、`unpersistedChunkCount() > 0` および `notRegistered.length > 0` の早期リターンで担保する。`unpersistedChunkCount` には `() => controller.memoryBacklogCount` を渡す。`GET /chunks` の前には `ensureMeeting`（App は `MeetingRegistrar.ensure()` を渡す）で会議をサーバーへ登録する。Chunk を 1 件も PUT できていない会議（トークン失効中に止めた会議など）はサーバーに未登録で、一覧・確定が 404 になり続けるためである。再試行のたびに通し（登録は冪等）、失敗したら一覧を取らずに `verify` の失敗を返す。401/403 は `MeetingRegistrar` が Monitor へ報告する。登録・一覧・確定 POST の認証エラー（`UNAUTHORIZED`・401/403）と App のトークン未設定は、失敗の結果に `reason: "unauthorized"` を付ける。UI（`finalizeResultText`）はこの分類でトークンの確認を案内し、`detail` の文字列では判定しない（一覧の `meetingId` などサーバー由来の値が `HTTP 403` で終わるだけで認証エラーに見えないように）。登録は状態検査・メモリ待機・`notRegistered` の早期リターンの後に置くので、中止済み・確定済みの会議を登録しない。同じ会議への呼び出しが重なった場合は実行中の Promise を共有し、POST は 1 回だけにする（後から失敗した側が `finalized` を `stop_requested` で上書きしないため）。すでに `finalized` の会議に対しては POST せずに成功を返し、二重の finalize で `endedAt` を書き換えない。POST が失敗して `stop_requested` に戻った会議を再試行するときも、最初に記録した `endedAt` をそのまま送る。IndexedDB に書けずメモリ待機中の末尾 Chunk は IndexedDB の一覧に現れず、連続性検査をすり抜けるためである。
+サーバー未起動のまま利用者が停止した場合、Meeting は `stop_requested` で IndexedDB に残り、次回起動時の復旧（§23）でサーバーが `HEALTHY` になった時点から自動的に Barrier を再試行する。「最後の Chunk を保存する前に finalizing へ遷移してはいけない」（v4.0 §43）は、`finalizeMeeting` が `RecordingController.stop()` の完了後にしか呼ばれない呼び出し規約、会議の `status` が `stop_requested`（または POST 中に中断された `finalizing`）でなければ `verify` で失敗させる検査、`unpersistedChunkCount() > 0` および `notRegistered.length > 0` の早期リターンで担保する。`unpersistedChunkCount` には `() => controller.memoryBacklogCount` を渡す。`GET /chunks` の前には `ensureMeeting`（App は `MeetingRegistrar.ensure()` を渡す）で会議をサーバーへ登録する。Chunk を 1 件も PUT できていない会議（トークン失効中に止めた会議など）はサーバーに未登録で、一覧・確定が 404 になり続けるためである。再試行のたびに通し（登録は冪等）、失敗したら一覧を取らずに `verify` の失敗を返す。401/403 は `MeetingRegistrar` が Monitor へ報告する。登録・一覧・確定 POST の認証エラー（`UNAUTHORIZED`・401/403）と App のトークン未設定は、失敗の結果に `reason: "unauthorized"` を付ける。接続失敗・タイムアウトには `reason: "network"` を付け、UI（`finalizeResultText`）は手動の再試行を求めず、サーバーが使えるようになれば自動で再試行すると案内する。UI はまた `reason: "unauthorized"` の分類でトークンの確認を案内し、`detail` の文字列では判定しない（一覧の `meetingId` などサーバー由来の値が `HTTP 403` で終わるだけで認証エラーに見えないように）。登録は状態検査・メモリ待機・`notRegistered` の早期リターンの後に置くので、中止済み・確定済みの会議を登録しない。同じ会議への呼び出しが重なった場合は実行中の Promise を共有し、POST は 1 回だけにする（後から失敗した側が `finalized` を `stop_requested` で上書きしないため）。すでに `finalized` の会議に対しては POST せずに成功を返し、二重の finalize で `endedAt` を書き換えない。POST が失敗して `stop_requested` に戻った会議を再試行するときも、最初に記録した `endedAt` をそのまま送る。IndexedDB に書けずメモリ待機中の末尾 Chunk は IndexedDB の一覧に現れず、連続性検査をすり抜けるためである。
 
 `SAVED`（サーバーがファイル書き込みだけ成功し `registered: false` を返した Chunk）は Scheduler の再開対象ではない（`resumeAll`・起動時の復旧・遅れて発火したリトライタイマーのいずれも送らない）。PUT を再送しても `registered: false` が続きうるため、`notRegistered` からは除外してサーバー一覧の照合へ進める。一覧で `registered: true` かつ sha256 一致が確認できたら `DB_REGISTERED` に更新する。確認できなければ他の不一致と同様に `LOCAL_SAVE_PENDING` に戻して再投入する。
 
@@ -3672,7 +3679,7 @@ function errorMessage(error: unknown): string {
 
 連続性検査はサーバー一覧を取得した後に行う。IndexedDB にない `sequenceNo` でも、サーバー一覧に `registered: true` で載っていれば揃っているとみなし、送る件数（`expectedChunkCounts.mic` と `finalChunkCount`）は「IndexedDB とサーバーのどちらかにある最大の `sequenceNo` + 1」とする。IndexedDB に書けずサーバーへ直接送った Chunk（§15 `drainMemoryBacklog()`）は IndexedDB に残らないため、IndexedDB の件数で送るとサーバーが件数不一致の 409 を返し続けるからである。サーバーにだけある Chunk は手元にコピーがないので SHA-256 を照合できないが、サーバーが finalize 時にファイルの SHA-256 を検証する。
 
-確定に成功したら、会議の `sessionClock.audioFrameCount`（`totalAudioFrames`）と最後の Chunk の `endFrame` を比べ、差があれば `{ ok: true, missingTailMs }` を返す（`measureMissingTailMs()`）。`stop()` が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま確定するためである。失った音声は取り戻せないので確定は止めず、UI が「末尾 約◯秒が保存されていません」と警告する。`audioFrameCount` は heartbeat（1 秒ごと）でも進むので、最後の heartbeat より後の 1 秒未満の欠けは検出できない。最後の `sequenceNo` が IndexedDB になくサーバーにだけある場合（IDB に書けず直接送信した末尾）は、`offIdbEndFrame`（App はこのタブが直接送信で DB 登録まで済んだ Chunk の連番→`endFrame` を渡す）でその `endFrame` を引いて比べる。それでも分からない場合（再読み込み後や別タブが送った場合）は、欠けなしとして扱う。App はこの対応表と直接送信の件数を確定待ちの内訳表示にも使い、確定に成功したら消す。クラッシュ復旧した会議は `audioFrameCount` を保存済み Chunk の最大 `endFrame` から復元する（§23）ため、欠けとは判定されない。
+確定に成功したら、会議の `sessionClock.audioFrameCount`（`totalAudioFrames`）と最後の Chunk の `endFrame` を比べ、差があれば `{ ok: true, missingTailMs }` を返す（`measureMissingTailMs()`）。`stop()` が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま確定するためである。失った音声は取り戻せないので確定は止めず、UI が「末尾 約◯秒が保存されていません」と警告する。`audioFrameCount` は heartbeat（1 秒ごと）でも進むので、最後の heartbeat より後の 1 秒未満の欠けは検出できない。最後の `sequenceNo` が IndexedDB になくサーバーにだけある場合（IDB に書けず直接送信した末尾）は、`offIdbEndFrame`（App はこのタブが直接送信で DB 登録まで済んだ Chunk の連番→`endFrame` を渡す）でその `endFrame` を引いて比べる。それでも分からない場合（再読み込み後や別タブが送った場合）は、欠けなしとして扱う。Chunk が 1 件もない会議（最初の Chunk も届かずに停止を打ち切った場合）は終わりを 0 とし、`audioFrameCount` 全体を欠けとして返す。App はこの対応表と直接送信の件数を確定待ちの内訳表示にも使い、確定に成功したら消す。クラッシュ復旧した会議は `audioFrameCount` を保存済み Chunk の最大 `endFrame` から復元する（§23）ため、欠けとは判定されない。
 
 `finalizeMeeting` は失敗を例外ではなく `FinalizeResult` で返す。`GET /chunks` の応答は外部入力なので `isChunkListResponse` で検証し、契約に合わなければ `verify` の失敗とする。応答の `meetingId` が要求した会議と異なる場合も `verify` の失敗とし、ローカルの Chunk を `DB_REGISTERED` にしない（無音など同一内容の Chunk は別会議でも SHA-256 が一致しうるため）。`GET /chunks` と `POST /finalize` にはそれぞれ `timeoutMs`（既定 30 秒）の `AbortController` を付ける。応答しないサーバーに対しても、接続失敗と同じ経路で失敗結果を返す。`POST /finalize` が失敗した場合（HTTP エラー、接続失敗、タイムアウトのいずれも）は会議を `stop_requested` に戻し、`finalizing` のまま残さない。`finalChunkCount` も POST 前の値へ戻す（失敗した POST の件数を記録として残さない）。応答を得られなかった失敗（一覧・確定 POST の接続失敗とタイムアウト、会議登録の `NETWORK` / `TIMEOUT`）には `reason: "network"` を付ける。Monitor のポーリングの合間の瞬断ではヘルス状態が変わらず、復帰通知（`onBackendAvailable`）が来ないため、App はこの失敗の後に `backoffMs()` の間隔で確定の再試行を予約する。タイマーは取り消せないので、予約は会議ごとの世代で管理し、発火時に世代が一致するものだけ実行する。確定・中止・ネットワーク以外の失敗で予約と回数を消す（認証エラーの扱いは変えない）。発火時にサーバーが使えなければ実行せず、復帰通知に任せる。
 
@@ -5756,6 +5763,8 @@ export function finalizeResultText(result: FinalizeResult): string {
   if (result.ok) return result.missingTailMs === undefined ? "録音を確定しました" : `録音を確定しました。${missingTailText(result.missingTailMs)}`;
   // detail の文字列一致で判定すると、サーバー由来の値（一覧の meetingId など）が "HTTP 403" で終わるだけで認証エラーに見える
   if (result.reason === "unauthorized") return "サーバーのトークンを設定で確認・保存してください。保存済みの音声は保持しています";
+  // 接続失敗・タイムアウトは App が時間をおいて自動で再試行する（復帰通知でも再試行される）。手動の再試行を求めない
+  if (result.reason === "network") return `確定待ち：サーバーに接続できませんでした。サーバーが使えるようになれば自動で再試行します。保存済みの音声は保持しています（${result.detail}）`;
   if (result.stage === "waiting_local_save") {
     const memory = result.detail.match(/^(\d+) chunks not persisted to IDB$/);
     if (memory) return `確定待ち：メモリ内に未保存の音声が ${memory[1]} 件あります。WAV を書き出してから、サーバーの状態を確認してください`;
