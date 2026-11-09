@@ -573,7 +573,7 @@ export function jobFromServerRow(row: Record<string, unknown>): JobSummary | nul
 変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出し、`stop_requested` の保存に失敗しても末尾を Chunk にしてから Worklet を切り離すこと、メモリ待機が残る間と Mic の最終保存に失敗したときは stop 後も会議ロックを保持し `takeMeetingLock()` で App へ渡すこと（最終保存の失敗で保持したロックは drain で空になっても解放せず、渡すまで同じインスタンスの `start()` を拒否する）を含む）。会議ロックは Mic の Controller だけが持つ。そこで Mic または System のどちらかのメモリ待機が残る間は、Mic の stop 後もロックを持ち続け、両方が空になってから解放する。Mic のメモリ待機だけを見ると、Mic が空で System に末尾が残るときに Mic の `stop()` がロックを手放し、別タブの Barrier が System の末尾を数えられないまま確定しうるためである。配線は次のとおり。
 
 1. Mic の Controller にだけ `otherSourceBacklogCount: () => systemController.memoryBacklogCount` を渡す。Mic の `stop()` の最後と `drainMemoryBacklog()` が空になったときの解放は、自身のメモリ待機に加えてこの値も 0 のときだけロックを解放する。
-2. 停止は `DualRecorder.stop()`（§6）のとおり System を先に止め、完了してから Mic を止める。System の末尾 Chunk がメモリ待機に入るか確定した後で、Mic がロックを手放すか決めるためである。録音中に `dropSystem()` で System だけ止めた場合も、App はその System Controller を保持し続け、`otherSourceBacklogCount` と合計件数に数える（null にした後もメモリ待機は残りうる）。
+2. 停止は `DualRecorder.stop()`（§6）のとおり System を先に止め、完了してから Mic を止める。System の末尾 Chunk がメモリ待機に入るか確定した後で、Mic がロックを手放すか決めるためである。System の停止が失敗しても Mic は止めて停止理由を永続化し、その後で System の失敗を投げる。録音中に `dropSystem()` で System だけ止めた場合も、App はその System Controller を保持し続け、`otherSourceBacklogCount` と合計件数に数える（null にした後もメモリ待機は残りうる）。
 3. App は Mic の `stop()` の直後に `takeMeetingLock()` でロックを受け取り（Phase 1 §31 の `heldLocks`）、`memoryBacklogCount(meetingId)` と `releaseHeldLockIfDrained()` は Mic と System の件数の合計で判定する。合計が 0 になるまでロックを解放しない。
 4. System 側の drain も Mic 側と同じく App の drain 関数で包む。空になったら `releaseHeldLockIfDrained()` を呼び、確定の再試行（`onChunkSaved`）を起こす。サーバー復帰時（`onBackendAvailable`）は Mic と System の両方を drain してから確定を再試行する。Finalizer の `unpersistedChunkCount` も両方の合計を渡す（§7）。`retryFinalize()` が Barrier の前に行う drain（サーバーが使えなければ IDB への書き戻しだけ。送信中のトークン変更で送れなければ drain を終えてから送り直す。Phase 1 §31）も、Mic と System の両方を対象にする。共有の IDB 保存警告を外す判定（`otherMeetingsBacklogCount`）には、他の会議に加えて同じ会議のもう一方の source の Controller も数える。Phase 1 で追加した `onMeetingCreated` は Mic 側で維持し、IDB 障害時の直接送信用の会議情報を保持する。System 側は既存の Mic 会議を使う。
 
@@ -1295,10 +1295,17 @@ export class MultiSourceRecorder {
   /**
    * System を先に止め、最後に Mic を止める（Mic 側が meeting.status を stop_requested にする）。
    * 検出時刻の既定値は epoch ms（Date.now）。deps.now はドリフト計測用の performance 時計なので使わない。
+   * System の停止が失敗しても Mic は止め、停止理由を永続化してから System の失敗を投げる（マイクを取得したまま残さない）。
    */
   async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<{ readonly mic: number; readonly system: number }> {
-    if (this.system !== null) await this.system.stop();
+    let systemError: unknown = null;
+    try {
+      if (this.system !== null) await this.system.stop();
+    } catch (error) {
+      systemError = error;
+    }
     if (this.mic !== null) await this.mic.stop(reason, detectedAtEpochMs);
+    if (systemError !== null) throw systemError;
     return { mic: this.mic?.chunkCount ?? 0, system: this.system?.chunkCount ?? 0 };
   }
 
@@ -1317,7 +1324,7 @@ export class MultiSourceRecorder {
 
 # 7. `src/recording/finalizer.ts` の変更
 
-mic / system の両方を検証する。System なしの会議は `expectedChunkCounts.system = 0`。会議の状態の検査（`finalized` なら POST せず成功を返す、`stop_requested` / `finalizing` 以外は `verify` で失敗させる）と、`GET /chunks` の応答を `isChunkListResponse` に通し `meetingId` の一致を確かめる検査は Phase 1 §22 と同じ。連続性検査をサーバー一覧の取得後に行い、IndexedDB にない連番でもサーバーに登録済みなら揃っているとみなす点（source ごとに判定）、確定に成功したら末尾の欠けを `missingTailMs` で返す点も Phase 1 §22 と同じ。末尾の欠けは Mic だけで判定する。`totalAudioFrames` は Mic の時計で、System の `audioFrameCount` は会議レコードに残らないためである。
+mic / system の両方を検証する。System なしの会議は `expectedChunkCounts.system = 0`。会議の状態の検査（`finalized` なら POST せず成功を返す、`stop_requested` / `finalizing` 以外は `verify` で失敗させる）と、`GET /chunks` の応答を `isChunkListResponse` に通し `meetingId` の一致を確かめる検査は Phase 1 §22 と同じ。連続性検査をサーバー一覧の取得後に行い、IndexedDB にない連番でもサーバーに登録済みなら揃っているとみなす点（source ごとに判定）、確定に成功したら末尾の欠けを `missingTailMs` で返す点も Phase 1 §22 と同じ。会議登録の後の `GET /chunks`・`POST /finalize` が 401/403 を返したら、`unauthorized` で返す前に `onBackendUnauthorized` で Monitor へ伝える点も Phase 1 §22 と同じ。末尾の欠けは Mic だけで判定する。`totalAudioFrames` は Mic の時計で、System の `audioFrameCount` は会議レコードに残らないためである。
 
 ```typescript
 // src/recording/finalizer.ts
@@ -1342,6 +1349,8 @@ export interface FinalizerDeps {
   readonly unpersistedChunkCount: () => number;
   /** 照合の前に会議をサーバーへ登録する（MeetingRegistrar.ensure、Phase 1 §22）。未登録の会議は一覧・確定が 404 になるため */
   readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>;
+  /** GET /chunks・POST /finalize の 401/403 を Monitor へ伝える（Phase 1 §22。会議登録の分は MeetingRegistrar が報告する） */
+  readonly onBackendUnauthorized?: () => void;
 }
 
 /**
@@ -1424,7 +1433,7 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     }
   }
 
-  // 再試行でも毎回通す。登録に失敗したら一覧を取らない（Phase 1 §22）
+  // 再試行でも毎回通す。登録に失敗したら一覧を取らない（401/403 は MeetingRegistrar が Monitor へ報告済み、Phase 1 §22）
   if (deps.ensureMeeting !== undefined) {
     const registration = await deps.ensureMeeting(meetingId);
     if (!registration.ok) {
@@ -1449,7 +1458,10 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   } catch (error) {
     return { ok: false, stage: "verify", detail: `list failed: ${describeFetchError(error, timeoutMs)}` };
   }
-  if (listRes.status === 401 || listRes.status === 403) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}`, reason: "unauthorized" };
+  if (listRes.status === 401 || listRes.status === 403) {
+    deps.onBackendUnauthorized?.();
+    return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}`, reason: "unauthorized" };
+  }
   if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
   // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
@@ -1536,10 +1548,11 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     await restore();
     return { ok: false, stage: "finalize", detail: `finalize failed: ${describeFetchError(error, timeoutMs)}` };
   }
+  const finUnauthorized = finRes.status === 401 || finRes.status === 403;
+  if (finUnauthorized) deps.onBackendUnauthorized?.();
   if (!finRes.ok) {
     await restore();
-    const reason = finRes.status === 401 || finRes.status === 403 ? { reason: "unauthorized" as const } : {};
-    return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}`, ...reason };
+    return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}`, ...(finUnauthorized ? { reason: "unauthorized" as const } : {}) };
   }
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);
