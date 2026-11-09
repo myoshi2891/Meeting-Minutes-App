@@ -239,6 +239,34 @@ describe("ブラウザクラッシュ後の復旧", () => {
     expect(report.requeuedChunks).toBe(0);
   });
 
+  it("会議の書き直しに失敗しても起動時の復旧を止めず、その会議は未復旧として報告して Chunk も再投入しない", async () => {
+    // Arrange：2 件の中断会議のうち 1 件だけ、復旧の書き直しが失敗する
+    const h = await createHarness();
+    await h.meetingStore.put(meetingOf("put-fail", "recording"));
+    await h.meetingStore.put(meetingOf("put-ok", "recording"));
+    const r = await makeChunkRecord("put-fail", 0, 160);
+    r.save.status = "LOCAL_SAVE_PENDING";
+    await h.chunkStore.putChunk(r);
+    const put = h.meetingStore.put.bind(h.meetingStore);
+    const spy = vi.spyOn(h.meetingStore, "put").mockImplementation(async (m) => {
+      if (m.meetingId === "put-fail") throw new Error("IDB write failed");
+      return put(m);
+    });
+    const resume = vi.spyOn(h.scheduler, "resumeAll");
+    try {
+      // Act
+      const report = await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+      // Assert：書けた会議は復旧し、書けなかった会議は recording のまま残して確定・再送の対象にしない
+      expect(report.interruptedMeetings.map((m) => m.meetingId).filter((id) => id.startsWith("put-"))).toEqual(["put-ok"]);
+      expect(report.unreadMeetingIds).toEqual(["put-fail"]);
+      expect((await h.meetingStore.get("put-fail"))?.status).toBe("recording");
+      expect((await h.meetingStore.get("put-ok"))?.status).toBe("stop_requested");
+      expect(resume.mock.calls[0]?.[0]?.has("put-fail")).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("停止理由と検出時刻の片方だけが残った会議は両方を外して直し、起動も他の会議の復旧も止めない", async () => {
     // Arrange：MeetingStore.put は片方だけの会議を拒否するので、壊れた行は IDB へ直接書く
     const h = await createHarness();

@@ -8,7 +8,10 @@ export interface RecoveryReport {
   /** status は復旧前の値。recording と通常停止後の確定待ちを UI で区別する。 */
   readonly interruptedMeetings: ReadonlyArray<{ readonly meetingId: string; readonly status: MeetingRecord["status"]; readonly chunkCount: number }>;
   readonly requeuedChunks: number;
-  /** ロック後の読み直しに失敗した会議。状態を確かめられないので触らず（Chunk も再投入しない）、次回の起動・サーバー復帰時の再投入に任せる */
+  /**
+   * ロック後の読み直し、または補いの書き直しに失敗した会議。状態を確かめられない・直せないので触らず（Chunk も再投入しない）、
+   * 次回の起動に任せる。App はこの会議を確定しない（古い audioFrameCount・片方だけの停止理由のまま確定しない）
+   */
   readonly unreadMeetingIds: ReadonlyArray<string>;
 }
 
@@ -21,6 +24,7 @@ export interface RecoveryReport {
  *   audioFrameCount は stop() でしか永続化されないため、保存済み Chunk の最大 endFrame から復元する
  * - stop_requested でも audioFrameCount が保存済み Chunk の最大 endFrame より小さければ補う（flush 後の最終保存の前に落ちた会議）
  * - 停止理由と検出時刻の片方だけが残った会議は両方を外して書き直す（put が拒否して起動ごと止まらないように）
+ * - 書き直しに失敗した会議は unreadMeetingIds で報告し、起動と他の会議の復旧は続ける
  * - 会議ロック（§15）が保持中の会議は別タブで録音中なので、会議も Chunk も触らない
  */
 export async function recoverOnStartup(
@@ -78,7 +82,15 @@ export async function recoverOnStartup(
         }
         if (needsFrames || incompleteStop) {
           current.updatedAt = Date.now();
-          await meetingStore.put(current);
+          try {
+            await meetingStore.put(current);
+          } catch {
+            // 書けなければ補う前の値（recording・古い audioFrameCount）が残る。読めなかった会議と同じく未復旧として報告し、
+            // Chunk も再投入しない。App はこの会議を確定しない。起動と他の会議の復旧は続ける
+            unread.push(m.meetingId);
+            active.add(m.meetingId);
+            continue;
+          }
         }
         interrupted.push({ meetingId: m.meetingId, status: originalStatus, chunkCount: chunks.length });
       } finally {
