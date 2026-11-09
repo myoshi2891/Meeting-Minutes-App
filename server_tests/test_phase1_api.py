@@ -260,20 +260,23 @@ def test_invalid_stop_metadata_is_rejected_and_legacy_request_stays_unknown(tmp_
 
 
 def test_existing_database_gets_nullable_stop_columns_without_changing_recordings(tmp_path):
-    # Arrange: 停止理由列を持たない旧スキーマ
+    # Arrange: 停止理由列を持たない旧スキーマの会議表を直接作る（DROP COLUMN は SQLite 3.35 未満にない）
     import sqlite3
+    with sqlite3.connect(tmp_path / "minutes.sqlite") as db:
+        db.execute("""CREATE TABLE meetings (
+ id TEXT PRIMARY KEY, local_user_id TEXT NOT NULL DEFAULT 'local', title TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('created','recording','finalizing','finalized','transcribing','transcribed','summarizing','completed','failed')),
+ session_start_epoch_ms INTEGER NOT NULL, native_sample_rate INTEGER NOT NULL,
+ consent_confirmed_at INTEGER NOT NULL, ended_at INTEGER, total_audio_frames INTEGER,
+ transcript_version INTEGER NOT NULL DEFAULT 0, stt_model_used TEXT, llm_model_used TEXT,
+ created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)""")
+        db.execute("""INSERT INTO meetings (id,title,status,session_start_epoch_ms,native_sample_rate,consent_confirmed_at,created_at,updated_at)
+ VALUES ('m-1','定例','recording',1000,48000,900,1000,1000)""")
+    # Act: 旧スキーマから起動して録音を保存し、再起動でもう一度マイグレーションを通す
     state = start_server_state(tmp_path, token="token")
     with TestClient(create_app(state)) as client:
-        client.post("/v1/meetings", json=meeting(), headers={"Authorization": "Bearer token"})
         assert put(client).status_code == 201
-    with sqlite3.connect(tmp_path / "minutes.sqlite") as db:
-        columns = {r[1] for r in db.execute("PRAGMA table_info(meetings)")}
-        for name in ("stop_reason", "stop_detected_at"):
-            if name in columns:
-                db.execute(f"ALTER TABLE meetings DROP COLUMN {name}")
     before = (tmp_path / "recordings/m-1/mic/000000.wav").read_bytes()
-    # Act: 再起動2回でもマイグレーションできる
-    start_server_state(tmp_path, token="token")
     state = start_server_state(tmp_path, token="token")
     # Assert
     with state.connect() as db:
