@@ -598,7 +598,7 @@ import {
 } from "../types/recording";
 import { computeFrameClockDriftMs, createSessionClock, frameToOffsetMs } from "./session-clock";
 import { buildStandaloneWav } from "../audio/wav";
-import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
+import { ChunkStore, MeetingStore, isQuotaExceeded, isValidStopDetectedAt } from "../storage/idb";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
 import type { SaveOutcome } from "../api/local-saver";
 
@@ -660,6 +660,18 @@ export interface StartOptions {
 
 export function makeChunkKey(meetingId: string, source: AudioSource, sequenceNo: number): string {
   return `${meetingId}:${source}:${sequenceNo.toString().padStart(6, "0")}`;
+}
+
+/**
+ * createMediaStreamSource が使う音声トラック（Phase 1 §15 と同じ）。Web Audio の仕様では、id をコード単位順に並べて最初のトラックだけを使う。
+ * 監視するトラックをこれと揃える（別のトラックの終了を、録音中のトラックの切断と取り違えない）
+ */
+export function selectSourceTrack(mediaStream: Pick<MediaStream, "getAudioTracks">): MediaStreamTrack | undefined {
+  let selected: MediaStreamTrack | undefined;
+  for (const track of mediaStream.getAudioTracks()) {
+    if (selected === undefined || track.id < selected.id) selected = track;
+  }
+  return selected;
 }
 
 export async function sha256Hex(data: ArrayBuffer): Promise<string> {
@@ -763,6 +775,8 @@ export class RecordingController {
       throw error;
     }
 
+    /** 録音に使うトラック。切断の監視はこのトラックだけにする（使っていないトラックの終了で録音を止めない） */
+    let sourceTrack: MediaStreamTrack | undefined;
     try {
       const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
         numberOfInputs: 1,
@@ -775,6 +789,7 @@ export class RecordingController {
         this.handleWorkletEvent(event.data);
       };
       this.node = node;
+      sourceTrack = selectSourceTrack(mediaStream);
       this.sourceNode = audioContext.createMediaStreamSource(mediaStream);
       this.sourceNode.connect(node);
 
@@ -789,10 +804,10 @@ export class RecordingController {
     // 前の録音の切断を、この録音の不健全として表示しない（Phase 1 §15 と同じ）
     this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter((r) => r !== this.endedReason);
     this.trackListeners = new AbortController();
-    for (const track of mediaStream.getAudioTracks()) {
-      track.addEventListener("ended", () => this.handleTrackEnded(), { signal: this.trackListeners.signal });
+    if (sourceTrack !== undefined) {
+      sourceTrack.addEventListener("ended", () => this.handleTrackEnded(), { signal: this.trackListeners.signal });
       // 登録前に終了したトラックには ended が届かない（Phase 1 §15 と同じ）
-      if (track.readyState === "ended") this.handleTrackEnded();
+      if (sourceTrack.readyState === "ended") this.handleTrackEnded();
     }
   }
 
@@ -867,7 +882,8 @@ export class RecordingController {
           statusError = error;
         }
         if (meeting !== undefined) {
-          if (meeting.stopReason === undefined) {
+          // サーバーが受け付けない検出時刻は記録せず、未観測として扱う（Phase 1 §15 と同じ）
+          if (meeting.stopReason === undefined && isValidStopDetectedAt(detectedAtEpochMs)) {
             meeting.stopReason = reason;
             meeting.stopDetectedAtEpochMs = detectedAtEpochMs;
           }
@@ -888,7 +904,7 @@ export class RecordingController {
         const meeting = await this.deps.meetingStore.get(this.meetingId);
         if (meeting !== undefined) {
           // 最初の読み書きに失敗していても、ここで stop_requested と最初の停止理由を書く（recording のまま停止を完了させない）
-          const firstStop = meeting.stopReason === undefined ? { stopReason: reason, stopDetectedAtEpochMs: detectedAtEpochMs } : {};
+          const firstStop = meeting.stopReason === undefined && isValidStopDetectedAt(detectedAtEpochMs) ? { stopReason: reason, stopDetectedAtEpochMs: detectedAtEpochMs } : {};
           await this.deps.meetingStore.put({ ...meeting, ...firstStop, status: "stop_requested", sessionClock: { ...this.clock }, updatedAt: Date.now() });
           finalSaved = true;
         } else finalMissing = true;
@@ -1011,6 +1027,8 @@ export class RecordingController {
   private async sendDirect(record: AudioChunkRecord): Promise<boolean> {
     if (this.deps.directSaver === undefined) return false;
     const outcome = await this.deps.directSaver.put(record);
+    // Scheduler の PUT 成功と同じく、サーバーに書けたら（DB 未登録でも）保存の成功時刻を進める（Phase 1 §15 と同じ）
+    if (outcome.ok) this.deps.health.lastSuccessfulLocalSaveAt = performance.now();
     // DB 未登録（registered: false）は成功にしない。IDB にもないので外すと Finalizer が埋められない欠番になる
     return outcome.ok && outcome.registered;
   }
@@ -1371,7 +1389,7 @@ mic / system の両方を検証する。System なしの会議は `expectedChunk
 
 ```typescript
 // src/recording/finalizer.ts
-import type { ChunkStore, MeetingStore } from "../storage/idb";
+import { isValidStopObservation, type ChunkStore, type MeetingStore } from "../storage/idb";
 import type { LocalSaveScheduler } from "./local-save-scheduler";
 import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
@@ -1577,8 +1595,8 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     expectedChunkCounts: counts,
     endedAtEpochMs: meeting.endedAt,
     totalAudioFrames: meeting.sessionClock.audioFrameCount,
-    stopReason: meeting.stopReason,
-    stopDetectedAtEpochMs: meeting.stopDetectedAtEpochMs,
+    // 保存済みの値がサーバーの制約を満たさなければ両方省略する（未観測、Phase 1 §22 と同じ）
+    ...(isValidStopObservation(meeting) ? { stopReason: meeting.stopReason, stopDetectedAtEpochMs: meeting.stopDetectedAtEpochMs } : {}),
   };
   const finUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/finalize`, deps.baseUrl);
   assertLocalHost(finUrl);
