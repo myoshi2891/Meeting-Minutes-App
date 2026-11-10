@@ -14,7 +14,7 @@ import {
 } from "../types/recording";
 import { createSessionClock, frameToOffsetMs } from "./session-clock";
 import { buildStandaloneWav } from "../audio/wav";
-import { ChunkStore, MeetingStore, isQuotaExceeded } from "../storage/idb";
+import { ChunkStore, MeetingStore, isQuotaExceeded, isValidStopDetectedAt } from "../storage/idb";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
 import type { SaveOutcome } from "../api/local-saver";
 
@@ -62,6 +62,18 @@ const FLUSH_TIMEOUT_MS = 5_000;
 
 export function makeChunkKey(meetingId: string, source: "mic" | "system", sequenceNo: number): string {
   return `${meetingId}:${source}:${sequenceNo.toString().padStart(6, "0")}`;
+}
+
+/**
+ * createMediaStreamSource が使う音声トラック。Web Audio の仕様では、id をコード単位順に並べて最初のトラックだけを使う。
+ * 監視するトラックをこれと揃える（別のトラックの終了を、録音中のマイクの切断と取り違えない）
+ */
+export function selectSourceTrack(mediaStream: Pick<MediaStream, "getAudioTracks">): MediaStreamTrack | undefined {
+  let selected: MediaStreamTrack | undefined;
+  for (const track of mediaStream.getAudioTracks()) {
+    if (selected === undefined || track.id < selected.id) selected = track;
+  }
+  return selected;
 }
 
 export async function sha256Hex(data: ArrayBuffer): Promise<string> {
@@ -161,6 +173,8 @@ export class RecordingController {
     // 連番は会議ごと。同じインスタンスで次の会議を録ると前の会議の続きから採番され、Finalizer の連番チェックが通らなくなる
     this.nextSequenceNo = 0;
 
+    /** 録音に使うトラック。切断の監視はこのトラックだけにする（使っていないトラックの終了で録音を止めない） */
+    let sourceTrack: MediaStreamTrack | undefined;
     try {
       const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
         numberOfInputs: 1,
@@ -173,6 +187,7 @@ export class RecordingController {
         this.handleWorkletEvent(event.data);
       };
       this.node = node;
+      sourceTrack = selectSourceTrack(mediaStream);
       this.sourceNode = audioContext.createMediaStreamSource(mediaStream);
       this.sourceNode.connect(node);
 
@@ -187,10 +202,10 @@ export class RecordingController {
     // 前の録音の切断を、この録音の不健全として表示しない
     this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter((r) => r !== "MIC_TRACK_ENDED");
     this.trackListeners = new AbortController();
-    for (const track of mediaStream.getAudioTracks()) {
-      track.addEventListener("ended", () => this.handleMicEnded(), { signal: this.trackListeners.signal });
+    if (sourceTrack !== undefined) {
+      sourceTrack.addEventListener("ended", () => this.handleMicEnded(), { signal: this.trackListeners.signal });
       // 登録前に終了したトラックには ended が届かない
-      if (track.readyState === "ended") this.handleMicEnded();
+      if (sourceTrack.readyState === "ended") this.handleMicEnded();
     }
   }
 
@@ -251,7 +266,8 @@ export class RecordingController {
     let finalSaved = false;
     try {
       // Worklet の応答待ちより前に保存する。停止が重なっても最初の観測を保持する。
-      if (meeting.stopReason === undefined) {
+      // サーバーが受け付けない検出時刻（NaN・小数・負数）は記録しない。確定が 422 で止まらないよう未観測として扱う
+      if (meeting.stopReason === undefined && isValidStopDetectedAt(detectedAtEpochMs)) {
         meeting.stopReason = reason;
         meeting.stopDetectedAtEpochMs = detectedAtEpochMs;
       }
@@ -393,6 +409,8 @@ export class RecordingController {
   private async sendDirect(record: AudioChunkRecord): Promise<boolean> {
     if (this.deps.directSaver === undefined) return false;
     const outcome = await this.deps.directSaver.put(record);
+    // Scheduler の PUT 成功と同じく、サーバーに書けたら（DB 未登録でも）保存の成功時刻を進める。時計も Scheduler の既定と同じ performance 時計
+    if (outcome.ok) this.deps.health.lastSuccessfulLocalSaveAt = performance.now();
     // DB 未登録（registered: false）は成功にしない。IDB にもないので外すと Finalizer が埋められない欠番になる
     return outcome.ok && outcome.registered;
   }

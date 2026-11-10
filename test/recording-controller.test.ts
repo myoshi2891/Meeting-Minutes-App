@@ -93,7 +93,7 @@ interface Setup {
   untilCommand: (type: WorkletCommand["type"]) => Promise<void>;
 }
 
-async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, directSaver?: DirectChunkSaver, onMicEnded?: () => void, otherMeetingsBacklogCount?: () => number): Promise<Setup> {
+async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, directSaver?: DirectChunkSaver, onMicEnded?: () => void, otherMeetingsBacklogCount?: () => number, extraTracks: ReadonlyArray<EventTarget & { readonly id: string; readyState: MediaStreamTrackState; stop: () => void }> = []): Promise<Setup> {
   const db = await openDatabase(new IDBFactory());
   const chunkStore = chunkStoreOverride?.(db) ?? new ChunkStore(db);
   const meetingStore = new MeetingStore(db);
@@ -119,7 +119,7 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
     audioWorklet: { addModule: vi.fn(async () => undefined) },
     createMediaStreamSource: () => ({ connect: vi.fn(), disconnect: vi.fn() }),
   } as unknown as AudioContext;
-  const mediaStream = { getAudioTracks: () => [track] } as unknown as MediaStream;
+  const mediaStream = { getAudioTracks: () => [track, ...extraTracks] } as unknown as MediaStream;
   const useFreshTrack = (): Track => {
     track = makeTrack();
     return track;
@@ -187,6 +187,18 @@ describe("RecordingController", () => {
       status: "stop_requested", stopReason: reason, stopDetectedAtEpochMs: 123456,
       sessionClock: { audioFrameCount: 1600 },
     });
+  });
+  it.each([Number.NaN, -1, 1.5])("サーバーが受け付けない検出時刻 %s は記録せず、停止理由ごと未観測として停止を完了する", async (detectedAt) => {
+    // Arrange
+    const s = await setup();
+    await s.controller.start(`stop-invalid-${String(detectedAt)}`, "停止理由", 1);
+    // Act
+    await s.controller.stop("manual", detectedAt);
+    // Assert：確定が 422 で止まらないよう両方を省き、停止と最終フレーム数は保存する
+    const m = await s.meetingStore.get(`stop-invalid-${String(detectedAt)}`);
+    expect(m).toMatchObject({ status: "stop_requested", sessionClock: { audioFrameCount: 1600 } });
+    expect(m?.stopReason).toBeUndefined();
+    expect(m?.stopDetectedAtEpochMs).toBeUndefined();
   });
   it.each(["manual", "mic_ended"] as const)("停止 %s の完了前に別の理由で停止が重なっても、最初の停止理由と検出時刻を保つ", async (reason) => {
     // Arrange：Worklet が応答せず、最初の停止が完了しない
@@ -695,6 +707,27 @@ describe("RecordingController", () => {
     expect(s.controller.memoryBacklogCount).toBe(0);
   });
 
+  it("直接送信に成功したら保存の成功時刻を進め、失敗したら変えない", async () => {
+    // Arrange：1 件目の直接送信は失敗、2 回目の drain で成功する
+    const { s, bringServerUp } = await startWithUnsavableBacklog();
+    s.worklet.sendChunk(1600);
+    await s.until(() => s.errors.length >= 1);
+    const now = vi.spyOn(performance, "now").mockReturnValue(9876);
+    try {
+      // Act（失敗）
+      await s.controller.drainMemoryBacklog().catch(() => undefined);
+      // Assert：失敗では進めない
+      expect(s.health.lastSuccessfulLocalSaveAt).toBe(0);
+      // Act（成功）
+      bringServerUp();
+      await s.controller.drainMemoryBacklog();
+      // Assert：Scheduler と同じ performance 時計で記録する
+      expect(s.health.lastSuccessfulLocalSaveAt).toBe(9876);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("drain が重なっても順に処理し、送れなかった Chunk を別の drain がメモリ待機から外さない", async () => {
     // Arrange：IDB に書けない Chunk が 2 件メモリ待機にあり、2 件目の直接送信は 1 回目だけ失敗する
     const registered = new Set<string>();
@@ -853,6 +886,35 @@ describe("RecordingController", () => {
     expect(ended).not.toHaveBeenCalled();
     s.track.dispatchEvent(new Event("ended"));
     s.track.dispatchEvent(new Event("ended"));
+    expect(ended).toHaveBeenCalledOnce();
+  });
+
+  it("音声トラックが複数あれば、音源に使う（id が最小の）トラックの終了だけを切断として扱う", async () => {
+    // Arrange：既定のトラック（id "track-b"）より id の小さい "track-a" を後ろに足す。createMediaStreamSource は "track-a" を使う
+    const ended = vi.fn();
+    const sourceTrack = Object.assign(new EventTarget(), { id: "track-a", readyState: "live" as MediaStreamTrackState, stop: vi.fn() });
+    const s = await setup(undefined, undefined, ended, undefined, [sourceTrack]);
+    Object.assign(s.track, { id: "track-b" });
+    await s.controller.start("multi-track", "定例", 1);
+    // Act：音源に使っていないトラックが終わる
+    s.track.dispatchEvent(new Event("ended"));
+    // Assert：録音中のマイクは生きているので止めない
+    expect(ended).not.toHaveBeenCalled();
+    // Act：音源のトラックが終わる
+    sourceTrack.dispatchEvent(new Event("ended"));
+    // Assert
+    expect(ended).toHaveBeenCalledOnce();
+  });
+
+  it("音源のトラックが監視の登録前に終わっていても切断として扱う", async () => {
+    // Arrange
+    const ended = vi.fn();
+    const sourceTrack = Object.assign(new EventTarget(), { id: "track-a", readyState: "ended" as MediaStreamTrackState, stop: vi.fn() });
+    const s = await setup(undefined, undefined, ended, undefined, [sourceTrack]);
+    Object.assign(s.track, { id: "track-b" });
+    // Act
+    await s.controller.start("multi-track-ended", "定例", 1);
+    // Assert
     expect(ended).toHaveBeenCalledOnce();
   });
 
