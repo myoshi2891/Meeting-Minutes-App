@@ -1100,8 +1100,8 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect((await s.app.meetingStore.get(id))?.status).toBe("stop_requested");
     // Act：ロックが空いてから予約が発火する
     release?.();
-    // FakeLockManager はコールバックの完了後（数マイクロタスク後）に解放する
-    await new Promise((r) => setTimeout(r, 0));
+    // FakeLockManager はコールバックの完了後（数マイクロタスク後）に解放する。実時間ではなく解放そのものを待つ
+    await vi.waitFor(() => expect(s.locks.held.size).toBe(0));
     for (const t of second) t.fn();
     // Assert
     await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
