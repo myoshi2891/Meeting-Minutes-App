@@ -573,7 +573,7 @@ export function jobFromServerRow(row: Record<string, unknown>): JobSummary | nul
 変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出し、確定を中止した会議の `discardMemoryBacklog()`（drain と直列、録音中は拒否。App の `SessionController` が使う）、`start()` の準備中は drain・破棄が空で終わってもロックを解放しないこと、`stop_requested` の保存に失敗しても末尾を Chunk にしてから Worklet を切り離すこと、メモリ待機が残る間と Mic の最終保存に失敗したときは stop 後も会議ロックを保持し `takeMeetingLock()` で App へ渡すこと（最終保存の失敗で保持したロックは drain で空になっても解放せず、渡すまで同じインスタンスの `start()` を拒否する）を含む）。会議ロックは Mic の Controller だけが持つ。そこで Mic または System のどちらかのメモリ待機が残る間は、Mic の stop 後もロックを持ち続け、両方が空になってから解放する。Mic のメモリ待機だけを見ると、Mic が空で System に末尾が残るときに Mic の `stop()` がロックを手放し、別タブの Barrier が System の末尾を数えられないまま確定しうるためである。配線は次のとおり。
 
 1. Mic の Controller にだけ `otherSourceBacklogCount: () => systemController.memoryBacklogCount` を渡す。Mic の `stop()` の最後と、`drainMemoryBacklog()`・`discardMemoryBacklog()` が空にしたときの解放は、自身のメモリ待機に加えてこの値も 0 のときだけロックを解放する。
-2. 停止は `DualRecorder.stop()`（§6）のとおり System を先に止め、完了してから Mic を止める。System の末尾 Chunk がメモリ待機に入るか確定した後で、Mic がロックを手放すか決めるためである。System の停止が失敗しても Mic は止めて停止理由を永続化し、その後で System の失敗を投げる。録音中に `dropSystem()` で System だけ止めた場合も、App はその System Controller を保持し続け、`otherSourceBacklogCount` と合計件数に数える（null にした後もメモリ待機は残りうる）。
+2. 停止は `DualRecorder.stop()`（§6）のとおり System を先に止め、完了してから Mic を止める。System の末尾 Chunk がメモリ待機に入るか確定した後で、Mic がロックを手放すか決めるためである。System の停止が失敗しても Mic は止めて停止理由を永続化し、その後で System の失敗を投げる。Mic の停止も失敗したときは、Mic の失敗を先頭（停止状態の復旧に使う主たる失敗）、System の失敗を 2 番目にした `AggregateError` で両方を投げる。録音中に `dropSystem()` で System だけ止めた場合も、App はその System Controller を保持し続け、`otherSourceBacklogCount` と合計件数に数える（null にした後もメモリ待機は残りうる）。
 3. App は Mic の `stop()` の直後に `takeMeetingLock()` でロックを受け取り（Phase 1 §31 の `heldLocks`）、`memoryBacklogCount(meetingId)` と `releaseHeldLockIfDrained()` は Mic と System の件数の合計で判定する。合計が 0 になるまでロックを解放しない。
 4. 確定中止後の破棄（`App.discardMemoryBacklog()`、Phase 1 §31）は Mic と System の両方の Controller で `discardMemoryBacklog()` を呼ぶ。ロックは 3. で App が受け取っているので、両方を空にした後の `releaseHeldLockIfDrained()`（合計 0 で解放）で手放す。Controller 側の解放判定も `otherSourceBacklogCount` を数えるので、片方だけ空にしてもロックは外れない。
 5. System 側の drain も Mic 側と同じく App の drain 関数で包む。空になったら `releaseHeldLockIfDrained()` を呼び、確定の再試行（`onChunkSaved`）を起こす。サーバー復帰時（`onBackendAvailable`）は Mic と System の両方を drain してから確定を再試行する。Finalizer の `unpersistedChunkCount` も両方の合計を渡す（§7）。`retryFinalize()` が Barrier の前に行う drain（サーバーが使えなければ IDB への書き戻しだけ。送信中のトークン変更で送れなければ drain を終えてから送り直す。Phase 1 §31）も、Mic と System の両方を対象にする。共有の IDB 保存警告を外す判定（`otherMeetingsBacklogCount`）には、他の会議に加えて同じ会議のもう一方の source の Controller も数える。Phase 1 で追加した `onMeetingCreated` は Mic 側で維持し、IDB 障害時の直接送信用の会議情報を保持する。System 側は既存の Mic 会議を使う。
@@ -1332,6 +1332,7 @@ export class MultiSourceRecorder {
    * System を先に止め、最後に Mic を止める（Mic 側が meeting.status を stop_requested にする）。
    * 検出時刻の既定値は epoch ms（Date.now）。deps.now はドリフト計測用の performance 時計なので使わない。
    * System の停止が失敗しても Mic は止め、停止理由を永続化してから System の失敗を投げる（マイクを取得したまま残さない）。
+   * 両方失敗したら、Mic の失敗を errors[0]（停止状態の復旧に使う主たる失敗）、System の失敗を errors[1] にした AggregateError を投げる。
    */
   async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<{ readonly mic: number; readonly system: number }> {
     let systemError: unknown = null;
@@ -1340,7 +1341,13 @@ export class MultiSourceRecorder {
     } catch (error) {
       systemError = error;
     }
-    if (this.mic !== null) await this.mic.stop(reason, detectedAtEpochMs);
+    try {
+      if (this.mic !== null) await this.mic.stop(reason, detectedAtEpochMs);
+    } catch (micError) {
+      // Mic の失敗だけを投げると System の失敗が報告されずに消える
+      if (systemError === null) throw micError;
+      throw new AggregateError([micError, systemError], "mic and system stop failed");
+    }
     if (systemError !== null) throw systemError;
     return { mic: this.mic?.chunkCount ?? 0, system: this.system?.chunkCount ?? 0 };
   }
@@ -2510,6 +2517,21 @@ describe("MultiSourceRecorder", () => {
     // Assert
     expect(controllers[0].stopArgs).toEqual([["mic_ended", 123456]]);
     expect(controllers[1].stopArgs).toEqual([[]]);
+  });
+
+  it("Mic と System の停止が両方失敗したら、Mic の失敗を先頭にした AggregateError で両方を報告する", async () => {
+    // Arrange
+    const { rec, controllers } = build(true);
+    await rec.start("m", "t", 1);
+    const micError = new Error("mic stop failed");
+    const systemError = new Error("system stop failed");
+    controllers[0].stop = async () => { throw micError; };
+    controllers[1].stop = async () => { throw systemError; };
+    // Act
+    const error = await rec.stop().catch((e: unknown) => e);
+    // Assert
+    if (!(error instanceof AggregateError)) throw new Error("AggregateError expected");
+    expect(error.errors).toEqual([micError, systemError]);
   });
 
   it("ドリフト差は mic − system で記録され、P95/P99 を返す", async () => {

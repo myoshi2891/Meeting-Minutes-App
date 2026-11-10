@@ -2654,7 +2654,10 @@ export interface SchedulerDeps {
   readonly backend: () => LocalBackendHealth;
   readonly health: RecordingHealth;
   readonly maxConcurrency: number;
+  /** 再試行の期限（nextRetryAt）・lastError.at に使う時計。IDB に残るので epoch ms */
   readonly now: () => number;
+  /** health.lastSuccessfulLocalSaveAt に使う performance 時計（RecordingHealth の他の時刻と揃える）。省略時は performance.now() */
+  readonly perfNow?: () => number;
   readonly setTimer: (fn: () => void, ms: number) => unknown;
   /** PUT が NETWORK / TIMEOUT で失敗したとき呼ぶ。配線先は BackendHealthMonitor.reportUnreachable()（§18） */
   readonly onBackendUnreachable: () => void;
@@ -2908,7 +2911,7 @@ export class LocalSaveScheduler {
     const outcome = await saver.put(record);
 
     if (outcome.ok) {
-      this.deps.health.lastSuccessfulLocalSaveAt = this.deps.now();
+      this.deps.health.lastSuccessfulLocalSaveAt = (this.deps.perfNow ?? (() => performance.now()))();
       // 送信中に別タブの復旧が新しい試行で確保し直していたら、その試行の状態を上書きしない（結果はその試行が書く）
       const owned = await this.updateClaimed(chunkKey, attempts, (r) => {
         r.save.status = outcome.registered ? "DB_REGISTERED" : "SAVED";
@@ -5858,7 +5861,7 @@ export async function confirmAbandon(meeting: Pick<MeetingRecord, "meetingId" | 
     await actions.exportWav();
   }
   const exportNotice = memoryCount > 0 ? "書き出した WAV を保存できたことを確認してください。\n" : "";
-  if (!actions.confirm(`${exportNotice}「${meeting.title}」（${meeting.meetingId}）の確定を中止し、一覧から外しますか？\n音声が欠けている可能性があります。確定済みにはなりません。保存済みの音声と会議情報は削除しません。自動再送・確定は再開しません。`)) return "cancelled";
+  if (!actions.confirm(`${exportNotice}「${meeting.title}」（${meeting.meetingId}）の確定を中止し、一覧から外しますか？\n音声が欠けている可能性があります。このブラウザからの自動再送・確定は再開しません。サーバーで確定済みになっていた場合は取り消しません。保存済みの音声と会議情報は削除しません。`)) return "cancelled";
   await actions.abandon(meeting.meetingId, true);
   // 中止した会議のメモリ待機は送られないので、保存を確かめたら捨てられるようにする（捨てるまで離脱確認が残る）
   if (memoryCount > 0 && actions.discardBacklog !== undefined && actions.confirm(discardBacklogQuestion(meeting.title, memoryCount))) {
