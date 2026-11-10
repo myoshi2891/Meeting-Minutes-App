@@ -19,19 +19,21 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ORIGIN = "http://127.0.0.1:5173"
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 # finalize 前の状態。これ以外の会議には新しい Chunk を足さず、確定値も書き換えない
 OPEN_STATUSES = ("created", "recording", "finalizing")
+# SQLite INTEGER（符号付き 64 bit）の上限。超える値は登録時に OverflowError となり 500 になるため 422 で弾く
+SQLITE_INT_MAX = 2**63 - 1
 
 
 class StorageFullError(Exception):
@@ -103,6 +105,12 @@ CREATE TABLE IF NOT EXISTS audio_chunks (
  created_at INTEGER NOT NULL, UNIQUE(meeting_id,source,sequence_no));
 CREATE INDEX IF NOT EXISTS idx_chunks_meeting_stt ON audio_chunks(meeting_id,stt_status);
 """)
+        # 既存データは NULL（未記録）のまま維持。複数起動の列追加も直列化する。
+        db.execute("BEGIN IMMEDIATE")
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(meetings)")}
+        for name, sql_type in (("stop_reason", "TEXT"), ("stop_detected_at", "INTEGER")):
+            if name not in columns:
+                db.execute(f"ALTER TABLE meetings ADD COLUMN {name} {sql_type}")
     return state
 
 
@@ -118,6 +126,14 @@ class FinalizeRequest(BaseModel):
     expectedChunkCounts: dict[str, int]
     endedAtEpochMs: int = Field(ge=0)
     totalAudioFrames: int = Field(ge=0)
+    stopReason: Literal["manual", "mic_ended"] | None = None
+    stopDetectedAtEpochMs: int | None = Field(default=None, ge=0, le=SQLITE_INT_MAX, strict=True)
+
+    @model_validator(mode="after")
+    def validate_stop_observation(self) -> "FinalizeRequest":
+        if (self.stopReason is None) != (self.stopDetectedAtEpochMs is None):
+            raise ValueError("stopReason and stopDetectedAtEpochMs must be supplied together")
+        return self
 
 
 def error(status: int, code: str, message: str) -> JSONResponse:
@@ -331,9 +347,9 @@ def create_app(state: ServerState) -> FastAPI:
                         return error(409, "CONFLICT_CHUNKS_MISSING", "chunk file missing or corrupt")
                 counts[source] = len(chosen)
             # 先に確定した値を正とする（2 回目以降は更新せず、保存済みの値を読み直す）
-            db.execute(f"""UPDATE meetings SET status='finalized', ended_at=?, total_audio_frames=?, updated_at=?
+            db.execute(f"""UPDATE meetings SET status='finalized', ended_at=?, total_audio_frames=?, updated_at=?, stop_reason=?, stop_detected_at=?
                 WHERE id=? AND status IN ({",".join("?" * len(OPEN_STATUSES))})""",
-                       (body.endedAtEpochMs, body.totalAudioFrames, int(time.time() * 1000), meeting_id, *OPEN_STATUSES))
+                       (body.endedAtEpochMs, body.totalAudioFrames, int(time.time() * 1000), body.stopReason, body.stopDetectedAtEpochMs, meeting_id, *OPEN_STATUSES))
             meeting = db.execute("SELECT * FROM meetings WHERE id=?", (meeting_id,)).fetchone()
         # コミット後に書き、meeting.json が DB より先行しないようにする。失敗しても再送で書き直せる
         assert meeting is not None
@@ -341,7 +357,8 @@ def create_app(state: ServerState) -> FastAPI:
                     "sessionStartEpochMs": meeting["session_start_epoch_ms"],
                     "nativeSampleRate": meeting["native_sample_rate"],
                     "consentConfirmedAt": meeting["consent_confirmed_at"],
-                    "endedAtEpochMs": meeting["ended_at"], "totalAudioFrames": meeting["total_audio_frames"]}
+                    "endedAtEpochMs": meeting["ended_at"], "totalAudioFrames": meeting["total_audio_frames"],
+                    "stopReason": meeting["stop_reason"], "stopDetectedAtEpochMs": meeting["stop_detected_at"]}
         try:
             _write_atomic(state.data_dir / "recordings" / meeting_id / "meeting.json", json.dumps(snapshot, ensure_ascii=False).encode())
         except OSError as exc:

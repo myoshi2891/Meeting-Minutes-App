@@ -194,6 +194,92 @@ describe("BackendHealthMonitor.checkOnce", () => {
     expect(health.degradedReasons).toEqual([]);
   });
 
+  it("失効の報告より前に始めたヘルスチェックの成功応答では unauthorized を解除しない", async () => {
+    // Arrange：認証済みの応答を返すチェックを途中で止める
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let calls = 0;
+    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async () => {
+      if (++calls === 1) await gate;
+      return json({ status: "ok", service: "minutes-local", capabilities: CAPS });
+    });
+    const stale = m.checkOnce();
+    // Act：応答待ちの間に PUT などが 401 を受けて報告する
+    m.reportUnauthorized();
+    release();
+    await stale;
+    // Assert：古い結果は捨て、報告後に始めたチェックだけが解除できる
+    expect(m.state.unauthorized).toBe(true);
+    expect(m.state.status).toBe("UNREACHABLE");
+    expect((await m.checkOnce()).unauthorized).toBe(false);
+  });
+
+  it("先に始めたヘルスチェックの成功が、後から始めたチェックの 401 より遅れて届いても unauthorized を解除しない", async () => {
+    // Arrange：1 本目（成功）を止めている間に、サーバー再起動などで 2 本目が 401 を受ける
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let calls = 0;
+    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async () => {
+      if (++calls === 1) {
+        await gate;
+        return json({ status: "ok", service: "minutes-local", capabilities: CAPS });
+      }
+      return json({ error: "unauthorized", code: "UNAUTHORIZED" }, 401);
+    });
+    const older = m.checkOnce();
+    await m.checkOnce();
+    // Act
+    release();
+    await older;
+    // Assert
+    expect(m.state.unauthorized).toBe(true);
+  });
+
+  it("古いトークンで始めたヘルスチェックの 401 は、新しいトークンのチェックの成功を打ち消さない", async () => {
+    // Arrange：古いトークンのチェックの応答待ち中にトークンが差し替わる
+    let token = "stale";
+    let releaseStale!: () => void;
+    const staleGate = new Promise<void>((r) => { releaseStale = r; });
+    const m = new BackendHealthMonitor({ ...CONFIG, token: () => token }, createInitialHealth("running"), async (_input, init) => {
+      if (new Headers(init?.headers).get("Authorization") === "Bearer stale") {
+        await staleGate;
+        return json({ error: "unauthorized", code: "UNAUTHORIZED" }, 401);
+      }
+      return json({ status: "ok", service: "minutes-local", capabilities: CAPS });
+    });
+    const stale = m.checkOnce();
+    token = "new";
+    // Act：新しいトークンのチェックが終わってから、古いチェックの 401 が遅れて届く
+    const state = await m.checkOnce();
+    expect(state.unauthorized).toBe(false);
+    expect(state.status).toBe("HEALTHY");
+    releaseStale();
+    await stale;
+    // Assert
+    expect(m.state.unauthorized).toBe(false);
+    expect(m.state.status).toBe("HEALTHY");
+  });
+
+  it("応答待ちの間にトークンが差し替わったら、古いトークンの成功応答で unauthorized を解除しない", async () => {
+    // Arrange：失効中に古いトークンのチェックを止めている間、利用者が別のトークンを保存する
+    let token = "old";
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const m = new BackendHealthMonitor({ ...CONFIG, token: () => token }, createInitialHealth("running"), async (_input, init) => {
+      if (new Headers(init?.headers).get("Authorization") === "Bearer old") await gate;
+      return json({ status: "ok", service: "minutes-local", capabilities: CAPS });
+    });
+    m.reportUnauthorized();
+    const stale = m.checkOnce();
+    token = "new";
+    // Act
+    release();
+    await stale;
+    // Assert：新しいトークンの正しさはこの応答では分からない
+    expect(m.state.unauthorized).toBe(true);
+    expect((await m.checkOnce()).unauthorized).toBe(false);
+  });
+
   it("401 応答で UNREACHABLE になったときは latencyMs と capabilities を持たない", async () => {
     // Arrange：認証済みで HEALTHY（capabilities あり）にしてから 401 を返す
     let authorized = true;

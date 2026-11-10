@@ -3,6 +3,7 @@ import type { ChunkStore, MeetingStore } from "../storage/idb";
 import type { LocalSaveScheduler } from "./local-save-scheduler";
 import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
+import type { RegistrationOutcome } from "../api/meeting-registrar";
 import type { AudioChunkRecord } from "../types/recording";
 import { frameToOffsetMs } from "./session-clock";
 
@@ -15,8 +16,13 @@ export interface FinalizerDeps {
   readonly fetchImpl?: typeof fetch;
   /** GET /chunks と POST /finalize それぞれのタイムアウト。既定 30000ms */
   readonly timeoutMs?: number;
+  readonly onBackendUnauthorized?: () => void;
   /** IDB に書けずメモリ待機中の Chunk 数（RecordingController.memoryBacklogCount）。0 でない限り Barrier を通さない。 */
   readonly unpersistedChunkCount: () => number;
+  /** 照合の前に会議をサーバーへ登録する（MeetingRegistrar.ensure）。Chunk を 1 件も PUT できていない会議は一覧・確定が 404 になるため */
+  readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>;
+  /** IDB にない Chunk（このタブが直接送信した分）の endFrame。末尾を直接送ったときも末尾の欠けを測るために使う */
+  readonly offIdbEndFrame?: (sequenceNo: number) => number | undefined;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -24,15 +30,21 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 export type FinalizeResult =
   /** missingTailMs：末尾の Chunk が欠けたまま確定した長さ（ms）。欠けがなければ省く（T1-e） */
   | { readonly ok: true; readonly missingTailMs?: number }
-  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string };
+  /**
+   * reason：失敗の分類。"unauthorized" はトークン未設定・サーバーの 401/403 で、UI はトークンの確認を案内する。
+   * "network" はサーバーへの要求が応答を得られなかった（接続失敗・タイムアウト）。ヘルス状態が変わらないこともあるので、呼び出し元が時間をおいて再試行する。
+   * detail はサーバー由来の文字列を含みうるので、分類には使わない
+   */
+  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string; readonly reason?: "unauthorized" | "network" };
 
 /**
  * Finalization Barrier：
  *   1. 最終 Chunk が IDB にある（呼び出し前提：RecordingController.stop() 完了）かつメモリ待機中の Chunk がない
  *   2. IDB 上の全 Chunk が DB_REGISTERED（SAVED はサーバー一覧で登録確認できれば DB_REGISTERED に進める）
- *   3. サーバーの一覧と件数・sha256 が一致（IDB にない連番は、サーバーに登録済みなら揃っているとみなす）
- *   4. POST /finalize
- * 1〜3 を満たさない限り finalizing へ遷移しない。
+ *   3. 会議がサーバーに登録済み（ensureMeeting。再試行のたびに通し、失敗したら一覧を取らない）
+ *   4. サーバーの一覧と件数・sha256 が一致（IDB にない連番は、サーバーに登録済みなら揃っているとみなす）
+ *   5. POST /finalize
+ * 1〜4 を満たさない限り finalizing へ遷移しない。
  */
 export function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
   // 同じ会議への呼び出しが重なると、両方が stop_requested を読んで二重に POST し、
@@ -73,6 +85,16 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     return { ok: false, stage: "waiting_local_save", detail: `${notRegistered.length} chunks not registered` };
   }
 
+  // 再試行でも毎回通す。登録に失敗したら一覧を取らない（401/403 は MeetingRegistrar が Monitor へ報告済み）
+  if (deps.ensureMeeting !== undefined) {
+    const registration = await deps.ensureMeeting(meetingId);
+    if (!registration.ok) {
+      const kind = registration.error.kind;
+      const reason = kind === "UNAUTHORIZED" ? { reason: "unauthorized" as const } : kind === "NETWORK" || kind === "TIMEOUT" ? { reason: "network" as const } : {};
+      return { ok: false, stage: "verify", detail: `meeting registration failed: ${registration.error.message}`, ...reason };
+    }
+  }
+
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
   assertLocalHost(listUrl);
   // タイムアウトで abort すると fetch / json() が reject し、既存のエラー経路で Result になる
@@ -85,9 +107,13 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
     list = listRes.ok ? await listRes.json().catch(() => null) : null;
   } catch (error) {
-    return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}` };
+    return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}`, reason: "network" };
   } finally {
     clearTimeout(listTimer);
+  }
+  if (listRes.status === 401 || listRes.status === 403) {
+    deps.onBackendUnauthorized?.();
+    return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}`, reason: "unauthorized" };
   }
   if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
@@ -148,6 +174,8 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     expectedChunkCounts: { mic: chunkCount, system: 0 },
     endedAtEpochMs: meeting.endedAt,
     totalAudioFrames: meeting.sessionClock.audioFrameCount,
+    stopReason: meeting.stopReason,
+    stopDetectedAtEpochMs: meeting.stopDetectedAtEpochMs,
   };
   const finUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/finalize`, deps.baseUrl);
   assertLocalHost(finUrl);
@@ -167,18 +195,20 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   } catch (error) {
     // finalizing のまま残さない。次回の Barrier 再試行は stop_requested から行う
     await restore();
-    return { ok: false, stage: "finalize", detail: `finalize request failed: ${errorMessage(error)}` };
+    return { ok: false, stage: "finalize", detail: `finalize request failed: ${errorMessage(error)}`, reason: "network" };
   } finally {
     clearTimeout(finTimer);
   }
+  const finUnauthorized = finRes.status === 401 || finRes.status === 403;
+  if (finUnauthorized) deps.onBackendUnauthorized?.();
   if (!finRes.ok) {
     await restore();
-    return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}` };
+    return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}`, ...(finUnauthorized ? { reason: "unauthorized" as const } : {}) };
   }
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);
   // 欠けた音声は取り戻せないので確定は止めず、UI が警告できるよう長さを返す（T1-e）
-  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, chunks, chunkCount);
+  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, chunks, chunkCount, deps.offIdbEndFrame);
   return missingTailMs > 0 ? { ok: true, missingTailMs } : { ok: true };
 }
 
@@ -186,12 +216,21 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
  * 末尾の欠け（ms）。stop() が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま会議が確定する。
  * audioFrameCount は heartbeat（1 秒ごと）でも進むので、最後の Chunk の endFrame より大きければ末尾が欠けている
  * （最後の heartbeat より後の 1 秒未満の欠けは検出できない）。
- * 最後の連番が IDB にない（サーバーへ直接送った）ときは endFrame が分からないので 0 を返す。
+ * 最後の連番が IDB にない（サーバーへ直接送った）ときは offIdbEndFrame の値を使い、それも分からなければ 0 を返す。
+ * Chunk が 1 件もなければ（chunkCount === 0）終わりを 0 とし、audioFrameCount 全体を欠けとして返す。
  */
-export function measureMissingTailMs(audioFrameCount: number, chunks: ReadonlyArray<AudioChunkRecord>, chunkCount: number): number {
+export function measureMissingTailMs(
+  audioFrameCount: number,
+  chunks: ReadonlyArray<AudioChunkRecord>,
+  chunkCount: number,
+  offIdbEndFrame?: (sequenceNo: number) => number | undefined,
+): number {
+  const lastSeq = chunkCount - 1;
   const last = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
-  if (last === undefined || last.meta.sequenceNo !== chunkCount - 1) return 0;
-  return frameToOffsetMs(Math.max(0, audioFrameCount - last.meta.endFrame));
+  // Chunk が 1 件もなければ録音した長さ全体が欠けている
+  const endFrame = chunkCount === 0 ? 0 : last?.meta.sequenceNo === lastSeq ? last.meta.endFrame : offIdbEndFrame?.(lastSeq);
+  if (endFrame === undefined) return 0;
+  return frameToOffsetMs(Math.max(0, audioFrameCount - endFrame));
 }
 
 function errorMessage(error: unknown): string {

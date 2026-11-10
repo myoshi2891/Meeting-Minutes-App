@@ -80,6 +80,119 @@ describe("LocalSaver.put", () => {
     expect(auths).toEqual(["Bearer new-tok"]);
   });
 
+  it("送信中にトークンが変わって 401 になったら、失効として返さず新しいトークンで送り直す", async () => {
+    // Arrange：古いトークンの PUT の応答待ち中に setToken される
+    const r = await makeChunkRecord("m1", 0, 160);
+    const auths: (string | null)[] = [];
+    let saver: LocalSaver | undefined;
+    saver = saverWith(async (_input, init) => {
+      const auth = new Headers(init?.headers).get("Authorization");
+      auths.push(auth);
+      if (auth === "Bearer tok") {
+        saver?.setToken("new-tok");
+        return new Response(JSON.stringify({ error: "unauthorized", code: "UNAUTHORIZED" }), { status: 401 });
+      }
+      return new Response(okBody(r), { status: 201 });
+    });
+    // Act
+    const outcome = await saver.put(r);
+    // Assert
+    expect(outcome).toMatchObject({ ok: true, registered: true });
+    expect(auths).toEqual(["Bearer tok", "Bearer new-tok"]);
+  });
+
+  it("401 の本文を読んでいる間にトークンが変わったら、失効として返さず新しいトークンで送り直す", async () => {
+    // Arrange：本文の読み出し時に setToken される
+    const r = await makeChunkRecord("m1", 0, 160);
+    const auths: (string | null)[] = [];
+    let saver: LocalSaver | undefined;
+    saver = saverWith(async (_input, init) => {
+      const auth = new Headers(init?.headers).get("Authorization");
+      auths.push(auth);
+      if (auth !== "Bearer tok") return new Response(okBody(r), { status: 201 });
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          saver?.setToken("new-tok");
+          controller.enqueue(new TextEncoder().encode(JSON.stringify({ error: "unauthorized", code: "UNAUTHORIZED" })));
+          controller.close();
+        },
+      }, { highWaterMark: 0 });
+      return new Response(body, { status: 401 });
+    });
+    // Act
+    const outcome = await saver.put(r);
+    // Assert
+    expect(outcome).toMatchObject({ ok: true, registered: true });
+    expect(auths).toEqual(["Bearer tok", "Bearer new-tok"]);
+  });
+
+  it("送り直し中にもトークンが変わったら、失効ではなく再試行できる失敗で返す", async () => {
+    // Arrange：送るたびにトークンが差し替わる
+    const r = await makeChunkRecord("m1", 0, 160);
+    let n = 0;
+    let saver: LocalSaver | undefined;
+    saver = saverWith(async () => {
+      saver?.setToken(`tok-${++n}`);
+      return new Response("{}", { status: 403 });
+    });
+    // Act
+    const outcome = await saver.put(r);
+    // Assert：送り直しは 1 回だけ。Scheduler が上限に数えず送り直せるよう、トークン変更による失敗と分かる印を付ける
+    expect(outcome).toMatchObject({ ok: false, retryable: true, tokenChanged: true, error: { kind: "UNKNOWN" } });
+    expect(n).toBe(2);
+  });
+
+  it("送り直し前の会議確認を待つ間にトークンが変わったら、確認後の最新トークンで送る", async () => {
+    // Arrange：最初の PUT 中に tok → tok-2、送り直し前の ensureMeeting 中に tok-2 → tok-3。サーバーは tok-3 だけ受け付ける
+    const r = await makeChunkRecord("m1", 0, 160);
+    const sent: string[] = [];
+    let ensures = 0;
+    let saver: LocalSaver | undefined;
+    const ensure = async () => {
+      if (++ensures === 2) saver?.setToken("tok-3");
+      return { ok: true as const };
+    };
+    saver = new LocalSaver({ baseUrl: BASE, token: "tok", requestTimeoutMs: 1000 }, async (_input, init) => {
+      const auth = new Headers(init?.headers).get("Authorization") ?? "";
+      sent.push(auth);
+      if (sent.length === 1) saver?.setToken("tok-2");
+      return auth === "Bearer tok-3" ? new Response(okBody(r), { status: 201 }) : new Response("{}", { status: 401 });
+    }, ensure);
+    // Act
+    const outcome = await saver.put(r);
+    // Assert
+    expect(sent).toEqual(["Bearer tok", "Bearer tok-3"]);
+    expect(outcome).toMatchObject({ ok: true });
+  });
+
+  it("トークン変更で送り直す前に会議の送信可否を確かめ、確定中止されていれば PUT しない", async () => {
+    // Arrange：最初の PUT の応答待ち中にトークンが変わり、同時に会議が確定中止された
+    const r = await makeChunkRecord("m1", 0, 160);
+    let puts = 0;
+    let abandoned = false;
+    let saver: LocalSaver | undefined;
+    const ensure = async () => abandoned
+      ? { ok: false as const, retryable: false, error: { kind: "VALIDATION" as const, message: "meeting abandoned", httpStatus: null, at: 0 } }
+      : { ok: true as const };
+    saver = new LocalSaver({ baseUrl: BASE, token: "tok", requestTimeoutMs: 1000 }, async () => {
+      puts++;
+      saver?.setToken("new-tok");
+      abandoned = true;
+      return new Response("{}", { status: 401 });
+    }, ensure);
+    // Act
+    const outcome = await saver.put(r);
+    // Assert
+    expect(puts).toBe(1);
+    expect(outcome).toMatchObject({ ok: false, retryable: false, error: { kind: "VALIDATION", message: "meeting abandoned" } });
+  });
+
+  it("トークンが変わっていない 401 は UNAUTHORIZED で返す", async () => {
+    const r = await makeChunkRecord("m1", 0, 160);
+    const saver = saverWith(async () => new Response("{}", { status: 401 }));
+    expect(await saver.put(r)).toMatchObject({ ok: false, retryable: false, error: { kind: "UNAUTHORIZED", httpStatus: 401 } });
+  });
+
   it("ブラウザの fetch を渡してもメソッド呼び出しにせず PUT を送る（Illegal invocation にならない）", async () => {
     // Arrange
     const r = await makeChunkRecord("m1", 0, 160);
@@ -155,6 +268,33 @@ describe("LocalSaver.put", () => {
       const pending = saverWith(hanging, 20).put(r);
       await vi.advanceTimersByTimeAsync(20);
       expect(await pending).toMatchObject({ ok: false, retryable: true, error: { kind: "TIMEOUT" } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("トークン変更の送り直しは、会議確認の後に新しいタイムアウトで送る（最初の PUT の期限切れを引き継がない）", async () => {
+    // Arrange：最初の PUT は 401 中にトークンが変わり、送り直し前の会議確認が最初の期限（20ms）より後に終わる
+    const r = await makeChunkRecord("m1", 0, 160);
+    let ensures = 0;
+    let saver: LocalSaver | undefined;
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      if (init?.signal?.aborted === true) throw new DOMException("aborted", "AbortError");
+      if (new Headers(init?.headers).get("Authorization") === "Bearer tok") {
+        saver?.setToken("new-tok");
+        return new Response(JSON.stringify({ error: "unauthorized", code: "UNAUTHORIZED" }), { status: 401 });
+      }
+      return new Response(okBody(r), { status: 201 });
+    };
+    const ensureMeeting = () => (++ensures === 1 ? Promise.resolve({ ok: true } as const) : new Promise<{ ok: true }>((resolve) => setTimeout(() => resolve({ ok: true }), 30)));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      saver = new LocalSaver({ baseUrl: BASE, token: "tok", requestTimeoutMs: 20 }, fetchImpl, ensureMeeting);
+      // Act
+      const pending = saver.put(r);
+      await vi.advanceTimersByTimeAsync(30);
+      // Assert
+      expect(await pending).toMatchObject({ ok: true, registered: true });
     } finally {
       vi.useRealTimers();
     }

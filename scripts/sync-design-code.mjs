@@ -3,6 +3,13 @@ import { readFileSync, writeFileSync } from "node:fs";
 
 const docPath = "design-local-phase1.md";
 const sources = [
+  "src/types/recording.ts",
+  "src/api/contracts.ts",
+  "src/recording/local-save-scheduler.ts",
+  "src/recording/finalizer.ts",
+  "src/recording/recovery.ts",
+  "src/api/backend-health-monitor.ts",
+  "src/ui/pending-actions.ts",
   "src/recording/recording-controller.ts",
   "src/api/local-saver.ts",
   "src/api/meeting-registrar.ts",

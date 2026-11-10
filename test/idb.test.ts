@@ -180,6 +180,20 @@ describe("MeetingStore / SettingsStore", () => {
     expect(await store.get("zzz")).toBeUndefined();
   });
 
+  it("停止理由と検出時刻の片方だけの会議は保存せず、両方あり・両方なしは保存する", async () => {
+    // Arrange
+    const store = new MeetingStore(await freshDb());
+    const base = makeMeeting("stop-pair", "stop_requested");
+    // Act / Assert：片方だけはサーバーの確定が 422 になるので IDB に残さない
+    await expect(store.put({ ...base, stopReason: "manual" })).rejects.toThrow("together");
+    await expect(store.put({ ...base, stopDetectedAtEpochMs: 1800 })).rejects.toThrow("together");
+    expect(await store.get("stop-pair")).toBeUndefined();
+    await store.put(base);
+    expect(await store.get("stop-pair")).toEqual(base);
+    await store.put({ ...base, stopReason: "mic_ended", stopDetectedAtEpochMs: 1800 });
+    expect(await store.get("stop-pair")).toMatchObject({ stopReason: "mic_ended", stopDetectedAtEpochMs: 1800 });
+  });
+
   it("settings は値を保存でき、未設定キーは undefined", async () => {
     const store = new SettingsStore(await freshDb());
     await store.set("token", "abc");

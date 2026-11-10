@@ -33,6 +33,8 @@ export class BackendHealthMonitor {
   /** 最後に console.warn した接続失敗の理由。同じ理由をポーリングのたびに出さないために使い、到達できたら null に戻す。 */
   private lastWarnedReason: string | null = null;
   private readonly healthUrl: URL;
+  /** reportUnauthorized() とヘルスチェックの 401/403 の回数。失効より前に始めたヘルスチェックの結果で unauthorized を上書きしないために使う */
+  private unauthorizedReports = 0;
 
   constructor(
     private readonly config: BackendHealthMonitorConfig,
@@ -67,14 +69,16 @@ export class BackendHealthMonitor {
     this.transition("UNREACHABLE", null, null);
   }
 
-  /** PUT が 401/403 を受けたときに Scheduler から呼ばれる。認証付きのヘルス応答が返るまで unauthorized を保持する。 */
+  /** PUT・会議登録・一覧照合・確定が 401/403 を受けたときに呼ばれる。認証付きのヘルス応答が返るまで unauthorized を保持する。 */
   reportUnauthorized(): void {
+    this.unauthorizedReports++;
     this.state.unauthorized = true;
     this.transition("UNREACHABLE", null, null);
   }
 
   async checkOnce(): Promise<LocalBackendHealth> {
     const started = performance.now();
+    const reportsAtStart = this.unauthorizedReports;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
@@ -87,6 +91,10 @@ export class BackendHealthMonitor {
       const latency = performance.now() - started;
 
       if (response.status === 401 || response.status === 403) {
+        // 応答待ちの間にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（新しいトークンのチェックに任せる）
+        if (this.config.token() !== token) return this.state;
+        // 先に始めた別のチェックの成功が後から届いても、この失効を打ち消さない
+        this.unauthorizedReports++;
         this.state.unauthorized = true;
         this.transition("UNREACHABLE", latency, null);
         return this.state;
@@ -97,6 +105,9 @@ export class BackendHealthMonitor {
         this.transition("UNREACHABLE", latency, null);
         return this.state;
       }
+      // 応答待ちの間に失効が報告された、またはトークンが差し替わった。古い要求の成功で unauthorized を解除せず、
+      // 状態も変えない（backend 復帰の通知も出さない）。報告後・差し替え後のチェックに任せる
+      if (this.unauthorizedReports !== reportsAtStart || this.config.token() !== token) return this.state;
       // capabilities は認証済みのときだけ返る（§12）。認証なしの応答ではトークンの正しさを判断できないので unauthorized を解除しない
       if (body.capabilities !== undefined) this.state.unauthorized = false;
       const status = body.status === "degraded" || latency > this.config.degradedLatencyMs ? "DEGRADED" : "HEALTHY";

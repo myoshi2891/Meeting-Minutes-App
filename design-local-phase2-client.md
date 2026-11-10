@@ -216,7 +216,9 @@ export interface LocalStorageQuota {
   readonly checkedAt: number;
 }
 
-export type MeetingStatus = "created" | "recording" | "stop_requested" | "finalizing" | "finalized";
+export type MeetingStatus = "created" | "recording" | "stop_requested" | "finalizing" | "finalized" | "abandoned";
+
+export type RecordingStopReason = "manual" | "mic_ended";
 
 export interface MeetingRecord {
   readonly meetingId: string;
@@ -227,6 +229,8 @@ export interface MeetingRecord {
   createdAt: number;
   updatedAt: number;
   endedAt: number | null;
+  stopReason?: RecordingStopReason;
+  stopDetectedAtEpochMs?: number;
   finalChunkCount: number | null;
 }
 
@@ -566,9 +570,15 @@ export function jobFromServerRow(row: Record<string, unknown>): JobSummary | nul
 
 # 4. `src/recording/recording-controller.ts` の変更
 
-変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出しを含む）。Phase 1 で追加した `onMeetingCreated` は Mic 側で維持し、IDB 障害時の直接送信用の会議情報を保持する。System 側は既存の Mic 会議を使う。
+変更点は 4 つ。(1) `source` をコンストラクタ引数に、(2) `start()` に `registerMeeting` を追加（System 側は会議レコードを作らない）、(3) `start()` に `timelineOriginEpochMs` を追加し、`startOffsetMs` / `endOffsetMs` を会議タイムライン（Mic の `sessionStartEpochMs`）基準へ正規化する（基本設計 §16.2）、(4) `frameClockDriftMs` をメタデータに載せる。それ以外は Phase 1 §15 と同一（`requestId` による `flushed` の対応付けとタイムアウト、書き込み失敗時のメモリ待機、`drainMemoryBacklog()` のサーバーへの直接送信、`exportMemoryBacklog()` による WAV の書き出し、確定を中止した会議の `discardMemoryBacklog()`（drain と直列、録音中は拒否。App の `SessionController` が使う）、`start()` の準備中は drain・破棄が空で終わってもロックを解放しないこと、`stop_requested` の保存に失敗しても末尾を Chunk にしてから Worklet を切り離すこと、メモリ待機が残る間と Mic の最終保存に失敗したときは stop 後も会議ロックを保持し `takeMeetingLock()` で App へ渡すこと（最終保存の失敗で保持したロックは drain で空になっても解放せず、渡すまで同じインスタンスの `start()` を拒否する）を含む）。会議ロックは Mic の Controller だけが持つ。そこで Mic または System のどちらかのメモリ待機が残る間は、Mic の stop 後もロックを持ち続け、両方が空になってから解放する。Mic のメモリ待機だけを見ると、Mic が空で System に末尾が残るときに Mic の `stop()` がロックを手放し、別タブの Barrier が System の末尾を数えられないまま確定しうるためである。配線は次のとおり。
 
-`stop()` の最後の会議レコード保存だけは Phase 1 と形が違う。Phase 1 は Controller が会議レコードを保持し、その `sessionClock` が Controller の時計と同じオブジェクトなので、保存し直すだけで最終 `audioFrameCount` が残る。Phase 2 は `registerMeeting` のため会議レコードを IndexedDB から読み直すので、別オブジェクトになる。そこで Mic 側は、最終 Chunk の書き込み完了後に会議レコードを読み直し、Controller の `SessionClock` を写した新しいオブジェクトとして保存する。`sessionClock` は `readonly` なので、書き換えずに置き換える。System 側は会議レコードを持たないので何もしない。
+1. Mic の Controller にだけ `otherSourceBacklogCount: () => systemController.memoryBacklogCount` を渡す。Mic の `stop()` の最後と、`drainMemoryBacklog()`・`discardMemoryBacklog()` が空にしたときの解放は、自身のメモリ待機に加えてこの値も 0 のときだけロックを解放する。
+2. 停止は `DualRecorder.stop()`（§6）のとおり System を先に止め、完了してから Mic を止める。System の末尾 Chunk がメモリ待機に入るか確定した後で、Mic がロックを手放すか決めるためである。System の停止が失敗しても Mic は止めて停止理由を永続化し、その後で System の失敗を投げる。Mic の停止も失敗したときは、Mic の失敗を先頭（停止状態の復旧に使う主たる失敗）、System の失敗を 2 番目にした `AggregateError` で両方を投げる。録音中に `dropSystem()` で System だけ止めた場合も、App はその System Controller を保持し続け、`otherSourceBacklogCount` と合計件数に数える（null にした後もメモリ待機は残りうる）。
+3. App は Mic の `stop()` の直後に `takeMeetingLock()` でロックを受け取り（Phase 1 §31 の `heldLocks`）、`memoryBacklogCount(meetingId)` と `releaseHeldLockIfDrained()` は Mic と System の件数の合計で判定する。合計が 0 になるまでロックを解放しない。
+4. 確定中止後の破棄（`App.discardMemoryBacklog()`、Phase 1 §31）は Mic と System の両方の Controller で `discardMemoryBacklog()` を呼ぶ。ロックは 3. で App が受け取っているので、両方を空にした後の `releaseHeldLockIfDrained()`（合計 0 で解放）で手放す。Controller 側の解放判定も `otherSourceBacklogCount` を数えるので、片方だけ空にしてもロックは外れない。
+5. System 側の drain も Mic 側と同じく App の drain 関数で包む。空になったら `releaseHeldLockIfDrained()` を呼び、確定の再試行（`onChunkSaved`）を起こす。サーバー復帰時（`onBackendAvailable`）は Mic と System の両方を drain してから確定を再試行する。Finalizer の `unpersistedChunkCount` も両方の合計を渡す（§7）。`retryFinalize()` が Barrier の前に行う drain（サーバーが使えなければ IDB への書き戻しだけ。送信中のトークン変更で送れなければ drain を終えてから送り直す。Phase 1 §31）も、Mic と System の両方を対象にする。共有の IDB 保存警告を外す判定（`otherMeetingsBacklogCount`）には、他の会議に加えて同じ会議のもう一方の source の Controller も数える。Phase 1 で追加した `onMeetingCreated` は Mic 側で維持し、IDB 障害時の直接送信用の会議情報を保持する。System 側は既存の Mic 会議を使う。
+
+`stop()` の最後の会議レコード保存だけは Phase 1 と形が違う。Phase 1 は Controller が会議レコードを保持し、その `sessionClock` が Controller の時計と同じオブジェクトなので、保存し直すだけで最終 `audioFrameCount` が残る。Phase 2 は `registerMeeting` のため会議レコードを IndexedDB から読み直すので、別オブジェクトになる。そこで Mic 側は、最終 Chunk の書き込み完了後に会議レコードを読み直し、Controller の `SessionClock` を写した新しいオブジェクトとして保存する。`sessionClock` は `readonly` なので、書き換えずに置き換える。最初の読み取り（`meetingStore.get`）に失敗した場合も書き込み失敗と同じく扱い、`requestFlush("stop")` で末尾を Chunk にしてから Worklet を切り離す。最後の保存では `status: "stop_requested"` と、未記録なら最初の停止理由・検出時刻も書く。最初の読み書きに失敗したまま会議が `recording` で残り、停止が完了したことにならないようにするためである。最後の読み取りがエラーなしで会議を見つけられなかった場合は、最初の読み書きが成功していても、最終の `audioFrameCount` と停止状態を書く先がないので `stop()` を reject する（読み書きの失敗は従来どおり `statusError` で扱い、会議の欠落とは区別する）。完了として返すと、App が最終の停止状態のないまま確定へ進むためである。System 側は会議レコードを持たないので何もしない。
 
 ```typescript
 // src/recording/recording-controller.ts
@@ -581,6 +591,7 @@ import {
   type ChunkTimingMetadata,
   type MeetingRecord,
   type RecordingHealth,
+  type RecordingStopReason,
   type SessionClock,
   type WorkletCommand,
   type WorkletEvent,
@@ -617,6 +628,8 @@ export interface RecordingControllerDeps {
   readonly health: RecordingHealth;
   readonly workletModuleUrl: string;
   readonly onError: (error: Error) => void;
+  /** mic の ended だけを上位へ通知する（Phase 1 T12-b）。system 終了では mic を止めない。 */
+  readonly onMicEnded?: () => void;
   /** flush / stop の応答待ちタイムアウト用。既定は setTimeout（Phase 1 §15 と同じ） */
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
   /** 録音中の会議ロック（本番は navigator.locks、Phase 1 §15 と同じ）。会議レコードを作る側（Mic）だけが取る */
@@ -625,6 +638,10 @@ export interface RecordingControllerDeps {
   readonly directSaver?: DirectChunkSaver;
   /** Phase 1: IDB 障害時の直接送信用に開始時の会議情報を保持する。Mic 側だけが通知する。 */
   readonly onMeetingCreated?: (meeting: MeetingRecord) => void;
+  /** Mic 側だけに渡す System Controller の memoryBacklogCount。0 でない間は stop 後も会議ロックを解放しない（§4） */
+  readonly otherSourceBacklogCount?: () => number;
+  /** このタブの他の Controller（他の会議と、同じ会議のもう一方の source）のメモリ待機件数。0 になるまで共有の IDB 保存警告を外さない（Phase 1 §15） */
+  readonly otherMeetingsBacklogCount?: () => number;
 }
 
 /** Worklet が flush / stop に応答しないときに待機を打ち切るまでの時間（Phase 1 §15 と同じ） */
@@ -664,6 +681,16 @@ export class RecordingController {
   private nextRequestId = 0;
   /** 会議ロックの解放。registerMeeting の start で取得し、stop の完了で解放する（Phase 1 §15 と同じ） */
   private releaseLock: (() => void) | null = null;
+  /** Mic の stop の最終保存に失敗したか。drain で空になってもロックを解放せず、takeMeetingLock で渡すまで持つ（Phase 1 §15 と同じ） */
+  private finalStopUnsaved = false;
+  /** この録音で切断を処理済みか。health は録音をまたいで共有されるので、degradedReasons では判定しない（Phase 1 §15 と同じ） */
+  private trackEndedHandled = false;
+  /** drainMemoryBacklog の直列化 */
+  private drainQueue: Promise<unknown> = Promise.resolve();
+  /** 実行中の stop。重なった stop はこれを待ち、完了までは次の録音を始めない（Phase 1 §15 と同じ） */
+  private stopping: Promise<void> | null = null;
+  /** start の準備中か。node はまだ null なので、この間に drain・破棄が空で終わっても会議ロックを解放しない（Phase 1 §15 と同じ） */
+  private starting = false;
   /** トラックの ended リスナーの解除用。stop で abort する（Phase 1 §15 と同じ） */
   private trackListeners: AbortController | null = null;
 
@@ -678,17 +705,25 @@ export class RecordingController {
   }
 
   async start(meetingId: string, title: string, consentConfirmedAt: number, options: StartOptions = {}): Promise<void> {
+    if (this.stopping !== null) throw new Error("previous recording is still stopping");
+    // 前の録音のメモリ待機が残るうちは始めない（Phase 1 §15。保持中のロックの解放手段を上書きし、別会議の Chunk も混ざる）
+    if (this.memoryBacklog.length > 0) throw new Error("memory backlog from the previous recording remains");
+    // 最終保存の失敗で保持したロックも、呼び出し元が takeMeetingLock で受け取るまでは上書きしない（Phase 1 §15）
+    if (this.releaseLock !== null) throw new Error("meeting lock from the previous recording is still held");
     if (options.registerMeeting !== false) {
       // recording を書く前にロックを取る（Phase 1 §15）。System 側は Mic のロックに乗る
       const release = await tryAcquireMeetingLock(this.deps.locks, meetingId);
       if (release === null) throw new Error(`meeting ${meetingId} is already being recorded`);
       this.releaseLock = release;
     }
+    this.starting = true;
     try {
       await this.setUp(meetingId, title, consentConfirmedAt, options);
     } catch (error) {
       this.unlock();
       throw error;
+    } finally {
+      this.starting = false;
     }
   }
 
@@ -750,21 +785,31 @@ export class RecordingController {
       throw error;
     }
 
-    const endedReason = this.source === "mic" ? "MIC_TRACK_ENDED" : "SYSTEM_TRACK_ENDED";
+    this.trackEndedHandled = false;
+    // 前の録音の切断を、この録音の不健全として表示しない（Phase 1 §15 と同じ）
+    this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter((r) => r !== this.endedReason);
     this.trackListeners = new AbortController();
     for (const track of mediaStream.getAudioTracks()) {
-      track.addEventListener(
-        "ended",
-        () => {
-          // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する（Phase 1 §15 と同じ）
-          if (this.node === null) return;
-          if (!this.deps.health.degradedReasons.includes(endedReason)) {
-            this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, endedReason];
-          }
-        },
-        { signal: this.trackListeners.signal },
-      );
+      track.addEventListener("ended", () => this.handleTrackEnded(), { signal: this.trackListeners.signal });
+      // 登録前に終了したトラックには ended が届かない（Phase 1 §15 と同じ）
+      if (track.readyState === "ended") this.handleTrackEnded();
     }
+  }
+
+  private get endedReason(): "MIC_TRACK_ENDED" | "SYSTEM_TRACK_ENDED" {
+    return this.source === "mic" ? "MIC_TRACK_ENDED" : "SYSTEM_TRACK_ENDED";
+  }
+
+  /** トラックの切断を録音ごとに 1 回だけ処理する。 */
+  private handleTrackEnded(): void {
+    // stop 後（node === null）に届いた ended は次の録音の健全性判定を汚すため無視する（Phase 1 §15 と同じ）
+    if (this.node === null || this.trackEndedHandled) return;
+    this.trackEndedHandled = true;
+    // SYSTEM_TRACK_ENDED は SystemCapture 側の addReason でも追加されるので重複させない
+    if (!this.deps.health.degradedReasons.includes(this.endedReason)) {
+      this.deps.health.degradedReasons = [...this.deps.health.degradedReasons, this.endedReason];
+    }
+    if (this.source === "mic") this.deps.onMicEnded?.();
   }
 
   /**
@@ -795,14 +840,44 @@ export class RecordingController {
     await this.chunkQueue;
   }
 
-  async stop(): Promise<void> {
+  /** 重なった呼び出しは実行中の停止を共有する（Phase 1 §15 と同じ） */
+  stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<void> {
+    if (this.stopping !== null) return this.stopping;
+    if (this.node === null || this.meetingId === null) return Promise.resolve();
+    const run = this.stopOnce(reason, detectedAtEpochMs).finally(() => {
+      this.stopping = null;
+    });
+    this.stopping = run;
+    return run;
+  }
+
+  private async stopOnce(reason: RecordingStopReason, detectedAtEpochMs: number): Promise<void> {
     if (this.node === null || this.meetingId === null) return;
+    let statusError: unknown = null;
+    let finalSaved = false;
+    /** 最終の読み取りがエラーなしで会議を見つけられなかった（最終の audioFrameCount と stop_requested を書く先がない） */
+    let finalMissing = false;
     try {
       if (this.source === "mic") {
-        const meeting = await this.deps.meetingStore.get(this.meetingId);
+        // 読み取りに失敗しても下の requestFlush まで進み、末尾を Chunk にしてから Worklet を切り離す（書き込み失敗と同じ扱い）
+        let meeting: MeetingRecord | undefined;
+        try {
+          meeting = await this.deps.meetingStore.get(this.meetingId);
+        } catch (error) {
+          statusError = error;
+        }
         if (meeting !== undefined) {
+          if (meeting.stopReason === undefined) {
+            meeting.stopReason = reason;
+            meeting.stopDetectedAtEpochMs = detectedAtEpochMs;
+          }
           meeting.status = "stop_requested";
-          await this.deps.meetingStore.put(meeting);
+          // 保存に失敗しても Worklet を切り離す前に末尾を Chunk にする（Phase 1 §15 と同じ）
+          try {
+            await this.deps.meetingStore.put(meeting);
+          } catch (error) {
+            statusError = error;
+          }
         }
       }
       await this.requestFlush("stop");
@@ -812,9 +887,18 @@ export class RecordingController {
         // 会議レコードは IDB から読み直した別オブジェクトなので、Controller の SessionClock を写して保存し直す
         const meeting = await this.deps.meetingStore.get(this.meetingId);
         if (meeting !== undefined) {
-          await this.deps.meetingStore.put({ ...meeting, sessionClock: { ...this.clock }, updatedAt: Date.now() });
-        }
+          // 最初の読み書きに失敗していても、ここで stop_requested と最初の停止理由を書く（recording のまま停止を完了させない）
+          const firstStop = meeting.stopReason === undefined ? { stopReason: reason, stopDetectedAtEpochMs: detectedAtEpochMs } : {};
+          await this.deps.meetingStore.put({ ...meeting, ...firstStop, status: "stop_requested", sessionClock: { ...this.clock }, updatedAt: Date.now() });
+          finalSaved = true;
+        } else finalMissing = true;
       }
+      // 最終保存で stop_requested も書けていれば停止は完了。最初の失敗は通知だけにし、App を確定へ進める（Phase 1 §15）
+      if (statusError !== null && finalSaved) this.deps.onError(statusError instanceof Error ? statusError : new Error(String(statusError)));
+      else if (statusError !== null) throw statusError;
+      // 最終の読み取りで会議がない。最初の保存が済んでいても最終の停止状態は保存できていないので、完了として App を確定へ進めない
+      // （読み取り・書き込みの失敗は上の statusError で扱い、ここでは会議の欠落だけを判定する）
+      else if (finalMissing) throw new Error(`meeting ${this.meetingId} not found; stop state not saved`);
     } finally {
       // 途中で reject してもマイク／画面共有トラックと Worklet を解放する（Phase 1 §15 と同じ）
       this.sourceNode?.disconnect();
@@ -823,8 +907,20 @@ export class RecordingController {
       this.trackListeners?.abort();
       this.trackListeners = null;
       for (const track of this.deps.mediaStream.getAudioTracks()) track.stop();
-      this.unlock();
+      // メモリ待機が残るうちはロックを持ち続ける（Phase 1 §15。別タブの Barrier はこのタブのメモリ待機を数えられない）。System 側の分も数える
+      // Mic の最終保存（最終の audioFrameCount）に失敗したときも、別タブが古い値で確定しないよう保持する（Phase 1 §15）
+      this.finalStopUnsaved = this.source === "mic" && !finalSaved;
+      if (this.memoryBacklog.length === 0 && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0 && !this.finalStopUnsaved) this.unlock();
     }
+  }
+
+  /** stop 後もメモリ待機のために保持しているロックを呼び出し元へ渡す（Phase 1 §15 と同じ）。保持していなければ null */
+  takeMeetingLock(): (() => void) | null {
+    if (this.node !== null) return null;
+    const release = this.releaseLock;
+    this.releaseLock = null;
+    this.finalStopUnsaved = false;
+    return release;
   }
 
   private unlock(): void {
@@ -833,14 +929,27 @@ export class RecordingController {
   }
 
   /** クォータ以外の失敗はサーバーへ直接送る。直接送信も失敗したら元の例外を投げ、メモリ待機に残す（Phase 1 §15 と同じ） */
-  async drainMemoryBacklog(): Promise<number> {
+  drainMemoryBacklog(): Promise<number> {
+    // 並行させない。先頭を読んでから外すまでに別の drain が先頭を外すと、送っていない Chunk を外してしまう（Phase 1 §15 と同じ）
+    const run = this.drainQueue.then(() => this.drainSerially());
+    this.drainQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async drainSerially(): Promise<number> {
     let drained = 0;
     while (this.memoryBacklog.length > 0) {
       const record = this.memoryBacklog[0];
       try {
         await this.deps.chunkStore.putChunk(record);
       } catch (error) {
-        if (isQuotaExceeded(error)) break;
+        // クォータ超過は空きを待つ。ただし停止後は空きを作る保存が続かないので、サーバーに登録できれば直接送る（Phase 1 §15）
+        if (isQuotaExceeded(error)) {
+          if (!(await this.sendDirect(record))) break;
+          this.memoryBacklog.shift();
+          drained++;
+          continue;
+        }
         if (!(await this.sendDirect(record))) throw error;
         this.memoryBacklog.shift();
         drained++;
@@ -851,13 +960,36 @@ export class RecordingController {
       await this.deps.scheduler.enqueue(record.chunkKey);
       drained++;
     }
-    if (this.memoryBacklog.length === 0) {
-      // IDB の劣化理由は「メモリ待機がクラッシュで失われうる」ことの警告。空になったら外す（次に書けなければ persistChunk が付け直す）
+    if (this.memoryBacklog.length === 0) this.onMemoryBacklogEmptied();
+    return drained;
+  }
+
+  /**
+   * 停止後のメモリ待機を捨てる。確定を中止した会議で、利用者が書き出した WAV の保存を確かめた後だけ呼ぶ（Phase 1 §15・§31 と同じ）。
+   * drain と並行させない。録音中は捨てない（採番済みの Chunk を捨てると欠番になる）。App は Mic と System の両方の Controller で呼ぶ
+   */
+  discardMemoryBacklog(): Promise<number> {
+    const run = this.drainQueue.then(() => {
+      if (this.node !== null) throw new Error("cannot discard memory backlog while recording");
+      const discarded = this.memoryBacklog.length;
+      this.memoryBacklog.length = 0;
+      this.onMemoryBacklogEmptied();
+      return discarded;
+    });
+    this.drainQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private onMemoryBacklogEmptied(): void {
+    // IDB の劣化理由は「メモリ待機がクラッシュで失われうる」ことの警告。このタブの全 Controller のメモリ待機が空になったら外す（Phase 1 §15）
+    if ((this.deps.otherMeetingsBacklogCount?.() ?? 0) === 0) {
       this.deps.health.degradedReasons = this.deps.health.degradedReasons.filter(
         (r) => r !== "IDB_QUOTA_EXHAUSTED" && r !== "IDB_WRITE_FAILED",
       );
     }
-    return drained;
+    // stop 後に保持していたロック（takeMeetingLock で渡していなければ）を解放する。System 側のメモリ待機が残るうち、
+    // Mic の最終保存に失敗したとき、start の準備中は持ち続ける（Phase 1 §15）
+    if (this.node === null && !this.starting && (this.deps.otherSourceBacklogCount?.() ?? 0) === 0 && !this.finalStopUnsaved) this.unlock();
   }
 
   get memoryBacklogCount(): number {
@@ -1080,11 +1212,15 @@ export async function acquireSystemAudio(deps: SystemAudioDeps | null): Promise<
 
 # 6. 複数ソース録音 `src/recording/multi-source-recorder.ts`
 
+停止理由・検出時刻の永続化は Phase 1 §12 を継承する。組み立て層は最初の停止要求の理由と epoch ms を確定して `MultiSourceRecorder.stop(reason, detectedAtEpochMs)` に渡し、System の終了を待っている間にも上書きしない。System単独の共有終了は会議の停止理由にしない。
+
+T12-b の mic 切断通知を組み立て層へ接続するときは、このコーディネータ全体の停止を一度だけ呼び、system 終了とは区別する。T12-d の `abandoned` はブラウザ内だけの状態であり、サーバーの `MeetingStatusV2` へ追加しない。
+
 Mic と System の 2 つの `RecordingController` を束ね、共有 `LocalSaveScheduler` に流し、ドリフト差を計測する。Controller の生成は依存として注入し、テストでは Fake を使う。
 
 ```typescript
 // src/recording/multi-source-recorder.ts
-import type { AudioSource, RecordingHealth, SessionClock } from "../types/recording";
+import type { AudioSource, RecordingHealth, RecordingStopReason, SessionClock } from "../types/recording";
 import { computeFrameClockDriftMs } from "./session-clock";
 
 /** RecordingController のうち本クラスが使う面だけを切り出した契約。テストで Fake に差し替える。 */
@@ -1093,7 +1229,7 @@ export interface SourceController {
   readonly sessionClock: SessionClock | null;
   readonly chunkCount: number;
   start(meetingId: string, title: string, consentConfirmedAt: number, options: { registerMeeting: boolean; timelineOriginEpochMs?: number }): Promise<void>;
-  stop(): Promise<void>;
+  stop(reason?: RecordingStopReason, detectedAtEpochMs?: number): Promise<void>;
   flush(): Promise<void>;
 }
 
@@ -1192,10 +1328,27 @@ export class MultiSourceRecorder {
     await Promise.all([this.mic?.flush(), this.system?.flush()]);
   }
 
-  /** System を先に止め、最後に Mic を止める（Mic 側が meeting.status を stop_requested にする）。 */
-  async stop(): Promise<{ readonly mic: number; readonly system: number }> {
-    if (this.system !== null) await this.system.stop();
-    if (this.mic !== null) await this.mic.stop();
+  /**
+   * System を先に止め、最後に Mic を止める（Mic 側が meeting.status を stop_requested にする）。
+   * 検出時刻の既定値は epoch ms（Date.now）。deps.now はドリフト計測用の performance 時計なので使わない。
+   * System の停止が失敗しても Mic は止め、停止理由を永続化してから System の失敗を投げる（マイクを取得したまま残さない）。
+   * 両方失敗したら、Mic の失敗を errors[0]（停止状態の復旧に使う主たる失敗）、System の失敗を errors[1] にした AggregateError を投げる。
+   */
+  async stop(reason: RecordingStopReason = "manual", detectedAtEpochMs = Date.now()): Promise<{ readonly mic: number; readonly system: number }> {
+    let systemError: unknown = null;
+    try {
+      if (this.system !== null) await this.system.stop();
+    } catch (error) {
+      systemError = error;
+    }
+    try {
+      if (this.mic !== null) await this.mic.stop(reason, detectedAtEpochMs);
+    } catch (micError) {
+      // Mic の失敗だけを投げると System の失敗が報告されずに消える
+      if (systemError === null) throw micError;
+      throw new AggregateError([micError, systemError], "mic and system stop failed");
+    }
+    if (systemError !== null) throw systemError;
     return { mic: this.mic?.chunkCount ?? 0, system: this.system?.chunkCount ?? 0 };
   }
 
@@ -1214,7 +1367,7 @@ export class MultiSourceRecorder {
 
 # 7. `src/recording/finalizer.ts` の変更
 
-mic / system の両方を検証する。System なしの会議は `expectedChunkCounts.system = 0`。会議の状態の検査（`finalized` なら POST せず成功を返す、`stop_requested` / `finalizing` 以外は `verify` で失敗させる）と、`GET /chunks` の応答を `isChunkListResponse` に通し `meetingId` の一致を確かめる検査は Phase 1 §22 と同じ。連続性検査をサーバー一覧の取得後に行い、IndexedDB にない連番でもサーバーに登録済みなら揃っているとみなす点（source ごとに判定）、確定に成功したら末尾の欠けを `missingTailMs` で返す点も Phase 1 §22 と同じ。末尾の欠けは Mic だけで判定する。`totalAudioFrames` は Mic の時計で、System の `audioFrameCount` は会議レコードに残らないためである。
+mic / system の両方を検証する。System なしの会議は `expectedChunkCounts.system = 0`。会議の状態の検査（`finalized` なら POST せず成功を返す、`stop_requested` / `finalizing` 以外は `verify` で失敗させる）と、`GET /chunks` の応答を `isChunkListResponse` に通し `meetingId` の一致を確かめる検査は Phase 1 §22 と同じ。連続性検査をサーバー一覧の取得後に行い、IndexedDB にない連番でもサーバーに登録済みなら揃っているとみなす点（source ごとに判定）、確定に成功したら末尾の欠けを `missingTailMs` で返す点も Phase 1 §22 と同じ。会議登録の後の `GET /chunks`・`POST /finalize` が 401/403 を返したら、`unauthorized` で返す前に `onBackendUnauthorized` で Monitor へ伝える点も Phase 1 §22 と同じ。末尾の欠けは Mic だけで判定する。`totalAudioFrames` は Mic の時計で、System の `audioFrameCount` は会議レコードに残らないためである。
 
 ```typescript
 // src/recording/finalizer.ts
@@ -1222,6 +1375,7 @@ import type { ChunkStore, MeetingStore } from "../storage/idb";
 import type { LocalSaveScheduler } from "./local-save-scheduler";
 import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
+import type { RegistrationOutcome } from "../api/meeting-registrar";
 import type { AudioChunkRecord, AudioSource } from "../types/recording";
 import { frameToOffsetMs } from "./session-clock";
 
@@ -1236,6 +1390,12 @@ export interface FinalizerDeps {
   readonly fetchImpl?: typeof fetch;
   /** mic / system 両 Controller の memoryBacklogCount の合計。0 でない限り Barrier を通さない（Phase 1 §22）。 */
   readonly unpersistedChunkCount: () => number;
+  /** 照合の前に会議をサーバーへ登録する（MeetingRegistrar.ensure、Phase 1 §22）。未登録の会議は一覧・確定が 404 になるため */
+  readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>;
+  /** GET /chunks・POST /finalize の 401/403 を Monitor へ伝える（Phase 1 §22。会議登録の分は MeetingRegistrar が報告する） */
+  readonly onBackendUnauthorized?: () => void;
+  /** IDB にない Mic の Chunk（このタブが直接送信した分）の endFrame。末尾を直接送ったときも末尾の欠けを測る（Phase 1 §22） */
+  readonly offIdbEndFrame?: (sequenceNo: number) => number | undefined;
 }
 
 /**
@@ -1268,7 +1428,11 @@ function describeFetchError(error: unknown, timeoutMs: number): string {
 export type FinalizeResult =
   /** missingTailMs：Mic の末尾の Chunk が欠けたまま確定した長さ（ms）。欠けがなければ省く（Phase 1 §22） */
   | { readonly ok: true; readonly counts: Readonly<Record<AudioSource, number>>; readonly missingTailMs?: number }
-  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string };
+  /**
+   * reason：トークン未設定・401/403 なら "unauthorized"。UI は detail の文字列でなくこれでトークン案内を出す（Phase 1 §22）。
+   * 応答を得られなかった（接続失敗・タイムアウト）なら "network"。App が時間をおいて確定を再試行する（Phase 1 §22）
+   */
+  | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string; readonly reason?: "unauthorized" | "network" };
 
 const SOURCES: ReadonlyArray<AudioSource> = ["mic", "system"];
 
@@ -1317,6 +1481,16 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     }
   }
 
+  // 再試行でも毎回通す。登録に失敗したら一覧を取らない（401/403 は MeetingRegistrar が Monitor へ報告済み、Phase 1 §22）
+  if (deps.ensureMeeting !== undefined) {
+    const registration = await deps.ensureMeeting(meetingId);
+    if (!registration.ok) {
+      const kind = registration.error.kind;
+      const reason = kind === "UNAUTHORIZED" ? { reason: "unauthorized" as const } : kind === "NETWORK" || kind === "TIMEOUT" ? { reason: "network" as const } : {};
+      return { ok: false, stage: "verify", detail: `meeting registration failed: ${registration.error.message}`, ...reason };
+    }
+  }
+
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
   assertLocalHost(listUrl);
   let listRes: Response;
@@ -1331,7 +1505,11 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
       (res): Promise<unknown> => (res.ok ? res.json().catch(() => null) : Promise.resolve(null)),
     ));
   } catch (error) {
-    return { ok: false, stage: "verify", detail: `list failed: ${describeFetchError(error, timeoutMs)}` };
+    return { ok: false, stage: "verify", detail: `list failed: ${describeFetchError(error, timeoutMs)}`, reason: "network" };
+  }
+  if (listRes.status === 401 || listRes.status === 403) {
+    deps.onBackendUnauthorized?.();
+    return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}`, reason: "unauthorized" };
   }
   if (!listRes.ok) return { ok: false, stage: "verify", detail: `list HTTP ${listRes.status}` };
   if (!isChunkListResponse(list)) return { ok: false, stage: "verify", detail: "malformed ChunkListResponse" };
@@ -1399,6 +1577,8 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     expectedChunkCounts: counts,
     endedAtEpochMs: meeting.endedAt,
     totalAudioFrames: meeting.sessionClock.audioFrameCount,
+    stopReason: meeting.stopReason,
+    stopDetectedAtEpochMs: meeting.stopDetectedAtEpochMs,
   };
   const finUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/finalize`, deps.baseUrl);
   assertLocalHost(finUrl);
@@ -1415,24 +1595,37 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     }, timeoutMs, async () => null));
   } catch (error) {
     await restore();
-    return { ok: false, stage: "finalize", detail: `finalize failed: ${describeFetchError(error, timeoutMs)}` };
+    return { ok: false, stage: "finalize", detail: `finalize failed: ${describeFetchError(error, timeoutMs)}`, reason: "network" };
   }
+  const finUnauthorized = finRes.status === 401 || finRes.status === 403;
+  if (finUnauthorized) deps.onBackendUnauthorized?.();
   if (!finRes.ok) {
     await restore();
-    return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}` };
+    return { ok: false, stage: "finalize", detail: `finalize HTTP ${finRes.status}`, ...(finUnauthorized ? { reason: "unauthorized" as const } : {}) };
   }
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);
   // 末尾の欠けは Mic だけで判定する。totalAudioFrames は Mic の時計で、System の audioFrameCount は会議レコードに残らない（Phase 1 §22）
-  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, bySource.mic, counts.mic);
+  const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, bySource.mic, counts.mic, deps.offIdbEndFrame);
   return missingTailMs > 0 ? { ok: true, counts, missingTailMs } : { ok: true, counts };
 }
 
-/** 末尾の欠け（ms）。最後の連番が IDB にない（サーバーへ直接送った）ときは endFrame が分からないので 0（Phase 1 §22 と同じ） */
-export function measureMissingTailMs(audioFrameCount: number, chunks: ReadonlyArray<AudioChunkRecord>, chunkCount: number): number {
+/**
+ * 末尾の欠け（ms）。最後の連番が IDB にない（サーバーへ直接送った）ときは offIdbEndFrame を使い、それも分からなければ 0。
+ * Chunk が 1 件もなければ終わりを 0 とし、audioFrameCount 全体を欠けとして返す（Phase 1 §22 と同じ）
+ */
+export function measureMissingTailMs(
+  audioFrameCount: number,
+  chunks: ReadonlyArray<AudioChunkRecord>,
+  chunkCount: number,
+  offIdbEndFrame?: (sequenceNo: number) => number | undefined,
+): number {
+  const lastSeq = chunkCount - 1;
   const last = chunks.length > 0 ? chunks[chunks.length - 1] : undefined;
-  if (last === undefined || last.meta.sequenceNo !== chunkCount - 1) return 0;
-  return frameToOffsetMs(Math.max(0, audioFrameCount - last.meta.endFrame));
+  // Chunk が 1 件もなければ録音した長さ全体が欠けている
+  const endFrame = chunkCount === 0 ? 0 : last?.meta.sequenceNo === lastSeq ? last.meta.endFrame : offIdbEndFrame?.(lastSeq);
+  if (endFrame === undefined) return 0;
+  return frameToOffsetMs(Math.max(0, audioFrameCount - endFrame));
 }
 ```
 
@@ -2249,13 +2442,16 @@ class FakeController implements SourceController {
   chunkCount = 0;
   readonly calls: string[] = [];
   registerMeeting: boolean | null = null;
+  /** stop に渡された引数。省略時は空配列のまま記録する */
+  readonly stopArgs: unknown[][] = [];
   constructor(readonly source: AudioSource, private readonly startPerf: number) {}
   async start(_m: string, _t: string, _c: number, options: { registerMeeting: boolean }): Promise<void> {
     this.registerMeeting = options.registerMeeting;
     this.sessionClock = { sessionStartEpochMs: 0, performanceTimeOrigin: 0, sessionStartPerformanceMs: this.startPerf, audioContextStartTime: 0, nativeSampleRate: 48000, audioFrameCount: 0 };
     this.calls.push("start");
   }
-  async stop(): Promise<void> {
+  async stop(...args: unknown[]): Promise<void> {
+    this.stopArgs.push(args);
     this.calls.push("stop");
   }
   async flush(): Promise<void> {
@@ -2310,6 +2506,32 @@ describe("MultiSourceRecorder", () => {
     }
     expect(await rec.stop()).toEqual({ mic: 3, system: 2 });
     expect(stopOrder).toEqual(["system", "mic"]);
+  });
+
+  it("停止理由と検出時刻を Mic の Controller へそのまま渡し、System には渡さない", async () => {
+    // Arrange
+    const { rec, controllers } = build(true);
+    await rec.start("m", "t", 1);
+    // Act
+    await rec.stop("mic_ended", 123456);
+    // Assert
+    expect(controllers[0].stopArgs).toEqual([["mic_ended", 123456]]);
+    expect(controllers[1].stopArgs).toEqual([[]]);
+  });
+
+  it("Mic と System の停止が両方失敗したら、Mic の失敗を先頭にした AggregateError で両方を報告する", async () => {
+    // Arrange
+    const { rec, controllers } = build(true);
+    await rec.start("m", "t", 1);
+    const micError = new Error("mic stop failed");
+    const systemError = new Error("system stop failed");
+    controllers[0].stop = async () => { throw micError; };
+    controllers[1].stop = async () => { throw systemError; };
+    // Act
+    const error = await rec.stop().catch((e: unknown) => e);
+    // Assert
+    if (!(error instanceof AggregateError)) throw new Error("AggregateError expected");
+    expect(error.errors).toEqual([micError, systemError]);
   });
 
   it("ドリフト差は mic − system で記録され、P95/P99 を返す", async () => {

@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-06 終了時（ブランチ `dev`）
+最終更新: 2026-11-10（62 回目のレビュー修正・未コミット、ブランチ `dev`。61 回目はコミット済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -17,14 +17,56 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 | 1-c | §10 IndexedDB + §15 RecordingController | ✅ 保存・全WAV音声確認済み（次Stepへ進む） | 30秒×10件＋16.115125秒×1件、全件valid。利用者が全11件の音声を確認。Chrome単体再生は未確認として残す |
 | 1-d | §17 LocalSaver / Scheduler + §18 BackendHealthMonitor | ✅ 実ブラウザで確認（T4-A 合格 2026-10-01、T4-B サーバー停止5分 合格 2026-10-03） | — |
 | 1-e | §22 Finalizer + §23 Recovery | 🟡 強制終了 → 復旧 → `finalized` を実機確認（T4-C、2026-10-03） | **未**：終了時に未送信 Chunk がある状態からの再送（任意の C2） |
-| 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | ✅ T4-D〜H 合格（2026-10-03・10-07） | 観察 4 件を T12 に起票（不合格扱いにはしない） |
-| 1-g | 60 分実録音 | ⬜ 未着手 | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
+| 1-f | §19 ヘルス / §20 ページライフサイクル / §21 クォータ + §31 配線 + UI | 🟡 T4-D〜G 合格（2026-10-03・10-07）、H は一部確認 | **未**：H の既存 Chunk の聴取確認（既存11件の Chrome 再生は 2026-11-08 に全件最後までメディアエラーなく確認済み。書き出した WAV の再生と外部通信なしも確認済み）。観察 4 件を T12 に起票（不合格扱いにはしない） |
+| 1-g | 60 分実録音 | ⏸ 保留（2026-11-08 利用者指示・再開指示待ち） | 120 Chunk・欠番なし・全件 `DB_REGISTERED`・外部通信なし |
 
-- 自動テスト: Python 7 件、TypeScript 22 ファイル / 306 件がすべて通過。`npm run typecheck`・`npm run build` も通過、`npm audit` は 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
+- 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
 - Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
 
 ### 今回の変更と残課題
+
+- 2026-11-10（62 回目・未コミット）：レビュー指摘 4 件を検証し全件修正。(1) Phase 2 client の `MultiSourceRecorder.stop()`（設計書のみ）は Mic の停止も失敗したとき、Mic の失敗を先頭・System の失敗を 2 番目にした `AggregateError` を投げる（従来は Mic の例外が System の失敗を消していた。片方だけの失敗は従来どおりその例外を投げる）。設計書のテストに 1 件追加。(2) PROGRESS の見出しとテスト件数を更新（61 回目の 478 件は HEAD で実行して確認）。(3) 確定中止の確認文言から「確定済みにはなりません」を外し、「このブラウザからの自動再送・確定は再開しません。サーバーで確定済みになっていた場合は取り消しません」にする（タイムアウトした確定 POST をサーバーが処理済みのことがある。指摘箇所は app.ts だが文言は `pending-actions.ts`）。(4) `LocalSaveScheduler` の `health.lastSuccessfulLocalSaveAt` を任意の `perfNow`（既定 `performance.now()`）で記録する（型の契約は performance.now() だが、App が渡す `now` は Date.now だった。再試行の `now` は変更なし）。回帰テスト 1 件（(4)、修正前の Red を確認）。インターフェース変更：`SchedulerDeps.perfNow?` を追加（任意、呼び出し元の変更なし）。Phase 1 埋め込み同期（DIFF 0）。
+- 2026-11-09（61 回目・コミット済み）：レビュー指摘 5 件を検証し全件修正。(1) Phase 2 client の RecordingController に `discardMemoryBacklog()` を戻す（`SessionController` が Phase 1 から引き継ぐ契約。drain と同じ `drainQueue` で直列化し、空にした後の処理を `onMemoryBacklogEmptied()` にまとめ、ロック解放は `otherSourceBacklogCount` も数える）。§4 の配線に「破棄は Mic と System の両方で呼び、App が合計 0 でロックを解放する」を追加。(2) README の報告項目に 5（ZIP）の結果を追加。(3) `measureMissingTailMs()` は Chunk が 1 件もない（`chunkCount === 0`）とき終わりを 0 とし、`audioFrameCount` 全体を欠けとして返す（従来は 0 を返し、最初の Chunk も届かずに確定した会議を警告しなかった）。(4) `RecordingController` は `start()` の準備中（`starting`。ロック取得後、Worklet ノード生成前で `node === null`）に drain・破棄が空で終わってもロックを解放しない（サーバー復帰の drain が準備中に走ると、録音を始める会議のロックが外れた）。(5) `finalizeResultText()` は `reason: "network"` に「サーバーが使えるようになれば自動で再試行します」と案内する（従来は「確定できませんでした」「再試行してください」で、App の自動再試行を伝えていなかった）。回帰テスト 3 件（(3) Finalizer 1・(4) Controller 1・(5) View 1。修正前の Red を確認）、新規テスト 1 件（(3) の欠けなし側）。既存テスト 1 件の fixture を修正（`recordAndSave(h, 0)` が Chunk 0 件で `audioFrameCount: 1600` を残しており、コメントの「最後の Chunk の終わりに揃える」と矛盾 → 0）。インターフェース変更なし（Phase 2 設計書の Controller に `discardMemoryBacklog()` を追加）。Phase 1 埋め込み同期（DIFF 0）・本文（§15 準備中のロック、§22 Chunk 0 件の欠けと network の文言）、Phase 2 client の RecordingController（破棄・準備中のロック）と Finalizer（Chunk 0 件の欠け）を更新。
+- 2026-11-09（60 回目・未コミット）：レビュー指摘 7 件を検証し 4 件を修正、3 件スキップ。(1) README の残りの実機確認に 5（WAV 書き出しの ZIP 化）を追加。(2) 確定の会議登録が `tokenChanged` で失敗したら、現在のトークンが確定開始時と同じ（A → B → A）でも Barrier の後にやり直す（従来はトークンの不一致だけで判定し、`setToken` の確定は借用中のロックに弾かれるので、次の契機まで確定しなかった）。(3) 起動時復旧の書き直し（停止理由の補修・`audioFrameCount` の補い）に失敗した会議は `unreadMeetingIds` で報告して Chunk も再投入せず、起動と他の会議の復旧を続ける（従来は例外で `createApp` ごと止まった）。App は `unreadMeetingIds` の会議を再読み込みまで確定しない（`retryFinalize()` が `startup recovery not saved; reload to retry`。読み直しに失敗した会議も同じく確定しなくなった＝挙動変更。起動時の通知文言も「読み書きできませんでした」に）。(4) テスト「drain 後もメモリ待機が残っていれば確定を再試行しない」は drain の Promise の決着と後続の IDB 読み取りまで待つ（ガードを外すと Red になることを確認）。スキップ：ネットワーク再試行のタイマーがロック使用中で終わる件（ロックを持つ側＝このタブの確定・中止、または別タブがその会議の確定を自分で進め、ネットワーク失敗なら自分の再試行を予約する）、`main.ts` の書き出しと破棄の確認の対象がずれる件（停止後のメモリ待機は増えず、`recording_stopped` 時点で件数が確定し、残る controller はすべて `stoppedWithBacklog` に入るので、破棄の対象は必ず書き出し対象に含まれる）、`dispose()` 時のロックの持ち主の件（`dispose()` は src から呼ばれず、呼んでも `heldLocks` を解放しないのでロックはタブが閉じるまで残る＝安全側）。回帰テスト 3 件（(2) App 1・(3) recovery 1・App 1、修正前の Red を確認）。テスト強化 1 件（(4)）。インターフェース変更：`RecoveryReport.unreadMeetingIds` に書き直しの失敗も含める、`retryFinalize()` の失敗 detail に `startup recovery not saved; reload to retry` を追加。Phase 1 埋め込み同期（DIFF 0）・本文（§12 復旧の書き直し失敗、§31 登録の tokenChanged）を更新。後続フェーズに同じコードの写しはない。
+- 2026-11-09（59 回目・コミット済み 8e5e10f まで）：レビュー指摘 8 件を検証し 7 件を修正、1 件スキップ。(1) App の drain は実行中に来た直接送信の drain 要求（サーバー復帰・`setToken`）を、実行中の drain が直接送信でも記録し、終わってからメモリ待機が残れば直接送信で送り直す（確定再試行の直接送信 PUT が接続失敗する間の `setToken` の復旧が捨てられ、借用中のロックで確定再試行も弾かれていた）。(2) `acquireMeetingLock()` は取れなかったとき、このタブの使用中（借用中の保持ロック・取得中の `acquiredLocks`）か別タブかを返し、`retryFinalize()` は前者を `meeting is busy in this tab` で返す。(3) Scheduler の NETWORK / TIMEOUT 失敗は自タブの確保が残るときだけ `onBackendUnreachable()` を呼ぶ（別タブが確保し直した古い試行の遅いタイムアウトで、このタブの送信を止めていた）。(4) 起動時復旧は停止理由と検出時刻の片方だけの行から両方を外して書き直す（`MeetingStore.put()` が拒否して起動ごと止まり、確定も 422 になる）。(5)〜(7) テスト：Scheduler の会議登録 POST を認証より前で数えて 1 回を確認（FakeLocalServer は認証で弾いた要求を記録しないため、従来の 0 件は何も確かめていなかった）、古いトークンの 401 を新しいチェックの完了後に届けて前後で HEALTHY を確認、drain の重なりテストで登録済み＋メモリ待機の連番集合を照合。スキップ：直接送信でメモリ待機から外した末尾のフレーム数（タブ内では `unsavedStops` の `sessionClock` と `directRegisteredEndFrames` が保持し、ロック・離脱確認・controller もそれが残る間は外れない。失われるのは再読み込み・クラッシュだけで、外さなくても音声ごと失われる。サーバーは `total_audio_frames` を保存するだけで拒否しない。再読み込み後の復元には一覧 API に `endFrame` が要る＝API 変更のため「保留・メモ」に記録）。回帰テスト 4 件（(1)(2)(3)(4)、修正前の Red を確認）。ガードのテスト 1 件（別タブ保持時の文言、修正前から通る）。テスト強化 3 件（(5)〜(7)、修正前から通る）。インターフェース変更：App 内部の `acquireMeetingLock()` の戻り値を `MeetingLockResult`（private）に、`retryFinalize()` の失敗 detail に `meeting is busy in this tab` を追加。`acquiredLocks` 経路（`tryAcquireMeetingLock` で取得中の同タブ競合）は専用テストなし。Phase 1 埋め込み同期（DIFF 0）・本文（§12 停止理由の復旧、§18 配線、§31 drain・ロック競合の文言）を更新。後続フェーズに同じコードの写しはない。
+- 2026-11-09（58 回目・未コミット）：レビュー指摘 5 件を検証し全件修正。(1) `MeetingRegistrar` の登録 POST は試行ごとに `AbortController` とタイムアウトを持つ（トークン変更の送り直しが 1 回目の待ち時間の残りしか使えず、到達できるサーバーへの登録が `TIMEOUT` になった）。(2) 確定中止した会議のメモリ待機を、WAV の保存を確認した後に破棄できる（`App.discardMemoryBacklog()`・`discardableMemoryBacklog()`、`RecordingController.discardMemoryBacklog()`。破棄で離脱確認・保持ロック・バナーの件数・controller の控えを外す。`confirmAbandon()` は中止後に 3 つ目の確認を出し、断った場合は「書き出し」ボタンの後に同じ確認を出す）。(3) `main.ts` の確定中止のキャンセル・失敗時は、会議 ID（`data-meeting-id`）で今の行を探してボタンを戻す（書き出し・中止を待つ間の再描画で元のボタンが外れていた）。失敗の通知は維持。(4) Finalizer は接続失敗・タイムアウト（一覧・確定 POST・会議登録の `NETWORK` / `TIMEOUT`）に `reason: "network"` を付け、App は `backoffMs()` の間隔で確定の再試行を予約する（ポーリングの合間の瞬断ではヘルス状態が変わらず、再試行されなかった）。予約は世代で管理し、確定・中止・他の失敗で消す。発火時にサーバーが使えなければ復帰通知に任せる。(5) `RecordingController.stop()` は重なった呼び出しで実行中の停止を共有し、完了まで `start()` を拒否する（後から終わる stop の後始末が次の録音の入力・`onmessage`・ロックを外しえた）。回帰テスト 3 件（(1) Registrar 1・(4) App 1・(5) Controller 1。修正前の Red を確認）。新規テスト 7 件（(2) Controller 2・App 2・`confirmAbandon` 3。メソッドがなかったため Red は回帰の確認ではない）。既存テスト 1 件を変更（停止の重なりで Worklet への `stop` が 2 回送られるのを待っていた → 1 回）。インターフェース変更：`FinalizeResult.reason` に `"network"`、`SessionController` に `discardMemoryBacklog`、`AbandonActions.discardBacklog?`、`discardBacklogQuestion()`、`App.discardMemoryBacklog()` / `discardableMemoryBacklog()`、`RecordingController.discardMemoryBacklog()`。`main.ts`（(3) と破棄の配線）は Vitest 対象外で typecheck のみ。実機確認に追加：確定中止で破棄の確認が出て、OK 後にタブを閉じても確認が出ない・バナーが消える／書き出し待ちの間に一覧が更新されても、キャンセル後にボタンが押せる。Phase 1 埋め込み同期（DIFF 0）・本文（§15 stop の共有、§17.1 Registrar のタイムアウト、§22 network の再試行、§31 破棄と行の復元）、Phase 2 client の RecordingController（stop の共有）と Finalizer（`reason: "network"`）を更新。
+- 2026-11-09（57 回目・未コミット）：レビュー指摘 9 件を検証し 8 件を修正、1 件スキップ。(1) `LocalSaver.put()` のタイムアウトを PUT ごとに張り直す（トークン変更の送り直しが会議確認を待つ間に最初の期限が切れると、中断済みの signal で送って即 `TIMEOUT` になった）。Phase 3 client の LocalSaver にも同じ修正。(2) Scheduler の送信前の確保と `markAllPendingUnavailable()` を `isResumable()` で判定し、non-retryable の `LOCAL_SAVE_FAILED`（`resumeAll` の再送が 409・422 になった後）を前の試行のリトライタイマーが再送・`BACKEND_UNAVAILABLE` に書き戻さない。(3) App は確定・確定中止した会議の controller・drain・`meetingFallbacks` を手放す（`releaseSettledMeeting`。メモリ待機・未保存の停止状態が残れば保つ）。(4) 手動「再試行」の失敗は前回と同じ理由でも通知欄に出す（`manualRetryNeedsNotice()`、理由が変わったときは `finalize_pending` に任せて重ねない）。(5) メモリ待機の WAV 書き出しを 1 回のダウンロードに（複数は新規 `src/export/zip.ts` の無圧縮 ZIP、外部依存なし。入れたファイル名を通知欄に表示）。(6) 確定中止の最初の確認に「キャンセルで中止も取りやめ」を明記、`exportWav` は Promise も受ける。(7) README の停止理由の確認に停止前後の時刻の控えと、検出時刻がその時間帯（±5秒）に入るかの確認を追加。(8) T4-H の状態を「Chrome 再生は全件確認済み・聴取のみ未確認」に統一し、2026-10-07 の再開点を履歴と明記（README も同様）。スキップ：`put()` が 401 を返す直前のトークン確認と Scheduler の処理の間にトークンが変わる件（確認から `return`・`runOne` の続きまでは同じマイクロタスク列で、`setToken` のトークン代入は IDB 保存完了という別タスクの後なので割り込めない）。回帰テスト 5 件（Scheduler 2・LocalSaver 1・App 1・確認文言のアサーション 1、修正前の Red を確認）。新規テスト 6 件（`manualRetryNeedsNotice` 3・ZIP 3。関数がなかったため Red は回帰の確認ではない。`main.ts` の配線は typecheck のみ）。インターフェース変更：`AbandonActions.exportWav` が `void | Promise<void>` を返せる、`manualRetryNeedsNotice()` を追加、新規 `src/export/zip.ts`。`main.ts` は Vitest 対象外（typecheck のみ）。ZIP は unzip -t・Python zipfile・ditto で展開でき、中身のハッシュ一致を確認。実ブラウザでの書き出しは未確認で、次の実機確認に追加（メモリ待機 2 件以上で「複数ファイルのダウンロード」確認なしに ZIP が 1 つ保存される、Finder で開ける、通知のファイル名と一致、各 WAV が再生できる）。Phase 1 埋め込み同期（DIFF 0）・本文（§9 遷移表、§17 二重送信防止・LocalSaver のタイムアウト、§31 controller の解放・書き出し・手動再試行）、Phase 3 client の LocalSaver を更新。
+- 2026-11-09（56 回目・未コミット）：レビュー指摘 7 件を検証し 4 件を修正、3 件スキップ。(1) Phase 2 client の Mic `stop()` は最終の読み取りで会議がなければ、最初の読み書きが成功していても reject（`firstMissing` を削除）。(2) Python の旧スキーマ移行テストは `DROP COLUMN`（SQLite 3.35 以上）をやめ、停止理由列のない会議表を直接作ってから起動する（移行を無効にすると落ちることを確認）。(3) `onBackendAvailable()` の再投入と確定の再試行を別々の try に（`recording` の一覧が読めなければ再投入はせず、確定は続ける）。(4) `listPendingFinalize()` は `unsavedStops` と IDB の両方にある会議を、IDB の状態＋保持中の `sessionClock` で返す。スキップ：直接送信の成功で `lastSuccessfulLocalSaveAt` を更新する件（この値を読む箇所が src にない。設定しても挙動が変わらない）、起動時復旧で読めなかった会議を同じ実行内で読み直す件（主な原因の接続切断はページの寿命の間は直らず、既に `unreadMeetingIds` で再読み込みを案内している）、App テストで本物の Controller を使う nitpick（`recording-controller.test` が本物の Controller で drain の IDB 書き戻しを検証済み。49 回目と同じ判断）。回帰テスト 2 件（(3)(4)、修正前の Red を確認）。インターフェース変更なし。Phase 1 埋め込み同期（DIFF 0）・§31 本文、Phase 2 client §6 の `stop()` コードと本文を更新。
+- 2026-11-09（55 回目・未コミット）：レビュー指摘 7 件を検証し 6 件を修正、1 件スキップ。(1) App は直接送信の件数と連番→endFrame（`directRegisteredEndFrames`。従来の `directRegisteredEndFrame`・`directRegisteredSeqs` を 1 つに統合）を確定成功時に消す（確定待ちの間は保つ）。(2) `listPendingFinalize()` は `stop_requested` と `finalizing` の取得を別々に試み、片方の失敗でも読めたほうを返す。(3) 両方に載った会議は会議 ID で 1 行にまとめ、`main.ts` の再試行・確定中止は同じ会議の操作中ならクリックを無視する。(4) 末尾を直接送信した会議でも末尾の欠けを測る：Finalizer に `offIdbEndFrame` を追加し、`measureMissingTailMs` は最後の連番が IDB になければその値を使う（指摘は Controller の配列を残す案だったが、App が既に endFrame を持つので Finalizer に渡す形にした）。(5)(6) IDB・確定中止テストの nitpick。スキップ：`MeetingStore.put()` の検出時刻をサーバーの制約（0 以上・SQLite 整数上限・整数）で検証する件（値は `Date.now()` 由来の整数だけで、put で拒否すると 422 の理論上の可能性が停止状態の保存失敗に変わり、かえって確定できなくなる）。回帰テスト 4 件（(1)+(4) の App 1・Finalizer 1・(2) 1・(3) 1、修正前の Red を確認）。インターフェース変更：`FinalizerDeps.offIdbEndFrame`（任意）、`measureMissingTailMs` の第 4 引数（任意）。`main.ts` は Vitest 対象外（typecheck のみ）。Phase 1 埋め込み同期（DIFF 0）・§22・§31 本文、Phase 2 client の Finalizer を更新。
+- 2026-11-09（54 回目・未コミット）：レビュー指摘 9 件を検証し全件修正。(1) Phase 2 client の Finalizer に `onBackendUnauthorized` を追加し、`GET /chunks`・`POST /finalize` の 401/403 で Monitor へ伝える（Phase 1 と同じ）。(2) Phase 2 client の `stop()` は System の停止が失敗しても Mic を止め、その後で System の失敗を投げる。(3) App：停止状態を書けていない間も離脱確認を続け、書き直せてメモリ待機も空になったら外す（`releaseLifecycleIfSettled`）。(4) `listPendingFinalize()` は `finalizing` の取得だけ失敗しても `stop_requested` を返す。(5) `retryFinalize()` の停止状態書き直しの失敗も `finalizeIssues` に記録し `finalize_pending` を通知（`recordFinalizeIssue` に共通化、同じ stage/detail は重ねない）。(6) `App.whenBackendRecoverySettled()` を追加し、テストの `settleMonitor` が復帰時の復旧完了まで待つ。(7) crash-recovery テストの片付けを finally へ。(8) App テストの FakeController が `backlog` を WAV として書き出す。IDB 外の連番・endFrame・中止後の書き出しのテスト 2 件を追加。(9) Controller の停止が重なっても最初の停止理由を保つテストを追加。回帰テスト 3 件（(3)(4)(5)、修正前の Red を確認）。テスト追加 4 件（(8) 2 件・(9) 2 ケース。修正前から通る）。インターフェース変更：`App.whenBackendRecoverySettled()` を追加。Monitor 通知の復旧失敗は `AppEvent.error` で通知するようにした。TypeScript 440 件・typecheck 通過。Phase 1 埋め込み同期（DIFF 0）・§31 本文、Phase 2 client §6・§7 を更新。
+- 2026-11-09（53 回目・未コミット）：レビュー指摘 11 件を検証し 10 件を修正、1 件スキップ。(1) Phase 2 client の `MultiSourceRecorder.stop()` の検出時刻の既定値を `Date.now()` に（`deps.now` はドリフト計測用の performance 時計）。(2) App：サーバー停止中の確定再試行の drain（IDB への書き戻しだけ）の実行中にサーバーが戻ったら、その要求を記録し、drain を終えた直後に直接送信で drain し直す（復帰時の drain と確定が実行中の drain・借用中のロックに弾かれ、次の復帰まで末尾が残る問題）。(3) `main.ts` の確定待ち一覧の更新を世代番号から単一実行＋後続 1 回の再実行に（読み込みが 5 秒より遅いと一度も描画されない問題）。(4) Scheduler：`RETRYING` の期限前に `runOne()` に来た Chunk は残り時間のタイマーで再投入（即時再投入で期限まで空回り）。(5) Scheduler：成功の書き戻しも自タブの確保が残るときだけ行い、`onChunkSaved` もそのときだけ（52 回目の「成功は確保に関係なく書く」を変更。古い `registered: false` が新しい `DB_REGISTERED` を `SAVED` に戻すため）。(6) Controller の `drainMemoryBacklog()` を直列化（Phase 2 client の Controller にも同じ修正）。(7) `MeetingStore.put()` は停止理由と検出時刻の片方だけの会議を拒否。(8) Controller テストのトラックを `stop()` で `ended` にし、録り直しは新しいトラックで行う。(9) サーバーテストで最初の確定後に `meeting.json` を消し、再試行が最初の値で作り直すことを確認。(10) 確定中止で WAV 書き出し後に最後の確認を断るテストを追加。スキップ：Controller の監視トラックを `createMediaStreamSource` の 1 本に絞る件（`getUserMedia({ audio: true })` の音声トラックは 1 本で、全トラックの監視と挙動が変わらない。複数トラックのストリームを受ける経路はない）。回帰テスト 5 件（修正前の Red を確認：Scheduler 2・Controller 1・IDB 1・App 1）、テスト強化 3 件（トラックの再現性・サーバー snapshot・中止キャンセル。いずれも修正前から通る）。インターフェース変更：`MeetingStore.put()` が片方だけの停止情報で reject（呼び出し元は常に組で書くため影響なし）。`main.ts` は Vitest 対象外（typecheck のみ）。Phase 1 埋め込み同期（DIFF 0）・本文（§9.2 確保の規則、§12 停止理由、§15 drain の直列化、§31 retryFinalize・一覧更新）、Phase 2 client（`stop()` の既定値、Controller の drain 直列化）を更新。
+- 2026-11-08（52 回目・コミット済み 311c863 まで）：レビュー指摘 7 件をすべて有効と判定して修正。(1) `retryFinalize()` はサーバーが使えなくてもメモリ待機の drain を試す（IDB への書き戻しだけ。`directSaver` は送信前に失敗を返し、`memory_backlog_export_required` も重ねない）。(2) drain の直接送信が `tokenChanged` で送れなければ通知せず、drain を終えた直後に同じ引数で drain し直す（並行しない。`setToken` の drain が実行中の drain に弾かれて末尾が残る問題）。(3) Scheduler の `runOne()` は送信可否の確認と `SAVING` の確保を同じ `updateSaveState()` で行い、失敗の書き戻しは自タブの確保（`attempts` が確保時の値の `SAVING`）が残るときだけ行う（`updateClaimed()`・`recoverFailedRun()` も同じ）。(4) `tokenChanged` の回は確保時に足した `attempts` を戻す。(5) 起動時復旧はロック後に読み直した会議レコードで `audioFrameCount` を補う。(6) `FinalizeResult` の失敗に `reason: "unauthorized"` を追加（登録の `UNAUTHORIZED`・一覧／確定の 401/403・トークン未設定）、`finalizeResultText` は detail の正規表現をやめてこれで判定。(7) Registrar テストで `unauthorizedReported: true` を確認。回帰テスト 9 件（修正前の Red を確認）、ガードのテスト 3 件（オフライン時に直接送信しない・meetingId が "HTTP 403" で終わる一覧を認証エラーにしない・認証分類の UI 文言）を追加。インターフェース変更：`FinalizeResult` に任意の `reason`、App 内部の drain に `direct` 引数（private）。TypeScript 427 件・typecheck 通過。Phase 1 埋め込み同期（DIFF 0）・本文（§9.2 遷移表と確保の規則、§17 二重送信防止、§22 認証分類、§23 復旧、§31 retryFinalize・配線表）、Phase 2 client（Finalizer の `reason`、drain の記述）を更新。
+- 2026-11-08（51 回目・コミット済み 3bff8f5 まで）：レビュー指摘 13 件を検証し 8 件を修正、5 件スキップ。(1) `LocalSaver.put()` の送り直しは `ensureMeeting` の確認後に最新トークンを読む。(2) 送り直し中もトークンが替わり続けた失敗に `tokenChanged: true` を付け（`MeetingRegistrar` も同じ）、Scheduler は試行上限に数えずすぐ再投入する（上限の回で `LOCAL_SAVE_FAILED` に残り、送信中で `setToken` の `resumeAll` に拾われなかった Chunk が止まる問題）。(3) `retryFinalize()` は停止状態の書き直しより前にメモリ待機を drain（書き直し失敗で確定は止めたまま）。(4) 起動時復旧は `stop_requested` の会議も `audioFrameCount` を保存済み Chunk の最大 endFrame まで補う（大きい値は維持）。(5) App テストの固定 50ms 待ちを、LIST 2 回と Scheduler の待機 0 件の待ちに置換。(6) Phase 2 client の Mic `stop()` は両方の読み取りで会議がなければ reject。(7) Phase 3 client の LocalSaver を Phase 1 現行全文（`ensureMeeting`・`unauthorizedReported`・`isRetryableError`・上記 1〜2）＋許可 origin に組み直し。(8) Phase 3 server に rebuild の停止理由の組（有効値の保持・不正値 6 通りの除去）のテストを追加。スキップ：Phase 3 client の 401 とトークンの対応付け（送り直しで既に古いトークンの 401 を報告しない）、トークン世代番号（A→B→A で A の 401 は現在のトークン A の失効を正しく示す）、ヘルスチェックの失敗経路のトークン照合（接続不能・5xx はトークンと無関係な到達性の観測で、次のポーリングで回復する）、Scheduler の中止後の NETWORK 再投入（`markAllPendingUnavailable` が中止会議のキーを外し、`runOne` が送信前に中止を確かめるので再送されない）、`pendingCountsText` の `Math.max` 展開（会議あたり数百件で引数上限に遠い）。回帰テスト 5 件追加・1 件強化（すべて修正前の Red を確認）。`fail()` の戻り型を失敗側に絞った（private）。TypeScript 415 件・typecheck 通過。Phase 1 埋め込み同期（DIFF 0）・本文（§9.2 遷移表、§17.1、§23、§31）を更新。
+- 2026-11-08（50 回目・未コミット）：レビュー指摘 15 件を検証し 13 件を修正、2 件スキップ。(1) サーバー照合の不一致で送り直した Chunk の保存完了で 1 回だけ確定を確認し直す（`mismatchRechecked`、再び不一致なら止める）。(2) `listPendingFinalize()` は IDB の一覧取得に失敗しても `error` を通知して `unsavedStops` の会議を返す。(3) サーバー復帰時、確定中止した会議のメモリ待機は drain しない。(4) `prepareChunkPut()` は IDB 読み取り失敗時に `abandoned` を確かめ直してから送る。(5) 再試行ボタンで確定中止ボタンも無効化。(6) 確定待ちの内訳が読めなくても行とボタンを出す（`main.ts`）。(7) Controller は最終保存に失敗したら drain で空になってもロックを解放しない（`finalStopUnsaved`）。(8) 保持中のロックを渡すまで `start()` を拒否。(9) `LocalSaver` はトークン変更で送り直す前に `ensureMeeting` を再確認。(10) テスト：送り直し回数の固定、最終保存失敗後の drain でのロック保持、停止状態書き直しのテストをサーバー停止で始めて自動再試行の競合を除去（flaky を確認して修正）。(11) Phase 2 client の MultiSourceRecorder テストに停止引数の受け渡しを追加。既存テスト「照合不一致による再送完了で確定と再送を繰り返さない」の読み取り回数を 1→2 に更新（1 回の再確認を許す仕様変更）。スキップ：Scheduler の `markAllPendingUnavailable` の中止判定失敗（`LOCAL_SAVE_PENDING` と `BACKEND_UNAVAILABLE` はどちらも再開可能で、送信前に `runOne`／`resumeAll` が中止を再確認するため挙動が変わらない）、確定待ちの不完全表示をサーバー停止中に常時付ける件（末尾の直接送信は `audioFrameCount` との比較 `hasUnknownTail` で既に不完全と表示される。最終保存も失敗して再読み込みした場合はサーバー照合なしには判定できず、サーバー状態では解決しない）。`main.ts` の変更は Vitest 対象外（typecheck のみ）。TypeScript 410 件・typecheck 通過。Phase 1 埋め込み同期（DIFF 0）・本文（§15 ロック、§17 LocalSaver、§31 T10・中止・確定待ち表示）、Phase 2 client の Controller とテストを更新。Phase 3 client の LocalSaver は `ensureMeeting` を持たないので対象外。
+- 2026-11-08（49 回目・コミット済み 0bd53e7 まで）：レビュー指摘 10 件を検証し 9 件を修正、1 件スキップ。(1) ヘルスチェックの成功も応答待ち中にトークンが替わったら捨てる。(2) Controller の drain はクォータ超過でもサーバーに登録できれば直接送る（停止後に末尾が永久に残らない）。(3) 最終保存に失敗した Controller はロックを保持し、App は停止状態を書き直すまでロックを解放しない（別タブが古い audioFrameCount で確定しない）。(4) 停止後もメモリ待機が残る間はページライフサイクルを外さず離脱確認を続ける。(5) 起動時復旧でロック後の読み直しに失敗した会議は触らず `unreadMeetingIds` で報告し、起動を続ける。(6) 一覧の認証エラーのテストを、会議登録は通して一覧だけ弾く形に組み直す。(7) 確定中止の確認文言のテストを強化。(8) Phase 3 rebuild は `endedAt` がなければ `endedAtEpochMs` を読む（テストを設計書に追加）。(9) 本ファイルの最新テスト集計を更新。スキップ：App テストで本物の Controller のクォータ経路を通す nitpick（`recording-controller.test` の既存テストが本物で同じ経路を検証済み）。TypeScript 403 件・Python 10 件・typecheck 通過。Phase 1 埋め込み同期（DIFF 0）・本文、Phase 2 client、Phase 3 server を更新。
+- 2026-11-08（48 回目・コミット済み 5e05dd9 まで）：レビュー指摘 15 件を全件有効と判定して修正。(1) ヘルスチェックの 401/403 も失効回数に数える（応答待ち中にトークンが変わった 401 は無視）。(2) `LocalSaver` は 401 の本文読み取り後にトークン変化を確かめる。(3) 確定の会議登録がトークン変更中に失敗したら `finalizeTokenChanged` でやり直す。(4) 停止状態を IDB に書けなかった会議は `unsavedStops` で確定待ちに残し、会議ロック下で書き直す（`recording` なら丸ごと、`stop_requested` なら最終の `audioFrameCount` と未記録の停止理由だけ。それ以外は上書きしない。`session.stop()` は reject せず結果を返す）。(5) `retryFinalize` はサーバーが使えればメモリ待機を先に drain。(6) サーバー復帰時の drain を IDB の一覧取得より前へ。(7) 共有の IDB 保存警告は他の会議のメモリ待機が空になるまで外さない（Controller の `otherMeetingsBacklogCount`）。(8) 確定待ちの欠番判定を IDB 外の連番（`App.offIdbSequenceNos()`）で行う。(9) マイク切断の警告文言から保存の約束を外す。(10) pydantic v2 を依存に明記し lock 更新。(11) README の SQLite 確認を会議 ID 指定に。(12) Phase 2 client の `stop()` で最初の読み取り失敗でも flush し、最後に stop_requested と停止理由を書く。(13) テストの FakeController を本物と同じく開始時からロック保持にし、停止処理中の別タブ確定・中止の拒否をテスト。TypeScript 397 件・Python 10 件・typecheck 通過。Phase 1 埋め込み同期（DIFF 0）・本文、Phase 2 client、Phase 3 client を更新。
+- 2026-11-08（47 回目・コミット済み f836da1 まで）：PR #12 の SonarCloud 品質ゲート失敗（新規コードの重複 3.3% > 3%）に対応。重複は `test/app.test.ts`（中止テスト 2 件の Arrange、25 行）と `test/recording-controller.test.ts`（メモリ待機のロック保持テスト 3 件の Arrange、37 行）のみで、それぞれ `abandonWhileRequestHeld()` / `startWithUnsavableBacklog()` に切り出した。テストの振る舞いは不変、TypeScript 383 件・typecheck 通過。
+- 2026-11-08（46 回目・コミット済み 218e72e まで）：レビュー指摘 10 件を全件有効と判定して修正。(1) `LocalSaver.put()` は送信中にトークンが変わった 401/403 を新しいトークンで送り直し、それでも変われば再試行できる `UNKNOWN` で返す（古いトークンの 401 で失効報告・新トークンのヘルス成功の打ち消しをしない。Monitor は無変更）。(2) 直接送信の PUT の 401/403 を App が Monitor へ報告。(3) `prepareChunkPut()` は会議ロックを持たない会議の中止判定が読めなければ retryable で PUT を始めない。(4) Finalizer に `ensureMeeting` を追加し、一覧取得前に毎回会議を登録（Chunk 0 件の会議が 404 で止まらない）。(5) Scheduler：`runOne()` の中止判定の読み取り失敗は状態に触れず再投入、`resumeAll()` は会議ごとに判定して失敗した会議だけ次回へ、`markAllPendingUnavailable()` の settled 除去に index 確認。テストハーネスは `requireMeetingRegistration` 時に一覧・確定も 404 にし、`LIST:` / `FINALIZE:` を記録。テスト 11 件追加（うち 9 件と、既存の認証回復テスト 2 件の強化は修正前の Red を確認。残り 2 件は報告しない側のガード）。Phase 1 埋め込み同期（DIFF 0）・本文、Phase 2 client（Finalizer の登録、Mic/System のメモリ待機両方でのロック保持）、Phase 3 client LocalSaver、Phase 3 server rebuild の停止理由の組検証を更新。TypeScript 383 件・typecheck 通過。
+- 2026-11-08（45 回目・コミット済み 8e550a0 まで）：CodeRabbit 指摘対応。(1) サーバーの `stopDetectedAtEpochMs` を SQLite 整数上限で検証（範囲外は 422）。(2) 会議登録の 401/403 を Scheduler が二重に Monitor へ報告しない（`unauthorizedReported`）。(3) 失効報告より前に始めたヘルスチェックの成功で `unauthorized` を解除しない。(4) `stop()` の最初の状態保存失敗が最終保存で回復したら停止を完了して確定へ進む（失敗は `onError`）。(5) メモリ待機が残る Controller の `start()` を拒否。(6) サーバー復帰時、確定の前に停止後のメモリ待機を drain（従来の残課題を解消）。(7) IDB が読めなくてもこのタブで中止した会議へ PUT しない。(8) 中止した会議の Chunk を待機件数から外す（`discardMeeting()`）。(9) 中止確認のキャンセルでボタンを即時復帰。テスト追加・Red確認済み。Phase 2 server の finalize にコミット後の `meeting.json` 書き出しを追加。ドキュメント網羅率（docstring）はスキップ。Python 10件・TypeScript 372件・typecheck・build 通過。テスト以外のサーバー起動はしていない。
+
+- **最新：利用者指示で停止中。** 本作業のテスト・API・Viteを停止。5173・5188・43117・43118に待ち受けなし、関連テストプロセスも残っていないことを確認した。以下の過去ログの「起動中」は現在の状態ではない。
+- 停止理由の永続化は作業途中・未コミット。`manual` / `mic_ended` と検出時刻をIDB→確定API→SQLite／`meeting.json`へ保存し、既存DBの列追加と旧データの未記録扱いを実装。追加テストのRedを確認後、TypeScript 358件・Python 10件、typecheck・buildが通過。Phase 1の埋め込みコード同期も確認済み。
+- 2026-11-08（44 回目・未コミット）：レビュー指摘対応。(1) `stop()` は `stop_requested` の保存に失敗しても Worklet の末尾を Chunk にしてから切り離す。(2) メモリ待機が残る会議は stop 後も会議ロックを保持し、`takeMeetingLock()` で App が受け取って確定・中止に借用、空になったら解放（別タブが末尾欠けのまま確定しない）。(3) 確定待ちの不完全表示を件数でなく末尾フレームの網羅で判定（`App.offIdbEndFrame()`、`PendingCounts.offIdbEndFrame`）。(4) 開始処理中のマイク切断のテストを追加。復旧の状態不一致時の `SAVING` 再送とドキュメント網羅率はスキップ。TypeScript 365件・typecheck 通過。Phase 1 §15・App 配線表、Phase 2 client の Controller を同期。
+- 残課題（44 回目から）：~~stop 後にメモリ待機が残ったまま、サーバー復帰で自動 drain する経路がない~~（45 回目で解消。ただし IDB にもサーバーにも送れない間はタブを閉じるまでロックを保持）。Phase 2 の System 側メモリ待機のロック保持は 46 回目で設計済み（Mic・System 両方のメモリ待機が空になるまで保持）、実装は未着手。
+- 再開時の残り：後続フェーズ設計書の変更レビュー、専用Chromeによる停止理由保存の結合検証、READMEの確認手順更新。ブラウザ検証は利用者の中断で実行完了していない。通常APIは旧コードのまま停止したため、通常データへの列追加は次回起動時になる。テスト・サーバーの再開は利用者の指示を待つ。
+
+- 2026-11-08（43 回目）：マイク切断試験の案内後に作られた最新会議 `bbd1a297-f448-42b6-8c08-c69839d01d1d`（無題の会議、10:11:21〜10:11:34 JST）を照合。13.25725秒・212,116サンプル・seq 0の1 Chunkが登録済み、サーバー状態は `finalized`。WAVのヘッダ・バイト数・SHA-256・サンプル数と、SQLite／`meeting.json`の確定値が一致。証跡は `private/next-action-2026-11-08/mic-disconnect-result.json`。サーバーに停止理由は記録されないため、T12-b は物理切断による自動停止・通知の利用者報告待ち。
+
+- 2026-11-08（41 回目）：利用者の確認依頼を受け、最新の「無題の会議」`f4ea99b6-a1f7-4804-a9c2-126a4e2130f5`（09:58:56〜09:59:33 JST）を読み取り照合。実サーバーで `finalized`、seq 0・1 の2件が登録済み。30秒＋6.8080625秒＝36.8080625秒、計588,929サンプル。連番・offsetの連続性、WAVヘッダ（16 kHz / 16 bit / mono）、バイト数、SHA-256、SQLiteと `meeting.json` の確定フレーム数が一致。両WAVはゼロ振幅ではない（音の内容・聴取は未確認）。証跡は `private/next-action-2026-11-08/manual-recording-result.json`。
+- 2026-11-08（42 回目）：利用者が「再試行ボタンは押さずに確定した」と報告。前回の実サーバー照合と合わせ、T10（停止後の自動確定）の実機確認を合格とした。ブラウザIDBの直接確認は今回の証跡に含めない。残りは T12-b の物理切断と T4-H の聴取。通常 API と Vite は引き続き起動中。
+
+- 2026-11-08（40 回目）：通常の保存先 `private/phase1-data/` で API と Vite を起動し、Chrome でアプリを表示。更新したトークンをローカルのクリップボードにコピーした。実マイクの35秒録音・停止を利用者へ依頼し、結果待ち。今回の終了時点では実機確認用の両サーバーを起動したままにしている。
+- T4-H の追加証跡：既存会議 `68c2f545…` の11 WAVを SQLite の SHA-256・サンプル数と照合。専用 Chrome 156.0.8078.80 のネイティブプレーヤーで各ファイルを最後まで再生し、全件 `ended: true`・メディアエラーなし。消音・16倍速のため聴取確認は代替しない。pageerror・HTTP(S) リクエストなし。`private/next-action-2026-11-08/existing-playback-result.json` と再生用 `existing-playback.html` に保存。H は利用者の聴取報告待ちとして維持。
+
+- 2026-11-08（39 回目）：専用の実 FastAPI サーバーと Chrome 156.0.8078.80（使い捨てプロファイル・合成マイク）で T10/T12 を結合確認。A の末尾 PUT を保留して B を開始し、A の自動確定前後とも B の停止ボタンが有効なこと、B の停止・確定まで確認。実 HTTP 401 の表示、通常停止会議の復旧文言、トークン修正後の再送・自動確定、合成 ended による停止・末尾保存、中止のキャンセル／確定・再読み込み・WAV 保持も通過。
+- 確定した 4 会議は各 1 Chunk、全件 `DB_REGISTERED`。IDB のフレーム総数と実 SQLite の確定値、WAV の 16 kHz / 16 bit / mono ヘッダ・サンプル数・SHA-256 が一致。pageerror・アプリの外部ホスト宛て要求は 0 件。検証記録・スクリプト・画像は `private/next-action-2026-11-08/`（Git 対象外）。検証 API の保存先は `/private/tmp/minutes-next-verification`。既存会議は変更していない。
+- 残りは実マイクでの短時間録音・物理切断と T4-H の既存 Chunk の Chrome 再生。手順は README「次の実機確認」。60 分録音は保留継続。今回のコード修正はなし。
+
+- 2026-11-08（ddf41e1〜6a240d0 でコミット済み）：T10/T12 差分のレビュー指摘を対応。トークン更新中の会議登録・確定の 401 の扱い、確定中止と PUT の競合（`prepareChunkPut()`）、直接送信完了後の確定再試行、マイク切断の録音ごとの判定と登録前終了の検出、復旧中に別タブが状態を進めた会議の除外、確定待ちの内訳（`SAVED`・直接送信・不完全表示）、次の録音の停止ボタンを修正。変更は `src/api/meeting-registrar.ts`・`src/app/app.ts`・`src/main.ts`・`src/recording/recording-controller.ts`・`src/recording/recovery.ts`・`src/ui/recording-view.ts`、対応テスト、設計書 Phase 1 / Phase 2 client。
+- 残課題（2026-11-08 レビュー対応から）: `src/main.ts` の停止ボタンは Vitest 対象外。「録音 A を停止 → 確定待ちの間に録音 B を開始 → B の停止ボタンが押せる」は39回目の実サーバー＋合成マイクによる Chrome 検証で確認済み。停止後の Scheduler は会議ロックを持たないため、別タブの送信中 `SAVING` を復旧が重複再送しうる（冪等 PUT で吸収）。再読み込み後の直接送信件数は復元できず、不完全表示にとどまる。
+
+- 2026-11-08：T10 を TDD で修正。T12-a〜d と共通通知・件数表示を TDD で実装済み。専用 Chrome プロファイルでの模擬 API・合成マイクによる画面検証も通過。実マイクと既存会議での確認は未実施。1-g は利用者指示で保留。着手時からあった本ファイルの T4-H などの訂正は保持した。
 
 - 着手時の作業ツリーは clean。2026-09-27 の「文書3件が未コミット」という引き継ぎ記述は現状と異なっていた。
 - Python / FastAPI / SQLite の最小サーバー、5 API、トークン更新、CORS、原子的Chunk保存、冪等PUT、finalize検証を実装。ローカルループバックの health 応答を確認。サーバー用テスト4件が通過。
@@ -43,7 +85,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 依存関係と並行実行の可否を明記する。「並行可」のタスクは、別エージェントや別セッションに分けても衝突しない（触るファイルが重ならない）。
 
-### T0. 2026-09-26 までの未コミット変更のコミット ✅ 完了（今回の差分は別途未コミット）
+### T0. 2026-09-26 までの未コミット変更のコミット ✅ 完了（T10/T12 レビュー修正も 6a240d0 までコミット済み）
 
 ### T1. レビュー修正の回帰テスト追加 ✅ 完了（2026-09-26・19 回目）
 
@@ -89,7 +131,7 @@ T3-c の内容（§31.4）:
 - Playwright で dev サーバーの画面を確認済み：サーバー未接続のバナー、ヘルプ文言が出る。コンソールのエラーなし（favicon は `data:,`）、通信先は 127.0.0.1 のみ
 - 実マイクでの録音・同意ダイアログ・getUserMedia 拒否・タブの切り替えは未確認（T4）
 
-### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-f / 1-g）【A〜H 合格（2026-10-07）・任意の C2 と 1-g が残り】
+### T4. 手動確認（Step 1-c / 1-d / 1-e / 1-f / 1-g）【A〜G 合格（2026-10-07）・H は既存 Chunk の再生待ち・任意の C2 と 1-g が残り】
 
 - 1-c 結果：会議 `68c2f545-ff0a-4741-8f43-3b2fd46711c2`（無題の会議）。seq 0〜9 は各480,000サンプル、seq 10 は257,842サンプル。計316.115125秒、欠番なし、`fullChunks: 10` / `partialChunks: 1` / `allValid: true`。全11件の音声を利用者が確認した。Chromeでの単体再生は未確認（再生アプリ・OS・Chrome版も未取得）。外部通信ゼロの実機確認も未完了。録り直しは求めず、Chromeの確認を残して1-dへ進むと案内済み。
 
@@ -99,20 +141,22 @@ T3-c の内容（§31.4）:
 - 会議作成APIの配線漏れは修正済み。通常送信・復旧・直接送信は共通の登録を通り、録音開始はサーバーを待たない。
 - 結果は [design-local-phase1.md](design-local-phase1.md) §28 の「状況」列に反映する。
 
-### 次セッションの再開点：T4 実機再確認チェックリスト（2026-10-01 作成・A〜H 合格）
+### 次セッションの再開点：T4 実機再確認チェックリスト（2026-10-01 作成・A〜G 合格、H は一部確認）
 
-- **次セッションの再開点（2026-10-07 終了時）**：
-  1. 両サーバーは停止済み。T4 の必須項目 A〜H はすべて合格。
-  2. **次は方針決め**：1-g（60 分実録音）の前に T10（停止のたびに確定待ち）を直すか、T12 の観察 4 件をどう扱うかを利用者と決める。推奨は T10 を先に TDD で直してから 1-g。
+- **履歴（2026-11-08・42 回目時点の T10 結果。最新の状態ではない）**：T10 は合格。利用者が手動再試行なしの確定を報告し、会議 `f4ea99b6…` の36.8080625秒・2 Chunk・サーバー確定済みの照合結果と一致。T12-b の案内後の会議 `bbd1a297…` は保存・確定済みまで43回目に照合した。まず物理切断で自動停止し通知が出たかを利用者へ確認する。その後、既存11 WAVの聴取（T4-H）を確認する。H の既存11件の Chrome 再生は全件最後までメディアエラーなく完了（2026-11-08・40 回目。消音・16倍速）、音が聞こえるかの聴取確認だけが未確認。**現在は通常 API・Vite とも停止中**（44 回目に利用者指示で停止）。テストとサーバーの再起動は利用者の指示があってから行う。
+
+- **履歴：次セッションの再開点（2026-10-07 終了時。最新の状態ではない。T4-H の現状は上の項目と「現在地」の表を参照）**：
+  1. 両サーバーは停止済み。T4 の必須項目 A〜G は合格。H は既存 Chunk の Chrome 再生が未確認で、結果を確認するまで合格としない（書き出した WAV の再生と外部通信なしは確認済み）。※その後 2026-11-08 に Chrome 再生は全件確認済み。残りは聴取確認のみ。
+  2. **2026-11-08・39 回目更新**：T10/T12 は実装・自動テストに加え、実サーバー＋合成マイクの Chrome 結合確認済み。次は README「次の実機確認」に沿った実マイクでの短時間録音・物理切断と T4-H の既存 Chunk 再生確認。1-g（60 分実録音）は利用者指示で保留し、明示的な再開指示まで実施しない。
   3. 任意：C2（サーバー停止中に強制終了 → 再起動・トークン保存 → 開き直して再送）。
   4. ブラウザの IDB に会議 `6a108d86…`（G 書き出し）が確定待ちで残っている（Chunk は書き出した WAV にしかない）。再読み込み後の扱いは未確認。T12-d を参照。
   5. 書き出した WAV 2 件のコピーが `private/g-export/`（git 対象外）にある。不要なら削除してよい。
-- **項目 F・G・H 合格（2026-10-07）**：Chrome は利用者の**別プロファイル**で最初に開いてしまい、IDB が空だった（プロファイルごとに IDB が別）。前回と同じプロファイルで再開。
+- **項目 F・G 合格、H は一部確認（2026-10-07）**：Chrome は利用者の**別プロファイル**で最初に開いてしまい、IDB が空だった（プロファイルごとに IDB が別）。前回と同じプロファイルで再開。
   - 前回の会議 `73f09961…` は、誤ったトークンで照合が 401 → 正しいトークンの保存（10:04:18）と同時に自動で `finalized`（14 Chunk・6,291,936 サンプル一致）。
   - F-1 画面ロック：会議 `da231ba0…`。Shift + Command + Q（ログアウト確認）→ すぐ Control + Command + Q でロック、約 20 秒後に解除。seq 0〜5 は欠番なく 0.07〜0.12 秒で登録、警告なし → **合格**（観測のみ）。
   - F-2 マイク切断：会議 `9a7c2188…`。「マイクが切断されました…」を表示。切断後は WAV がすべて 0 のまま停止まで続く（約 27 秒）。3 Chunk・`finalized` → **合格**。
   - G 書き出し：会議 `6a108d86…`。サーバー停止＋putChunk 失敗注入で、エラー通知・赤い警告・書き出しボタンが表示。書き出した 2 件（30.000 秒・20.218 秒、16 kHz/16 bit/mono、雑音 RMS 約 10）を確認 → **合格**。会議は確定待ちから抜けられない（T12-d）。
-  - H：書き出した WAV を Chrome のタブで再生（0:20/0:20）。全試験で通信先は 127.0.0.1 のみ → **合格**。
+  - H：G で書き出した WAV を Chrome のタブで再生（0:20/0:20）。全試験で通信先は 127.0.0.1 のみ。合格条件の既存 Chunk の再生は未実施 → **保留**（書き出した WAV は既存 Chunk の代わりにしない）。
   - 記録は §28.1・§28.3・§28.4 に反映。
 - **項目 F 途中（2026-10-03）**：会議 `73f09961…`（17:36:22 開始）。タブ切替（17:38:06〜17:38:21）・最小化（17:38:34〜17:39:08）とも、その間の seq 3・4 が予定どおり登録され警告なし → **合格**。画面ロックは未実施：利用者が記号「⌃」を Control と読めず別のキーを押し、何かのダイアログが出たまま約 1 分待った（文言・消え方は未確認）。その間 seq 5・6 の保存/送信が約 51 秒・21 秒遅れ、17:40:13 に同時登録。音声は欠けていない（全 Chunk 480,000 サンプル・offset 連続、seq 7 以降は通常の遅れ約 0.5 秒）。→ T11。
 - **項目 E 合格（2026-10-03）**：同意キャンセルは何も表示せず録音・マイク要求・`POST /v1/meetings` なし（§3.9 はエラー表示を要求しないので、表の「エラー表示」はキャンセル時は不要と読む）。マイク Block では「マイクの使用が許可されていません…」を表示し録音せず、開始ボタンは再び有効。サーバーの会議数は 6 件のまま。**次は項目 F**（マイク権限を Allow に戻してから）。
@@ -159,7 +203,7 @@ T3-c の内容（§31.4）:
 - 次回、利用者にダイアログの文言を確認するか、録音中に Command + Q を押して再現する。原因がページのダイアログなら、§20 に「確認ダイアログ中は保存が止まる」旨を書くか、警告の出し方を見直す。
 - 2026-10-07：ダイアログは macOS のログアウト確認（Shift + Command + Q、56 秒のカウントダウン付き）と判明。今回はその表示中・画面ロック中とも遅れなし（0.07〜0.12 秒）。前回の 51 秒の遅れは再現せず原因不明のまま。ダイアログを出していた時間が前回より短かった可能性がある。
 
-### T12. T4（2026-10-07）で見つかった観察【要方針確認・どれも試験は不合格にしない】
+### T12. T4（2026-10-07）で見つかった観察【2026-11-08 実サーバー結合確認済み・実マイク確認待ち】
 
 - a. **誤ったトークンが画面に出ない**：`/v1/health` は認証なしでも 200 を返し、`unauthorized` は PUT の 401 でしか立たない（`src/api/backend-health-monitor.ts`）。送る Chunk がないと、Finalizer の `list HTTP 401` だけが通知に出る。案：Finalizer・Registrar の 401 も Monitor に知らせる、または health の `capabilities` 欠落を「トークン不一致の疑い」として表示する。
 - b. **マイク切断後も無音のまま録音が続く**：警告で停止を促す設計（§15）どおりだが、長い会議で見落とすと無音の Chunk がたまる。自動停止や無音の継続時間の表示を検討する。
@@ -167,10 +211,30 @@ T3-c の内容（§31.4）:
 - d. **Chunk を失った会議を確定待ちから外せない**：G のように IDB にもサーバーにも Chunk がない会議は、再試行しても `waiting_local_save` のまま。トークン保存時の自動再試行では通知も出なかった。利用者が「確定を諦める」操作（または書き出した WAV の取り込み）が Phase 1 にない。
 - 付随：「サーバー未接続 —— 0 個の Chunk を…」の件数は IDB の Chunk だけを数え、メモリ待機の Chunk は赤い警告で別に示す。2 本の帯の数字が食い違って見える。
 
-### T10. 録音停止のたびに「確定待ち」になる【T4 の後／要方針確認】
+#### 共通方針と受入条件（2026-11-08）
+
+次アクションの依頼により a → c → b → d の順に実装済み。各不具合の回帰テストで修正前の Red → 修正後の Green を確認した。過去の T4 合格項目の判定は変更しない。39 回目に実サーバー＋合成マイクで再確認済み。実マイク・既存会議での再確認は未実施。
+
+- a：Registrar／Finalizer の 401/403 を Monitor に通知。送信 Chunk がない場合、直接送信、認証修正後の復帰を検証。
+- c：復旧前の状態を保存し、中断と確定待ちの件数を分ける。別タブの状態変更はロック取得後に再確認。
+- b：mic の ended で通常停止を一度だけ実行。手動停止との競合、mute では停止しないこと、メモリ未保存時の書き出し案内を検証。
+- d：確認付き「確定を中止」でローカルの `abandoned` に永続化。データは削除せず、復旧・再送・確定から除外。確定 POST 中の中止拒否、キャンセル、書き出し失敗時の中止防止、再起動後の保持を検証。中止前から送信中の PUT は取り消さない。既存会議 `6a108d86…` は変更していない。
+- 共通：会議ごとの失敗理由・保存先別件数、同じ失敗通知の重複抑止を実装。画面検証は `/tmp/minutes-t12-browser.cjs`、画像は `/tmp/minutes-t12-ui.png`（専用 origin 127.0.0.1:5188・使い捨てプロファイル・模擬 API・合成マイク、アプリの外部ホスト宛てリクエストなし／pageerror なし）。
+
+- **共通**：「何が失敗したか」「音声がどこまで保存されているか」「次にできる操作」を同じ画面に示す。再試行で回復可能な状態と、操作が必要な状態を分け、成功通知で失敗を隠さない。自動再試行の失敗も会議ごとに表示し、同じ通知を連打しない。
+- **a／認証**：Registrar・Finalizer の 401/403 も Monitor に伝える。health 200 や capabilities 欠落だけで認証の成否を推測しない。トークン修正への導線を表示し、正しいトークン保存後に送信・確定を再試行する。受入条件：送信 Chunk がゼロでも一覧／確定／会議登録の認証失敗を表示でき、修正後に回復する。トークン自体は通知・ログに出さない。
+- **b／マイク切断**：トラックの ended（切断確定）で通常の停止処理を一度だけ呼び、取得済み音声を保存する。単なる無音・一時的 mute は自動停止の根拠にしない。切断で停止したことと、マイクを選び直して新しい録音を始める操作を示す。受入条件：手動停止との競合でも二重停止せず、切断後に無音 Chunk を作り続けない。保存不能なら書き出しを促す。
+- **c／起動時文言**：復旧前の status に基づき、recording の中断と stop_requested／finalizing の確定待ちを分けて通知する。受入条件：通常停止の再読み込みでは「前回中断」と表示せず、混在時はそれぞれの件数と確定待ち一覧への導線を示す。別タブで録音中の会議は対象外。
+- **d／回復不能**：「確定を中止して一覧から外す」を追加する方針。確定成功とは扱わず、専用の中止状態で永続化する。音声・メタデータ・サーバー側データは削除しない。操作時に対象会議と未保存音声の可能性を説明し、メモリ待機があれば先に WAV 書き出しを案内したうえで明示確認を取る。受入条件：会議ロック下で録音／確定処理との競合を防ぎ、再読み込み後も中止状態が残り、自動再試行対象から外れる。書き出し済み WAV の取り込みは今回の範囲外。既存の `6a108d86…` を現時点で変更しない。
+- **件数表示**：IDB 内の未送信件数と、メモリ内の未保存件数を保存先名付きで区別し、0 件でも未保存音声がないと誤認させない。
+- a → c → b → d の順で TDD 実装済み。d は永続状態・復旧・UI を合わせて検証した。1-g の保留解除はこれらの完了から自動判断せず、利用者の再開指示を待つ。
+
+### T10. 録音停止のたびに「確定待ち」になる ✅ 完了（2026-11-08 実機確認合格）
+
+- 実機結果：会議 `f4ea99b6…`、36.8080625秒・2 Chunk、サーバーで登録・確定済み。利用者が手動の「再試行」を押さずに確定したと報告。WAVのサンプル数・ハッシュ・連番・offsetの連続性は41回目に照合済み。
 
 - T4-A・`c8512a13`・T4-B・T4-D の 4 回に加え、2026-10-07 の F-1・F-2・G でも（計 7 回）、停止直後は末尾 Chunk が PUT 中のため Barrier が `waiting_local_save` で止まり、手動の「再試行」が要った。§31.2 の「既知の制約」は実際には毎回起こる。
-- 案：Chunk の登録完了（Scheduler の成功通知）で、その会議が確定待ちなら Barrier を自動で再試行する。1-g（60分録音）の前に入れるかを利用者と決める。
+- 対応：Scheduler が成功状態を IDB に書き終えた後に App へ通知し、停止済みの会議をロック付きで自動再試行する。実行中の Barrier と通知が重なった場合は再判定を予約する。自動再試行は保存待ちからの復帰に限定し、照合不一致からの再送ループは回帰テストで防ぐ。録音中・別タブのロック保持中・メモリ未保存時は確定しない。停止後／Barrier 実行中の完了の 2 件で Red → Green を確認。復帰時の複数 Chunk と保護条件も回帰テストに追加。UI 文言も自動再試行に合わせた。60 分実録音は実施していない。
 - 付随の観察：`MeetingRegistrar` は成功結果を覚えないため、PUT 2 件ごとに冪等な `POST /v1/meetings` が出る。実害はないが、要求数を減らすなら登録済み会議をメモする。
 
 ### T9. T4-A で見つかった UI/診断の改善 ✅ 完了（a・c 2026-10-01、b 2026-10-03）
@@ -179,7 +243,7 @@ T3-c の内容（§31.4）:
   - 元の課題：トークン保存時に形式を検証する（ISO-8859-1 外・空白混入を拒否して通知）。現状は `trim()` のみで、不正な値を保存すると全通信が送信前に例外になり「サーバー未接続」とだけ出る。
 - b. ✅ 完了（2026-10-03・33 回目）：`BackendHealthMonitor.checkOnce` の例外で UNREACHABLE にしたとき、`<name>: <message>` を `console.warn` に残す。同じ理由は連続して出さず、到達できたらリセット。テスト2件（修正前に Red を確認）。§18 の本文に追記。`LocalSaver`・`MeetingRegistrar` は元から理由を `fail()` に残しているため対象外。`App` の `getMeeting` フォールバックの `catch {}` は代替値を返す設計なので据え置き。
   - 元の課題：`BackendHealthMonitor.checkOnce` などの `catch {}` で UNREACHABLE とした理由を `console.warn` に残す（原因特定に時間を要した）。
-- c. ✅ 完了（2026-10-01・32 回目、文言修正を採用）：「確定待ち（サーバーへの保存が終わったら、確定待ちの会議の「再試行」を押してください）」に変更。Chunk 登録完了時の自動再試行は未着手（必要になったら別タスク）。
+- c. ✅ 完了（2026-10-01・32 回目、文言修正を採用）：「確定待ち（サーバーへの保存が終わったら、確定待ちの会議の「再試行」を押してください）」に変更。Chunk 登録完了時の自動再試行は後日 T10（2026-11-08）で実装。
   - 元の課題：`finalizeResultText` の `waiting_local_save` 文言「サーバーへの保存が終わると自動で確定します」が §31.2 の既知の制約（自動再試行されない）と食い違う。文言を直すか、Chunk 登録完了時に Barrier を再試行する配線を足すかを決める。
 
 ### T5. 録音中の会議を起動時復旧から守る ✅ 完了（9 回目のレビュー対応）
@@ -205,7 +269,7 @@ T3-c の内容（§31.4）:
 ### 保留・メモ
 
 - T1-f で書き出した WAV（`exportMemoryBacklog()`）をサーバーへ取り込む経路は未設計。必要になったら Phase 2 以降で API を検討する。
-- `npm audit` で vitest 3 系（`@vitest/mocker`）に moderate 2 件。修正には vitest 5 への破壊的更新が要るため保留（vite 追加とは無関係）。
+- 直接送信した末尾の `endFrame` は IDB に残らず、再読み込み・クラッシュ後の復旧は IDB の Chunk だけで `audioFrameCount` を補うため小さくなりうる（サーバーは保存するだけで確定は通る。末尾の欠けの計測が過小になる）。直すなら `ChunkListResponse` に `endFrame` を足して復旧・Finalizer で補う（API 変更・要確認、59 回目のスキップ）。
 - `package.json` に lint スクリプトがない。コミット前の確認は現状 `typecheck` + `test` のみ。
 - 設計書のテストコード（`test/harness.ts`、`test/crash-recovery.test.ts`、`test/chunk-standalone.test.ts`、`test/resampler-aliasing.test.ts`）は、実装側にテストを足したため設計書と一致しない。設計書側は「最低限のテスト集合」という扱いで許容している。
 
@@ -215,12 +279,85 @@ T3-c の内容（§31.4）:
 
 新しい順。1 セッション 3〜5 行まで。
 
+### 2026-11-08（49 回目・レビュー指摘 10 件）
+
+- 9 件を修正、1 件スキップ（既存テストで同じ経路を検証済み）。新規テストは修正前の Red を確認（文言・テスト組み直しの 2 件を除く）。
+- Phase 1 同期（DIFF 0）、Phase 2 client・Phase 3 server に波及。コミット未実施。
+
+### 2026-11-08（48 回目・レビュー指摘 15 件）
+
+- 15 件すべて有効と判定し修正（コード 9・テスト 1・文書 5）。修正前の Red を確認したテストを中心に追加。flush 後の最終保存だけ失敗する経路も追加で修正。
+- Phase 1 同期（DIFF 0）、Phase 2 client・Phase 3 client に波及。重複は前回のヘルパーへ寄せ直した。コミット未実施。
+
+### 2026-11-08（47 回目・SonarCloud 重複率）
+
+- PR #12 の品質ゲート（新規コードの重複 3.3%）をテストのヘルパー抽出で解消。f836da1 までコミット済み。
+
+### 2026-11-08（46 回目・レビュー指摘 10 件）
+
+- 10 件すべて有効と判定し修正（コード 6・テスト 1・文書 3）。テスト 11 件追加（Red 確認 9 件＋既存 2 件強化）。
+- Phase 1 同期（DIFF 0）、Phase 2 client・Phase 3 client/server に波及。コミット未実施。
+
+### 2026-11-08（45 回目・CodeRabbit 指摘対応）
+
+- 指摘 19 件を照合し、18 件を修正（コード 9・テスト 3・文書 6）、docstring 網羅率はスキップ。回帰テストは修正前の Red を確認。
+- Phase 1 埋め込みコード同期（チェッカー DIFF 0）、Phase 1 本文、Phase 2 client の Controller、Phase 2/3 server の確定 API を更新。README に停止理由の3か所確認と、サーバー側 WAV の読取専用再生手順を追加。
+- コミット未実施。API・Vite は停止のまま。
+
+### 2026-11-08（43 回目・マイク切断試験の保存結果を照合）
+
+- 最新会議 `bbd1a297…` は13.25725秒・1 Chunk、サーバー登録・確定済み。WAVの形式・サンプル数・サイズ・ハッシュとSQLite／`meeting.json`の確定値を読み取り照合し一致。
+- サーバーの記録だけでは停止理由を判定できないため、物理切断による自動停止と通知表示の報告を待ち、T12-bはまだ合格にしない。
+- 証跡を `private/next-action-2026-11-08/mic-disconnect-result.json` に保存。製品コード変更なし、コミット未実施。T10合格・H聴取待ち・60分録音保留を維持。
+
+### 2026-11-08（42 回目・T10 実機確認合格）
+
+- 利用者が「再試行」ボタンを押さずに確定したと報告。会議 `f4ea99b6…` の前回のサーバー・WAV照合と合わせ、T10の実機確認を合格に更新。
+- 次は T12-b の物理切断と T4-H の既存音声の聴取。60分録音は保留を維持。
+- 進捗・README・Phase 1設計書を更新。製品コード変更なし、コミット未実施。
+
+### 2026-11-08（41 回目・利用者の録音結果を確認）
+
+- 最新の「無題の会議」`f4ea99b6…` を確認。36.8080625秒、seq 0・1、サーバーで全件登録済み・`finalized`。
+- WAVのヘッダ・サンプル数・SHA-256・ファイルサイズ・offset連続性、SQLiteと `meeting.json` の確定値を照合して一致。音声はゼロ振幅ではない。証跡を `private/next-action-2026-11-08/manual-recording-result.json` に保存。
+- 手動再試行の有無とIDB状態はサーバーから断定できないため、T10自動確定の実機合格は操作報告待ち。T12物理切断・H聴取・60分録音の保留は維持。
+- 製品コード変更なし。API・Viteは起動継続、文書差分は未コミット。
+
+### 2026-11-08（40 回目・実機確認の開始と既存 WAV 再生）
+
+- 通常の API と Vite を起動、Chrome にアプリを開き、トークンをクリップボードへコピー。利用者へ実マイクでの35秒録音・停止を依頼し、結果待ち。
+- 既存会議 `68c2f545…` の11 WAVの連番・ヘッダ・サンプル数・SHA-256を読み取り検証。Chromeのネイティブプレーヤーで全件を最後までエラーなく再生（消音・16倍速）。外部HTTP(S)通信・pageerrorなし。
+- 結果と聴取用ページを `private/next-action-2026-11-08/` に保存。T4-H は聴取待ち、T10実マイク・T12物理切断も結果待ち。60分録音は保留。
+- 製品コード変更なし。前回の文書差分を保持。実機確認用サーバーは起動中、コミット未実施。
+
+### 2026-11-08（39 回目・Next アクションの結合確認）
+
+- 実サーバー＋専用 Chrome＋合成マイクで T10/T12 を確認。A の末尾 PUT 待ち中に B を録音し、停止ボタン・両会議の自動確定、401 復帰、復旧文言、合成切断停止、中止と WAV 保持が通過。
+- 4 会議の IDB・SQLite・実 WAV を照合し、サンプル数・ハッシュ・確定状態が一致。pageerror・外部ホスト宛てアプリ通信なし。証跡は `private/next-action-2026-11-08/`。
+- 初回検証の照合失敗は Playwright の非同期条件待ちが原因。明示的な状態ポーリングへ修正して再実行し通過。製品コードの変更なし。
+- TypeScript 352 件・Python 7 件、typecheck・build 通過。実マイク／既存音声の確認手順を README に用意。60 分録音は保留、既存データは未変更。検証用 API と Vite は停止済み。今回の文書差分は未コミット。
+
+### 2026-11-08（38 回目・T12 実装）
+
+- T12-a/c/b/d を TDD で実装。認証失敗の伝達、復旧前の状態別通知、mic ended による一度だけの停止、確認付き確定中止（データ保持・再開除外）を追加。
+- 確定待ち一覧に失敗理由・保存先別件数を表示。同じ失敗通知を抑止し、マイク停止時の UI 解放と WAV 書き出しを接続。
+- TypeScript 23 ファイル／331 件・Python 7 件、typecheck・build・設計コード同期・diff check 通過。専用 Chrome で認証復帰・中止／再読み込み・合成マイク切断と末尾 1 Chunk 保存を確認、pageerror と外部ホストへのアプリ通信なし。
+- 1-g は引き続き保留。T4-H と実マイク／実サーバーでの短時間再確認は残す。既存録音データには触れていない。コミット未実施。
+
+### 2026-11-08（37 回目・T10 修正／T12 方針整理）
+
+- T10：停止後の末尾保存完了と Barrier 実行中の完了で Red を確認し、成功通知と再判定の配線で Green。録音中・別タブロック・メモリ待機の保護、復帰時の複数 Chunk も検証。照合不一致の再送ループも Red → Green で防止。UI の文言テストも Red → Green。
+- T12：4 件を共通の失敗通知・保存状況・復帰操作の方針にまとめ、各項目の受入条件と実装順を記録。実装は次回。
+- 1-g は利用者指示で保留。60 分実録音・T10 の実機検証は未実施。T4-H の保留も維持。
+- 検証：TypeScript 313 件・Python 7 件、typecheck・build・設計コード同期・差分チェック。コミットはしていない。
+
 ### 2026-11-06（36 回目・依存脆弱性の対応）
 
 - Dependabot 9 件に加え、npm audit のみで出る tinypool（Critical 2）・source-map-js（High）を精査。実害のある経路はなかったが全件更新で解消。
 - vite 7.3.7・vitest 5.1.0・source-map-js 1.2.2・certifi 2026.10.23 へ更新。vitest は 3.2.x では tinypool が残り、4.1.x は npm 10.9.8 の依存解決がクラッシュするため 5 系を採用。`vi.fn` の型が厳密になったので `test/page-lifecycle.test.ts` の宣言を `Mock<...>` に変更。
 - certifi は 2026.10.18 に固定しない（emSign ルートを全削除した版。アドバイザリは 10.19 以降を推奨）。Windows で使う場合、launch-editor 系の修正が vite 7.3.7 に含まれることが前提。
-- GitHub のアラートは main へのマージで閉じる。src・設計書は無変更。
+- PR #11 のマージで Dependabot の 9 件はすべて `fixed`（open 0 を確認）。src・設計書は無変更。
+- レビュー指摘 2 件を検証し修正：T4-H は再生対象が書き出した WAV で合格条件の既存 Chunk と異なるため保留に訂正（35 回目のログは当時の記録として残す）／古い `npm audit` の保留メモを削除。
 
 ### 2026-10-07（35 回目・T4 項目 F〜H 合格）
 

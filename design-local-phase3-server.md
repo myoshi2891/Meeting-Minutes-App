@@ -8,6 +8,8 @@
 
 ---
 
+停止理由の追加契約（Phase 1 §12）を継承する。`stopReason` / `stopDetectedAtEpochMs` は対で省略可能、既存会議は未記録のまま保持し、最初の確定値を上書きしない。`mic_ended` は音声トラック終了の観測であり物理切断の断定ではない。
+
 # 1. 目的と範囲、Phase 2 からの変更一覧
 
 | 区分 | ファイル | 内容 |
@@ -442,6 +444,8 @@ class Meeting(BaseModel):
     consent_confirmed_at: int
     ended_at: int | None = None
     total_audio_frames: int | None = None
+    stop_reason: Literal["manual", "mic_ended"] | None = None
+    stop_detected_at: int | None = None
     transcript_version: int = 0
     stt_model_used: str | None = None
     llm_model_used: str | None = None
@@ -1912,7 +1916,7 @@ def restore_latest(db_path: Path, backups_dir: Path) -> Path | None:
 
 # 18. 再構築 `storage/rebuild.py` と `meeting.json`
 
-finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` がそれと音声ファイルから欠損行を復元する。
+finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` がそれと音声ファイルから欠損行を復元する。Phase 1/2 の確定 API は終了時刻を `endedAtEpochMs` で書き、移行 011 はそのファイルを `recordings/local/` へ移すだけなので、rebuild は `endedAt` がなければ `endedAtEpochMs` を読む（終了時刻を失わない）。`meeting.json` は手で編集・破損しうる外部入力なので、停止理由（`stopReason`）と検出時刻（`stopDetectedAtEpochMs`）は `Meeting` を組み立てる前に組で検証する（`_stop_metadata()`）。未知の停止理由で `Meeting` の検証が失敗したり、範囲外の時刻で SQLite への挿入が `OverflowError` になったりすると、rebuild 全体が止まって他の会議も復元できなくなるためである。停止理由が `manual` / `mic_ended` のどちらかで、検出時刻が確定 API と同じ範囲（0〜2⁶³−1、SQLite INTEGER の上限）の整数（`bool` を除く）のときだけ両方を残し、どちらかが不正なら両方を `None` にする。
 
 ```python
 # minutes_local/storage/rebuild.py
@@ -1949,6 +1953,7 @@ def write_meeting_json(data_dir: Path, meeting: Meeting, chunks: list[AudioChunk
         "sessionStartEpochMs": meeting.session_start_epoch_ms, "nativeSampleRate": meeting.native_sample_rate,
         "consentConfirmedAt": meeting.consent_confirmed_at, "endedAt": meeting.ended_at,
         "totalAudioFrames": meeting.total_audio_frames,
+        "stopReason": meeting.stop_reason, "stopDetectedAtEpochMs": meeting.stop_detected_at,
         "chunks": [{"source": c.source, "sequenceNo": c.sequence_no, "startOffsetMs": c.start_offset_ms,
                     "endOffsetMs": c.end_offset_ms, "sampleCount": c.sample_count, "sha256": c.sha256,
                     "vadScore": c.vad_score, "hasVoice": c.has_voice} for c in chunks],
@@ -1978,6 +1983,15 @@ def _chunk_from_file(path: Path, codec: AudioCodec | None) -> tuple[int, str, by
     return None
 
 
+def _stop_metadata(meta: dict[str, Any]) -> tuple[str | None, int | None]:
+    """meeting.json の停止理由と検出時刻を組で検証する。片方でも不正なら両方 None（Meeting の検証で rebuild 全体を止めない）。"""
+    reason, detected = meta.get("stopReason"), meta.get("stopDetectedAtEpochMs")
+    # bool は int のサブクラスなので明示的に除く。範囲は確定 API と同じ SQLite INTEGER（範囲外は insert で OverflowError）
+    if reason in ("manual", "mic_ended") and isinstance(detected, int) and not isinstance(detected, bool) and 0 <= detected <= 2**63 - 1:
+        return reason, detected
+    return None, None
+
+
 def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) -> RebuildReport:
     report = RebuildReport(skipped_files=[])
     recordings = data_dir / "recordings"
@@ -1994,11 +2008,14 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
                 meta = {}
         t = now_ms()
         if repo.get_meeting(conn, meeting_id) is None:
+            stop_reason, stop_detected_at = _stop_metadata(meta)
             repo.insert_meeting(conn, Meeting(
                 id=meeting_id, local_user_id=str(meta.get("localUserId", user_id)), title=str(meta.get("title", "復元された会議")),
                 status="finalized", session_start_epoch_ms=int(meta.get("sessionStartEpochMs", 0)),
                 native_sample_rate=int(meta.get("nativeSampleRate", 0)), consent_confirmed_at=int(meta.get("consentConfirmedAt", 0)),
-                ended_at=meta.get("endedAt"), total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
+                # Phase 1/2 の finalize は endedAtEpochMs で書く（移行 011 で recordings/local/ へ移った meeting.json）。Phase 3 は endedAt
+                ended_at=meta.get("endedAt", meta.get("endedAtEpochMs")), total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
+                stop_reason=stop_reason, stop_detected_at=stop_detected_at,
             ))
             report.meetings_created += 1
         meta_chunks = {(c["source"], int(c["sequenceNo"])): c for c in meta.get("chunks", []) if "source" in c and "sequenceNo" in c}
@@ -2251,11 +2268,11 @@ from __future__ import annotations
 import base64
 import errno
 import json
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import Field, model_validator, BaseModel
 
 from ..db import repo
 from ..db.connection import now_ms
@@ -2278,8 +2295,16 @@ class CreateMeetingRequest(BaseModel):
 
 class FinalizeRequest(BaseModel):
     expectedChunkCounts: dict[str, int]
-    endedAtEpochMs: int
-    totalAudioFrames: int
+    endedAtEpochMs: int = Field(ge=0)
+    totalAudioFrames: int = Field(ge=0)
+    stopReason: Literal["manual", "mic_ended"] | None = None
+    stopDetectedAtEpochMs: int | None = Field(default=None, ge=0, le=2**63 - 1, strict=True)  # SQLite INTEGER の上限（Phase 1 §12）
+
+    @model_validator(mode="after")
+    def validate_stop_observation(self) -> "FinalizeRequest":
+        if (self.stopReason is None) != (self.stopDetectedAtEpochMs is None):
+            raise ValueError("stopReason and stopDetectedAtEpochMs must be supplied together")
+        return self
 
 
 def _capabilities(request: Request) -> dict[str, Any]:
@@ -2452,7 +2477,8 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
         if current is not None and current.status in ("created", "recording", "finalizing"):
             if len(repo.list_chunks(conn, meeting_id)) != len(chunks):
                 return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "chunks changed during finalize"), status_code=409)
-            repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames)
+            repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames,
+                                stop_reason=req.stopReason, stop_detected_at=req.stopDetectedAtEpochMs)
             pipeline.on_finalized(conn, meeting_id)
         snapshot = repo.get_meeting(conn, meeting_id)
         chunks_now = repo.list_chunks(conn, meeting_id)
@@ -3963,10 +3989,14 @@ async def test_dominant_language_selects_prompt(client3: httpx.AsyncClient, ctx3
 # tests/test_codec_recovery.py
 from __future__ import annotations
 
+import json
+
 import httpx
+import pytest
 
 from minutes_local.bootstrap import open_database_with_recovery
 from minutes_local.db import repo
+from minutes_local.db.models import Meeting
 from minutes_local.db.connection import Database
 from minutes_local.jobs import scheduler
 from minutes_local.jobs.context import AppContext
@@ -3974,7 +4004,7 @@ from minutes_local.jobs.runner import JobRunner
 from minutes_local.storage import backup
 from minutes_local.storage.codec import FakeCodec
 from minutes_local.storage.files import InvalidWavError, read_pcm
-from minutes_local.storage.rebuild import rebuild
+from minutes_local.storage.rebuild import RebuildReport, rebuild
 from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm
 
 
@@ -4048,6 +4078,58 @@ async def test_rebuild_from_recordings(client3: httpx.AsyncClient, ctx3: AppCont
     assert report.meetings_created == 1 and report.chunks_created == 2 and report.skipped_files == []
     assert m is not None and m.local_user_id == "local" and m.status == "finalized" and m.title == "t"
     assert after == before
+
+
+async def test_rebuild_keeps_end_time_from_phase2_snapshot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """Phase 1/2 の finalize が書いた meeting.json（endedAtEpochMs）を、移行 011 で移した後に rebuild しても終了時刻を失わない。"""
+    await _completed_meeting(client3, runner3, ctx3)
+    path = ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["endedAtEpochMs"] = snapshot.pop("endedAt")                                 # Phase 2 §21.2 の確定 API と同じキー
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+    with ctx3.db.write_sync() as conn:
+        rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    assert m is not None and m.ended_at == snapshot["endedAtEpochMs"] and m.ended_at is not None
+
+
+def _rewrite_snapshot_and_rebuild(ctx3: AppContext, **fields: object) -> tuple[RebuildReport, Meeting | None]:
+    """meeting.json の項目を書き換え、DB 行を消してから rebuild する。"""
+    path = ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot.update(fields)
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        return report, repo.get_meeting(conn, "m-1")
+
+
+async def test_rebuild_keeps_valid_stop_pair(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """有効な停止理由と検出時刻の組は、rebuild 後もそのまま残る。"""
+    await _completed_meeting(client3, runner3, ctx3)
+    report, m = _rewrite_snapshot_and_rebuild(ctx3, stopReason="mic_ended", stopDetectedAtEpochMs=1_700_000_000_000)
+    assert report.meetings_created == 1 and report.skipped_files == []
+    assert m is not None and m.stop_reason == "mic_ended" and m.stop_detected_at == 1_700_000_000_000
+
+
+@pytest.mark.parametrize(("reason", "detected"), [
+    ("unplugged", 1),                 # 未知の停止理由
+    ("manual", -1),                   # 範囲外（負）
+    ("manual", 2**63),                # 範囲外（SQLite INTEGER 超過）
+    ("manual", True),                 # bool は int のサブクラスだが時刻ではない
+    ("manual", "1"),                  # 文字列
+    (None, 1),                        # 片方だけ
+])
+async def test_rebuild_drops_malformed_stop_pair(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                 reason: object, detected: object) -> None:
+    """不正な停止理由・検出時刻は組ごと None にし、rebuild 全体を止めない（会議と Chunk は復元する）。"""
+    await _completed_meeting(client3, runner3, ctx3)
+    report, m = _rewrite_snapshot_and_rebuild(ctx3, stopReason=reason, stopDetectedAtEpochMs=detected)
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert m is not None and m.status == "finalized" and m.stop_reason is None and m.stop_detected_at is None
 
 
 async def test_missing_chunk_is_reported_for_resync(client3: httpx.AsyncClient, ctx3: AppContext) -> None:
@@ -4158,7 +4240,7 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | エコー除去 | `test_echo_from_system_is_dropped_on_mic` |
 | Chunk 単位言語判定・比率・混在時の要約言語 | `test_auto_detects_per_chunk_and_mixed_summary_language`、`test_dominant_language_selects_prompt`、`test_resolve_chunk_language_rules` |
 | 圧縮の往復検証・不一致時の保持 | `test_compress_replaces_wav_after_roundtrip`、`test_compress_keeps_wav_when_roundtrip_mismatches` |
-| バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_missing_chunk_is_reported_for_resync` |
+| バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
 | マイグレーション 008〜011 | `test_apply_phase3_moves_files_and_extends_job_types` |
 | Phase 2 の回帰 | Phase 2 §23 の 34 テスト（`test_phase1_contract.py` は物理パスのみ更新） |

@@ -79,7 +79,9 @@ interface Setup {
   health: RecordingHealth;
   errors: Error[];
   locks: FakeLockManager;
-  track: EventTarget & { stop: ReturnType<typeof vi.fn> };
+  track: EventTarget & { stop: ReturnType<typeof vi.fn>; readyState: MediaStreamTrackState };
+  /** 次の録音用に新しいマイクのトラックへ差し替える（止めたトラックは ended のまま残る） */
+  useFreshTrack: () => Setup["track"];
   audioContext: AudioContext;
   /** コントローラが持つ AudioWorkletNode 側のポート（onmessage の解除を確認する） */
   nodePort: MessagePort;
@@ -91,7 +93,7 @@ interface Setup {
   untilCommand: (type: WorkletCommand["type"]) => Promise<void>;
 }
 
-async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, directSaver?: DirectChunkSaver): Promise<Setup> {
+async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, directSaver?: DirectChunkSaver, onMicEnded?: () => void, otherMeetingsBacklogCount?: () => number): Promise<Setup> {
   const db = await openDatabase(new IDBFactory());
   const chunkStore = chunkStoreOverride?.(db) ?? new ChunkStore(db);
   const meetingStore = new MeetingStore(db);
@@ -104,7 +106,13 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
       readonly port = channel.port1;
     },
   );
-  const track = Object.assign(new EventTarget(), { stop: vi.fn() });
+  type Track = Setup["track"];
+  /** ブラウザと同じく stop() で ended になるトラック */
+  const makeTrack = (): Track => {
+    const t: Track = Object.assign(new EventTarget(), { stop: vi.fn(() => { t.readyState = "ended"; }), readyState: "live" as MediaStreamTrackState });
+    return t;
+  };
+  let track = makeTrack();
   const audioContext = {
     sampleRate: 48000,
     currentTime: 0,
@@ -112,6 +120,10 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
     createMediaStreamSource: () => ({ connect: vi.fn(), disconnect: vi.fn() }),
   } as unknown as AudioContext;
   const mediaStream = { getAudioTracks: () => [track] } as unknown as MediaStream;
+  const useFreshTrack = (): Track => {
+    track = makeTrack();
+    return track;
+  };
   const enqueued: string[] = [];
   const health = createHealth();
   const errors: Error[] = [];
@@ -137,16 +149,20 @@ async function setup(chunkStoreOverride?: (db: IDBDatabase) => ChunkStore, direc
     setTimer: (fn) => timers.push(fn),
     locks,
     directSaver,
+    onMicEnded,
+    otherMeetingsBacklogCount,
   });
   const fireTimers = () => {
     for (const fn of timers.splice(0)) fn();
   };
   const until = (condition: () => boolean) => signal.until(condition);
   const untilCommand = (type: WorkletCommand["type"]) => until(() => worklet.commands.some((c) => c.type === type));
-  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, locks, track, audioContext, nodePort: channel.port1, fireTimers, until, untilCommand };
+  return { controller, worklet, chunkStore, meetingStore, enqueued, health, errors, locks, track, useFreshTrack, audioContext, nodePort: channel.port1, fireTimers, until, untilCommand };
 }
 
 describe("makeChunkKey / sha256Hex", () => {
+
+
   it("chunkKey は sequenceNo を 6 桁ゼロ埋めし文字列順 = 番号順になる", () => {
     expect(makeChunkKey("m", "mic", 7)).toBe("m:mic:000007");
     expect(makeChunkKey("m", "mic", 10) > makeChunkKey("m", "mic", 9)).toBe(true);
@@ -159,6 +175,35 @@ describe("makeChunkKey / sha256Hex", () => {
 });
 
 describe("RecordingController", () => {
+  it.each(["manual", "mic_ended"] as const)("停止理由 %s と検出時刻を最終フレーム数とともに永続化する", async (reason) => {
+    // Arrange
+    const s = await setup();
+    await s.controller.start("stop-metadata", "停止理由", 1);
+    // Act
+    await s.controller.stop(reason, 123456);
+    await s.controller.stop("manual", 999999);
+    // Assert: 二度目の停止で最初の記録を変えない
+    expect(await s.meetingStore.get("stop-metadata")).toMatchObject({
+      status: "stop_requested", stopReason: reason, stopDetectedAtEpochMs: 123456,
+      sessionClock: { audioFrameCount: 1600 },
+    });
+  });
+  it.each(["manual", "mic_ended"] as const)("停止 %s の完了前に別の理由で停止が重なっても、最初の停止理由と検出時刻を保つ", async (reason) => {
+    // Arrange：Worklet が応答せず、最初の停止が完了しない
+    const s = await setup();
+    await s.controller.start(`stop-overlap-${reason}`, "停止理由", 1);
+    s.worklet.silent = true;
+    const first = s.controller.stop(reason, 123456);
+    // Act：最初の停止の待機中に、別の理由・時刻で停止する
+    const second = s.controller.stop(reason === "manual" ? "mic_ended" : "manual", 999999);
+    // 重なった停止は最初の停止を共有するので、Worklet への stop は 1 回だけ
+    await s.untilCommand("stop");
+    s.fireTimers();
+    await Promise.all([first, second]);
+    expect(s.worklet.commands.filter((c) => c.type === "stop")).toHaveLength(1);
+    // Assert
+    expect(await s.meetingStore.get(`stop-overlap-${reason}`)).toMatchObject({ status: "stop_requested", stopReason: reason, stopDetectedAtEpochMs: 123456 });
+  });
   beforeEach(() => {
     vi.unstubAllGlobals();
   });
@@ -298,17 +343,95 @@ describe("RecordingController", () => {
     expect((await s.meetingStore.get("m1"))?.sessionClock.audioFrameCount).toBe(481600);
   });
 
-  it("stop 中に会議の保存が失敗しても、トラック停止・onmessage の解除・会議ロックの解放を行う", async () => {
+  it("stop 中に会議の保存が失敗し続けたら reject し、トラック停止・onmessage の解除を行い、会議ロックは呼び出し元へ渡すまで保持する", async () => {
     // Arrange
     const s = await setup();
     await s.controller.start("m1", "定例", 1);
-    vi.spyOn(s.meetingStore, "put").mockRejectedValueOnce(new Error("put failed"));
+    vi.spyOn(s.meetingStore, "put").mockRejectedValue(new Error("put failed"));
     // Act
     await expect(s.controller.stop()).rejects.toThrow("put failed");
     // Assert
     expect(s.track.stop).toHaveBeenCalled();
     expect(s.nodePort.onmessage).toBeNull();
-    expect(s.locks.held.size).toBe(0);
+    // 停止状態を保存できていないので、別タブに確定させない（App が takeMeetingLock で受け取り、書き直してから解放する）
+    expect(s.locks.held.size).toBe(1);
+    expect(s.controller.takeMeetingLock()).not.toBeNull();
+  });
+
+  it("最初の stop_requested の保存に失敗しても、末尾の Chunk 化と最終保存が済めば停止を完了し、失敗は onError に通知する", async () => {
+    // Arrange
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    vi.spyOn(s.meetingStore, "put").mockRejectedValueOnce(new Error("put failed"));
+    // Act
+    await s.controller.stop();
+    // Assert：最終保存で stop_requested が残るので、呼び出し元は確定へ進める
+    expect(s.errors.map((e) => e.message)).toEqual(["put failed"]);
+    expect((await s.meetingStore.get("m1"))?.status).toBe("stop_requested");
+    // 切り離す前に stop を送り、部分 Chunk を IDB に残す
+    expect(s.worklet.commands.some((c) => c.type === "stop")).toBe(true);
+    expect(s.enqueued).toEqual(["m1:mic:000000"]);
+    expect((await s.chunkStore.getChunk("m1:mic:000000"))?.meta.sampleCount).toBe(1600);
+  });
+
+  it("メモリ待機を残して stop したら会議ロックを保持し続け、drain で空になったら解放する", async () => {
+    // Arrange：IDB に書けず、直接送信も最初は失敗する
+    const { s, bringServerUp } = await startWithUnsavableBacklog();
+    // Act
+    await s.controller.stop();
+    const heldAfterStop = s.locks.held.has(meetingLockName("m1"));
+    bringServerUp();
+    await s.controller.drainMemoryBacklog();
+    // Assert：別タブが末尾をメモリに残したまま確定しないよう、空になるまでロックを渡さない
+    expect(heldAfterStop).toBe(true);
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(false);
+  });
+
+  it("自分のメモリ待機が空になっても、他の会議のメモリ待機が残る間は IDB の保存警告を消さない", async () => {
+    // Arrange：IDB に書けず末尾がメモリ待機に残る。このタブの別の会議にもメモリ待機がある
+    let others = 1;
+    const { s, bringServerUp } = await startWithUnsavableBacklog(() => others);
+    await s.controller.stop();
+    expect(s.health.degradedReasons).toContain("IDB_WRITE_FAILED");
+    bringServerUp();
+    // Act
+    await s.controller.drainMemoryBacklog();
+    // Assert：共有の警告は全会議のメモリ待機が空になってから外す
+    expect(s.controller.memoryBacklogCount).toBe(0);
+    expect(s.health.degradedReasons).toContain("IDB_WRITE_FAILED");
+    others = 0;
+    await s.controller.drainMemoryBacklog();
+    expect(s.health.degradedReasons).not.toContain("IDB_WRITE_FAILED");
+  });
+
+  it("stop 後に保持したロックは takeMeetingLock で呼び出し元へ渡し、以後 drain では解放しない", async () => {
+    // Arrange
+    const { s, bringServerUp } = await startWithUnsavableBacklog();
+    await s.controller.stop();
+    // Act
+    const release = s.controller.takeMeetingLock();
+    bringServerUp();
+    await s.controller.drainMemoryBacklog();
+    // Assert
+    expect(release).not.toBeNull();
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(true);
+    release?.();
+    await vi.waitFor(() => expect(s.locks.held.has(meetingLockName("m1"))).toBe(false));
+    expect(s.controller.takeMeetingLock()).toBeNull();
+  });
+
+  it("前の録音のメモリ待機が残る間は、同じインスタンスで次の録音を始めず、保持したロックも手放さない", async () => {
+    // Arrange：m1 の末尾がメモリ待機に残り、ロックを保持したまま止まっている
+    const { s, bringServerUp } = await startWithUnsavableBacklog();
+    await s.controller.stop();
+    // Act
+    const starting = s.controller.start("m2", "定例2", 2);
+    // Assert：m1 のロックの解放手段を上書きせず、drain で空になれば解放できる
+    await expect(starting).rejects.toThrow("memory backlog");
+    expect(s.locks.held.has(meetingLockName("m2"))).toBe(false);
+    bringServerUp();
+    await s.controller.drainMemoryBacklog();
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(false);
   });
 
   it("同じインスタンスで stop 後に別の会議を start すると、Chunk の連番は 0 から始まる", async () => {
@@ -321,6 +444,29 @@ describe("RecordingController", () => {
     await s.controller.stop();
     // Assert
     expect(s.enqueued).toEqual(["m1:mic:000000", "m2:mic:000000"]);
+  });
+
+  it("stop が重なっても 1 回の停止を共有し、完了後に始めた次の録音のマイク・ロックを後から来た stop が外さない", async () => {
+    // Arrange：Worklet は自動では応答しない
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.silent = true;
+    // Act：stop を 2 回呼び、最初に送られた stop にだけ応答する
+    const first = s.controller.stop();
+    const second = s.controller.stop();
+    await s.untilCommand("stop");
+    const stopCmd = s.worklet.commands.find((c) => c.type === "stop");
+    if (stopCmd?.type !== "stop") throw new Error("stop command not sent");
+    s.worklet.sendFlushed(stopCmd.requestId);
+    await first;
+    s.useFreshTrack();
+    await s.controller.start("m2", "定例2", 2);
+    s.fireTimers();
+    await second;
+    // Assert
+    expect(s.worklet.commands.filter((c) => c.type === "stop")).toHaveLength(1);
+    expect(s.locks.held.has(meetingLockName("m2"))).toBe(true);
+    expect(s.nodePort.onmessage).not.toBeNull();
   });
 
   it("Worklet が stop に応答しなくてもタイムアウトで onError を通知し、トラックを解放して stop が終わる", async () => {
@@ -403,6 +549,82 @@ describe("RecordingController", () => {
     expect(s.enqueued).toContain("m1:mic:000000");
   });
 
+  /** IDB への Chunk の書き込みが常にクォータ超過で失敗する ChunkStore */
+  const fullStore = (db: IDBDatabase): ChunkStore =>
+    new (class extends ChunkStore {
+      override async putChunk(): Promise<void> {
+        throw new DOMException("full", "QuotaExceededError");
+      }
+    })(db);
+
+  it("クォータを使い切ったまま止めた末尾は、drain でサーバーへ直接送り、登録できなければメモリ待機に残す", async () => {
+    // Arrange：IDB の空きが戻らないまま停止し、末尾がメモリ待機に残っている
+    let registered = false;
+    const sent: string[] = [];
+    const s = await setup(fullStore, {
+      put: async (record) => {
+        sent.push(record.chunkKey);
+        return { ok: true, registered, serverPath: "recordings/x.wav", idempotent: false };
+      },
+    });
+    await s.controller.start("m1", "定例", 1);
+    await s.controller.stop();
+    expect(s.controller.memoryBacklogCount).toBe(1);
+    // Act・Assert：DB 未登録なら外さない
+    await s.controller.drainMemoryBacklog();
+    expect(s.controller.memoryBacklogCount).toBe(1);
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(true);
+    // DB 登録まで済めば外し、ロックも解放する
+    registered = true;
+    expect(await s.controller.drainMemoryBacklog()).toBe(1);
+    expect(s.controller.memoryBacklogCount).toBe(0);
+    expect(sent).toEqual(["m1:mic:000000", "m1:mic:000000"]);
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(false);
+  });
+
+  it("flush 後の最終保存に失敗したら停止を reject し、最終の音声フレーム数が書けるまで会議ロックを保持して呼び出し元へ渡す", async () => {
+    // Arrange：stop_requested の保存は通り、最終保存だけ失敗する
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    const put = s.meetingStore.put.bind(s.meetingStore);
+    let puts = 0;
+    vi.spyOn(s.meetingStore, "put").mockImplementation(async (meeting) => {
+      if (++puts === 2) throw new DOMException("quota", "QuotaExceededError");
+      return put(meeting);
+    });
+    // Act
+    await expect(s.controller.stop()).rejects.toThrow("quota");
+    // Assert：別タブが古い audioFrameCount のまま確定しないよう、ロックを手放さない（メモリ待機が空の drain でも解放しない）
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(true);
+    await s.controller.drainMemoryBacklog();
+    expect(s.locks.held.has(meetingLockName("m1"))).toBe(true);
+    const release = s.controller.takeMeetingLock();
+    expect(release).not.toBeNull();
+    release?.();
+    await vi.waitFor(() => expect(s.locks.held.has(meetingLockName("m1"))).toBe(false));
+  });
+
+  it("最終保存に失敗して保持したロックを呼び出し元が受け取るまでは、同じインスタンスで次の録音を始めない", async () => {
+    // Arrange：メモリ待機は空だが、最終保存の失敗で m1 のロックを保持している
+    const s = await setup();
+    await s.controller.start("m1", "定例", 1);
+    const put = s.meetingStore.put.bind(s.meetingStore);
+    let puts = 0;
+    vi.spyOn(s.meetingStore, "put").mockImplementation(async (meeting) => {
+      if (++puts === 2) throw new DOMException("quota", "QuotaExceededError");
+      return put(meeting);
+    });
+    await expect(s.controller.stop()).rejects.toThrow("quota");
+    // Act / Assert：解放手段を上書きして m1 のロックを取り残さない
+    await expect(s.controller.start("m2", "定例2", 2)).rejects.toThrow("meeting lock");
+    expect(s.locks.held.has(meetingLockName("m2"))).toBe(false);
+    // 受け取った後は再利用できる
+    const release = s.controller.takeMeetingLock();
+    release?.();
+    await s.controller.start("m3", "定例3", 3);
+    expect(s.locks.held.has(meetingLockName("m3"))).toBe(true);
+  });
+
   it("QuotaExceeded 以外の保存エラーは onError に通知しつつ、Chunk をメモリ待機に残して欠番を作らない", async () => {
     // Arrange：最初の put だけ一般エラーで失敗させる
     let failNext = true;
@@ -441,6 +663,18 @@ describe("RecordingController", () => {
       }
     })(db);
 
+  /** IDB に書けず、直接送信も bringServerUp() までは失敗する状態で m1 の録音を始める（末尾がメモリ待機に残る） */
+  async function startWithUnsavableBacklog(otherMeetingsBacklogCount?: () => number): Promise<{ s: Setup; bringServerUp: () => void }> {
+    let serverUp = false;
+    const s = await setup(closedStore, {
+      put: async () => serverUp
+        ? { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false }
+        : { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } },
+    }, undefined, otherMeetingsBacklogCount);
+    await s.controller.start("m1", "定例", 1);
+    return { s, bringServerUp: () => { serverUp = true; } };
+  }
+
   it("IDB に書けない Chunk は drain でサーバーへ直接送り、メモリ待機から外す", async () => {
     // Arrange
     const sent: string[] = [];
@@ -459,6 +693,33 @@ describe("RecordingController", () => {
     expect(drained).toBe(1);
     expect(sent).toEqual(["m1:mic:000000"]);
     expect(s.controller.memoryBacklogCount).toBe(0);
+  });
+
+  it("drain が重なっても順に処理し、送れなかった Chunk を別の drain がメモリ待機から外さない", async () => {
+    // Arrange：IDB に書けない Chunk が 2 件メモリ待機にあり、2 件目の直接送信は 1 回目だけ失敗する
+    const registered = new Set<string>();
+    let failSecond = true;
+    const s = await setup(closedStore, {
+      put: async (r) => {
+        if (r.meta.sequenceNo === 1 && failSecond) {
+          failSecond = false;
+          return { ok: false, retryable: true, error: { kind: "NETWORK", message: "down", httpStatus: null, at: 0 } };
+        }
+        registered.add(r.chunkKey);
+        return { ok: true, registered: true, serverPath: "recordings/x.wav", idempotent: false };
+      },
+    });
+    await s.controller.start("m1", "定例", 1);
+    s.worklet.sendChunk(1600);
+    s.worklet.sendChunk(1600);
+    await s.until(() => s.errors.length >= 2);
+    // Act
+    await Promise.allSettled([s.controller.drainMemoryBacklog(), s.controller.drainMemoryBacklog()]);
+    // Assert：外した Chunk はすべてサーバーに登録済み（送れなかった 2 件目を取りこぼさない）
+    const retained = s.controller.exportMemoryBacklog().map((f) => makeChunkKey(f.meta.meetingId, f.meta.source, f.meta.sequenceNo));
+    expect(registered.size + retained.length).toBe(2);
+    expect(new Set([...registered, ...retained])).toEqual(new Set(["m1:mic:000000", "m1:mic:000001"]));
+    expect(registered.has("m1:mic:000000")).toBe(true);
   });
 
   it("drain でメモリ待機が空になったら IDB の劣化理由だけを外し、他の劣化理由は残す", async () => {
@@ -502,6 +763,65 @@ describe("RecordingController", () => {
     expect(s.controller.memoryBacklogCount).toBe(1);
   });
 
+  it("停止後のメモリ待機を破棄すると空になり、IDB の保存警告と保持していたロックを外す", async () => {
+    // Arrange：IDB に書けない末尾をメモリ待機に残して止めた
+    const failing = (db: IDBDatabase) => {
+      const store = new ChunkStore(db);
+      vi.spyOn(store, "putChunk").mockRejectedValue(new Error("IDB closed"));
+      return store;
+    };
+    const s = await setup(failing);
+    await s.controller.start("m-discard", "定例", 1);
+    await s.controller.stop();
+    expect(s.controller.memoryBacklogCount).toBe(1);
+    expect(s.locks.held.has(meetingLockName("m-discard"))).toBe(true);
+    // Act
+    const discarded = await s.controller.discardMemoryBacklog();
+    // Assert
+    expect(discarded).toBe(1);
+    expect(s.controller.memoryBacklogCount).toBe(0);
+    expect(s.controller.exportMemoryBacklog()).toEqual([]);
+    expect(s.health.degradedReasons).not.toContain("IDB_WRITE_FAILED");
+    expect(s.locks.held.has(meetingLockName("m-discard"))).toBe(false);
+  });
+
+  it("start の準備中に drain・破棄が走っても会議ロックを解放しない", async () => {
+    // Arrange：addModule の完了を止め、start を準備中のままにする
+    const s = await setup();
+    let finishAddModule = (): void => undefined;
+    vi.mocked(s.audioContext.audioWorklet.addModule).mockImplementationOnce(
+      () => new Promise<void>((resolve) => { finishAddModule = resolve; }),
+    );
+    const starting = s.controller.start("m-start-drain", "定例", 1);
+    for (let i = 0; i < 100 && vi.mocked(s.audioContext.audioWorklet.addModule).mock.calls.length === 0; i++) await Promise.resolve();
+    expect(s.locks.held.has(meetingLockName("m-start-drain"))).toBe(true);
+    // Act：サーバー復帰の drain と破棄が準備中に走る（メモリ待機は空）
+    await s.controller.drainMemoryBacklog();
+    await s.controller.discardMemoryBacklog();
+    // Assert：録音を始める会議のロックは保持したまま
+    expect(s.locks.held.has(meetingLockName("m-start-drain"))).toBe(true);
+    finishAddModule();
+    await starting;
+    expect(s.locks.held.has(meetingLockName("m-start-drain"))).toBe(true);
+    await s.controller.stop();
+    expect(s.locks.held.has(meetingLockName("m-start-drain"))).toBe(false);
+  });
+
+  it("録音中はメモリ待機を破棄しない", async () => {
+    // Arrange
+    const failing = (db: IDBDatabase) => {
+      const store = new ChunkStore(db);
+      vi.spyOn(store, "putChunk").mockRejectedValue(new Error("IDB closed"));
+      return store;
+    };
+    const s = await setup(failing);
+    await s.controller.start("m-discard-rec", "定例", 1);
+    await s.controller.flush();
+    // Act / Assert
+    await expect(s.controller.discardMemoryBacklog()).rejects.toThrow("recording");
+    expect(s.controller.memoryBacklogCount).toBe(1);
+  });
+
   it("メモリ待機中の Chunk を WAV として書き出せる（書き出してもメモリ待機からは外さない）", async () => {
     // Arrange
     const s = await setup(closedStore);
@@ -523,6 +843,46 @@ describe("RecordingController", () => {
     s.worklet.port.postMessage({ type: "ready", nativeSampleRate: 44100, renderQuantum: 128 });
     await s.until(() => s.errors.length >= 1);
     expect(s.errors[0]?.message).toContain("sampleRate mismatch");
+  });
+
+  it("mute では停止を要求せず、ended だけ一度通知する", async () => {
+    const ended = vi.fn();
+    const s = await setup(undefined, undefined, ended);
+    await s.controller.start("mic-ended", "定例", 1);
+    s.track.dispatchEvent(new Event("mute"));
+    expect(ended).not.toHaveBeenCalled();
+    s.track.dispatchEvent(new Event("ended"));
+    s.track.dispatchEvent(new Event("ended"));
+    expect(ended).toHaveBeenCalledOnce();
+  });
+
+  it("前の録音の MIC_TRACK_ENDED が残っていても、次の録音の切断を通知する", async () => {
+    // Arrange：health は録音をまたいで共有される
+    const ended = vi.fn();
+    const s = await setup(undefined, undefined, ended);
+    await s.controller.start("m1", "定例", 1);
+    s.track.dispatchEvent(new Event("ended"));
+    await s.controller.stop();
+    // Act：次の録音は新しく取得したトラックで行う
+    const next = s.useFreshTrack();
+    await s.controller.start("m2", "定例", 1);
+    expect(s.health.degradedReasons).toEqual([]);
+    next.dispatchEvent(new Event("ended"));
+    // Assert
+    expect(ended).toHaveBeenCalledTimes(2);
+    expect(s.health.degradedReasons).toEqual(["MIC_TRACK_ENDED"]);
+  });
+
+  it("リスナー登録前に終了していたトラックも切断として通知する", async () => {
+    // Arrange
+    const ended = vi.fn();
+    const s = await setup(undefined, undefined, ended);
+    s.track.readyState = "ended";
+    // Act
+    await s.controller.start("m1", "定例", 1);
+    // Assert
+    expect(ended).toHaveBeenCalledOnce();
+    expect(s.health.degradedReasons).toEqual(["MIC_TRACK_ENDED"]);
   });
 
   it("Mic トラック終了で MIC_TRACK_ENDED が degradedReasons に入る", async () => {

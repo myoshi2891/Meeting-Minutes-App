@@ -215,7 +215,10 @@ export interface LocalStorageQuota {
 }
 
 /** Meeting の Phase 1 状態。v4.0 §42 の Phase 1 部分のみ。 */
-export type MeetingStatus = "created" | "recording" | "stop_requested" | "finalizing" | "finalized";
+export type MeetingStatus = "created" | "recording" | "stop_requested" | "finalizing" | "finalized" | "abandoned";
+
+/** ブラウザが観測した停止理由。mic_ended は物理切断の原因まで断定しない。 */
+export type RecordingStopReason = "manual" | "mic_ended";
 
 /** IndexedDB の meetings レコード */
 export interface MeetingRecord {
@@ -227,6 +230,9 @@ export interface MeetingRecord {
   createdAt: number;
   updatedAt: number;
   endedAt: number | null;
+  /** 両方省略なら未記録（旧データ・停止を観測できなかった中断）。 */
+  stopReason?: RecordingStopReason;
+  stopDetectedAtEpochMs?: number;
   /** Finalization Barrier 通過時に確定する Chunk 総数 */
   finalChunkCount: number | null;
 }

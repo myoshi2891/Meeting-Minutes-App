@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { finalizeMeeting, type FinalizerDeps } from "../src/recording/finalizer";
+import { finalizeMeeting, measureMissingTailMs, type FinalizerDeps } from "../src/recording/finalizer";
 import type { MeetingRecord } from "../src/types/recording";
 import { LocalSaver } from "../src/api/local-saver";
 import { BASE_URL, createHarness, makeChunkRecord, TOKEN, type Harness } from "./harness";
@@ -28,7 +28,7 @@ function meeting(): MeetingRecord {
 /** seq 0..n-1 を保存し、Scheduler 経由でサーバーへ送り切る。録音した長さは stop() の flush 後と同じく最後の Chunk の終わりに揃える */
 async function recordAndSave(h: Harness, n: number): Promise<void> {
   const m = meeting();
-  if (n > 0) m.sessionClock.audioFrameCount = (n - 1) * 480000 + 1600;
+  m.sessionClock.audioFrameCount = n > 0 ? (n - 1) * 480000 + 1600 : 0;
   await h.meetingStore.put(m);
   for (let seq = 0; seq < n; seq++) {
     const r = await makeChunkRecord(MEETING_ID, seq, 1600);
@@ -73,6 +73,34 @@ function deps(h: Harness, fetchImpl: typeof fetch = h.server.fetch): FinalizerDe
 }
 
 describe("finalizeMeeting（Finalization Barrier）", () => {
+  it("再読み取りした停止理由と検出時刻を確定APIへ渡す", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 0);
+    const m = (await h.meetingStore.get(MEETING_ID))!;
+    await h.meetingStore.put({ ...m, stopReason: "mic_ended", stopDetectedAtEpochMs: 123456 });
+    const posted: unknown[] = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      if (init?.method === "POST") posted.push(JSON.parse(String(init.body)));
+      return h.server.fetch(input, init);
+    };
+    // Act
+    expect(await finalizeMeeting(deps(h, fetchImpl), MEETING_ID)).toEqual({ ok: true });
+    // Assert
+    expect(posted).toEqual([expect.objectContaining({ stopReason: "mic_ended", stopDetectedAtEpochMs: 123456 })]);
+  });
+
+  it.each([401, 403])("確定 POST の %s を通知し、stop_requested に戻す", async (status) => {
+    const h = await createHarness();
+    await recordAndSave(h, 0);
+    const unauthorized = vi.fn();
+    const fetchImpl: typeof fetch = (input, init) => init?.method === "POST"
+      ? Promise.resolve(new Response(null, { status })) : h.server.fetch(input, init);
+    expect(await finalizeMeeting({ ...deps(h, fetchImpl), onBackendUnauthorized: unauthorized }, MEETING_ID)).toMatchObject({ ok: false, stage: "finalize", reason: "unauthorized" });
+    expect(unauthorized).toHaveBeenCalledOnce();
+    expect((await h.meetingStore.get(MEETING_ID))?.status).toBe("stop_requested");
+  });
+
   it("全 Chunk が DB_REGISTERED かつサーバー一覧と一致すれば finalized になる", async () => {
     // Arrange
     const h = await createHarness();
@@ -304,6 +332,34 @@ describe("finalizeMeeting（Barrier の追加条件）", () => {
     expect((await h.chunkStore.getChunk(first.chunkKey))?.save.status).toBe("DB_REGISTERED");
   });
 
+  it.each([401, 403])("GET /chunks の %s は認証エラーとして分類する", async (status) => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 0);
+    const fetchImpl: typeof fetch = (input, init) => String(input).endsWith("/chunks")
+      ? Promise.resolve(new Response(null, { status })) : h.server.fetch(input, init);
+    // Act
+    const result = await finalizeMeeting(deps(h, fetchImpl), MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: false, stage: "verify", detail: `list HTTP ${status}`, reason: "unauthorized" });
+  });
+
+  it("一覧の meetingId が \"HTTP 403\" で終わる別会議でも、認証エラーに分類しない", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 0);
+    const otherMeeting: typeof fetch = async (input, init) => {
+      const res = await h.server.fetch(input, init);
+      if (!String(input).endsWith("/chunks")) return res;
+      const body: unknown = await res.json();
+      return new Response(JSON.stringify({ ...(body as object), meetingId: "other HTTP 403" }), { status: 200 });
+    };
+    // Act
+    const result = await finalizeMeeting(deps(h, otherMeeting), MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: false, stage: "verify", detail: "list meetingId mismatch: other HTTP 403" });
+  });
+
   it("GET /chunks の応答が別会議の一覧なら verify で失敗し、SAVED の Chunk を DB_REGISTERED にしない", async () => {
     // Arrange：サーバーが中身は一致するが meetingId の違う一覧を返す
     const h = await createHarness();
@@ -352,6 +408,20 @@ describe("finalizeMeeting（末尾の欠けの検出、T1-e）", () => {
     // Act / Assert
     expect(await finalizeMeeting(deps(h), MEETING_ID)).toEqual({ ok: true });
   });
+
+  it("Chunk が 1 件もなく録音した長さがあれば、全体を末尾の欠けとして返す", () => {
+    // Arrange：stop() が Worklet の応答を待てず、最初の Chunk も届かなかった（2 秒分）
+    const audioFrameCount = 2 * 16000;
+    // Act
+    const missing = measureMissingTailMs(audioFrameCount, [], 0, () => undefined);
+    // Assert
+    expect(missing).toBe(2000);
+  });
+
+  it("Chunk が 1 件もなく録音した長さもなければ欠けは 0", () => {
+    // Act / Assert
+    expect(measureMissingTailMs(0, [], 0)).toBe(0);
+  });
 });
 
 describe("finalizeMeeting（IDB を経由せずサーバーへ直接送った Chunk、T1-f）", () => {
@@ -396,6 +466,21 @@ describe("finalizeMeeting（IDB を経由せずサーバーへ直接送った Ch
     // Assert
     expect(result).toEqual({ ok: true });
     expect((await h.meetingStore.get(MEETING_ID))?.finalChunkCount).toBe(2);
+  });
+
+  it("末尾の Chunk がサーバーにだけあっても、IDB 外で控えた終わりの位置があれば末尾の欠けを missingTailMs で返す", async () => {
+    // Arrange：seq 1（終わり 481600）を直接送った後、Worklet の stop 無応答で 1 秒ぶんの Chunk が届かなかった
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    await putDirectly(h, 1);
+    const m = await h.meetingStore.get(MEETING_ID);
+    if (m === undefined) throw new Error("meeting not found");
+    await h.meetingStore.put({ ...m, sessionClock: { ...m.sessionClock, audioFrameCount: 481600 + 16000 } });
+    const offIdbEndFrame = (seq: number) => (seq === 1 ? 481600 : undefined);
+    // Act
+    const result = await finalizeMeeting({ ...deps(h), offIdbEndFrame }, MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: true, missingTailMs: 1000 });
   });
 });
 

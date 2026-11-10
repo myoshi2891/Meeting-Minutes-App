@@ -1,10 +1,11 @@
 import { IDBFactory } from "fake-indexeddb";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { LocalSaver } from "../src/api/local-saver";
-import { LocalSaveScheduler } from "../src/recording/local-save-scheduler";
+import { LocalSaveScheduler, type SchedulerDeps } from "../src/recording/local-save-scheduler";
 import { createInitialHealth } from "../src/recording/recording-health-monitor";
 import { ChunkStore, openDatabase } from "../src/storage/idb";
 import type { AudioChunkRecord, LocalBackendHealth } from "../src/types/recording";
+import { MAX_SAVE_ATTEMPTS } from "../src/recording/backoff";
 import { BASE_URL, makeChunkRecord, TOKEN } from "./harness";
 
 type Responder = (record: { sequenceNo: number; attempt: number }) => Response | "network-error";
@@ -14,7 +15,7 @@ function okResponse(r: AudioChunkRecord, registered = true): Response {
   return new Response(JSON.stringify({ meetingId, source, sequenceNo, sha256, sizeBytes, path: `p/${sequenceNo}`, registered }), { status: 201 });
 }
 
-async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response | "network-error", backendStatus: LocalBackendHealth["status"] = "HEALTHY") {
+async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response | "network-error", backendStatus: LocalBackendHealth["status"] = "HEALTHY", extra: Pick<SchedulerDeps, "isMeetingAbandoned"> & Partial<Pick<SchedulerDeps, "saver" | "perfNow">> = {}) {
   const chunkStore = new ChunkStore(await openDatabase(new IDBFactory()));
   const backend: LocalBackendHealth = { status: backendStatus, lastCheckedAt: 0, lastHealthyAt: 0, latencyMs: 5, consecutiveFailures: 0, capabilities: null, unauthorized: false };
   const health = createInitialHealth("running");
@@ -52,6 +53,7 @@ async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response
     onBackendUnauthorized: () => {
       backend.unauthorized = true;
     },
+    ...extra,
   });
   const add = async (seq: number) => {
     const r = await makeChunkRecord("m", seq, 160);
@@ -81,6 +83,17 @@ describe("LocalSaveScheduler", () => {
     expect((await s.status(0))?.savedVia).toBe("api");
   });
 
+  it("PUT 成功時刻は再試行用の now ではなく performance 時計で記録する", async () => {
+    // Arrange: 再試行用の時計（epoch）と performance 時計を別の値にする
+    const s = await setup((r) => okResponse(r), "HEALTHY", { isMeetingAbandoned: undefined, perfNow: () => 4321 });
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    expect(s.health.lastSuccessfulLocalSaveAt).toBe(4321);
+  });
+
   it("並列 PUT は maxConcurrency（2）を超えない", async () => {
     const s = await setup((r) => okResponse(r));
     for (let i = 0; i < 6; i++) await s.add(i);
@@ -103,6 +116,45 @@ describe("LocalSaveScheduler", () => {
     const done = await s.status(0);
     expect(done?.status).toBe("DB_REGISTERED");
     expect(done?.attempts).toBe(2);
+  });
+
+  it("リトライ期限より前に再投入された Chunk は、期限まで読み直さず、期限後に送る", async () => {
+    // Arrange：1 回目は 5xx で RETRYING（期限付き）になる
+    const s = await setup((r, attempt) => (attempt === 1 ? new Response("{}", { status: 500 }) : okResponse(r)));
+    await s.add(0);
+    await s.advance(0);
+    const deadline = (await s.status(0))?.nextRetryAt ?? 0;
+    const getChunk = vi.spyOn(s.chunkStore, "getChunk");
+    // Act：リトライタイマーを期限前に発火させる
+    const early = s.timers.splice(0);
+    for (const t of early) t.fn();
+    await s.advance(0);
+    // Assert：期限前は 1 回確かめるだけで、残り時間のタイマーで戻す（pump で空回りしない）
+    expect(getChunk).toHaveBeenCalledTimes(1);
+    expect(s.timers.map((t) => t.at)).toEqual([deadline]);
+    expect(s.stats().putCount).toBe(1);
+    await s.advance(deadline);
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+  });
+
+  it("送信中に別の試行が SAVING を確保し直していたら、古い試行の成功で状態を上書きしない", async () => {
+    // Arrange：PUT の応答待ちの間に、別タブの復旧が新しい試行として確保し直す
+    const s = await setup((r) => okResponse(r));
+    const original = LocalSaver.prototype.put;
+    vi.spyOn(LocalSaver.prototype, "put").mockImplementationOnce(async function (this: LocalSaver, record) {
+      const outcome = await original.call(this, record);
+      await s.chunkStore.updateSaveState(record.chunkKey, (x) => {
+        x.save.status = "SAVING";
+        x.save.attempts += 1;
+      });
+      return outcome;
+    });
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert：新しい試行の状態のまま残す
+    expect(await s.status(0)).toMatchObject({ status: "SAVING", attempts: 2 });
+    vi.restoreAllMocks();
   });
 
   it("non-retryable（422）は LOCAL_SAVE_FAILED に留まり、後続 Chunk は詰まらない", async () => {
@@ -214,6 +266,40 @@ describe("LocalSaveScheduler", () => {
     expect(s.health.pendingChunkCount).toBe(0);
   });
 
+  it("再送が 409 で LOCAL_SAVE_FAILED（non-retryable）になった Chunk を、前の試行のリトライタイマーが再送しない", async () => {
+    // Arrange：1 回目は 500 で RETRYING（タイマー予約）、resumeAll による 2 回目は 409
+    const s = await setup((_r, attempt) => new Response("{}", { status: attempt === 1 ? 500 : 409 }));
+    await s.add(0);
+    await s.advance(0);
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+    // Act：1 回目のリトライタイマーが発火する
+    await s.advance(3_000);
+    // Assert
+    expect(s.stats().putCount).toBe(2);
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+  });
+
+  it("non-retryable の LOCAL_SAVE_FAILED を、backend 停止中に発火したリトライタイマーが BACKEND_UNAVAILABLE に書き戻さない", async () => {
+    // Arrange：上と同じく 409 で止まった後に backend が停止する
+    const s = await setup((_r, attempt) => new Response("{}", { status: attempt === 1 ? 500 : 409 }));
+    await s.add(0);
+    await s.advance(0);
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    s.backend.status = "UNREACHABLE";
+    // Act：タイマー発火 → 停止中の書き込み → 復帰後の resumeAll
+    await s.advance(3_000);
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+    s.backend.status = "HEALTHY";
+    await s.scheduler.resumeAll();
+    await s.advance(0);
+    // Assert：手動再試行まで送らない
+    expect(s.stats().putCount).toBe(2);
+    expect((await s.status(0))?.status).toBe("LOCAL_SAVE_FAILED");
+  });
+
   it("resumeAll で保存済みになった Chunk を、backend 停止中に発火したリトライタイマーが BACKEND_UNAVAILABLE に書き戻さない", async () => {
     // Arrange：1 回目は 5xx でリトライタイマーが残り、resumeAll による 2 回目で DB_REGISTERED になる
     const s = await setup((r, attempt) => (attempt === 1 ? new Response("{}", { status: 500 }) : okResponse(r)));
@@ -321,5 +407,170 @@ describe("LocalSaveScheduler", () => {
     // Assert：RETRYING のまま放置せず、停止中の待機状態を書き直す
     expect((await s.status(0))?.status).toBe("BACKEND_UNAVAILABLE");
     expect(s.stats().putCount).toBe(1);
+  });
+  it("送信前の中止判定が読めなければ、別経路が送信中の SAVING を書き換えず、後で読み直す", async () => {
+    // Arrange：中止判定の読み取り中に別タブが SAVING に進め、読み取りは失敗する
+    let reads = 0;
+    let store: ChunkStore | undefined;
+    const s = await setup((r) => okResponse(r), "HEALTHY", {
+      isMeetingAbandoned: async () => {
+        if (++reads > 1) return false;
+        await store?.updateSaveState("m:mic:000000", (r) => { r.save.status = "SAVING"; });
+        throw new Error("IDB read failed");
+      },
+    });
+    store = s.chunkStore;
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert：RETRYING に書き戻さず、タイマーで読み直す（読み直し後も SAVING なので送らない）
+    expect((await s.status(0))?.status).toBe("SAVING");
+    await s.advance(60_000);
+    expect(reads).toBeGreaterThan(1);
+    expect((await s.status(0))?.status).toBe("SAVING");
+    expect(s.stats().putCount).toBe(0);
+  });
+
+  it("resumeAll で中止判定が読めない会議があっても、他の会議の Chunk は再投入して送る", async () => {
+    // Arrange：会議 a の判定だけ失敗する。どちらも backend 停止中に待機した
+    const s = await setup((r) => okResponse(r), "UNREACHABLE", {
+      isMeetingAbandoned: async (id) => {
+        if (id === "a") throw new Error("IDB read failed");
+        return false;
+      },
+    });
+    const a = await makeChunkRecord("a", 0, 160);
+    a.save.status = "BACKEND_UNAVAILABLE";
+    await s.chunkStore.putChunk(a);
+    await s.add(0);
+    await s.advance(0);
+    s.backend.status = "HEALTHY";
+    // Act
+    await expect(s.scheduler.resumeAll()).resolves.toBeUndefined();
+    await s.advance(0);
+    // Assert：a は状態を変えずに次の resumeAll へ残す
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    expect((await s.chunkStore.getChunk(a.chunkKey))?.save.status).toBe("BACKEND_UNAVAILABLE");
+    expect(s.stats().putCount).toBe(1);
+  });
+
+  it("backend 停止中の書き込み待ちの間に外されたキーを外し直すとき、別会議のキーを消さない", async () => {
+    // Arrange：z を待機させた後、m の BACKEND_UNAVAILABLE 書き込み中に m が保存済みになり、discardMeeting で外される
+    const s = await setup((r) => okResponse(r), "UNREACHABLE");
+    const z = await makeChunkRecord("z", 0, 160);
+    await s.chunkStore.putChunk(z);
+    await s.scheduler.enqueue(z.chunkKey);
+    await s.advance(0);
+    const original = s.chunkStore.updateSaveState.bind(s.chunkStore);
+    let calls = 0;
+    s.chunkStore.updateSaveState = async (key, mutate) => {
+      if (key === "m:mic:000000" && ++calls === 2) {
+        await original(key, (r) => { r.save.status = "DB_REGISTERED"; });
+        s.scheduler.discardMeeting("m");
+      }
+      return original(key, mutate);
+    };
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert
+    expect(s.scheduler.pendingCount).toBe(1);
+  });
+  it("上限の回にトークン変更で送れなかった Chunk は、LOCAL_SAVE_FAILED に残さず新しいトークンですぐ送り直す", async () => {
+    // Arrange：上限直前まで失敗した Chunk。1 回目の put の間だけトークンが替わり続ける（setToken の再投入は送信中で拾えない）
+    const r = await makeChunkRecord("m", 0, 160);
+    r.save.attempts = MAX_SAVE_ATTEMPTS - 1;
+    let changes = 0;
+    let saver: LocalSaver | null = null;
+    saver = new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, async () => {
+      if (changes >= 2) return okResponse(r);
+      saver?.setToken(`tok-${++changes}`);
+      return new Response("{}", { status: 401 });
+    });
+    const s = await setup((x) => okResponse(x), "HEALTHY", { saver: () => saver });
+    await s.chunkStore.putChunk(r);
+    // Act
+    await s.scheduler.enqueue(r.chunkKey);
+    await s.advance(0);
+    // Assert：失効として通知せず、resumeAll を待たずに保存を終える
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    expect(s.backend.unauthorized).toBe(false);
+  });
+
+  it("トークン変更で送れなかった回は試行回数に数えない", async () => {
+    // Arrange：1 回目の put の間だけトークンが替わり続ける
+    const r = await makeChunkRecord("m", 0, 160);
+    r.save.attempts = 2;
+    let changes = 0;
+    let saver: LocalSaver | null = null;
+    saver = new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, async () => {
+      if (changes >= 2) return okResponse(r);
+      saver?.setToken(`tok-${++changes}`);
+      return new Response("{}", { status: 401 });
+    });
+    const s = await setup((x) => okResponse(x), "HEALTHY", { saver: () => saver });
+    await s.chunkStore.putChunk(r);
+    // Act
+    await s.scheduler.enqueue(r.chunkKey);
+    await s.advance(0);
+    // Assert：トークン変更の回（3）を戻し、成功した送り直しの 1 回だけを数える
+    expect(await s.status(0)).toMatchObject({ status: "DB_REGISTERED", attempts: 3 });
+  });
+
+  it("中止判定を待つ間に別タブが送信を始めた Chunk は、送らず状態も書き換えない", async () => {
+    // Arrange：中止判定の読み取り中に、別タブが SAVING を確保する
+    let store: ChunkStore | undefined;
+    const s = await setup((r) => okResponse(r), "HEALTHY", {
+      isMeetingAbandoned: async () => {
+        await store?.updateSaveState("m:mic:000000", (r) => { r.save.status = "SAVING"; r.save.attempts = 5; });
+        return false;
+      },
+    });
+    store = s.chunkStore;
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert
+    expect(s.stats().putCount).toBe(0);
+    expect(await s.status(0)).toMatchObject({ status: "SAVING", attempts: 5 });
+  });
+
+  it("送信中に別タブが確保し直した Chunk の失敗は、そのタブの SAVING を書き換えず再試行も予約しない", async () => {
+    // Arrange：PUT の応答待ちの間に、別タブの復旧が書き戻して送り直しを始める。このタブの PUT は 500 で失敗する
+    let store: ChunkStore | undefined;
+    const s = await setup(() => new Response("{}", { status: 500 }), "HEALTHY", {
+      isMeetingAbandoned: async () => false,
+      saver: () => new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, async () => {
+        await store?.updateSaveState("m:mic:000000", (r) => { r.save.status = "SAVING"; r.save.attempts += 1; });
+        return new Response("{}", { status: 500 });
+      }),
+    });
+    store = s.chunkStore;
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert
+    expect(await s.status(0)).toMatchObject({ status: "SAVING", attempts: 2 });
+    expect(s.timers).toHaveLength(0);
+  });
+
+  it("送信中に別タブが確保し直した Chunk の接続失敗は、Monitor へ到達不能を伝えず、状態も書き換えない", async () => {
+    // Arrange：PUT の応答待ちの間に、別タブの復旧が書き戻して送り直しを始める。このタブの古い PUT は接続失敗で終わる
+    let store: ChunkStore | undefined;
+    const s = await setup(() => "network-error", "HEALTHY", {
+      isMeetingAbandoned: async () => false,
+      saver: () => new LocalSaver({ baseUrl: BASE_URL, token: TOKEN, requestTimeoutMs: 1000 }, async () => {
+        await store?.updateSaveState("m:mic:000000", (r) => { r.save.status = "SAVING"; r.save.attempts += 1; });
+        throw new TypeError("Failed to fetch");
+      }),
+    });
+    store = s.chunkStore;
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert：古い試行の失敗でこのタブの送信を止めない（結果は確保し直した試行が書く）
+    expect(s.backend.status).toBe("HEALTHY");
+    expect(await s.status(0)).toMatchObject({ status: "SAVING", attempts: 2 });
+    expect(s.scheduler.pendingCount).toBe(0);
   });
 });

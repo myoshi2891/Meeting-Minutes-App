@@ -1,5 +1,5 @@
 // src/api/contracts.ts
-import type { AudioSource, ChunkTimingMetadata, LocalBackendCapabilities } from "../types/recording";
+import type { AudioSource, ChunkTimingMetadata, LocalBackendCapabilities, RecordingStopReason } from "../types/recording";
 
 export interface HealthResponse {
   readonly status: "ok" | "degraded";
@@ -46,6 +46,9 @@ export interface ChunkListResponse {
 }
 
 export interface FinalizeRequest {
+  /** 両方省略可能。未記録の旧会議を手動停止と推定しない。 */
+  readonly stopReason?: RecordingStopReason;
+  readonly stopDetectedAtEpochMs?: number;
   readonly expectedChunkCounts: Readonly<Record<AudioSource, number>>;
   readonly endedAtEpochMs: number;
   readonly totalAudioFrames: number;

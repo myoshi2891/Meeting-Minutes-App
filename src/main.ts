@@ -9,10 +9,14 @@ import {
   finalizeResultText,
   LOCAL_DATA_NOTICE,
   noticeFor,
+  pendingCountsText,
   storageUsageText,
   TAB_CLOSE_HELP,
   warningsFor,
 } from "./ui/recording-view";
+import { confirmAbandon, discardBacklogQuestion, manualRetryNeedsNotice } from "./ui/pending-actions";
+import { buildStoredZip } from "./export/zip";
+import type { MemoryBacklogFile } from "./recording/recording-controller";
 import workletModuleUrl from "./worklet/pcm-chunker.worklet.ts?worker&url";
 
 const BACKEND_BASE_URL = "http://127.0.0.1:43117";
@@ -65,7 +69,7 @@ const stoppedWithBacklog = new Set<SessionController>();
 let hiddenTimer: ReturnType<typeof setInterval> | null = null;
 
 function render(app: App): void {
-  const banner = backendBanner(app.monitor.state, app.health, recording !== null);
+  const banner = backendBanner(app.monitor.state, app.health, recording !== null, app.memoryBacklogCount());
   ui.banner.hidden = banner === null;
   ui.banner.textContent = banner ?? "";
 
@@ -108,25 +112,117 @@ function onHidden(app: App): void {
   hiddenTimer = setInterval(() => render(app), HIDDEN_RENDER_INTERVAL_MS);
 }
 
-async function refreshPending(app: App): Promise<void> {
+const pendingBusy = new Set<string>();
+
+/**
+ * 表示中の確定待ちの行のボタンを押せる状態に戻す。操作の待機中に一覧が再描画されると押した行は置き換わっているので、
+ * 押したときのボタンではなく会議 ID で今の行を探す（会議 ID は CSS セレクタに埋め込まない）
+ */
+function enablePendingRow(meetingId: string): void {
+  for (const li of ui.pending.children) {
+    if (!(li instanceof HTMLLIElement) || li.dataset.meetingId !== meetingId) continue;
+    for (const button of li.querySelectorAll("button")) button.disabled = false;
+  }
+}
+let pendingRefresh: Promise<void> | null = null;
+let pendingRefreshRequested = false;
+/**
+ * 確定待ち一覧の再描画。1 本ずつ順に実行し、実行中の要求は終わった後の 1 回にまとめる。
+ * 世代番号で古い結果を捨てる方式では、読み込みが更新間隔より遅いと毎回新しい要求に捨てられて一度も描画されない
+ */
+function refreshPending(app: App): Promise<void> {
+  if (pendingRefresh !== null) {
+    pendingRefreshRequested = true;
+    return pendingRefresh;
+  }
+  const run = async (): Promise<void> => {
+    try {
+      do {
+        pendingRefreshRequested = false;
+        await renderPending(app);
+      } while (pendingRefreshRequested);
+    } finally {
+      pendingRefresh = null;
+    }
+  };
+  pendingRefresh = run();
+  return pendingRefresh;
+}
+
+async function renderPending(app: App): Promise<void> {
   const meetings = await app.listPendingFinalize();
+  const details = await Promise.all(meetings.map(async (m) => {
+    let chunks: Awaited<ReturnType<typeof app.chunkStore.listByMeeting>>;
+    try {
+      chunks = await app.chunkStore.listByMeeting(m.meetingId, "mic");
+    } catch (error) {
+      // 内訳が読めなくても行（再試行・中止）は出す。IDB が読めないときこそ保持中の会議の再試行が要る
+      return `内訳を読み込めませんでした（${noticeFor({ type: "error", error }) ?? ""}）`;
+    }
+    return pendingCountsText({
+      chunks,
+      audioFrameCount: m.sessionClock.audioFrameCount,
+      directRegistered: app.directRegisteredCount(m.meetingId),
+      memoryCount: app.memoryBacklogCount(m.meetingId),
+      offIdbEndFrame: app.offIdbEndFrame(m.meetingId),
+      offIdbSequenceNos: app.offIdbSequenceNos(m.meetingId),
+    });
+  }));
   ui.pending.replaceChildren(
-    ...meetings.map((m) => {
+    ...meetings.map((m, index) => {
       const li = document.createElement("li");
+      li.dataset.meetingId = m.meetingId;
       const label = document.createElement("span");
       label.textContent = `${m.title}（${new Date(m.createdAt).toLocaleString()}） `;
       const retry = document.createElement("button");
       retry.type = "button";
       retry.textContent = "再試行";
+      retry.disabled = pendingBusy.has(m.meetingId);
       retry.addEventListener("click", () => {
-        retry.disabled = true;
+        // 同じ会議の操作が実行中なら、その操作の pendingBusy を書き換えない
+        if (pendingBusy.has(m.meetingId)) return;
+        // 再試行中は確定中止も押せないようにする（会議ロックの取り合いで「使用中」になるだけのため）
+        retry.disabled = abandon.disabled = true;
+        pendingBusy.add(m.meetingId);
+        const before = app.getFinalizeIssue(m.meetingId);
         void app
           .retryFinalize(m.meetingId)
-          .then((result) => notify(`${m.title}: ${finalizeResultText(result)}`))
+          .then((result) => {
+            // 前回と同じ理由の失敗は自動通知が出ないので、押した結果が分かるようにここで出す
+            if (!result.ok && manualRetryNeedsNotice(before, app.getFinalizeIssue(m.meetingId), result)) notify(`${m.title}: ${finalizeResultText(result)}`);
+          })
           .catch((error: unknown) => notify(noticeFor({ type: "error", error }) ?? ""))
-          .finally(() => void refreshPending(app));
+          .finally(() => { pendingBusy.delete(m.meetingId); void refreshPending(app); });
       });
-      li.append(label, retry);
+      const abandon = document.createElement("button");
+      abandon.type = "button";
+      abandon.textContent = "確定を中止";
+      abandon.disabled = pendingBusy.has(m.meetingId);
+      abandon.addEventListener("click", () => {
+        if (pendingBusy.has(m.meetingId)) return;
+        pendingBusy.add(m.meetingId);
+        abandon.disabled = retry.disabled = true;
+        void confirmAbandon(m, app.memoryBacklogCount(m.meetingId), {
+          confirm: (message) => window.confirm(message),
+          exportWav: () => downloadWavs(app.exportMemoryBacklog(m.meetingId)),
+          abandon: (id, confirmed) => app.abandonFinalize(id, confirmed),
+          discardBacklog: (id) => app.discardMemoryBacklog(id, true),
+        }).then((outcome) => {
+          // キャンセルは状態を変えないので、一覧の再読込（IDB 読み取り）を待たずにボタンを戻す
+          if (outcome !== "cancelled") return;
+          pendingBusy.delete(m.meetingId);
+          enablePendingRow(m.meetingId);
+        }).catch((error: unknown) => {
+          // 中止できなかった会議は一覧に残るので、再読込を待たずに今の行のボタンを戻す
+          pendingBusy.delete(m.meetingId);
+          enablePendingRow(m.meetingId);
+          notify(noticeFor({ type: "error", error }) ?? "");
+        }).finally(() => { pendingBusy.delete(m.meetingId); void refreshPending(app); });
+      });
+      const detail = document.createElement("p");
+      const issue = app.getFinalizeIssue(m.meetingId);
+      detail.textContent = `${details[index]}${issue === undefined ? "" : `。${finalizeResultText(issue)}`}`;
+      li.append(label, retry, abandon, detail);
       return li;
     }),
   );
@@ -163,6 +259,7 @@ async function startRecording(app: App): Promise<void> {
       onHidden: () => onHidden(app),
     });
     recording = { session, audioContext, detachAudioMonitor, startedAt: performance.now() };
+    if (app.currentSession !== session) releaseRecording(session.meetingId);
   } catch (error) {
     detachAudioMonitor();
     for (const track of mediaStream.getTracks()) track.stop();
@@ -173,45 +270,71 @@ async function startRecording(app: App): Promise<void> {
   }
 }
 
+function releaseRecording(meetingId: string): void {
+  if (recording?.session.meetingId !== meetingId) return;
+  const current = recording;
+  recording = null;
+  // 確定の完了を待たずに次の録音を始められるので、停止ボタンは録音の解放時点で戻す
+  ui.stop.disabled = false;
+  if (current.session.controller.memoryBacklogCount > 0) stoppedWithBacklog.add(current.session.controller);
+  current.detachAudioMonitor();
+  void current.audioContext.close().catch(() => undefined);
+}
+
 async function stopRecording(app: App): Promise<void> {
   if (recording === null) return;
   const current = recording;
   ui.stop.disabled = true;
   try {
     const result = await current.session.stop();
-    notify(finalizeResultText(result));
+    if (!result.ok && app.getFinalizeIssue(current.session.meetingId) !== result) notify(finalizeResultText(result));
   } catch (error) {
     notify(noticeFor({ type: "error", error }) ?? "");
   } finally {
-    recording = null;
-    if (current.session.controller.memoryBacklogCount > 0) stoppedWithBacklog.add(current.session.controller);
-    current.detachAudioMonitor();
-    await current.audioContext.close().catch(() => undefined);
-    ui.stop.disabled = false;
+    releaseRecording(current.session.meetingId);
     await refreshPending(app);
   }
 }
 
-/** §15：メモリ待機中の Chunk を利用者の手元へ書き出す（メモリ待機からは外さない） */
-function exportMemoryBacklog(): void {
+/**
+ * §15：メモリ待機中の Chunk を利用者の手元へ書き出す（メモリ待機からは外さない）。
+ * 確定を中止した会議の分は送られないので、書き出した後に保存を確かめて破棄できるようにする（中止時に破棄を見送った場合の経路）
+ */
+async function exportMemoryBacklog(app: App): Promise<void> {
   // 空になった controller は外す（drainMemoryBacklog でサーバーへ送れた場合など）
   for (const controller of stoppedWithBacklog) {
     if (controller.memoryBacklogCount === 0) stoppedWithBacklog.delete(controller);
   }
   const controllers = recording === null ? [...stoppedWithBacklog] : [recording.session.controller, ...stoppedWithBacklog];
-  for (const controller of controllers) {
-    for (const file of controller.exportMemoryBacklog()) {
-      const url = URL.createObjectURL(file.wav);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = file.fileName;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 0);
-    }
+  await downloadWavs(controllers.flatMap((controller) => controller.exportMemoryBacklog()));
+  for (const { meetingId, title, count } of app.discardableMemoryBacklog()) {
+    if (window.confirm(discardBacklogQuestion(title, count))) await app.discardMemoryBacklog(meetingId, true);
   }
 }
 
+/** ダウンロードの開始後、URL を破棄するまでの猶予。すぐ破棄すると保存先の確認中に失敗することがある */
+const DOWNLOAD_URL_TTL_MS = 60_000;
+
+/**
+ * WAV を 1 回のダウンロードで渡す。複数あれば無圧縮 ZIP にまとめる（Chrome は連続した自動ダウンロードを確認なしに止めることがある）。
+ * 入れたファイル名を通知欄に出し、利用者が保存したファイルの中身と照らせるようにする
+ */
+async function downloadWavs(files: readonly MemoryBacklogFile[]): Promise<void> {
+  if (files.length === 0) return;
+  const single = files.length === 1 ? files[0] : undefined;
+  const fileName = single?.fileName ?? `memory-backlog_${new Date().toISOString().replace(/[:.]/g, "-")}.zip`;
+  const blob = single?.wav ?? await buildStoredZip(files.map((f) => ({ name: f.fileName, data: f.wav })), new Date());
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), DOWNLOAD_URL_TTL_MS);
+  notify(single !== undefined ? `書き出し: ${fileName}` : `書き出し: ${fileName}（${files.length} 件: ${files.map((f) => f.fileName).join(", ")}）`);
+}
+
 function onEvent(event: AppEvent): void {
+  if (event.type === "recording_stopped") releaseRecording(event.meetingId);
   const text = noticeFor(event);
   if (text !== null) notify(text);
   if (event.type === "memory_backlog_export_required") ui.exportRow.hidden = false;
@@ -240,14 +363,16 @@ async function main(): Promise<void> {
     locks: navigator.locks,
     onEvent: (event) => {
       onEvent(event);
-      if (event.type === "finalized" && created !== null) void refreshPending(created);
+      if ((event.type === "finalized" || event.type === "finalize_pending" || event.type === "finalize_abandoned" || event.type === "recording_stopped") && created !== null) void refreshPending(created);
     },
   });
   created = app;
 
   ui.start.addEventListener("click", () => void startRecording(app));
   ui.stop.addEventListener("click", () => void stopRecording(app));
-  ui.exportButton.addEventListener("click", exportMemoryBacklog);
+  ui.exportButton.addEventListener("click", () => {
+    void exportMemoryBacklog(app).catch((error: unknown) => notify(noticeFor({ type: "error", error }) ?? ""));
+  });
   ui.tokenForm.addEventListener("submit", (e) => {
     e.preventDefault();
     const token = ui.token.value.trim();

@@ -23,7 +23,11 @@ export interface LocalSaverConfig {
 
 export type SaveOutcome =
   | { readonly ok: true; readonly registered: boolean; readonly serverPath: string; readonly idempotent: boolean }
-  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean };
+  /**
+   * unauthorizedReported：会議登録の 401/403 を MeetingRegistrar が Monitor へ報告済み。
+   * tokenChanged：送信中にトークンが替わり続けて送れなかった。サーバーの拒否ではないので、Scheduler は試行上限に数えず送り直す
+   */
+  | { readonly ok: false; readonly error: LocalSaveError; readonly retryable: boolean; readonly unauthorizedReported?: boolean; readonly tokenChanged?: boolean };
 
 const RETRYABLE: ReadonlySet<LocalSaveErrorKind> = new Set(["NETWORK", "TIMEOUT", "SERVER", "STORAGE_FULL", "HASH_MISMATCH", "UNKNOWN"]);
 
@@ -54,27 +58,47 @@ export class LocalSaver {
     const url = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks/${source}/${sequenceNo}`, this.base);
     assertLocalHost(url);
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
     // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
     const fetchImpl = this.fetchImpl;
+    let token = this.token;
+    // タイムアウトは送るたびに張り直す。送り直しが会議確認を待つ間に最初の PUT の期限が切れても、中断済みの signal で送らない
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const response = await fetchImpl(url, {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "audio/wav",
-          "X-Chunk-SHA256": record.meta.sha256,
-          "X-Chunk-Meta": encodeChunkMetaHeader(record.meta),
-        },
-        body: record.wav,
-        signal: controller.signal,
-        // ローカルサーバーなので credentials は不要。Cookie 方式（§4.3）の場合のみ "include"。
-        credentials: "omit",
-        // リダイレクト先は assertLocalHost を通らないため追従しない（録音データを外部へ再送させない、§4.4）
-        redirect: "error",
-      });
-      return await this.interpret(response, record);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+          // 送り直す前に送信可否を確かめ直す。最初の応答待ちの間に確定中止された会議へ新しい PUT を始めない
+          if (this.ensureMeeting !== undefined) {
+            const registration = await this.ensureMeeting(meetingId);
+            if (!registration.ok) return registration;
+          }
+          // 確認を待つ間にもトークンは変わりうる。送り直しは送信直前の最新トークンで送る
+          token = this.token;
+        }
+        clearTimeout(timer);
+        const controller = new AbortController();
+        timer = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+        const response = await fetchImpl(url, {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "audio/wav",
+            "X-Chunk-SHA256": record.meta.sha256,
+            "X-Chunk-Meta": encodeChunkMetaHeader(record.meta),
+          },
+          body: record.wav,
+          signal: controller.signal,
+          // ローカルサーバーなので credentials は不要。Cookie 方式（§4.3）の場合のみ "include"。
+          credentials: "omit",
+          // リダイレクト先は assertLocalHost を通らないため追従しない（録音データを外部へ再送させない、§4.4）
+          redirect: "error",
+        });
+        const outcome = await this.interpret(response, record);
+        // 送信後（本文の読み取り中を含む）にトークンが変わっていれば、この 401/403 は現在のトークンの失効を示さない（MeetingRegistrar と同じ）
+        if (!outcome.ok && outcome.error.kind === "UNAUTHORIZED" && this.token !== token) continue;
+        return outcome;
+      }
+      // 送り直し中にもトークンが変わった。UNAUTHORIZED にすると Scheduler が失効として通知するため、再試行できる失敗で返す
+      return { ...this.fail("UNKNOWN", "token changed during upload", null), tokenChanged: true };
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         return this.fail("TIMEOUT", `timeout after ${this.config.requestTimeoutMs}ms`, null);
@@ -119,7 +143,7 @@ export class LocalSaver {
     return this.fail("UNKNOWN", detail, status);
   }
 
-  private fail(kind: LocalSaveErrorKind, message: string, httpStatus: number | null): SaveOutcome {
+  private fail(kind: LocalSaveErrorKind, message: string, httpStatus: number | null): Extract<SaveOutcome, { ok: false }> {
     return {
       ok: false,
       error: { kind, message, httpStatus, at: performance.now() },
