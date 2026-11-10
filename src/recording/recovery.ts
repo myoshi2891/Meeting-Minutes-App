@@ -1,5 +1,5 @@
 // src/recording/recovery.ts
-import type { ChunkStore, MeetingStore } from "../storage/idb";
+import { isValidStopObservation, type ChunkStore, type MeetingStore } from "../storage/idb";
 import { isResumable, type LocalSaveScheduler } from "./local-save-scheduler";
 import { tryAcquireMeetingLock, type MeetingLockManager } from "./meeting-lock";
 import type { AudioChunkRecord, MeetingRecord } from "../types/recording";
@@ -69,8 +69,9 @@ export async function recoverOnStartup(
         // stop_requested でも、flush 後の最終保存の前に落ちた会議は値が古いので補う（書き直しを持つ App のメモリは再読み込みで失われる）
         // 一覧の m はロック前の値。一覧取得後に停止処理が書いた audioFrameCount などを巻き戻さないよう、ロック後に読み直した current を書く
         const lastEndFrame = chunks.reduce((max, c) => Math.max(max, c.meta.endFrame), 0);
-        // 停止理由と検出時刻の片方だけの行（壊れた行など）は put が拒否して起動ごと止まり、サーバーの確定も 422 になる。両方を外して未観測として扱う
-        const incompleteStop = (current.stopReason === undefined) !== (current.stopDetectedAtEpochMs === undefined);
+        // 停止理由と検出時刻の片方だけの行（壊れた行など）は put が拒否して起動ごと止まり、サーバーの確定も 422 になる。
+        // サーバーが受け付けない値（不明な理由・NaN・小数・負数の検出時刻）も 422 になる。どちらも両方を外して未観測として扱う（録音は残す）
+        const incompleteStop = !isValidStopObservation(current);
         if (incompleteStop) {
           delete current.stopReason;
           delete current.stopDetectedAtEpochMs;

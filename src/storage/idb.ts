@@ -176,6 +176,20 @@ export class ChunkStore {
   }
 }
 
+/**
+ * サーバーの確定 API が受け付ける停止の観測か（両方省略は未観測として受け付ける）。
+ * 検出時刻は 0 以上の整数（strict int・SQLite INTEGER）。JS の数値では安全な整数に限る（NaN・小数・負数は 422 になる）
+ */
+export function isValidStopObservation(record: Pick<MeetingRecord, "stopReason" | "stopDetectedAtEpochMs">): boolean {
+  const { stopReason, stopDetectedAtEpochMs } = record;
+  if (stopReason === undefined && stopDetectedAtEpochMs === undefined) return true;
+  return (stopReason === "manual" || stopReason === "mic_ended") && isValidStopDetectedAt(stopDetectedAtEpochMs);
+}
+
+export function isValidStopDetectedAt(epochMs: number | undefined): epochMs is number {
+  return Number.isSafeInteger(epochMs) && (epochMs ?? -1) >= 0;
+}
+
 export class MeetingStore {
   constructor(private readonly db: IDBDatabase) {}
 

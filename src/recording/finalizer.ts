@@ -1,5 +1,5 @@
 // src/recording/finalizer.ts
-import type { ChunkStore, MeetingStore } from "../storage/idb";
+import { isValidStopObservation, type ChunkStore, type MeetingStore } from "../storage/idb";
 import type { LocalSaveScheduler } from "./local-save-scheduler";
 import { isChunkListResponse, type FinalizeRequest } from "../api/contracts";
 import { assertLocalHost } from "../api/local-saver";
@@ -174,8 +174,8 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     expectedChunkCounts: { mic: chunkCount, system: 0 },
     endedAtEpochMs: meeting.endedAt,
     totalAudioFrames: meeting.sessionClock.audioFrameCount,
-    stopReason: meeting.stopReason,
-    stopDetectedAtEpochMs: meeting.stopDetectedAtEpochMs,
+    // 保存済みの値がサーバーの制約を満たさなければ両方省略する（未観測）。422 で確定が止まり続けないようにし、録音は残す
+    ...(isValidStopObservation(meeting) ? { stopReason: meeting.stopReason, stopDetectedAtEpochMs: meeting.stopDetectedAtEpochMs } : {}),
   };
   const finUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/finalize`, deps.baseUrl);
   assertLocalHost(finUrl);
