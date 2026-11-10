@@ -10,7 +10,7 @@ import { attachPageLifecycle } from "../recording/page-lifecycle";
 import { RecordingController, type ChunkEnqueuer, type MemoryBacklogFile, type RecordingControllerDeps } from "../recording/recording-controller";
 import { createInitialHealth } from "../recording/recording-health-monitor";
 import { recoverOnStartup, type RecoveryReport } from "../recording/recovery";
-import { ChunkStore, MeetingStore, SettingsStore } from "../storage/idb";
+import { ChunkStore, MeetingStore, SettingsStore, isValidStopDetectedAt } from "../storage/idb";
 import { enforceQuota, requestPersistence } from "../storage/quota-monitor";
 import type { LocalBackendHealth, MeetingRecord, RecordingHealth, RecordingStopReason } from "../types/recording";
 
@@ -65,6 +65,10 @@ export interface RecordingSession {
   /** 録音を止め、Finalization Barrier を試みる（§22）。サーバー未起動なら stop_requested のまま残り、復帰時に再試行される */
   stop(): Promise<FinalizeResult>;
 }
+
+/** retryFinalize が会議ロックを取れなかったときの detail。ネットワーク失敗の再試行はこれを見て予約し直す */
+export const MEETING_BUSY_IN_THIS_TAB = "meeting is busy in this tab";
+export const MEETING_LOCKED_BY_OTHER_TAB = "meeting is locked by another tab";
 
 const HEALTH_CONFIG = { healthyIntervalMs: 10_000, unreachableIntervalMs: 5_000, timeoutMs: 2_000, degradedLatencyMs: 1_000 } as const;
 const PUT_TIMEOUT_MS = 30_000;
@@ -370,7 +374,8 @@ export class App {
         // 停止状態を IDB に書けなかった。録音は止まっているので、会議を確定待ちに残して確定の前に書き直す
         const meeting = this.meetingFallbacks.get(meetingId);
         if (meeting === undefined) throw error;
-        const firstStop = meeting.stopReason === undefined ? { stopReason: reason, stopDetectedAtEpochMs: detectedAtEpochMs } : {};
+        // Controller と同じく、サーバーが受け付けない検出時刻は記録しない（未観測として扱う）
+        const firstStop = meeting.stopReason === undefined && isValidStopDetectedAt(detectedAtEpochMs) ? { stopReason: reason, stopDetectedAtEpochMs: detectedAtEpochMs } : {};
         this.unsavedStops.set(meetingId, { ...meeting, ...firstStop, status: "stop_requested", updatedAt: (this.deps.now ?? Date.now)() });
         this.deps.onEvent({ type: "error", error });
       } finally {
@@ -512,7 +517,7 @@ export class App {
     // 起動時の復旧が書けなかった会議は、補う前の値（古い audioFrameCount など）のまま確定しない
     if (this.unrecovered.has(meetingId)) return { ok: false, stage: "verify", detail: "startup recovery not saved; reload to retry" };
     const lock = await this.acquireMeetingLock(meetingId);
-    if (!lock.ok) return { ok: false, stage: "verify", detail: lock.heldBy === "this_tab" ? "meeting is busy in this tab" : "meeting is locked by another tab" };
+    if (!lock.ok) return { ok: false, stage: "verify", detail: lock.heldBy === "this_tab" ? MEETING_BUSY_IN_THIS_TAB : MEETING_LOCKED_BY_OTHER_TAB };
     const { release } = lock;
     try {
       // メモリ待機が残る会議は、Barrier の前に末尾を IDB へ書き戻すか直接送信する（残れば Barrier が waiting_local_save を返す）。
@@ -721,7 +726,11 @@ export class App {
       if (this.networkRetries.get(meetingId) !== generation) return;
       this.networkRetries.delete(meetingId);
       if (this.disposed || this.abandoned.has(meetingId) || !isUsable(this.monitor.state)) return;
-      const run = this.retryFinalize(meetingId).then(() => undefined, (error: unknown) => this.deps.onEvent({ type: "error", error }));
+      const run = this.retryFinalize(meetingId).then((result) => {
+        // ロックが使用中だと確定を試さずに返る（成功でもネットワーク以外の失敗でもない）。予約を失わないよう、間隔を延ばして予約し直す。
+        // このタブの確定が使用中なら、その確定の結果（予約・取り消し）が後からこの予約を上書きする
+        if (!result.ok && isLockBusy(result) && !this.disposed && !this.abandoned.has(meetingId) && !this.networkRetries.has(meetingId)) this.scheduleNetworkRetry(meetingId);
+      }, (error: unknown) => this.deps.onEvent({ type: "error", error }));
       this.backendRecovery = Promise.all([this.backendRecovery, run]).then(() => undefined);
     }, backoffMs(attempts));
   }
@@ -804,6 +813,10 @@ export class App {
 type MeetingLockResult =
   | { readonly ok: true; readonly release: () => void }
   | { readonly ok: false; readonly heldBy: "this_tab" | "other_tab" };
+
+function isLockBusy(result: Extract<FinalizeResult, { ok: false }>): boolean {
+  return result.stage === "verify" && (result.detail === MEETING_BUSY_IN_THIS_TAB || result.detail === MEETING_LOCKED_BY_OTHER_TAB);
+}
 
 function isUsable(state: LocalBackendHealth): boolean {
   return (state.status === "HEALTHY" || state.status === "DEGRADED") && !state.unauthorized;

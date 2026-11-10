@@ -1060,6 +1060,50 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     expect(s.events.filter((e) => e.type === "finalized" && e.meetingId === id)).toHaveLength(1);
   });
 
+  it("ネットワーク失敗の再試行が発火したときに会議ロックが別タブに使われていたら、予約し直して後で確定する", async () => {
+    // Arrange：一覧の GET が 1 回だけネットワーク失敗し、再試行の予約が入る
+    const timers: Array<{ fn: () => void; ms: number }> = [];
+    let failList = true;
+    let lockManager: FakeLockManager | undefined;
+    const s = await setup({
+      setTimer: (fn, ms) => timers.push({ fn, ms }),
+      seed: async (_db, _server, locks) => { lockManager = locks; },
+      wrapFetch: (f) => async (input, init) => {
+        if (failList && init?.method === undefined && String(input).endsWith("/chunks")) {
+          failList = false;
+          throw new TypeError("Failed to fetch");
+        }
+        return f(input, init);
+      },
+    });
+    await settleMonitor(s);
+    timers.length = 0;
+    const id = nextMeetingId();
+    const chunk = await seedChunk(s.db, id, 0, "DB_REGISTERED");
+    registerOnServer(s.server, chunk);
+    await seedMeeting(s.db, makeMeeting(id, "stop_requested"));
+    expect(await s.app.retryFinalize(id)).toMatchObject({ reason: "network" });
+    const first = timers.splice(0);
+    expect(first).toHaveLength(1);
+    // Act：発火の時点では別タブ（起動時の復旧など）がロックを持っている
+    if (lockManager === undefined) throw new Error("locks not captured");
+    const release = await tryAcquireMeetingLock(lockManager, id);
+    for (const t of first) t.fn();
+    await s.app.whenBackendRecoverySettled();
+    // Assert：確定を試せなかったので、予約を失わずに間隔を延ばして入れ直す
+    const second = timers.splice(0);
+    expect(second).toHaveLength(1);
+    expect(second[0].ms).toBeGreaterThan(first[0].ms);
+    expect((await s.app.meetingStore.get(id))?.status).toBe("stop_requested");
+    // Act：ロックが空いてから予約が発火する
+    release?.();
+    // FakeLockManager はコールバックの完了後（数マイクロタスク後）に解放する
+    await new Promise((r) => setTimeout(r, 0));
+    for (const t of second) t.fn();
+    // Assert
+    await vi.waitFor(async () => expect((await s.app.meetingStore.get(id))?.status).toBe("finalized"));
+  });
+
   it("停止状態を IDB に書けなかった会議は確定待ちに残し、書けるようになったら停止理由ごと書き直して確定する", async () => {
     // Arrange
     stubPageGlobals();
