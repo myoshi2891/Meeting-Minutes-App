@@ -23,7 +23,7 @@ export async function confirmAbandon(meeting: Pick<MeetingRecord, "meetingId" | 
     await actions.exportWav();
   }
   const exportNotice = memoryCount > 0 ? "書き出した WAV を保存できたことを確認してください。\n" : "";
-  if (!actions.confirm(`${exportNotice}「${meeting.title}」（${meeting.meetingId}）の確定を中止し、一覧から外しますか？\n音声が欠けている可能性があります。確定済みにはなりません。保存済みの音声と会議情報は削除しません。自動再送・確定は再開しません。`)) return "cancelled";
+  if (!actions.confirm(`${exportNotice}「${meeting.title}」（${meeting.meetingId}）の確定を中止し、一覧から外しますか？\n音声が欠けている可能性があります。このブラウザからの自動再送・確定は再開しません。サーバーで確定済みになっていた場合は取り消しません。保存済みの音声と会議情報は削除しません。`)) return "cancelled";
   await actions.abandon(meeting.meetingId, true);
   // 中止した会議のメモリ待機は送られないので、保存を確かめたら捨てられるようにする（捨てるまで離脱確認が残る）
   if (memoryCount > 0 && actions.discardBacklog !== undefined && actions.confirm(discardBacklogQuestion(meeting.title, memoryCount))) {
