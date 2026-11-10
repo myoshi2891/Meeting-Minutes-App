@@ -15,7 +15,7 @@ function okResponse(r: AudioChunkRecord, registered = true): Response {
   return new Response(JSON.stringify({ meetingId, source, sequenceNo, sha256, sizeBytes, path: `p/${sequenceNo}`, registered }), { status: 201 });
 }
 
-async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response | "network-error", backendStatus: LocalBackendHealth["status"] = "HEALTHY", extra: Pick<SchedulerDeps, "isMeetingAbandoned"> & Partial<Pick<SchedulerDeps, "saver">> = {}) {
+async function setup(respond: (r: AudioChunkRecord, attempt: number) => Response | "network-error", backendStatus: LocalBackendHealth["status"] = "HEALTHY", extra: Pick<SchedulerDeps, "isMeetingAbandoned"> & Partial<Pick<SchedulerDeps, "saver" | "perfNow">> = {}) {
   const chunkStore = new ChunkStore(await openDatabase(new IDBFactory()));
   const backend: LocalBackendHealth = { status: backendStatus, lastCheckedAt: 0, lastHealthyAt: 0, latencyMs: 5, consecutiveFailures: 0, capabilities: null, unauthorized: false };
   const health = createInitialHealth("running");
@@ -81,6 +81,17 @@ describe("LocalSaveScheduler", () => {
     await s.advance(0);
     expect((await s.status(0))?.status).toBe("SAVED");
     expect((await s.status(0))?.savedVia).toBe("api");
+  });
+
+  it("PUT 成功時刻は再試行用の now ではなく performance 時計で記録する", async () => {
+    // Arrange: 再試行用の時計（epoch）と performance 時計を別の値にする
+    const s = await setup((r) => okResponse(r), "HEALTHY", { isMeetingAbandoned: undefined, perfNow: () => 4321 });
+    // Act
+    await s.add(0);
+    await s.advance(0);
+    // Assert
+    expect((await s.status(0))?.status).toBe("DB_REGISTERED");
+    expect(s.health.lastSuccessfulLocalSaveAt).toBe(4321);
   });
 
   it("並列 PUT は maxConcurrency（2）を超えない", async () => {

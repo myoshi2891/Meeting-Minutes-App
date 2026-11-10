@@ -10,7 +10,10 @@ export interface SchedulerDeps {
   readonly backend: () => LocalBackendHealth;
   readonly health: RecordingHealth;
   readonly maxConcurrency: number;
+  /** 再試行の期限（nextRetryAt）・lastError.at に使う時計。IDB に残るので epoch ms */
   readonly now: () => number;
+  /** health.lastSuccessfulLocalSaveAt に使う performance 時計（RecordingHealth の他の時刻と揃える）。省略時は performance.now() */
+  readonly perfNow?: () => number;
   readonly setTimer: (fn: () => void, ms: number) => unknown;
   /** PUT が NETWORK / TIMEOUT で失敗したとき呼ぶ。配線先は BackendHealthMonitor.reportUnreachable()（§18） */
   readonly onBackendUnreachable: () => void;
@@ -264,7 +267,7 @@ export class LocalSaveScheduler {
     const outcome = await saver.put(record);
 
     if (outcome.ok) {
-      this.deps.health.lastSuccessfulLocalSaveAt = this.deps.now();
+      this.deps.health.lastSuccessfulLocalSaveAt = (this.deps.perfNow ?? (() => performance.now()))();
       // 送信中に別タブの復旧が新しい試行で確保し直していたら、その試行の状態を上書きしない（結果はその試行が書く）
       const owned = await this.updateClaimed(chunkKey, attempts, (r) => {
         r.save.status = outcome.registered ? "DB_REGISTERED" : "SAVED";
