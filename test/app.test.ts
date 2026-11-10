@@ -1024,8 +1024,8 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     return result;
   }
 
-  it("照合の一覧取得がネットワーク失敗で終わったら、ヘルス状態が変わらなくても時間をおいて確定を再試行する", async () => {
-    // Arrange：Monitor は HEALTHY のまま、一覧の GET だけが 1 回ネットワーク失敗する
+  /** Monitor は HEALTHY のまま一覧の GET だけが 1 回ネットワーク失敗する環境に、stop_requested の会議を 1 件用意する */
+  async function setupListFailsOnce() {
     const timers: Array<{ fn: () => void; ms: number }> = [];
     let failList = true;
     const s = await setup({
@@ -1044,6 +1044,29 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     const chunk = await seedChunk(s.db, id, 0, "DB_REGISTERED");
     registerOnServer(s.server, chunk);
     await seedMeeting(s.db, makeMeeting(id, "stop_requested"));
+    return { s, timers, id };
+  }
+
+  /** 音声フレーム数 1,600 で録音を止める。停止中の会議の書き込みは failsAt(n) が真になる n 回目を QuotaExceeded で失敗させる */
+  async function stopWithFailingMeetingPuts(s: Setup, id: string, failsAt: (n: number) => boolean) {
+    const session = await s.app.startRecording(startInput(id));
+    s.controllers[0].audioFrameCount = 1_600;
+    const put = s.app.meetingStore.put.bind(s.app.meetingStore);
+    let puts = 0;
+    const spy = vi.spyOn(s.app.meetingStore, "put").mockImplementation(async (meeting) => {
+      if (failsAt(++puts)) throw new DOMException("quota", "QuotaExceededError");
+      return put(meeting);
+    });
+    try {
+      return await session.stop();
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it("照合の一覧取得がネットワーク失敗で終わったら、ヘルス状態が変わらなくても時間をおいて確定を再試行する", async () => {
+    // Arrange
+    const { s, timers, id } = await setupListFailsOnce();
     // Act
     const first = await s.app.retryFinalize(id);
     const scheduled = timers.splice(0);
@@ -1062,32 +1085,12 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
 
   it("ネットワーク失敗の再試行が発火したときに会議ロックが別タブに使われていたら、予約し直して後で確定する", async () => {
     // Arrange：一覧の GET が 1 回だけネットワーク失敗し、再試行の予約が入る
-    const timers: Array<{ fn: () => void; ms: number }> = [];
-    let failList = true;
-    let lockManager: FakeLockManager | undefined;
-    const s = await setup({
-      setTimer: (fn, ms) => timers.push({ fn, ms }),
-      seed: async (_db, _server, locks) => { lockManager = locks; },
-      wrapFetch: (f) => async (input, init) => {
-        if (failList && init?.method === undefined && String(input).endsWith("/chunks")) {
-          failList = false;
-          throw new TypeError("Failed to fetch");
-        }
-        return f(input, init);
-      },
-    });
-    await settleMonitor(s);
-    timers.length = 0;
-    const id = nextMeetingId();
-    const chunk = await seedChunk(s.db, id, 0, "DB_REGISTERED");
-    registerOnServer(s.server, chunk);
-    await seedMeeting(s.db, makeMeeting(id, "stop_requested"));
+    const { s, timers, id } = await setupListFailsOnce();
     expect(await s.app.retryFinalize(id)).toMatchObject({ reason: "network" });
     const first = timers.splice(0);
     expect(first).toHaveLength(1);
     // Act：発火の時点では別タブ（起動時の復旧など）がロックを持っている
-    if (lockManager === undefined) throw new Error("locks not captured");
-    const release = await tryAcquireMeetingLock(lockManager, id);
+    const release = await tryAcquireMeetingLock(s.locks, id);
     for (const t of first) t.fn();
     await s.app.whenBackendRecoverySettled();
     // Assert：確定を試せなかったので、予約を失わずに間隔を延ばして入れ直す
@@ -1153,16 +1156,7 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     const s = await setup();
     await settleMonitor(s);
     const id = nextMeetingId();
-    const session = await s.app.startRecording(startInput(id));
-    s.controllers[0].audioFrameCount = 1_600;
-    const put = s.app.meetingStore.put.bind(s.app.meetingStore);
-    let puts = 0;
-    const spy = vi.spyOn(s.app.meetingStore, "put").mockImplementation(async (meeting) => {
-      if (++puts === 2) throw new DOMException("quota", "QuotaExceededError");
-      return put(meeting);
-    });
-    await session.stop();
-    spy.mockRestore();
+    await stopWithFailingMeetingPuts(s, id, (n) => n === 2);
     // Act
     const result = await s.app.retryFinalize(id);
     // Assert
@@ -1179,16 +1173,7 @@ describe("確定待ちの会議（listPendingFinalize / retryFinalize）", () =>
     const s = await setup();
     await settleMonitor(s);
     const id = nextMeetingId();
-    const session = await s.app.startRecording(startInput(id));
-    s.controllers[0].audioFrameCount = 1_600;
-    const put = s.app.meetingStore.put.bind(s.app.meetingStore);
-    let puts = 0;
-    const spy = vi.spyOn(s.app.meetingStore, "put").mockImplementation(async (meeting) => {
-      if (++puts >= 2) throw new DOMException("quota", "QuotaExceededError");
-      return put(meeting);
-    });
-    expect(await session.stop()).toMatchObject({ ok: false });
-    spy.mockRestore();
+    expect(await stopWithFailingMeetingPuts(s, id, (n) => n >= 2)).toMatchObject({ ok: false });
     const other = await createApp({ db: s.db, baseUrl: BASE_URL, workletModuleUrl: "/worklet.js", locks: s.locks,
       onEvent: () => undefined, setTimer: () => undefined,
       fetchImpl: async (input, init) => String(input).endsWith("/health") ? new Response(null, { status: 503 }) : s.server.fetch(input, init) });
