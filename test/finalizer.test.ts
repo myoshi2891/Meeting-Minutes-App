@@ -90,6 +90,27 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     expect(posted).toEqual([expect.objectContaining({ stopReason: "mic_ended", stopDetectedAtEpochMs: 123456 })]);
   });
 
+  // MAX_SAFE_INTEGER 超えはサーバー（2**63-1 まで）では受け付けるが、JS の数値では正確な整数として送れないのでクライアントの規則で省く
+  it.each([Number.NaN, -1, 1.5, Number.MAX_SAFE_INTEGER + 2])("保存済みの検出時刻 %s が安全な 0 以上の整数でなければ、停止理由ごと省いて確定する", async (detectedAt) => {
+    // Arrange：旧版や壊れた行で、サーバーが 422 にする検出時刻が IDB に残っている
+    const h = await createHarness();
+    await recordAndSave(h, 0);
+    const m = (await h.meetingStore.get(MEETING_ID))!;
+    await h.meetingStore.put({ ...m, stopReason: "manual", stopDetectedAtEpochMs: detectedAt });
+    const posted: Array<Record<string, unknown>> = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      if (init?.method === "POST") posted.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return h.server.fetch(input, init);
+    };
+    // Act
+    const result = await finalizeMeeting(deps(h, fetchImpl), MEETING_ID);
+    // Assert：未観測（両方省略）として送り、422 で止まらず確定まで進む
+    expect(result).toEqual({ ok: true });
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).not.toHaveProperty("stopReason");
+    expect(posted[0]).not.toHaveProperty("stopDetectedAtEpochMs");
+  });
+
   it.each([401, 403])("確定 POST の %s を通知し、stop_requested に戻す", async (status) => {
     const h = await createHarness();
     await recordAndSave(h, 0);

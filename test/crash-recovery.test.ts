@@ -296,6 +296,28 @@ describe("ブラウザクラッシュ後の復旧", () => {
     expect(await h.chunkStore.getChunk(r.chunkKey)).toBeDefined();
   });
 
+  it("サーバーが受け付けない停止の観測（小数の検出時刻・不明な理由）は両方を外して直し、音声は残す", async () => {
+    // Arrange
+    const h = await createHarness();
+    await h.meetingStore.put({ ...meetingOf("invalid-stop-ts", "stop_requested"), stopReason: "manual", stopDetectedAtEpochMs: 1.5 });
+    await h.meetingStore.put({ ...meetingOf("invalid-stop-reason", "stop_requested"), stopReason: "unknown" as never, stopDetectedAtEpochMs: 5 });
+    await h.meetingStore.put({ ...meetingOf("valid-stop", "stop_requested"), stopReason: "mic_ended", stopDetectedAtEpochMs: 5 });
+    const r = await makeChunkRecord("invalid-stop-ts", 0, 160);
+    await h.chunkStore.putChunk(r);
+    // Act
+    const report = await recoverOnStartup(h.meetingStore, h.chunkStore, h.scheduler, h.locks);
+    // Assert：確定が 422 で止まり続けないよう未観測にする。正しい観測は変えない
+    expect(report.unreadMeetingIds).toEqual([]);
+    for (const id of ["invalid-stop-ts", "invalid-stop-reason"]) {
+      const m = await h.meetingStore.get(id);
+      expect(m?.status).toBe("stop_requested");
+      expect(m?.stopReason).toBeUndefined();
+      expect(m?.stopDetectedAtEpochMs).toBeUndefined();
+    }
+    expect(await h.meetingStore.get("valid-stop")).toMatchObject({ stopReason: "mic_ended", stopDetectedAtEpochMs: 5 });
+    expect(await h.chunkStore.getChunk(r.chunkKey)).toBeDefined();
+  });
+
   it("中断状態（GENERATED / SAVING）だけを書き戻し、non-retryable の LOCAL_SAVE_FAILED と SAVED は再送しない", async () => {
     // Arrange
     const h = await createHarness();

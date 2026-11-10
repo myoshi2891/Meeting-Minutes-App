@@ -81,8 +81,9 @@ export class BackendHealthMonitor {
     const reportsAtStart = this.unauthorizedReports;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    // 失敗応答・例外の経路でも、開始後にトークンが差し替わったかを確かめるので try の外で控える
+    const token = this.config.token();
     try {
-      const token = this.config.token();
       const headers: Record<string, string> = {};
       if (token !== null) headers.Authorization = `Bearer ${token}`;
       // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
@@ -101,6 +102,8 @@ export class BackendHealthMonitor {
       }
       const body: unknown = await response.json().catch(() => null);
       if (!response.ok || !isHealthResponse(body)) {
+        // 応答待ちの間にトークンが差し替わったチェックの失敗で、新しいトークンのチェックの結果（HEALTHY・capabilities）を消さない
+        if (this.config.token() !== token) return this.state;
         // 別プロセスが同じポートで HTTP を返しているケースは service 識別子で弾く
         this.transition("UNREACHABLE", latency, null);
         return this.state;
@@ -114,6 +117,8 @@ export class BackendHealthMonitor {
       this.transition(status, latency, body.capabilities ?? null);
       return this.state;
     } catch (error) {
+      // 成功・失敗応答と同じく、差し替え前のトークンで始めたチェックの失敗は状態に反映しない（新しいトークンのチェックに任せる）
+      if (this.config.token() !== token) return this.state;
       // AbortError（タイムアウト）/ TypeError（接続不能・ヘッダー生成失敗）いずれも UNREACHABLE。
       // 画面には「サーバー未接続」としか出ないため、原因を特定できるよう理由を残す（トークン値は例外に含まれない）
       const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);

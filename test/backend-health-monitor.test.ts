@@ -260,6 +260,46 @@ describe("BackendHealthMonitor.checkOnce", () => {
     expect(m.state.status).toBe("HEALTHY");
   });
 
+  it.each([
+    ["失敗応答", "http-500"],
+    ["接続失敗", "network-error"],
+  ] as const)("古いトークンで始めたヘルスチェックの%sは、新しいトークンのチェックの HEALTHY と capabilities を消さない", async (_label, failure) => {
+    // Arrange：古いトークンのチェックの応答待ち中にトークンが差し替わる
+    let token = "stale";
+    let releaseStale!: () => void;
+    const staleGate = new Promise<void>((r) => { releaseStale = r; });
+    const m = new BackendHealthMonitor({ ...CONFIG, token: () => token }, createInitialHealth("running"), async (_input, init) => {
+      if (new Headers(init?.headers).get("Authorization") === "Bearer stale") {
+        await staleGate;
+        if (failure === "network-error") throw new TypeError("Failed to fetch");
+        return json({ error: "x", code: "INTERNAL" }, 500);
+      }
+      return json({ status: "ok", service: "minutes-local", capabilities: CAPS });
+    });
+    const stale = m.checkOnce();
+    token = "new";
+    expect((await m.checkOnce()).status).toBe("HEALTHY");
+    // Act：新しいトークンのチェックが終わってから、古いチェックの失敗が遅れて届く
+    releaseStale();
+    await stale;
+    // Assert
+    expect(m.state.status).toBe("HEALTHY");
+    expect(m.state.capabilities).toEqual(CAPS);
+  });
+
+  it("トークンが変わっていなければ、失敗応答と接続失敗は従来どおり UNREACHABLE にする", async () => {
+    // Arrange
+    let fail: "http-500" | "network-error" = "http-500";
+    const m = new BackendHealthMonitor(CONFIG, createInitialHealth("running"), async () => {
+      if (fail === "network-error") throw new TypeError("Failed to fetch");
+      return json({ error: "x", code: "INTERNAL" }, 500);
+    });
+    // Act / Assert
+    expect((await m.checkOnce()).status).toBe("UNREACHABLE");
+    fail = "network-error";
+    expect((await m.checkOnce()).consecutiveFailures).toBe(2);
+  });
+
   it("応答待ちの間にトークンが差し替わったら、古いトークンの成功応答で unauthorized を解除しない", async () => {
     // Arrange：失効中に古いトークンのチェックを止めている間、利用者が別のトークンを保存する
     let token = "old";

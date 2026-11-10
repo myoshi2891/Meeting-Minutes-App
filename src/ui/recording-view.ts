@@ -119,11 +119,18 @@ export interface PendingCounts {
 export function pendingCountsText({ chunks, audioFrameCount, directRegistered, memoryCount, offIdbEndFrame = 0, offIdbSequenceNos }: PendingCounts): string {
   const registered = chunks.filter((c) => c.save.status === "DB_REGISTERED").length;
   const saved = chunks.filter((c) => c.save.status === "SAVED").length;
+  // 長い会議では Chunk が数万件になりうる。Math.max に展開すると引数の上限で RangeError になるので、ループで求める
+  let maxSequenceNo = -1;
+  let maxEndFrame = Math.max(0, offIdbEndFrame);
+  for (const c of chunks) {
+    maxSequenceNo = Math.max(maxSequenceNo, c.meta.sequenceNo);
+    maxEndFrame = Math.max(maxEndFrame, c.meta.endFrame);
+  }
   const hasGap = offIdbSequenceNos === undefined
-    ? Math.max(-1, ...chunks.map((c) => c.meta.sequenceNo)) + 1 > chunks.length + directRegistered + memoryCount
+    ? maxSequenceNo + 1 > chunks.length + directRegistered + memoryCount
     : hasSequenceGap([...chunks.map((c) => c.meta.sequenceNo), ...offIdbSequenceNos]);
   // 件数が合っていても末尾まで届いているとは限らない。把握している Chunk の最大 endFrame で網羅を確かめる
-  const hasUnknownTail = audioFrameCount > Math.max(0, offIdbEndFrame, ...chunks.map((c) => c.meta.endFrame));
+  const hasUnknownTail = audioFrameCount > maxEndFrame;
   const note = hasGap || hasUnknownTail ? INCOMPLETE_COUNT_NOTE : "";
   return `サーバー登録確認済み ${registered + directRegistered} 件${note}／サーバー保存済み・登録未確認 ${saved} 件／ブラウザ保存済み・未送信 ${chunks.length - registered - saved} 件／メモリ内未保存 ${memoryCount} 件`;
 }
@@ -131,7 +138,8 @@ export function pendingCountsText({ chunks, audioFrameCount, directRegistered, m
 /** 0 から最大の連番までに抜けがあるか。件数で比べると、メモリ待機の連番が IDB の最大より後ろにあるとき欠番を見逃す */
 function hasSequenceGap(sequenceNos: ReadonlyArray<number>): boolean {
   const known = new Set(sequenceNos);
-  const max = Math.max(-1, ...known);
+  let max = -1;
+  for (const n of known) max = Math.max(max, n);
   for (let i = 0; i <= max; i++) if (!known.has(i)) return true;
   return false;
 }

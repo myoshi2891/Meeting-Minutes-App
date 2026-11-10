@@ -306,8 +306,19 @@ async function exportMemoryBacklog(app: App): Promise<void> {
     if (controller.memoryBacklogCount === 0) stoppedWithBacklog.delete(controller);
   }
   const controllers = recording === null ? [...stoppedWithBacklog] : [recording.session.controller, ...stoppedWithBacklog];
-  await downloadWavs(controllers.flatMap((controller) => controller.exportMemoryBacklog()));
-  for (const { meetingId, title, count } of app.discardableMemoryBacklog()) {
+  const files = controllers.flatMap((controller) => controller.exportMemoryBacklog());
+  const exported = new Set(files.map((f) => f.meta.meetingId));
+  // 破棄の確認は書き出しに含めた会議だけに出す。stoppedWithBacklog から漏れた controller の分も App から集めて同じ書き出しに入れる
+  const discardable = app.discardableMemoryBacklog();
+  for (const { meetingId } of discardable) {
+    if (exported.has(meetingId)) continue;
+    const extra = app.exportMemoryBacklog(meetingId);
+    files.push(...extra);
+    if (extra.length > 0) exported.add(meetingId);
+  }
+  await downloadWavs(files);
+  for (const { meetingId, title, count } of discardable) {
+    if (!exported.has(meetingId)) continue;
     if (window.confirm(discardBacklogQuestion(title, count))) await app.discardMemoryBacklog(meetingId, true);
   }
 }
