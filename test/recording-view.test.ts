@@ -263,4 +263,15 @@ describe("pendingCountsText", () => {
     // Assert
     expect(text.includes(INCOMPLETE_COUNT_NOTE)).toBe(incomplete);
   });
+
+  it("Chunk が引数の上限を超える件数でも、最大値の展開で落ちずに内訳を返す", () => {
+    // Arrange：Math.max(...list) は V8 の引数上限（十数万件）を超えると RangeError になる
+    const chunks = Array.from({ length: 300_000 }, (_, i) => chunk(i, "DB_REGISTERED"));
+    // Act
+    const withSeq = pendingCountsText({ chunks, audioFrameCount: 300_000 * 100, directRegistered: 0, memoryCount: 0, offIdbSequenceNos: [] });
+    const withoutSeq = pendingCountsText({ chunks, audioFrameCount: 300_000 * 100 + 1, directRegistered: 0, memoryCount: 0 });
+    // Assert：欠番・末尾の判定も変わらない
+    expect(withSeq).toBe("サーバー登録確認済み 300000 件／サーバー保存済み・登録未確認 0 件／ブラウザ保存済み・未送信 0 件／メモリ内未保存 0 件");
+    expect(withoutSeq).toContain(INCOMPLETE_COUNT_NOTE);
+  });
 });
