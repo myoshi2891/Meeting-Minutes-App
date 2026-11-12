@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""設計書のコードブロックを実ファイルとして書き出す。
+
+使い方: python3 scripts/extract-design-code.py <設計書.md> <出力先ディレクトリ> [--list]
+
+1 行目が `// src/...` `// test/...`（TypeScript）または `# minutes_local/...` `# tests/...` `# pyproject.toml`
+（Python / TOML）のコードブロックを、そのパスへ書き出す。同じパスが複数あれば後ろへ連結する。
+--list は書き出さずに、パス・開始行・行数を表示する。
+未実装フェーズ（Phase 2 / 3）の設計書を、実際にコンパイル・テストして確かめるために使う（scripts/verify-design-docs.sh）。
+"""
+import os
+import re
+import sys
+
+BLOCK = re.compile(r"^(?P<fence>`{3,})(?P<lang>\w+)[ \t]*\n(?P<body>.*?)^(?P=fence)[ \t]*$", re.S | re.M)
+HEAD = re.compile(r"^(?://|#) ((?:src|test|tests|minutes_local)/\S+|pyproject\.toml)\s*$")
+
+
+def main() -> int:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if len(args) != 2:
+        print(__doc__)
+        return 2
+    doc, out = args
+    listing = "--list" in sys.argv
+    text = open(doc, encoding="utf-8").read()
+    seen: dict[str, int] = {}
+    for m in BLOCK.finditer(text):
+        body = m.group("body")
+        head = HEAD.match(body.split("\n", 1)[0])
+        if head is None:
+            continue
+        path = head.group(1)
+        seen[path] = seen.get(path, 0) + 1
+        if listing:
+            print(f"{path}\tL{text.count(chr(10), 0, m.start()) + 1}\t{len(body.splitlines())} 行")
+            continue
+        target = os.path.join(out, path)
+        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+        with open(target, "a" if seen[path] > 1 else "w", encoding="utf-8") as f:
+            f.write(body)
+    if not listing:
+        print(f"{doc}: {len(seen)} ファイルを {out} へ書き出した")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
