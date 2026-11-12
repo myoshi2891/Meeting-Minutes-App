@@ -5,7 +5,7 @@
 **対となる文書:** Phase 3 詳細設計書 ── ブラウザ側（`docs/design-local-phase3-client.md`）。
 **配置:** `docs/design-local-phase3-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。LAN 共有は「利用者自身が管理する LAN 内」に限定し、インターネット公開は対象外。
-**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 97 件と本書の 36 件（計 18 ファイル 133 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
+**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 100 件と本書の 36 件（計 18 ファイル 136 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
 
 ---
 
@@ -836,7 +836,11 @@ def chunk_file_intact(data_dir: Path, chunk: AudioChunk) -> bool:
     """登録済み Chunk のファイルが存在し、WAV なら sha256 が登録時と一致するか（圧縮済みは存在だけを見る）。
     finalize と起動時の回収（Phase 2 の sweeper.resume_finalized）が同じ規則で照合する。"""
     path = data_dir / chunk.local_path
-    return path.exists() and (chunk.codec != "wav" or sha256_file(path) == chunk.sha256)
+    # ファイルシステムのエラーは「欠損」として False（起動時の回収で起動ごと止めず、finalize を 500 にしない。Phase 2 §12）
+    try:
+        return path.is_file() and (chunk.codec != "wav" or sha256_file(path) == chunk.sha256)
+    except OSError:
+        return False
 
 
 def on_finalized(conn: sqlite3.Connection, meeting_id: str, diarize: bool = False) -> int:
@@ -2384,6 +2388,7 @@ def _ownership_denied(path: str, user_id: str, ctx: AppContext) -> bool:
 """Phase 1 §12 の契約。形状は変更禁止、検証規則は Phase 2 §21.2 のまま。Phase 3 で利用者階層・Live フック・meeting.json・missing を追加。"""
 from __future__ import annotations
 
+import asyncio
 import base64
 import errno
 import json
@@ -2521,10 +2526,11 @@ def _validate_meta(header: str, meeting_id: str, source: str, sequence_no: int, 
     start, end = meta.get("startOffsetMs"), meta.get("endOffsetMs")
     if not _is_int(start) or not _is_int(end) or start < 0 or end < start:
         raise ValueError("invalid timing")
-    score = meta.get("vadScore", 0)
+    # VAD の結果も既定値で補わない。hasVoice を True で補うと無音の Chunk まで文字起こしに回る（欠落は 422）
+    score = meta.get("vadScore")
     if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
         raise ValueError("invalid vadScore")
-    if not isinstance(meta.get("hasVoice", True), bool):
+    if not isinstance(meta.get("hasVoice"), bool):
         raise ValueError("invalid hasVoice")
     if (meta.get("sha256", sha) != sha or meta.get("sizeBytes", size) != size
             or meta.get("sampleRate", 16000) != 16000 or meta.get("channels", 1) != 1):
@@ -2611,7 +2617,7 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
         id=repo.new_id(), meeting_id=meeting_id, source=source, sequence_no=sequence_no,  # type: ignore[arg-type]
         start_offset_ms=meta["startOffsetMs"], end_offset_ms=meta["endOffsetMs"],
         duration_ms=duration_ms, sample_count=header.sample_count, local_path=rel, size_bytes=len(data), sha256=sha,
-        vad_score=float(meta.get("vadScore", 0.0)), has_voice=bool(meta.get("hasVoice", True)), created_at=now_ms(),
+        vad_score=float(meta["vadScore"]), has_voice=meta["hasVoice"], created_at=now_ms(),
     )
     # 同期誤差サンプル（基本設計 §16.3.1）。frameClockDriftMs は Phase 1 の ChunkTimingMetadata に
     # 後から足した optional フィールドなので、欠落や非数値は 422 にせず無視する
@@ -2672,7 +2678,8 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     counts = {"mic": 0, "system": 0}
     missing: list[str] = []
     for c in chunks:
-        if not pipeline.chunk_file_intact(ctx.settings.data_dir, c):
+        # sha256 の計算はファイル全体を読むので、イベントループを塞がないようスレッドで行う（書き込みトランザクションの前）
+        if not await asyncio.to_thread(pipeline.chunk_file_intact, ctx.settings.data_dir, c):
             missing.append(f"{c.source}/{c.sequence_no}")
             continue
         counts[c.source] += 1
@@ -3777,7 +3784,7 @@ if __name__ == "__main__":
 
 ## 23.1 ハーネス（変更）と Phase 2 テストの回帰
 
-Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 97 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
+Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 100 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
 
 ```python
 # tests/conftest.py
@@ -4710,7 +4717,7 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
 | マイグレーション 009〜012 | `test_apply_phase3_moves_files_and_extends_job_types`、`test_apply_phase3_keeps_other_recordings_when_meeting_id_equals_user_id` |
-| Phase 2 の回帰 | Phase 2 §23 の 97 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
+| Phase 2 の回帰 | Phase 2 §23 の 100 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
 
 ---
 

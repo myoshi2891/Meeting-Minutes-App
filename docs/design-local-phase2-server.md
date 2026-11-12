@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── ブラウザ側（`docs/design-local-phase2-client.md`）。
 **配置:** `docs/design-local-phase2-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。
-**検証状態:** 本書のコードブロック（58 ファイル：`pyproject.toml`・実装 46・テスト 11）はパッケージとして抽出でき、Fake Provider による pytest 11 ファイル 97 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
+**検証状態:** 本書のコードブロック（58 ファイル：`pyproject.toml`・実装 46・テスト 11）はパッケージとして抽出でき、Fake Provider による pytest 11 ファイル 100 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
 
 ---
 
@@ -1714,9 +1714,16 @@ BLOCKING_STT = ("pending", "queued", "processing")
 
 
 def chunk_file_intact(data_dir: Path, chunk: AudioChunk) -> bool:
-    """登録済み Chunk のファイルが存在し、sha256 が登録時と一致するか。finalize と起動時の回収（sweeper）が同じ規則で照合する。"""
+    """登録済み Chunk のファイルが存在し、sha256 が登録時と一致するか。finalize と起動時の回収（sweeper）が同じ規則で照合する。
+
+    確かめる・読む途中のファイルシステムのエラー（権限・ディレクトリ・照合中の削除など）は「欠損」として False にする。
+    例外のまま上げると、起動時の回収がサーバーの起動ごと止まり、finalize は 500 になる（409 で再送させるべき状態）。
+    """
     path = data_dir / chunk.local_path
-    return path.exists() and sha256_file(path) == chunk.sha256
+    try:
+        return path.is_file() and sha256_file(path) == chunk.sha256
+    except OSError:
+        return False
 
 
 def on_finalized(conn: sqlite3.Connection, meeting_id: str) -> int:
@@ -3783,7 +3790,7 @@ Phase 1 §12 の 5 エンドポイント。リクエスト／レスポンス形�
 | PUT の URL | `source` は `mic` / `system`、`sequenceNo` ≥ 0 | `422 VALIDATION` |
 | PUT のヘッダ | `Content-Type: audio/wav`、`X-Chunk-SHA256`（小文字 16 進 64 桁）、`X-Chunk-Meta` がすべて必須 | `422 VALIDATION` |
 | WAV 本体 | PCM16 / mono / 16 kHz、データ長が 0 でなく偶数 | `422 VALIDATION` |
-| `X-Chunk-Meta` | `meetingId` / `source` / `sequenceNo` が URL と、`sampleCount` が WAV と一致。`startOffsetMs` / `endOffsetMs` は整数で 0 ≤ start ≤ end。`vadScore` は有限の数、`hasVoice` は真偽値。`sha256` / `sizeBytes` / `sampleRate` / `channels` は載っていれば実体と一致 | `422 VALIDATION`。既定値で補わない（時刻がずれた transcript になる） |
+| `X-Chunk-Meta` | `meetingId` / `source` / `sequenceNo` が URL と、`sampleCount` が WAV と一致。`startOffsetMs` / `endOffsetMs` は整数で 0 ≤ start ≤ end。`vadScore` は有限の数、`hasVoice` は真偽値（どちらも必須。欠落を既定値で補うと、無音の Chunk まで文字起こしに回る）。`sha256` / `sizeBytes` / `sampleRate` / `channels` は載っていれば実体と一致 | `422 VALIDATION`。既定値で補わない（時刻がずれた transcript になる） |
 | 登録済み Chunk の再送 | sha256 が同じでファイルも無事なら `200`。**ファイルが失われた・壊れていれば書き戻して `200`**（確定後の会議でも受け付ける） | sha256 が違えば `409 CONFLICT_HASH_MISMATCH` |
 | 確定の本文 | `expectedChunkCounts` のキーはちょうど `mic` と `system`、値は 0 以上 | `422 VALIDATION` |
 | 確定の照合 | 件数一致に加え、source ごとの連番が `0..n-1` で連続し、登録済み Chunk に欠損・破損（ファイルなし・sha256 不一致）が 1 件もない | `409 CONFLICT_CHUNKS_MISSING` |
@@ -3796,6 +3803,7 @@ Phase 2 で加えた挙動：`frameClockDriftMs` の保存（基本設計 §16.3
 """Phase 1 §12 の契約。変更禁止（基本設計 §2）。検証規則は Phase 1 の実装 `minutes_local/phase1.py` と同じにする（§21.2）。"""
 from __future__ import annotations
 
+import asyncio
 import base64
 import errno
 import json
@@ -3933,10 +3941,11 @@ def _validate_meta(header: str, meeting_id: str, source: str, sequence_no: int, 
     start, end = meta.get("startOffsetMs"), meta.get("endOffsetMs")
     if not _is_int(start) or not _is_int(end) or start < 0 or end < start:
         raise ValueError("invalid timing")
-    score = meta.get("vadScore", 0)
+    # VAD の結果も既定値で補わない。hasVoice を True で補うと無音の Chunk まで文字起こしに回る（欠落は 422）
+    score = meta.get("vadScore")
     if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
         raise ValueError("invalid vadScore")
-    if not isinstance(meta.get("hasVoice", True), bool):
+    if not isinstance(meta.get("hasVoice"), bool):
         raise ValueError("invalid hasVoice")
     if (meta.get("sha256", sha) != sha or meta.get("sizeBytes", size) != size
             or meta.get("sampleRate", 16000) != 16000 or meta.get("channels", 1) != 1):
@@ -4005,7 +4014,7 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
         id=repo.new_id(), meeting_id=meeting_id, source=source, sequence_no=sequence_no,  # type: ignore[arg-type]
         start_offset_ms=meta["startOffsetMs"], end_offset_ms=meta["endOffsetMs"],
         duration_ms=duration_ms, sample_count=header.sample_count, local_path=rel, size_bytes=len(data), sha256=sha,
-        vad_score=float(meta.get("vadScore", 0.0)), has_voice=bool(meta.get("hasVoice", True)), created_at=now_ms(),
+        vad_score=float(meta["vadScore"]), has_voice=meta["hasVoice"], created_at=now_ms(),
     )
     # 同期誤差サンプル（基本設計 §16.3.1）。frameClockDriftMs は Phase 1 の ChunkTimingMetadata に
     # 後から足した optional フィールドなので、欠落や非数値は 422 にせず無視する
@@ -4060,7 +4069,8 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     counts = {"mic": 0, "system": 0}
     missing: list[str] = []
     for c in chunks:
-        if not pipeline.chunk_file_intact(ctx.settings.data_dir, c):
+        # sha256 の計算はファイル全体を読むので、イベントループを塞がないようスレッドで行う（書き込みトランザクションの前）
+        if not await asyncio.to_thread(pipeline.chunk_file_intact, ctx.settings.data_dir, c):
             missing.append(f"{c.source}/{c.sequence_no}")
             continue
         counts[c.source] += 1
@@ -5090,7 +5100,7 @@ def _b64(meta: dict[str, object]) -> str:
 
 def _meta(seq: int = 0, **overrides: object) -> dict[str, object]:
     return {"meetingId": "m-1", "source": "mic", "sequenceNo": seq, "sampleCount": 16000,
-            "startOffsetMs": seq * 30000, "endOffsetMs": seq * 30000 + 1000, **overrides}
+            "startOffsetMs": seq * 30000, "endOffsetMs": seq * 30000 + 1000, "vadScore": 0.5, "hasVoice": True, **overrides}
 
 
 async def _raw_put(client: httpx.AsyncClient, *, meeting_id: str = "m-1", seq: int = 0, headers: dict[str, str] | None = None,
@@ -5190,6 +5200,7 @@ async def test_put_chunk_rejects_bad_key_and_headers(client: httpx.AsyncClient) 
     _meta(meetingId="m-other"), _meta(source="system"), _meta(sequenceNo=1), _meta(sampleCount=15999),
     {k: v for k, v in _meta().items() if k != "startOffsetMs"}, _meta(startOffsetMs=-1), _meta(endOffsetMs=-1),
     _meta(startOffsetMs=1.5), _meta(vadScore="high"), _meta(hasVoice="yes"), _meta(sampleRate=48000), _meta(channels=2),
+    {k: v for k, v in _meta().items() if k != "vadScore"}, {k: v for k, v in _meta().items() if k != "hasVoice"},
     _meta(sizeBytes=1), _meta(sha256="0" * 64),
 ])
 async def test_put_chunk_rejects_meta_that_disagrees_with_url_or_wav(client: httpx.AsyncClient, meta: dict[str, object]) -> None:
@@ -5549,6 +5560,7 @@ async def test_web_dir_is_served_at_root_without_token_and_does_not_shadow_api(c
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from minutes_local.db import repo
 from minutes_local.db.connection import now_ms
@@ -5621,6 +5633,27 @@ async def test_resume_finalized_creates_vad_jobs_for_meetings_finalized_before_m
     assert await resume_finalized(ctx.db, ctx.settings.data_dir) == 1
     with ctx.db.read() as conn:
         assert len(repo.list_jobs(conn, "m-1")) == 2
+
+
+async def test_resume_finalized_skips_meeting_when_file_check_raises(client: httpx.AsyncClient, ctx: AppContext,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 確定済みの会議のファイルを読むと OSError（権限など）になる
+    await create_meeting(client, "m-1")
+    await put_chunk(client, "m-1", 0, sine_pcm(1))
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE meetings SET status = 'finalized' WHERE id = 'm-1'")
+
+    def denied(_path: object) -> str:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("minutes_local.jobs.pipeline.sha256_file", denied)
+    # Act: 例外で起動を止めない
+    resumed = await resume_finalized(ctx.db, ctx.settings.data_dir)
+    # Assert: 欠損として扱い、finalized のまま残す
+    assert resumed == 0
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").status == "finalized"
+        assert repo.list_jobs(conn, "m-1") == []
 
 
 def test_retry_decisions() -> None:
@@ -6246,7 +6279,7 @@ def _meta(seq: int, source: str, drift: float | None) -> str:
     m: dict[str, object] = {
         "meetingId": "m-1", "source": source, "sequenceNo": seq, "sampleCount": 480000,
         "startOffsetMs": seq * 30000, "endOffsetMs": (seq + 1) * 30000, "durationMs": 30000,
-        "wallClockStartEpochMs": 1_700_000_000_000 + seq * 30000,
+        "wallClockStartEpochMs": 1_700_000_000_000 + seq * 30000, "vadScore": 0.5, "hasVoice": True,
     }
     if drift is not None:
         m["frameClockDriftMs"] = drift
