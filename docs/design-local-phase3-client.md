@@ -1,7 +1,8 @@
 # 議事録Webアプリケーション Phase 3 詳細設計書 ── ブラウザ側（TypeScript）
 
 **対象:** Phase 1・Phase 2 詳細設計のブラウザ側コードに対する Phase 3 の追加・変更。Live Transcript ペイン／話者名の割当／言語バッジ／欠損 Chunk の逆同期／LAN モード（許可ホストと HTTPS）／Live STT の負荷監視。
-**上位文書:** Phase 3 詳細設計書 ── サーバー側（`design-local-phase3-server.md`）§2 の設計判断と §20 の API。
+**上位文書:** Phase 3 詳細設計書 ── サーバー側（`docs/design-local-phase3-server.md`）§2 の設計判断と §20 の API。
+**配置:** `docs/design-local-phase3-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** Phase 1・2 と同じ（ブラウザ標準 API と TypeScript のみ、UI フレームワーク非依存の状態モデル）。
 **検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Phase 1・2 の 41 テストと本書の 18 テスト（計 15 ファイル 59 件）が vitest で全件通過することを設計時点で確認している（§9）。
 

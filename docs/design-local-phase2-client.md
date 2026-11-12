@@ -1,8 +1,9 @@
 # 議事録Webアプリケーション Phase 2 詳細設計書 ── ブラウザ側（TypeScript）
 
-**対象:** Phase 1 詳細設計書（`design-local-phase1.md`）のブラウザ側コードを前提に、Phase 2 で追加・変更するファイルの実装コードとテストコード。
-**上位文書:** Phase 2 基本設計書（`design-local-phase2.md`）§14・§16〜§19。
-**対となる文書:** Phase 2 詳細設計書 ── サーバー側（`design-local-phase2-server.md`）。API 契約はそちらの §21 と 1 対 1。
+**対象:** Phase 1 詳細設計書（`docs/design-local-phase1.md`）のブラウザ側コードを前提に、Phase 2 で追加・変更するファイルの実装コードとテストコード。
+**上位文書:** Phase 2 基本設計書（`docs/design-local-phase2.md`）§14・§16〜§19。
+**対となる文書:** Phase 2 詳細設計書 ── サーバー側（`docs/design-local-phase2-server.md`）。API 契約はそちらの §21 と 1 対 1。
+**配置:** `docs/design-local-phase2-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** ブラウザ標準 API（`MediaStream` / `AudioContext` / `AudioWorklet` / `IndexedDB` / `fetch` / `EventSource`）と TypeScript のみ。UI フレームワークは本書で選定せず、状態モデル（§11）をフレームワーク非依存の reducer として定義する。
 **検証状態:** 本書の全 `typescript` コードブロック（17 ファイル）は Phase 1 のコードと同じツリーに抽出され、`tsc --noEmit`（strict）を通過し、Phase 1 の 11 テストと本書の 23 テスト（計 11 ファイル 34 件）が Node 22 + Vitest で全件通過することを設計時点で確認している（§12）。
 

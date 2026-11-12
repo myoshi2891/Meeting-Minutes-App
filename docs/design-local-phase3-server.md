@@ -1,8 +1,9 @@
 # 議事録Webアプリケーション Phase 3 詳細設計書 ── サーバー側（Python）
 
-**対象:** Phase 2 詳細設計（`design-local-phase2-server.md`）の `minutes_local` パッケージに対する Phase 3 の追加・変更。Live STT（準リアルタイム）／話者分離／日英言語認識／FLAC 事後圧縮と高度な復旧／LAN 共有。
+**対象:** Phase 2 詳細設計（`docs/design-local-phase2-server.md`）の `minutes_local` パッケージに対する Phase 3 の追加・変更。Live STT（準リアルタイム）／話者分離／日英言語認識／FLAC 事後圧縮と高度な復旧／LAN 共有。
 **上位文書:** Phase 2 基本設計書 §20〜§24（Phase 3 概要）。Phase 3 には基本設計が存在しないため、本書 §2 で基本設計相当の判断を先に確定する。
-**対となる文書:** Phase 3 詳細設計書 ── ブラウザ側（`design-local-phase3-client.md`）。
+**対となる文書:** Phase 3 詳細設計書 ── ブラウザ側（`docs/design-local-phase3-client.md`）。
+**配置:** `docs/design-local-phase3-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。LAN 共有は「利用者自身が管理する LAN 内」に限定し、インターネット公開は対象外。
 **検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 34 テストと本書の 20 テスト（計 12 ファイル 54 件）が Fake Provider による pytest で全件通過することを設計時点で確認している（§23）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
 

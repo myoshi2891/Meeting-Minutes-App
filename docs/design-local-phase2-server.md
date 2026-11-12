@@ -1,8 +1,9 @@
 # 議事録Webアプリケーション Phase 2 詳細設計書 ── サーバー側（Python）
 
 **対象:** 常駐サーバー `minutes-local`（FastAPI + SQLite + faster-whisper + Silero VAD + Ollama HTTP）の実装コードとテストコード。
-**上位文書:** Phase 2 基本設計書（`design-local-phase2.md`）。本書は基本設計の §7〜§15 を実装粒度に展開する。基本設計の DDL（§8）・API 契約（§14）・状態遷移（§9）は変更せず再掲する。
-**対となる文書:** Phase 2 詳細設計書 ── ブラウザ側（`design-local-phase2-client.md`）。
+**上位文書:** Phase 2 基本設計書（`docs/design-local-phase2.md`）。本書は基本設計の §7〜§15 を実装粒度に展開する。基本設計の DDL（§8）・API 契約（§14）・状態遷移（§9）は変更せず再掲する。
+**対となる文書:** Phase 2 詳細設計書 ── ブラウザ側（`docs/design-local-phase2-client.md`）。
+**配置:** `docs/design-local-phase2-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。
 **検証状態:** 本書の全 `python` コードブロック（54 ファイル）はパッケージとして抽出でき、Fake Provider による pytest 9 ファイル 34 テストが Python 3.12 + FastAPI + pydantic v2 で全件通過することを設計時点で確認している（§23）。実モデル（faster-whisper / Silero / Ollama）は設計時点では実行していない。
 

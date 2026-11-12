@@ -3,9 +3,10 @@
 **対象フェーズ:** Phase 2 ── finalize 済み会議を、利用者のマシン上だけで「確定 transcript → AI 議事録 → 手動編集」まで処理する。System Audio の追加を含む。
 **Phase 3:** Live STT / 話者分離 / FLAC / 高度な復旧 / LAN 共有 ── 方針と接続点のみ（概要レベル）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation
-**上位文書:** システム設計書 v4.0、Phase 1 詳細設計書（`design-local-phase1.md`）。本書は両者の「Recording is Source of Truth」原則と Invariant 1〜10 を変更せずに継承する。
+**上位文書:** システム設計書 v4.0、Phase 1 詳細設計書（`docs/design-local-phase1.md`）。本書は両者の「Recording is Source of Truth」原則と Invariant 1〜10 を変更せずに継承する。
 **粒度:** 基本設計。アーキテクチャ・API 契約・SQLite スキーマ・状態遷移・アルゴリズム方針までを確定し、実装コードは TypeScript 型定義と SQL DDL に限る。Python 側はモジュール構成と責務の記述にとどめる。
 **技術選定（確定）:** 常駐サーバーは Python（FastAPI + SQLite + faster-whisper + Ollama HTTP API）。
+**配置:** `docs/design-local-phase2.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 
 ---
 
