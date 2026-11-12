@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-12（PR #14 の 6 回目のレビュー指摘・未コミット、ブランチ `dev`。PR #13 までマージ済み）
+最終更新: 2026-11-12（PR #14 の 7 回目のレビュー指摘・未コミット、ブランチ `dev`。PR #13 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -26,7 +26,16 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### 今回の変更と残課題
 
-- 2026-11-12（PR #14 の 6 回目の指摘・未コミット）：CodeRabbit 4 件を検証し、3 件を修正、1 件をスキップした。新規テストは修正前に Red を確認。製品コード（`src/`・`test/`）は無変更。
+- 2026-11-12（PR #14 の 7 回目の指摘・未コミット）：CodeRabbit 6 件（nitpick 1 件を含む）を検証し、すべて有効として対応した（スキップなし）。新規テストは修正前の設計書で Red を確認（Phase 2 / 3 の両方）。製品コード（`src/`・`test/`）は無変更。
+  - **Phase 2 client §11 `jobs_loaded`**：アクションに `meetingId`（`JobListResponse.meetingId` を渡す）を足し、表示中の会議と違えば捨てる（`transcript_loaded` と同じ）。会議の切り替え前の一覧取得の後着が新しい会議の jobs に混ざっていた。会議切り替えのテストに 2 段の確認を追加。Phase 3 client は `state.ts` を載せ直していないので対象外。
+  - **Phase 2 / 3 client `backfill()`**：`failed` を `onError` より先に立て、`onError` の例外は `console.error` に記録して続ける。`onError` が投げると保留の解放と取り直しの予約が飛んでいた。回帰 1 件。
+  - **Phase 2 / 3 client `FetchEventSource.run()`/`pump()`**：listener の例外で抜けたとき、`pump` がストリームを `reader.cancel()` し、`run` の catch で `controller.abort()` する（`this.controller = null` の前）。接続が開いたまま残っていた。回帰 1 件。
+  - **Phase 2 server 修復（PUT 再送）**：照合を `pipeline.chunk_file_intact()`（`to_thread`）に替え、読めないファイルで 500 にせず書き戻す。未使用になった `sha256_file` の import を削除。Phase 3 は `_stored_chunk_intact` が `OSError` を受けていなかったので同じく欠損扱いにした。回帰 1 件（root では skip）。
+  - **Phase 2 / 3 server finalize**：書き込みトランザクションで読み直した会議が `None`（照合中に削除）なら 404。従来は「finalized」の成功応答を返していた。回帰 1 件。
+  - **nitpick `scripts/extract-design-code.py`**：argparse 化。不明なオプション・`--help` はファイルを開く前に終了コード 2 で止まる（従来は `--` で始まる未知の引数を黙って無視）。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過。`verify-design-docs.sh all`：Phase 2 server 102 件・Phase 3 server 138 件・Phase 2 client 551 件・Phase 3 client 586 件、pyflakes 指摘なし。
+
+- 2026-11-12（PR #14 の 6 回目の指摘・244090c でコミット済み）：CodeRabbit 4 件を検証し、3 件を修正、1 件をスキップした。新規テストは修正前に Red を確認。製品コード（`src/`・`test/`）は無変更。
   - **スキップ：Phase 2 client `NotesStore.save()`**（送信の完了後に dirty なら schedule）：送信中の編集は `setDraft` がタイマーを予約し、`doSave` も `stillSame` が false なら `schedule()` を呼ぶので、dirty のまま予約なしで残る経路がない。
   - **Phase 2 / 3 server（`chunk_file_intact`）**：照合中のファイルシステムのエラー（権限・照合中の削除など）を `OSError` で受けて False（欠損）にする。存在確認も `is_file()` に変更。起動時の回収がサーバーの起動ごと止まらず、finalize も 500 ではなく 409 になる。回帰 1 件。
   - **Phase 2 / 3 server（`X-Chunk-Meta`）**：`vadScore` / `hasVoice` を必須にし、欠落を既定値（0 / True）で補わない（`hasVoice` を True で補うと無音の Chunk まで文字起こしに回る）。§21 の照合表も「どちらも必須」に更新。テストの `_meta` 2 か所に両フィールドを追加し、欠落の 2 ケースを追加（回帰 2 件）。
