@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-12（PR #14 の 5 回目のレビュー指摘・未コミット、ブランチ `dev`。PR #13 までマージ済み）
+最終更新: 2026-11-12（PR #14 の 6 回目のレビュー指摘・未コミット、ブランチ `dev`。PR #13 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,17 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-12 の PR #14 の 5 回目の指摘の対応後：Phase 2 server 97 件・Phase 3 server 133 件・Phase 2 client 30 ファイル 549 件・Phase 3 client 34 ファイル 584 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-12 の PR #14 の 6 回目の指摘の対応後：Phase 2 server 100 件・Phase 3 server 136 件・Phase 2 client 30 ファイル 549 件・Phase 3 client 34 ファイル 584 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-12（PR #14 の 6 回目の指摘・未コミット）：CodeRabbit 4 件を検証し、3 件を修正、1 件をスキップした。新規テストは修正前に Red を確認。製品コード（`src/`・`test/`）は無変更。
+  - **スキップ：Phase 2 client `NotesStore.save()`**（送信の完了後に dirty なら schedule）：送信中の編集は `setDraft` がタイマーを予約し、`doSave` も `stillSame` が false なら `schedule()` を呼ぶので、dirty のまま予約なしで残る経路がない。
+  - **Phase 2 / 3 server（`chunk_file_intact`）**：照合中のファイルシステムのエラー（権限・照合中の削除など）を `OSError` で受けて False（欠損）にする。存在確認も `is_file()` に変更。起動時の回収がサーバーの起動ごと止まらず、finalize も 500 ではなく 409 になる。回帰 1 件。
+  - **Phase 2 / 3 server（`X-Chunk-Meta`）**：`vadScore` / `hasVoice` を必須にし、欠落を既定値（0 / True）で補わない（`hasVoice` を True で補うと無音の Chunk まで文字起こしに回る）。§21 の照合表も「どちらも必須」に更新。テストの `_meta` 2 か所に両フィールドを追加し、欠落の 2 ケースを追加（回帰 2 件）。
+  - **Phase 2 / 3 server（finalize）**：`chunk_file_intact`（sha256 でファイル全体を読む）を `asyncio.to_thread` で実行し、イベントループを塞がない。書き込みトランザクションの前のまま。非ブロックを確かめるテストはなし（既存の finalize のテストで挙動が同じことを確認）。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過。`verify-design-docs.sh all`：Phase 2 server 100 件・Phase 3 server 136 件・Phase 2 client 549 件・Phase 3 client 584 件、pyflakes 指摘なし。
+  - 残り：リポジトリの Phase 1 サーバー（`minutes_local/phase1.py`）は `vadScore` / `hasVoice` を既定値で補ったまま（Phase 2 で置き換える対象。§25 Step 2-a）。
 
 - 2026-11-12（PR #14 の 5 回目の指摘・未コミット）：CodeRabbit 5 件（nitpick 1 件を含む）を検証し、すべて有効として対応した（スキップなし）。新規テストは修正前に Red を確認（nitpick のテスト強化は現行の挙動の確認）。製品コード（`src/`・`test/`）は無変更。
   - **Phase 2 client §15.1 W2**：テストの期待値を §4 の 1 に合わせた。ロックが `heldLocks` に入るのは、Mic か System のメモリ待機が残るときと Mic の最終保存に失敗したときだけ。Mic が保存しきり両方空なら Mic の `stop()` が解放済みで、System の失敗で reject しても `heldLocks` には入らない。
