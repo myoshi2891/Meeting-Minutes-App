@@ -1704,11 +1704,19 @@ def decide(err: JobError, attempts: int, max_attempts: int, now: int, rng: rando
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 from ..db import repo
 from ..db.models import AudioChunk, Job
+from ..storage.files import sha256_file
 
 BLOCKING_STT = ("pending", "queued", "processing")
+
+
+def chunk_file_intact(data_dir: Path, chunk: AudioChunk) -> bool:
+    """登録済み Chunk のファイルが存在し、sha256 が登録時と一致するか。finalize と起動時の回収（sweeper）が同じ規則で照合する。"""
+    path = data_dir / chunk.local_path
+    return path.exists() and sha256_file(path) == chunk.sha256
 
 
 def on_finalized(conn: sqlite3.Connection, meeting_id: str) -> int:
@@ -2096,27 +2104,50 @@ class JobRunner:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from ..db import repo
 from ..db.connection import Database, now_ms
+from ..db.models import AudioChunk
 from . import pipeline
 
 SWEEP_INTERVAL_S = 30.0
 
 
-async def resume_finalized(db: Database) -> int:
-    """status が finalized のまま止まった会議に vad_chunk を作り、パイプラインを始める。起動時に 1 回呼ぶ。戻り値は会議数。
+async def resume_finalized(db: Database, data_dir: Path) -> int:
+    """status が finalized のまま止まった会議に vad_chunk を作り、パイプラインを始める。起動時に 1 回呼ぶ。戻り値は始めた会議数。
 
     Phase 2 の finalize は finalized への遷移と on_finalized（transcribing への遷移）を 1 トランザクションで行うので、
     finalized が残るのは Phase 1 のサーバーで確定した会議（移行した DB）と、Phase 3 の doctor --rebuild が復元した会議だけ。
     finalize の再送は確定済みの会議にジョブを作らない（冪等）ので、ここで拾わないと処理されないまま残る。
     on_finalized は transcribing に進めるので 2 回目の起動では拾わない。insert_job は既存ジョブを作り直さない（冪等）。
+    始める前に finalize と同じ規則（source ごとの連番の連続、pipeline.chunk_file_intact）で登録済みファイルを照合する。
+    欠損・破損があれば始めず finalized のまま残す（失敗する vad ジョブで止めない。ファイルを直せば次の起動で拾う）。
+    sha256 の計算は書き込みロックの外で行い、ロック下では状態だけ確かめ直す。
     """
-    async with db.write() as conn:
+    with db.read() as conn:
         ids = [r["id"] for r in conn.execute("SELECT id FROM meetings WHERE status = 'finalized' ORDER BY id").fetchall()]
-        for meeting_id in ids:
+        chunks_of = {meeting_id: repo.list_chunks(conn, meeting_id) for meeting_id in ids}
+    intact = [meeting_id for meeting_id in ids if _chunks_intact(data_dir, chunks_of[meeting_id])]
+    resumed = 0
+    async with db.write() as conn:
+        for meeting_id in intact:
+            current = repo.get_meeting(conn, meeting_id)
+            if current is None or current.status != "finalized":
+                continue
             pipeline.on_finalized(conn, meeting_id)
-    return len(ids)
+            resumed += 1
+        if len(intact) < len(ids):
+            repo.record_metric(conn, "resume_finalized_skipped", len(ids) - len(intact))
+    return resumed
+
+
+def _chunks_intact(data_dir: Path, chunks: list[AudioChunk]) -> bool:
+    for source in ("mic", "system"):
+        seqs = sorted(c.sequence_no for c in chunks if c.source == source)
+        if seqs != list(range(len(seqs))):
+            return False
+    return all(pipeline.chunk_file_intact(data_dir, c) for c in chunks)
 
 
 async def sweep_once(db: Database) -> int:
@@ -4029,8 +4060,7 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     counts = {"mic": 0, "system": 0}
     missing: list[str] = []
     for c in chunks:
-        path = ctx.settings.data_dir / c.local_path
-        if not path.exists() or sha256_file(path) != c.sha256:
+        if not pipeline.chunk_file_intact(ctx.settings.data_dir, c):
             missing.append(f"{c.source}/{c.sequence_no}")
             continue
         counts[c.source] += 1
@@ -4076,7 +4106,7 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 ```
 
-`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を返す。`meeting.json` は書き込みトランザクションのコミット後に、DB に残った確定値（停止理由・検出時刻を含む）から書き出す。再送を含む成功した finalize のたびに書き直すので、書き出しに失敗しても再送で回復する（Phase 1 §12。Phase 3 §20.2 は Chunk 一覧も加えて同じ位置で書く）。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。再送はジョブを作らないので、Phase 1 のサーバーで確定した会議（移行した DB に `finalized` のまま残る）は、`serve` の起動時に `sweeper.resume_finalized()` が `on_finalized` を呼んで回収する（§14・§22。`transcribing` に進めるので 2 回目の起動では拾わない）。
+`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を返す。`meeting.json` は書き込みトランザクションのコミット後に、DB に残った確定値（停止理由・検出時刻を含む）から書き出す。再送を含む成功した finalize のたびに書き直すので、書き出しに失敗しても再送で回復する（Phase 1 §12。Phase 3 §20.2 は Chunk 一覧も加えて同じ位置で書く）。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。再送はジョブを作らないので、Phase 1 のサーバーで確定した会議（移行した DB に `finalized` のまま残る）は、`serve` の起動時に `sweeper.resume_finalized()` が `on_finalized` を呼んで回収する（§14・§22。`transcribing` に進めるので 2 回目の起動では拾わない）。回収の前に finalize と同じ規則（連番の連続と `pipeline.chunk_file_intact()`）でファイルを照合し、欠損・破損があれば `finalized` のまま残す（直せば次の起動で拾う）。
 
 ## 21.3 Phase 2 ルート `api/routes_meetings.py`
 
@@ -4697,7 +4727,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         app = create_app(ctx, token)
         stop = asyncio.Event()
         await sweeper.sweep_once(ctx.db)
-        await sweeper.resume_finalized(ctx.db)  # Phase 1 で確定した会議（移行した DB）のジョブを作る
+        await sweeper.resume_finalized(ctx.db, s.data_dir)  # Phase 1 で確定した会議（移行した DB）のジョブを作る
         runners = [JobRunner(ctx, HANDLERS, i) for i in range(ctx.models.max_concurrent_stt)]
         tasks = [asyncio.create_task(r.run_forever()) for r in runners]
         tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, stop)))
@@ -5566,18 +5596,29 @@ async def test_resume_finalized_creates_vad_jobs_for_meetings_finalized_before_m
     for seq in range(2):
         await put_chunk(client, "m-1", seq, sine_pcm(1))
     await create_meeting(client, "m-empty")
+    # ファイルが壊れた確定済み会議は始めない（失敗する vad ジョブで止めず、直れば次の起動で拾う）
+    await create_meeting(client, "m-broken")
+    await put_chunk(client, "m-broken", 0, sine_pcm(1))
     async with ctx.db.write() as conn:
-        conn.execute("UPDATE meetings SET status = 'finalized' WHERE id IN ('m-1', 'm-empty')")
+        conn.execute("UPDATE meetings SET status = 'finalized' WHERE id IN ('m-1', 'm-empty', 'm-broken')")
+        broken = repo.list_chunks(conn, "m-broken")[0]
+    broken_path = ctx.settings.data_dir / broken.local_path
+    original = broken_path.read_bytes()
+    broken_path.write_bytes(original[:-2] + b"\x01\x00")
     # Act
-    resumed = await resume_finalized(ctx.db)
+    resumed = await resume_finalized(ctx.db, ctx.settings.data_dir)
     # Assert: vad_chunk が Chunk ごとに 1 つでき、パイプラインが始まる。Chunk のない会議は merge まで進む
     assert resumed == 2
     with ctx.db.read() as conn:
         assert repo.get_meeting(conn, "m-1").status == "transcribing"
         assert sorted(j.job_type for j in repo.list_jobs(conn, "m-1")) == ["vad_chunk", "vad_chunk"]
         assert [j.job_type for j in repo.list_jobs(conn, "m-empty")] == ["merge_transcript"]
-    # 2 回目の起動では拾わず、ジョブも増えない（finalize の冪等性と同じ）
-    assert await resume_finalized(ctx.db) == 0
+        assert repo.get_meeting(conn, "m-broken").status == "finalized"
+        assert repo.list_jobs(conn, "m-broken") == []
+    # 2 回目の起動では拾わず、ジョブも増えない（finalize の冪等性と同じ）。直した会議は拾う
+    assert await resume_finalized(ctx.db, ctx.settings.data_dir) == 0
+    broken_path.write_bytes(original)
+    assert await resume_finalized(ctx.db, ctx.settings.data_dir) == 1
     with ctx.db.read() as conn:
         assert len(repo.list_jobs(conn, "m-1")) == 2
 

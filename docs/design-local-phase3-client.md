@@ -4,7 +4,7 @@
 **上位文書:** Phase 3 詳細設計書 ── サーバー側（`docs/design-local-phase3-server.md`）§2 の設計判断と §20 の API。
 **配置:** `docs/design-local-phase3-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** Phase 1・2 と同じ（ブラウザ標準 API と TypeScript のみ、UI フレームワーク非依存の状態モデル）。
-**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 34 ファイル 579 件（Phase 1・2 の 30 ファイル 545 件を含む）が全件通過することを確認している（2026-11-12、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
+**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 34 ファイル 584 件（Phase 1・2 の 30 ファイル 549 件を含む）が全件通過することを確認している（2026-11-12、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
 
 ---
 
@@ -295,7 +295,17 @@ export class Phase3Client {
       // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
       const fetchImpl = this.fetchImpl;
       const res = await fetchImpl(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal, credentials: "omit", redirect: "error" });
-      const json: unknown = res.status === 204 ? null : await res.json().catch(() => null);
+      let json: unknown = null;
+      if (res.status !== 204) {
+        try {
+          json = await res.json();
+        } catch (error) {
+          // 本文の読み取り中の中断（タイムアウト）・通信断は外の catch で TIMEOUT / NETWORK にする（成功扱いにしない）
+          if (!(error instanceof SyntaxError)) throw error;
+          // 壊れた本文。成功応答なら null を値として返さず MALFORMED、エラー応答なら本文なしとして status で返す
+          if (res.ok) return { ok: false, status: res.status, code: "MALFORMED", message: `malformed body for ${method} ${path}` };
+        }
+      }
       if (res.ok) {
         const value = decode(json);
         if (value === null) return { ok: false, status: res.status, code: "MALFORMED", message: `malformed body for ${method} ${path}` };
@@ -1639,6 +1649,22 @@ describe("Phase3Client の応答検証", () => {
       async () => new Response(body, { status: 200, headers: { "Content-Type": "application/json" } }),
     );
 
+  it("本文が JSON として壊れていたら MALFORMED、読み取り中の期限切れは TIMEOUT（成功扱いにしない）", async () => {
+    // Arrange: 壊れた本文と、ヘッダの後で本文が止まる応答
+    const stalled: typeof fetch = async (_input, init) => new Response(new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode("{"));
+        init?.signal?.addEventListener("abort", () => c.error(new DOMException("aborted", "AbortError")));
+      },
+    }), { status: 200 });
+    // Act
+    const malformed = await client("{broken").getLive("m", 0);
+    const timeout = await new Phase3Client({ baseUrl: "http://127.0.0.1:43117", token: "t", timeoutMs: 50 }, stalled).getLive("m", 0);
+    // Assert
+    expect(malformed).toMatchObject({ ok: false, status: 200, code: "MALFORMED" });
+    expect(timeout).toMatchObject({ ok: false, status: 0, code: "TIMEOUT" });
+  });
+
   it("getLive は segments が配列でない応答を MALFORMED として返す", async () => {
     // `json as T` で通すと型だけが通り、LiveTranscriptStore.upsert の for-of で
     // TypeError になる。失敗は ApiResult の失敗分岐で表現する（§2.2）
@@ -1944,6 +1970,10 @@ describe("欠損 Chunk の逆同期", () => {
     // 1 件目は積んだまま残す（巻き戻すより進んだ状態を保つ方が Chunk を失わない）。
     // 積んだ後の保存状態は Scheduler が進める（送信中・送信済みになりうる）ので、状態の値ではなく「積んだこと」を確かめる
     expect(enqueued).toEqual([r0.chunkKey]);
+    // 積んだ 1 件は実際に送られ、サーバーには 1 回だけ届く（積めなかった 2 件目は届かない）
+    for (let i = 0; i < 5; i++) await h.advance(1_000);
+    expect(h.server.putCount).toBe(1);
+    expect(h.server.arrivalOrder).toEqual([`${meetingId}:mic:0`]);
   });
 
   it("一覧取得がタイムアウトしても例外を投げず、失敗として返す", async () => {

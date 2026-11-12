@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── サーバー側（`docs/design-local-phase2-server.md`）。API 契約はそちらの §21 と 1 対 1。
 **配置:** `docs/design-local-phase2-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** ブラウザ標準 API（`MediaStream` / `AudioContext` / `AudioWorklet` / `IndexedDB` / `fetch` / `EventSource`）と TypeScript のみ。UI フレームワークは本書で選定せず、状態モデル（§11）をフレームワーク非依存の reducer として定義する。
-**検証状態:** 本書の全 `typescript` コードブロック（17 ファイル）を Phase 1 の現行ソースへ上書き・追加した状態で、`tsc --noEmit`（strict）と Vitest 30 ファイル 545 件が全件通過することを確認している（2026-11-12）。詳細と再現手順は §1.2。**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**（§15）。
+**検証状態:** 本書の全 `typescript` コードブロック（17 ファイル）を Phase 1 の現行ソースへ上書き・追加した状態で、`tsc --noEmit`（strict）と Vitest 30 ファイル 549 件が全件通過することを確認している（2026-11-12）。詳細と再現手順は §1.2。**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**（§15）。
 
 ---
 
@@ -41,7 +41,7 @@ Phase 2 のブラウザ側の責務は次の 3 つである。
 
 ## 1.2 検証状態
 
-本書の `// src/...` と `// test/...` のコードブロックを Phase 1 の現行ソース（2026-11-12 時点）へ上書き・追加した状態で、`npm run typecheck` が通り、Vitest 30 ファイル 545 件が全件通過することを確認している（Phase 1 の 24 ファイルを含む。Phase 1 側の変更は §7 に記した `test/app.test.ts` の 1 か所）。確認の手順は `scripts/verify-design-docs.sh`。実ブラウザ（`getDisplayMedia`・SSE の実接続）では実行していない。
+本書の `// src/...` と `// test/...` のコードブロックを Phase 1 の現行ソース（2026-11-12 時点）へ上書き・追加した状態で、`npm run typecheck` が通り、Vitest 30 ファイル 549 件が全件通過することを確認している（Phase 1 の 24 ファイルを含む。Phase 1 側の変更は §7 に記した `test/app.test.ts` の 1 か所）。確認の手順は `scripts/verify-design-docs.sh`。実ブラウザ（`getDisplayMedia`・SSE の実接続）では実行していない。
 
 Phase 1 のファイルを全文で載せているブロック（`recording-controller.ts`・`finalizer.ts`・`types/recording.ts`）は、**Phase 1 の現行ソースに Phase 2 の差分を当てたもの**である。Phase 1 側を直したら、同じ修正を本書のブロックにも当てて上の検証をやり直す（CLAUDE.md ルール 3）。
 
@@ -2093,7 +2093,17 @@ export class Phase2Client {
         credentials: "omit",
         redirect: "error",
       });
-      const json: unknown = res.status === 204 ? null : await res.json().catch(() => null);
+      let json: unknown = null;
+      if (res.status !== 204) {
+        try {
+          json = await res.json();
+        } catch (error) {
+          // 本文の読み取り中の中断（タイムアウト）・通信断は外の catch で TIMEOUT / NETWORK にする（成功扱いにしない）
+          if (!(error instanceof SyntaxError)) throw error;
+          // 壊れた本文。成功応答なら null を値として返さず MALFORMED、エラー応答なら本文なしとして status で返す
+          if (res.ok) return { ok: false, status: res.status, code: "MALFORMED", message: `malformed body for ${method} ${path}` };
+        }
+      }
       if (res.ok) return { ok: true, value: json as T, status: res.status };
       const err = (typeof json === "object" && json !== null ? json : {}) as { code?: unknown; error?: unknown };
       return {
@@ -2155,6 +2165,8 @@ export interface NotesStoreDeps {
   readonly setTimer: (fn: () => void, ms: number) => unknown;
   readonly clearTimer: (handle: unknown) => void;
   readonly onChange: (state: NotesState) => void;
+  /** 保存後の控え（IndexedDB）の書き込みの失敗。サーバーには保存済みなので状態は変えない */
+  readonly onError?: (error: Error) => void;
 }
 
 interface Draft {
@@ -2276,7 +2288,7 @@ export class NotesStore {
     this.disposed = true;
     if (this.timer !== null) this.deps.clearTimer(this.timer);
     this.timer = null;
-    // doSave は失敗を Result で扱い reject しない。完了時には控え（新しい revision）の書き込みも依頼済み
+    // doSave は失敗を Result で扱い reject しない。控え（新しい revision）の書き込みの完了まで待つ
     if (this.inflight !== null) await this.inflight;
   }
 
@@ -2311,9 +2323,16 @@ export class NotesStore {
     if (res.ok) {
       const stillSame = this.state.json === snapshot.json;
       this.set({ revision: res.value.revision, sync: stillSame ? "saved" : "dirty" });
-      // stillSame が false なら保存中に編集が入っている＝控えの内容はまだ未送信。
-      void this.deps.drafts.set(this.draftKey(), { json: this.state.json, revision: res.value.revision, lastAppliedSummaryVersion: this.state.lastAppliedSummaryVersion, savedAt: Date.now(), saved: stillSame } satisfies Draft);
       if (!stillSame) this.schedule();
+      // stillSame が false なら保存中に編集が入っている＝控えの内容はまだ未送信。
+      // 書き込みの完了を待ってから返す。dispose() はこの完了を待つので、作り直したインスタンスの load() が
+      // 古い revision の控えを読んで競合にしない（§15.1 W8）。失敗は onError に渡す。サーバーには保存済みで、
+      // 控えが古いまま残っても次の load() は差分 UI（conflict）になるだけで編集は失われない
+      try {
+        await this.deps.drafts.set(this.draftKey(), { json: this.state.json, revision: res.value.revision, lastAppliedSummaryVersion: this.state.lastAppliedSummaryVersion, savedAt: Date.now(), saved: stillSame } satisfies Draft);
+      } catch (error) {
+        this.deps.onError?.(error instanceof Error ? error : new Error(String(error)));
+      }
       return;
     }
     if (res.status === 409) {
@@ -2846,6 +2865,7 @@ describe("finalize（mic + system）", () => {
 import { describe, expect, it, vi } from "vitest";
 import { BACKFILL_RETRY_DELAYS_MS, FetchEventSource, MeetingEventsClient, SSE_CONNECT_TIMEOUT_MS, SSE_IDLE_TIMEOUT_MS, SSE_STABLE_MS, normalizeEvent, type EventSourceLike } from "../src/api/events";
 import type { JobListResponse, MeetingDetailResponse, MeetingEvent } from "../src/api/contracts-phase2";
+import { Phase2Client } from "../src/api/phase2-client";
 
 class FakeEventSource implements EventSourceLike {
   readonly listeners = new Map<string, Array<(e: MessageEvent<string>) => void>>();
@@ -3330,6 +3350,43 @@ describe("FetchEventSource の停止検知", () => {
     }
   });
 });
+
+describe("Phase2Client の本文の読み取り", () => {
+  const config = { baseUrl: "http://127.0.0.1:43117", token: "t", timeoutMs: 50 };
+
+  it("成功応答の本文が壊れていたら成功扱いにせず MALFORMED、エラー応答の壊れた本文は status で返す", async () => {
+    // Arrange
+    const reply = (status: number) => new Phase2Client(config, async () => new Response("{broken", { status }));
+    // Act
+    const ok = await reply(200).getModels();
+    const ng = await reply(500).getModels();
+    // Assert
+    expect(ok).toEqual({ ok: false, status: 200, code: "MALFORMED", message: "malformed body for GET /v1/models" });
+    expect(ng).toEqual({ ok: false, status: 500, code: "UNKNOWN", message: "HTTP 500" });
+  });
+
+  it("本文の読み取り中に期限を過ぎたら TIMEOUT、読み取り中の通信断は NETWORK", async () => {
+    // Arrange: ヘッダの後で本文が止まる（abort で読み取りが失敗する）応答と、本文の途中で切れる応答
+    const stalled: typeof fetch = async (_input, init) => new Response(new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode("{"));
+        init?.signal?.addEventListener("abort", () => c.error(new DOMException("aborted", "AbortError")));
+      },
+    }), { status: 200 });
+    const broken: typeof fetch = async () => new Response(new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode("{"));
+        c.error(new TypeError("network error"));
+      },
+    }), { status: 200 });
+    // Act
+    const timeout = await new Phase2Client(config, stalled).getModels();
+    const network = await new Phase2Client(config, broken).getModels();
+    // Assert
+    expect(timeout).toMatchObject({ ok: false, status: 0, code: "TIMEOUT" });
+    expect(network).toMatchObject({ ok: false, status: 0, code: "NETWORK" });
+  });
+});
 ```
 
 ## 12.5 ノートの Autosave
@@ -3420,6 +3477,50 @@ describe("NotesStore", () => {
     // Assert: 古い PUT で進んだ revision から編集を送り、競合にしない
     expect(b.puts).toEqual([{ json: ["a"], revision: 0 }, { json: ["ab"], revision: 1 }]);
     expect(next.current.sync).toBe("saved");
+  });
+
+  it("dispose は保存後の控え（新しい revision）の書き込みの完了まで待ち、作り直したインスタンスは競合にしない", async () => {
+    // Arrange: 控えの書き込みを止めておく（実際の IndexedDB は PUT の応答より遅れて完了しうる）
+    const b = build();
+    let releaseDrafts: () => void = () => undefined;
+    const draftGate = new Promise<void>((r) => (releaseDrafts = r));
+    const deps: NotesStoreDeps = { ...b.deps, drafts: { get: b.deps.drafts.get, set: async (k, v) => { await draftGate; await b.deps.drafts.set(k, v); } } };
+    const store = new NotesStore(deps, "m");
+    await store.load();
+    store.setDraft(["a"]);
+    await b.fire();                                      // PUT は成功し、控えの書き込みが止まっている
+    // Act
+    let disposed = false;
+    const disposing = store.dispose().then(() => (disposed = true));
+    await new Promise((r) => setTimeout(r, 0));
+    // Assert: 控えを書き終えるまで dispose は終わらない
+    expect(disposed).toBe(false);
+    releaseDrafts();
+    await disposing;
+    const next = new NotesStore(b.deps, "m");
+    await next.load();
+    expect(next.current.sync).toBe("saved");
+    expect(b.puts).toHaveLength(1);
+  });
+
+  it("保存後の控えの書き込みに失敗したら onError に渡し、dispose は reject しない", async () => {
+    // Arrange: 保存済みの控え（saved: true）の書き込みだけが失敗する
+    const b = build();
+    const errors: Error[] = [];
+    const deps: NotesStoreDeps = {
+      ...b.deps,
+      drafts: { get: b.deps.drafts.get, set: async (k, v) => { if ((v as { saved?: unknown }).saved === true) throw new Error("idb full"); await b.deps.drafts.set(k, v); } },
+      onError: (e) => errors.push(e),
+    };
+    const store = new NotesStore(deps, "m");
+    await store.load();
+    store.setDraft(["a"]);
+    await b.fire();
+    // Act
+    await store.dispose();
+    // Assert: サーバーには保存済みなので状態は saved のまま。失敗は呼び出し側へ知らせる
+    expect(store.current.sync).toBe("saved");
+    expect(errors.map((e) => e.message)).toEqual(["idb full"]);
   });
 
   it("送信中に編集して dispose したら、送信の完了後も古いインスタンスは送り直しを予約しない", async () => {
@@ -3723,7 +3824,7 @@ describe("UI reducer", () => {
 | # | 配線 | 変更するファイル | 根拠 | テストで確かめること |
 | --- | --- | --- | --- | --- |
 | W1 | 録音の開始・停止を `MultiSourceRecorder` 経由にする。System を使わない会議は Mic の Controller だけを持ち、Phase 1 と同じ経路になる | `app.ts` | §6 | System なしで Phase 1 の `app.test.ts` が通る。System ありで `PUT …/chunks/system/0` が届く |
-| W2 | 停止は System → Mic の順。ロックを持つのは Mic の `RecordingController`（App が `MultiSourceDeps.createController("mic", …)` で生成したもの。`MultiSourceRecorder` と `SourceController` はロックを公開しない）。App は生成時にその参照を保持し、`recorder.stop()` を `try/finally` で囲んで `finally` で Mic Controller の `takeMeetingLock()` を呼ぶ。`stop()` が reject（System・Mic・両方の失敗）しても受け渡しを飛ばさない。Mic の `stop()` は失敗しても `finally` で Worklet を切り離すので、`takeMeetingLock()` は保持中のロックを返せる | `app.ts` | §4 の 2・3 | System の停止が失敗しても Mic が止まり、停止理由が IDB に残る。System の失敗・Mic の最終保存の失敗のそれぞれで `stop()` が reject しても、ロックが App の `heldLocks` に入る |
+| W2 | 停止は System → Mic の順。ロックを持つのは Mic の `RecordingController`（App が `MultiSourceDeps.createController("mic", …)` で生成したもの。`MultiSourceRecorder` と `SourceController` はロックを公開しない）。App は生成時にその参照を保持し、`recorder.stop()` を `try/finally` で囲んで `finally` で Mic Controller の `takeMeetingLock()` を呼ぶ。`stop()` が reject（System・Mic・両方の失敗）しても受け渡しを飛ばさない。Mic の `stop()` は失敗しても `finally` で Worklet を切り離すので、`takeMeetingLock()` は保持中のロックを返せる | `app.ts` | §4 の 2・3 | System の停止が失敗しても Mic が止まり、停止理由が IDB に残る。Mic か System のメモリ待機が残るとき、または Mic の最終保存に失敗したときは、`stop()` が reject（System の失敗・Mic の失敗のどちらでも）しても `takeMeetingLock()` が返したロックが App の `heldLocks` に入る。Mic が最終保存まで終え、両方のメモリ待機が空なら、Mic の `stop()` がロックを解放済みで `takeMeetingLock()` は `null` を返し、System の失敗で reject しても `heldLocks` には入らない（§4 の 1） |
 | W3 | `memoryBacklogCount(meetingId)`・`releaseHeldLockIfDrained()`・離脱確認（`releaseLifecycleIfSettled`）は Mic と System の件数の合計で判定する | `app.ts` | §4 の 3 | System だけにメモリ待機が残る間、ロックと離脱確認が外れない |
 | W4 | `finalizeMeeting` の `unpersistedChunkCount` に Mic と System の合計を渡す | `app.ts` | §7 | System のメモリ待機が残っていれば `waiting_local_save` |
 | W5 | drain（サーバー復帰・`setToken`・確定再試行）と破棄・WAV 書き出しを Mic と System の両方の Controller に行う | `app.ts`・`main.ts` | §4 の 4、Phase 1 §31 | 確定中止後の書き出しに System の WAV も入る。破棄で両方が空になりロックが外れる |

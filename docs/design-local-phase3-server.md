@@ -823,11 +823,20 @@ flowchart LR
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 from ..db import repo
 from ..db.models import AudioChunk, Job
+from ..storage.files import sha256_file
 
 BLOCKING_STT = ("pending", "queued", "processing")
+
+
+def chunk_file_intact(data_dir: Path, chunk: AudioChunk) -> bool:
+    """登録済み Chunk のファイルが存在し、WAV なら sha256 が登録時と一致するか（圧縮済みは存在だけを見る）。
+    finalize と起動時の回収（Phase 2 の sweeper.resume_finalized）が同じ規則で照合する。"""
+    path = data_dir / chunk.local_path
+    return path.exists() and (chunk.codec != "wav" or sha256_file(path) == chunk.sha256)
 
 
 def on_finalized(conn: sqlite3.Connection, meeting_id: str, diarize: bool = False) -> int:
@@ -2391,7 +2400,7 @@ from ..db.connection import now_ms
 from ..db.models import AudioChunk, Meeting
 from ..jobs import live, pipeline
 from ..jobs.context import AppContext
-from ..storage.files import (InvalidWavError, chunk_relative_path, meeting_dir, parse_wav_header, read_pcm, sha256_file, sha256_hex,
+from ..storage.files import (InvalidWavError, chunk_relative_path, meeting_dir, parse_wav_header, read_pcm, sha256_hex,
                              write_atomic)
 from ..storage.rebuild import write_meeting_json
 from .common import error_body, get_ctx
@@ -2663,9 +2672,7 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     counts = {"mic": 0, "system": 0}
     missing: list[str] = []
     for c in chunks:
-        path = ctx.settings.data_dir / c.local_path
-        ok = path.exists() and (c.codec != "wav" or sha256_file(path) == c.sha256)
-        if not ok:
+        if not pipeline.chunk_file_intact(ctx.settings.data_dir, c):
             missing.append(f"{c.source}/{c.sequence_no}")
             continue
         counts[c.source] += 1
@@ -3714,7 +3721,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         stop = asyncio.Event()
         await sweeper.sweep_once(ctx.db)
         # Phase 1 で確定した会議と doctor --rebuild が復元した会議のジョブを作る（Phase 2 §14）。diarize は既定の False
-        await sweeper.resume_finalized(ctx.db)
+        await sweeper.resume_finalized(ctx.db, s.data_dir)
         runners = [JobRunner(ctx, HANDLERS, i) for i in range(ctx.models.max_concurrent_stt)]
         tasks = [asyncio.create_task(r.run_forever()) for r in runners]
         tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, stop)))
