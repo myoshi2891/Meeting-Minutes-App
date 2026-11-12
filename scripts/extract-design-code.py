@@ -12,10 +12,36 @@ import argparse
 import os
 import re
 import sys
+from collections.abc import Iterator
 
-# 閉じフェンスは開きと同じ文字（` か ~）で、長さが開き以上のもの（CommonMark）。短いもの・別の文字では閉じない
-BLOCK = re.compile(r"^(?P<fence>(?P<ch>[`~])(?P=ch){2,})(?P<lang>\w+)[ \t]*\n(?P<body>.*?)^(?P=fence)(?P=ch)*[ \t]*$", re.S | re.M)
+OPEN = re.compile(r"^(?P<fence>(?P<ch>[`~])(?P=ch){2,})(?P<info>.*)$")
 HEAD = re.compile(r"^(?://|#) ((?:src|test|tests|minutes_local)/\S+|pyproject\.toml)\s*$")
+
+
+def top_level_blocks(text: str) -> Iterator[tuple[int, str, str]]:
+    """トップレベルのフェンスコードブロックを先頭から順に返す（開きの行番号, 言語, 本文）。
+
+    言語のないブロックも追跡し、その中身は開きフェンスとして読まない（入れ子の ```python などを取り出さない）。
+    閉じフェンスは開きと同じ文字（` か ~）で、長さが開き以上のもの（CommonMark）。短いもの・別の文字では閉じない。
+    閉じていないブロック（文書末まで続く）は返さない。
+    """
+    lines = text.splitlines(keepends=True)
+    i = 0
+    while i < len(lines):
+        m = OPEN.match(lines[i].rstrip("\r\n"))
+        # バッククォートのフェンスの info に ` は入らない（CommonMark）。インラインコードの行をフェンスとみなさない
+        if m is None or (m.group("ch") == "`" and "`" in m.group("info")):
+            i += 1
+            continue
+        close = re.compile(rf"^{re.escape(m.group('ch'))}{{{len(m.group('fence'))},}}[ \t]*$")
+        j = i + 1
+        while j < len(lines) and close.match(lines[j].rstrip("\r\n")) is None:
+            j += 1
+        if j == len(lines):
+            print(f"L{i + 1}: 閉じていないコードブロックを無視した", file=sys.stderr)
+            return
+        yield i + 1, m.group("info").strip(), "".join(lines[i + 1:j])
+        i = j + 1
 
 
 def main() -> int:
@@ -29,15 +55,15 @@ def main() -> int:
     listing = args.list
     text = open(doc, encoding="utf-8").read()
     seen: dict[str, int] = {}
-    for m in BLOCK.finditer(text):
-        body = m.group("body")
-        head = HEAD.match(body.split("\n", 1)[0])
+    for line_no, lang, body in top_level_blocks(text):
+        # 言語のあるブロックだけを対象にする（従来どおり）。見出しは 1 行目だけを見る
+        head = HEAD.match(body.split("\n", 1)[0]) if re.fullmatch(r"\w+", lang) else None
         if head is None:
             continue
         path = head.group(1)
         seen[path] = seen.get(path, 0) + 1
         if listing:
-            print(f"{path}\tL{text.count(chr(10), 0, m.start()) + 1}\t{len(body.splitlines())} 行")
+            print(f"{path}\tL{line_no}\t{len(body.splitlines())} 行")
             continue
         # 見出しのパスは設計書（外部入力）由来。`src/../../x` のような出力先の外への書き込みを拒否する
         target = os.path.realpath(os.path.join(out, path))
