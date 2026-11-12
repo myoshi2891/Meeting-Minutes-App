@@ -14,8 +14,9 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${VERIFY_DIR:-$(mktemp -d)}
 TARGET=${1:-all}
-EXTRACT="python3 $ROOT/scripts/extract-design-code.py"
 mkdir -p "$WORK"
+WORK=$(cd "$WORK" && pwd)   # 相対パスの VERIFY_DIR でも、下の cd 後に venv を指せるよう絶対パスにする
+extract() { python3 "$ROOT/scripts/extract-design-code.py" "$@"; }
 echo "作業ディレクトリ: $WORK"
 status=0
 
@@ -29,12 +30,16 @@ if [ "$TARGET" = server ] || [ "$TARGET" = all ]; then
     "fastapi>=0.115" "uvicorn>=0.30" "httpx>=0.27" "pydantic>=2.7" "psutil>=5.9" \
     "pytest>=8" "pytest-asyncio>=0.23" "anyio>=4" "cryptography>=42" pyflakes
   rm -rf "$WORK/p2s" "$WORK/p3s"; mkdir -p "$WORK/p2s"
-  $EXTRACT "$ROOT/docs/design-local-phase2-server.md" "$WORK/p2s"; init_packages "$WORK/p2s"
+  extract "$ROOT/docs/design-local-phase2-server.md" "$WORK/p2s"; init_packages "$WORK/p2s"
   cp -R "$WORK/p2s" "$WORK/p3s"
-  $EXTRACT "$ROOT/docs/design-local-phase3-server.md" "$WORK/p3s"; init_packages "$WORK/p3s"
+  extract "$ROOT/docs/design-local-phase3-server.md" "$WORK/p3s"; init_packages "$WORK/p3s"
   for phase in p2s p3s; do
     echo "== $phase: pyflakes + pytest"
-    (cd "$WORK/$phase" && "$WORK/venv/bin/python" -m pyflakes minutes_local tests | grep -v "'soundfile' imported but unused" || true)
+    # soundfile の未使用 import（import の可否で依存の有無を確かめている）だけを許す。それ以外の指摘と pyflakes 自体の失敗は NG
+    rc=0
+    out=$(cd "$WORK/$phase" && "$WORK/venv/bin/python" -m pyflakes minutes_local tests 2>&1) || rc=$?
+    rest=$(printf '%s\n' "$out" | grep -v "'soundfile' imported but unused" | grep -v '^$' || true)
+    if [ -n "$rest" ] || [ "$rc" -gt 1 ]; then printf '%s\n' "$rest"; echo "pyflakes: NG (exit $rc)"; status=1; fi
     (cd "$WORK/$phase" && "$WORK/venv/bin/python" -m pytest -q -p no:cacheprovider) || status=1
   done
 fi
@@ -44,8 +49,8 @@ if [ "$TARGET" = client ] || [ "$TARGET" = all ]; then
     d="$WORK/c$phase"; rm -rf "$d"; mkdir -p "$d"
     cp -R "$ROOT/src" "$ROOT/test" "$ROOT/tsconfig.json" "$ROOT/vitest.config.ts" "$ROOT/vite.config.ts" "$ROOT/package.json" "$d/"
     ln -s "$ROOT/node_modules" "$d/node_modules"
-    $EXTRACT "$ROOT/docs/design-local-phase2-client.md" "$d"
-    [ "$phase" = 3 ] && $EXTRACT "$ROOT/docs/design-local-phase3-client.md" "$d"
+    extract "$ROOT/docs/design-local-phase2-client.md" "$d"
+    [ "$phase" = 3 ] && extract "$ROOT/docs/design-local-phase3-client.md" "$d"
     # Phase 2 client §7 が指定する Phase 1 テストの適応（listByMeeting は mic の呼び出しだけを数える）
     python3 - "$d/test/app.test.ts" <<'PY'
 import sys
@@ -56,7 +61,8 @@ assert text.count(old) == 1, "test/app.test.ts の対象箇所が変わった。
 open(path, "w", encoding="utf-8").write(text.replace(old, '      if (args[1] !== "mic") return chunks;\n' + old))
 PY
     echo "== phase$phase client: tsc + vitest"
-    (cd "$d" && npx tsc --noEmit && npx vitest run) || status=1
+    # npx は見つからないパッケージをその場で取得しうる。npm ci 済みのものだけを使う
+    (cd "$d" && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/vitest run) || status=1
   done
 fi
 

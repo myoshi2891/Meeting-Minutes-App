@@ -12,7 +12,8 @@ import os
 import re
 import sys
 
-BLOCK = re.compile(r"^(?P<fence>`{3,})(?P<lang>\w+)[ \t]*\n(?P<body>.*?)^(?P=fence)[ \t]*$", re.S | re.M)
+# 閉じフェンスは開きと同じ文字（` か ~）で、長さが開き以上のもの（CommonMark）。短いもの・別の文字では閉じない
+BLOCK = re.compile(r"^(?P<fence>(?P<ch>[`~])(?P=ch){2,})(?P<lang>\w+)[ \t]*\n(?P<body>.*?)^(?P=fence)(?P=ch)*[ \t]*$", re.S | re.M)
 HEAD = re.compile(r"^(?://|#) ((?:src|test|tests|minutes_local)/\S+|pyproject\.toml)\s*$")
 
 
@@ -21,7 +22,7 @@ def main() -> int:
     if len(args) != 2:
         print(__doc__)
         return 2
-    doc, out = args
+    doc, out = args[0], os.path.realpath(args[1])
     listing = "--list" in sys.argv
     text = open(doc, encoding="utf-8").read()
     seen: dict[str, int] = {}
@@ -35,7 +36,11 @@ def main() -> int:
         if listing:
             print(f"{path}\tL{text.count(chr(10), 0, m.start()) + 1}\t{len(body.splitlines())} 行")
             continue
-        target = os.path.join(out, path)
+        # 見出しのパスは設計書（外部入力）由来。`src/../../x` のような出力先の外への書き込みを拒否する
+        target = os.path.realpath(os.path.join(out, path))
+        if os.path.commonpath([out, target]) != out:
+            print(f"{doc}: 出力先の外を指すパスを拒否した: {path}", file=sys.stderr)
+            return 1
         os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
         with open(target, "a" if seen[path] > 1 else "w", encoding="utf-8") as f:
             f.write(body)
