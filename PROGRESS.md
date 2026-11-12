@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-12（PR #14 の 7 回目のレビュー指摘・未コミット、ブランチ `dev`。PR #13 までマージ済み）
+最終更新: 2026-11-13（設計書の厳しめレビュー 2 回目・未コミット、ブランチ `dev`。PR #13 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,21 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-12 の PR #14 の 6 回目の指摘の対応後：Phase 2 server 100 件・Phase 3 server 136 件・Phase 2 client 30 ファイル 549 件・Phase 3 client 34 ファイル 584 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 の設計書レビュー 2 回目の後：Phase 2 server 128 件・Phase 3 server 164 件・Phase 2 client 31 ファイル 557 件・Phase 3 client 35 ファイル 592 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-13（設計書の厳しめレビュー 2 回目・未コミット）：`docs/` の Phase 2 / 3 設計書を、展開したコードの**カバレッジ**（テストが一度も実行していない行）を起点にレビューした。前回までのレビューは「テストが通るか」で見ていたので、Fake Provider が通らない経路（実モデル・CLI・SSE・未テストのエンドポイント）が手つかずだった。見つけた欠陥は実験かテストの Red で確かめてから直した。製品コード（`src/`・`test/`・`minutes_local/`）は無変更。Phase 1 設計書も無変更（src と一致のまま）。
+  - **Phase 2 server（SSE）**：`wait_for(gen.__anext__())` のタイムアウトで非同期ジェネレータごと終わり、**最初の keepalive（15 秒の無通信）の次の周回で接続が必ず落ちた**（実験で `RuntimeError: async generator raised StopAsyncIteration` を確認）。`EventBroker.attach()` / `detach()` を足し、SSE はキューを直接待つ。回帰 1 件。
+  - **Phase 2 / 3 server（実行デバイス）**：Apple Silicon は区分が `gpu_*` になり `float16` → `device="cuda"` を選んでいた（基本設計 §7.2 は「Apple Silicon は int8」。**開発機の Mac では STT が必ず失敗する**）。`SttCandidate.device` / `STTRequest.device` を足し、CUDA 以外は CPU の int8 にする（`tiers.for_backend`）。`compute_type` から device を推測する箇所をなくした（`gpu_small` の int8 が CPU で走っていた点も直る）。Phase 3 の `FasterWhisperLanguageDetector` も同じ。
+  - **Phase 2 / 3 server（モデルの選び直し）**：`ModelSelection` が起動時のままで、後から起動した Ollama・後から配置／取得したモデル・`PUT /settings` の変更が再起動まで反映されなかった。新規 `jobs/selection.py`（`select_models` を bootstrap から移動、`refresh_stt` / `refresh_llm`）。`list_models()` を `SummaryProvider` の Protocol に入れ、「届かない（None）」と「届くがモデルなし（[]）」を区別（後者は `MODEL_MISSING`）。Ollama の 404 は `ModelMissingError`。
+  - **Phase 2 server（プロセスプール）**：タイムアウトしたワーカーが止まらずプールを塞ぎ、ワーカーが落ちると `BrokenProcessPool` のまま以後の STT が全滅した（基本設計 §5.1 の「プールの再生成」が未設計）。`PoolExecutor` がプールを作り直す。巻き込まれたジョブは `INTERNAL`、原因のジョブは `OOM`。実プロセスのテスト 2 件。
+  - **Phase 2 / 3 server（ダウングレード）**：同じモデルで 2 件が OOM すると 2 段落ちた／未配置の段へ落とすと `MODEL_MISSING` で止まった／落としても前のモデルをワーカーが握ったままだった／`"cuda"` を含むだけで OOM 扱いにしていた。それぞれ修正（`is_oom_message`）。
+  - **Phase 2 server（モデル取得）**：`large-v3` のファイル名が違う（`vocabulary.json`・`preprocessor_config.json`。2026-11-13 に配布元の一覧で確認）、リダイレクト先 `us.aws.cdn.hf.co` が allowlist 外で**全モデルの取得が失敗**、しかも失敗がバックグラウンドのタスクの例外として消えていた。リダイレクトは要求の前に検査、`model.bin` を最後に取得、結果は新規 `ModelDownloads` → `GET /v1/models` の `downloads`。
+  - **Phase 2 / 3 server（操作系エンドポイント、すべて未テストだった）**：録音中の `transcript/rerun` が会議を `transcribing` に進め**以後の Chunk の PUT が 409**になった／無音 Chunk の手動 STT を `skipped` 以外に呼ぶと Chunk が `queued` で固まり、成功しても transcript に入らなかった／`PUT /settings` が無検証で、モデル指定を外す手段がなかった／存在しない会議の `exclude-failed` が 500。前提条件を §21.3 の表にし、回帰 7 件（すべて修正前に Red）。
+  - **Phase 2 client**：`Phase2Client` が成功応答を `json as T` で通していた（CLAUDE.md「サーバー応答は型ガードを通す」に反する。Phase 3 はデコーダ方式で対処済みだった）。デコーダ 11 個を `contracts-phase2.ts` に足し、`meetingId` の一致まで見る。フィクスチャはサーバー設計書を展開して取得した実応答。新規 `test/phase2-client.test.ts` 5 件（3 件は修正前に Red）。
+  - 確認：`verify-design-docs.sh all` 通過（Phase 2 server 128・Phase 3 server 164・Phase 2 client 557・Phase 3 client 592、pyflakes 指摘なし）。Phase 1 埋め込み同期 DIFF 0。`test_stt_runtime.py` の 17 件は新しい API を import するため、修正前の Red は収集エラーとして確認（1 件ずつの Red ではない）。
+  - **残り（未対応・要判断）**：Phase 2 server §26 に R1〜R6 として記載（取得中の health `degraded`、`vad_sampling_ratio` を読むコードがない、LLM の OOM 時の縮退、SSE の job が snake_case、`If-Match` なしの上書き、要約実行中の STT の排他）。**Phase 3 固有の部分（pyannote・FLAC・LAN / TLS・scheduler・rebuild）は今回読んでいない**（カバレッジは `pyannote_provider.py` 0%・`codec.py` 52%・`scheduler.py` 59%・`__main__.py` 28%）。`__main__.py`（`serve` / `doctor`）は両フェーズともテストなし。Phase 2 / 3 の画面層は未決事項 D1・D2（Phase 2 client §15.2）の判断待ちのまま。Apple Silicon の実機で `doctor` と実モデルの STT を確かめる（Step 2-b）。
 
 - 2026-11-12（PR #14 の 7 回目の指摘・未コミット）：CodeRabbit 6 件（nitpick 1 件を含む）を検証し、すべて有効として対応した（スキップなし）。新規テストは修正前の設計書で Red を確認（Phase 2 / 3 の両方）。製品コード（`src/`・`test/`）は無変更。
   - **Phase 2 client §11 `jobs_loaded`**：アクションに `meetingId`（`JobListResponse.meetingId` を渡す）を足し、表示中の会議と違えば捨てる（`transcript_loaded` と同じ）。会議の切り替え前の一覧取得の後着が新しい会議の jobs に混ざっていた。会議切り替えのテストに 2 段の確認を追加。Phase 3 client は `state.ts` を載せ直していないので対象外。
@@ -355,6 +367,12 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-11-13（設計書の厳しめレビュー 2 回目）
+
+- 展開したコードのカバレッジを起点に、テストが通っていない経路をレビュー。SSE が最初の keepalive で落ちる、Apple Silicon で STT が cuda を選ぶ、モデルの選定が起動時のまま、プールが作り直されない、モデル取得が全滅、録音中の rerun が保存を止める、クライアントが応答を無検証で通す、を修正。詳細は「今回の変更と残課題」。
+- 検証：`scripts/verify-design-docs.sh all` 通過（Phase 2 server 128・Phase 3 server 164・Phase 2 client 557・Phase 3 client 592）。製品コードは無変更のため `npm test` は未実行。未コミット。
+- 次：Phase 3 固有部分のレビュー（未着手）と、Phase 2 server §26 の R1〜R6・未決事項 D1 / D2 の判断。
 
 ### 2026-11-12（Phase 2 / 3 設計書のレビューと修正）
 
