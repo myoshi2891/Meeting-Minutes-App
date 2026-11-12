@@ -1799,8 +1799,14 @@ export class MeetingEventsClient {
       for (const job of list.jobs) this.deps.onEvent({ type: "job", job });
     } catch (error) {
       if (generation !== this.generation) return;
-      this.deps.onError(error instanceof Error ? error : new Error(String(error)));
+      // 先に失敗を記録する。onError 自体が投げても、下の保留の解放と取り直しの予約を飛ばさない
       failed = true;
+      try {
+        this.deps.onError(error instanceof Error ? error : new Error(String(error)));
+      } catch (callbackError) {
+        // 呼び出し側の不具合。投げ直すと void で呼ばれた補完の未処理の reject になるだけなので、記録して続ける
+        console.error("[MeetingEventsClient] onError threw:", callbackError);
+      }
     }
     // 補完に失敗しても保留分は流す（live を失わない）
     const held = this.held ?? [];
@@ -1924,6 +1930,9 @@ export class FetchEventSource implements EventSourceLike {
         });
       } catch {
         // 中断も切断も同じ扱い。close() 済みならこの下で抜ける。
+        // listener の例外で抜けた場合は接続が開いたまま残るので中断する（pump は読み取り中のストリームを取り消して抜ける）。
+        // 中断・切断の後の abort は何もしない
+        controller.abort();
       } finally {
         clearTimeout(watchdog);
         if (stableTimer !== null) clearTimeout(stableTimer);
@@ -1942,19 +1951,26 @@ export class FetchEventSource implements EventSourceLike {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      onData();
-      buffer += decoder.decode(value, { stream: true });
-      // イベントは空行区切り。LF / CRLF の両方を受ける。
+    try {
       for (;;) {
-        const match = /\r?\n\r?\n/.exec(buffer);
-        if (match === null) break;
-        const block = buffer.slice(0, match.index);
-        buffer = buffer.slice(match.index + match[0].length);
-        this.dispatchBlock(block);
+        const { done, value } = await reader.read();
+        if (done) return;
+        onData();
+        buffer += decoder.decode(value, { stream: true });
+        // イベントは空行区切り。LF / CRLF の両方を受ける。
+        for (;;) {
+          const match = /\r?\n\r?\n/.exec(buffer);
+          if (match === null) break;
+          const block = buffer.slice(0, match.index);
+          buffer = buffer.slice(match.index + match[0].length);
+          this.dispatchBlock(block);
+        }
       }
+    } catch (error) {
+      // listener の例外・読み取りの失敗で途中でやめる。ストリームを取り消して読み取りを止め、元の例外を run() へ返す
+      // （中断・切断で既に壊れたストリームの取り消しは reject しうるが、伝えるべきは元の例外なので待つだけにする）
+      await reader.cancel(error).then(() => undefined, () => undefined);
+      throw error;
     }
   }
 
@@ -2389,7 +2405,8 @@ export type UiAction =
   | { readonly type: "meeting_loaded"; readonly meeting: MeetingDetailResponse }
   | { readonly type: "transcript_loaded"; readonly transcript: TranscriptResponse }
   | { readonly type: "summary_loaded"; readonly summary: SummaryResponse }
-  | { readonly type: "jobs_loaded"; readonly jobs: ReadonlyArray<JobSummary> }
+  /** meetingId は一覧を取得した会議（JobListResponse.meetingId）。表示中の会議と違えば捨てる */
+  | { readonly type: "jobs_loaded"; readonly meetingId: string; readonly jobs: ReadonlyArray<JobSummary> }
   | { readonly type: "backend"; readonly backend: LocalBackendHealth }
   | { readonly type: "event"; readonly event: MeetingEvent }
   | { readonly type: "toggle_rejected" };
@@ -2429,6 +2446,8 @@ export function reduce(state: UiState, action: UiAction): UiState {
         staleSummaryVersion: state.staleSummaryVersion !== null && state.staleSummaryVersion <= action.summary.version ? null : state.staleSummaryVersion,
       };
     case "jobs_loaded": {
+      // transcript_loaded と同じく、会議の切り替え前に出した要求の後着は捨てる（前の会議の jobs を混ぜない）
+      if (state.meeting !== null && action.meetingId !== state.meeting.meetingId) return state;
       // applyEvent の job と同じ updatedAt 比較をかける。無条件に上書きすると、
       // SSE で先に届いた新しい状態を、後から解決した一覧取得の古い行が巻き戻す。
       const jobs = new Map(state.jobs);
@@ -3192,6 +3211,47 @@ describe("MeetingEventsClient", () => {
     }
   });
 
+  it("onError が例外を投げても、補完中に保留した live イベントを流し、補完の取り直しを予約する", async () => {
+    vi.useFakeTimers();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // Arrange: 1 回目の補完は失敗し、onError も投げる
+      let es: FakeEventSource | null = null;
+      let calls = 0;
+      let rejectFirst: (error: Error) => void = () => undefined;
+      const received: MeetingEvent[] = [];
+      const client = new MeetingEventsClient({
+        baseUrl: "http://127.0.0.1:43117",
+        token: "tok",
+        createEventSource: () => (es = new FakeEventSource()),
+        fetchJobs: async () => emptyJobs,
+        fetchMeeting: () => {
+          if (++calls === 1) return new Promise<MeetingDetailResponse>((_, reject) => { rejectFirst = reject; });
+          return Promise.resolve(meetingDetail);
+        },
+        onEvent: (e) => received.push(e),
+        onError: () => { throw new Error("callback bug"); },
+      }, "m");
+      client.connect();
+      const source = es as unknown as FakeEventSource;
+      source.emit("open");
+      source.emit("meeting_status", JSON.stringify({ type: "meeting_status", status: "completed" }));
+      // Act
+      rejectFirst(new Error("server down"));
+      await vi.advanceTimersByTimeAsync(0);
+      // Assert: 保留分は流れ、onError の例外は記録され、取り直しが予約されている
+      expect(received).toEqual([{ type: "meeting_status", status: "completed" }]);
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(BACKFILL_RETRY_DELAYS_MS[0]);
+      expect(calls).toBe(2);
+      expect(received).toContainEqual({ type: "meeting_status", status: "transcribing" });
+      client.close();
+    } finally {
+      consoleError.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("補完の取り直しは上限回数で止まり、close や再接続の後は古い接続の分を取り直さない", async () => {
     vi.useFakeTimers();
     try {
@@ -3344,6 +3404,38 @@ describe("FetchEventSource の停止検知", () => {
       await vi.advanceTimersByTimeAsync(1_000);
       expect(calls.count).toBe(4);
       expect(SSE_STABLE_MS).toBeLessThan(SSE_IDLE_TIMEOUT_MS);
+      es.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("listener が例外を投げたら接続を中断してストリームを取り消し、再接続する", async () => {
+    vi.useFakeTimers();
+    try {
+      // Arrange: 応答は 1 イベントを送った後も開いたまま。job の listener が投げる
+      const signals: AbortSignal[] = [];
+      let cancelled = 0;
+      const fetchImpl: typeof fetch = (_input, init) => {
+        if (init?.signal) signals.push(init.signal);
+        const body = new ReadableStream<Uint8Array>({
+          start: (c) => c.enqueue(new TextEncoder().encode("event: job\ndata: {}\n\n")),
+          cancel: () => { cancelled++; },
+        });
+        return Promise.resolve(new Response(body, { status: 200 }));
+      };
+      const es = new FetchEventSource(url, "tok", fetchImpl);
+      const seen: string[] = [];
+      es.addEventListener("job", () => { throw new Error("listener bug"); });
+      es.addEventListener("error", () => seen.push("error"));
+      // Act
+      await vi.advanceTimersByTimeAsync(0);
+      // Assert: 開いたままの接続を残さない
+      expect(seen).toEqual(["error"]);
+      expect(cancelled).toBe(1);
+      expect(signals[0]?.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(signals).toHaveLength(2);
       es.close();
     } finally {
       vi.useRealTimers();
@@ -3634,7 +3726,7 @@ const job = (id: string, status: JobSummary["status"], updatedAt = 1): JobSummar
 
 describe("UI reducer", () => {
   it("job イベントは updatedAt が新しいものだけ採用する", () => {
-    let s = reduce(INITIAL_UI_STATE, { type: "jobs_loaded", jobs: [job("j1", "processing", 5)] });
+    let s = reduce(INITIAL_UI_STATE, { type: "jobs_loaded", meetingId: "m", jobs: [job("j1", "processing", 5)] });
     s = reduce(s, { type: "event", event: { type: "job", job: job("j1", "completed", 3) } });
     expect(s.jobs.get("j1")?.status).toBe("processing");
     s = reduce(s, { type: "event", event: { type: "job", job: job("j1", "completed", 6) } });
@@ -3645,11 +3737,11 @@ describe("UI reducer", () => {
   it("jobs_loaded も updatedAt が古い行では上書きしない", () => {
     // SSE の completed が先に届き、遅れて解決した一覧取得が古い processing を運んでくる状況
     let s = reduce(INITIAL_UI_STATE, { type: "event", event: { type: "job", job: job("j1", "completed", 9) } });
-    s = reduce(s, { type: "jobs_loaded", jobs: [job("j1", "processing", 4), job("j2", "pending", 1)] });
+    s = reduce(s, { type: "jobs_loaded", meetingId: "m", jobs: [job("j1", "processing", 4), job("j2", "pending", 1)] });
     expect(s.jobs.get("j1")?.status).toBe("completed");
     expect(s.jobs.get("j2")?.status).toBe("pending");
     // 新しい行なら採用する
-    s = reduce(s, { type: "jobs_loaded", jobs: [job("j1", "failed", 12)] });
+    s = reduce(s, { type: "jobs_loaded", meetingId: "m", jobs: [job("j1", "failed", 12)] });
     expect(s.jobs.get("j1")?.status).toBe("failed");
   });
 
@@ -3694,7 +3786,7 @@ describe("UI reducer", () => {
     const trOf = (id: string, v: number): TranscriptResponse => ({ meetingId: id, transcriptVersion: v, segments: [], gaps: [] });
     let s = reduce(INITIAL_UI_STATE, { type: "meeting_loaded", meeting: meetingOf("a") });
     s = reduce(s, { type: "transcript_loaded", transcript: trOf("a", 3) });
-    s = reduce(s, { type: "jobs_loaded", jobs: [job("j1", "completed")] });
+    s = reduce(s, { type: "jobs_loaded", meetingId: "a", jobs: [job("j1", "completed")] });
     s = reduce(s, { type: "event", event: { type: "summary_version", version: 2 } });
     s = reduce(s, { type: "toggle_rejected" });
     // 同じ会議の読み直しは会議ごとの状態を保つ
@@ -3712,6 +3804,11 @@ describe("UI reducer", () => {
     expect(s.transcript).toEqual(trOf("b", 1));
     s = reduce(s, { type: "transcript_loaded", transcript: trOf("a", 4) });
     expect(s.transcript).toEqual(trOf("b", 1));
+    // jobs も同じ。切り替え前に出した A の一覧取得の後着は混ぜず、B の一覧は採る
+    s = reduce(s, { type: "jobs_loaded", meetingId: "a", jobs: [job("j1", "completed")] });
+    expect(s.jobs.size).toBe(0);
+    s = reduce(s, { type: "jobs_loaded", meetingId: "b", jobs: [job("j2", "pending")] });
+    expect([...s.jobs.keys()]).toEqual(["j2"]);
   });
 
   it("未取得のまま古い版の通知が後から届いても、stale の印を戻さない", () => {
@@ -3749,7 +3846,7 @@ describe("UI reducer", () => {
   });
 
   it("失敗ジョブとバナー", () => {
-    let s = reduce(INITIAL_UI_STATE, { type: "jobs_loaded", jobs: [job("j1", "failed"), job("j2", "completed")] });
+    let s = reduce(INITIAL_UI_STATE, { type: "jobs_loaded", meetingId: "m", jobs: [job("j1", "failed"), job("j2", "completed")] });
     expect(failedJobs(s).map((j) => j.jobId)).toEqual(["j1"]);
     expect(backendBanner(s)).toBeNull();
     s = reduce(s, { type: "backend", backend: { status: "UNREACHABLE", lastCheckedAt: 0, lastHealthyAt: null, latencyMs: null, consecutiveFailures: 3, capabilities: null, unauthorized: false } });

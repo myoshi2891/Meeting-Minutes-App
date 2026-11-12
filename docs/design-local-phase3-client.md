@@ -475,8 +475,14 @@ export class MeetingEventsClient {
       for (const job of list.jobs) this.deps.onEvent({ type: "job", job });
     } catch (error) {
       if (generation !== this.generation) return;
-      this.deps.onError(error instanceof Error ? error : new Error(String(error)));
+      // 先に失敗を記録する。onError 自体が投げても、下の保留の解放と取り直しの予約を飛ばさない
       failed = true;
+      try {
+        this.deps.onError(error instanceof Error ? error : new Error(String(error)));
+      } catch (callbackError) {
+        // 呼び出し側の不具合。投げ直すと void で呼ばれた補完の未処理の reject になるだけなので、記録して続ける
+        console.error("[MeetingEventsClient] onError threw:", callbackError);
+      }
     }
     // 補完に失敗しても保留分は流す（live を失わない）
     const held = this.held ?? [];
@@ -600,6 +606,9 @@ export class FetchEventSource implements EventSourceLike {
         });
       } catch {
         // 中断も切断も同じ扱い。close() 済みならこの下で抜ける。
+        // listener の例外で抜けた場合は接続が開いたまま残るので中断する（pump は読み取り中のストリームを取り消して抜ける）。
+        // 中断・切断の後の abort は何もしない
+        controller.abort();
       } finally {
         clearTimeout(watchdog);
         if (stableTimer !== null) clearTimeout(stableTimer);
@@ -618,19 +627,26 @@ export class FetchEventSource implements EventSourceLike {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      onData();
-      buffer += decoder.decode(value, { stream: true });
-      // イベントは空行区切り。LF / CRLF の両方を受ける。
+    try {
       for (;;) {
-        const match = /\r?\n\r?\n/.exec(buffer);
-        if (match === null) break;
-        const block = buffer.slice(0, match.index);
-        buffer = buffer.slice(match.index + match[0].length);
-        this.dispatchBlock(block);
+        const { done, value } = await reader.read();
+        if (done) return;
+        onData();
+        buffer += decoder.decode(value, { stream: true });
+        // イベントは空行区切り。LF / CRLF の両方を受ける。
+        for (;;) {
+          const match = /\r?\n\r?\n/.exec(buffer);
+          if (match === null) break;
+          const block = buffer.slice(0, match.index);
+          buffer = buffer.slice(match.index + match[0].length);
+          this.dispatchBlock(block);
+        }
       }
+    } catch (error) {
+      // listener の例外・読み取りの失敗で途中でやめる。ストリームを取り消して読み取りを止め、元の例外を run() へ返す
+      // （中断・切断で既に壊れたストリームの取り消しは reject しうるが、伝えるべきは元の例外なので待つだけにする）
+      await reader.cancel(error).then(() => undefined, () => undefined);
+      throw error;
     }
   }
 

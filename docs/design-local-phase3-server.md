@@ -2544,6 +2544,8 @@ def _stored_chunk_intact(ctx: AppContext, chunk: AudioChunk) -> bool:
         read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec)
     except InvalidWavError:        # 欠損・sha256 不一致・復号の失敗（コーデックは失敗を ValueError で返し、read_pcm が包む）
         return False
+    except OSError:                # 権限・照合中の削除など読めないファイルも欠損として修復へ進める（500 にしない。chunk_file_intact と同じ規則）
+        return False
     return True
 
 
@@ -2702,7 +2704,10 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     async with ctx.db.write() as conn:
         # 先に確定した値を正とする。書き込みロック下で状態と件数を確かめ直し、2 回目以降は更新しない
         current = repo.get_meeting(conn, meeting_id)
-        if current is not None and current.status in OPEN_STATUSES:
+        # 照合の間に削除された会議を「確定した」と返さない（Phase 2 §21.2 と同じ）
+        if current is None:
+            return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
+        if current.status in OPEN_STATUSES:
             if len(repo.list_chunks(conn, meeting_id)) != len(chunks):
                 return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "chunks changed during finalize"), status_code=409)
             repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames,

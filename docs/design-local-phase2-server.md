@@ -3819,7 +3819,7 @@ from ..db import repo
 from ..db.connection import now_ms
 from ..db.models import AudioChunk, Meeting
 from ..jobs import pipeline
-from ..storage.files import InvalidWavError, chunk_relative_path, parse_wav_header, sha256_file, sha256_hex, write_atomic
+from ..storage.files import InvalidWavError, chunk_relative_path, parse_wav_header, sha256_hex, write_atomic
 from .common import error_body, get_ctx
 
 router = APIRouter(prefix="/v1")
@@ -3984,8 +3984,8 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
     if existing is not None:
         if existing.sha256 != sha:
             return JSONResponse(error_body("CONFLICT_HASH_MISMATCH", "chunk exists with different content"), status_code=409)
-        path = ctx.settings.data_dir / existing.local_path
-        if path.is_file() and sha256_file(path) == sha:
+        # finalize と同じ照合（読めないファイルも欠損として修復へ進める。例外のまま 500 にしない）。sha256 の計算はスレッドで行う
+        if await asyncio.to_thread(pipeline.chunk_file_intact, ctx.settings.data_dir, existing):
             return JSONResponse(_chunk_response(existing), status_code=200)   # 冪等再送（基本設計 §11）
         # 修復：登録済みだがファイルが失われた・壊れた。内容は同じ（sha256 一致）なので書き戻す。
         # 確定後の会議でも受け付ける（finalize の 409 CONFLICT_CHUNKS_MISSING からブラウザが再送して回復する経路）
@@ -4091,7 +4091,10 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
             repo.update_chunk(conn, c.id, save_status="missing" if f"{c.source}/{c.sequence_no}" in missing else "verified")
         # 先に確定した値を正とする。書き込みロック下で状態と件数を確かめ直し、2 回目以降は更新しない
         current = repo.get_meeting(conn, meeting_id)
-        if current is not None and current.status in OPEN_STATUSES:
+        # 照合の間に削除された会議を「確定した」と返さない
+        if current is None:
+            return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
+        if current.status in OPEN_STATUSES:
             if len(repo.list_chunks(conn, meeting_id)) != len(chunks):
                 return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "chunks changed during finalize"), status_code=409)
             repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames,
@@ -4116,7 +4119,7 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 ```
 
-`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を返す。`meeting.json` は書き込みトランザクションのコミット後に、DB に残った確定値（停止理由・検出時刻を含む）から書き出す。再送を含む成功した finalize のたびに書き直すので、書き出しに失敗しても再送で回復する（Phase 1 §12。Phase 3 §20.2 は Chunk 一覧も加えて同じ位置で書く）。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。再送はジョブを作らないので、Phase 1 のサーバーで確定した会議（移行した DB に `finalized` のまま残る）は、`serve` の起動時に `sweeper.resume_finalized()` が `on_finalized` を呼んで回収する（§14・§22。`transcribing` に進めるので 2 回目の起動では拾わない）。回収の前に finalize と同じ規則（連番の連続と `pipeline.chunk_file_intact()`）でファイルを照合し、欠損・破損があれば `finalized` のまま残す（直せば次の起動で拾う）。
+`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を、会議が削除されていれば 404 を返す（確定したとは返さない）。`meeting.json` は書き込みトランザクションのコミット後に、DB に残った確定値（停止理由・検出時刻を含む）から書き出す。再送を含む成功した finalize のたびに書き直すので、書き出しに失敗しても再送で回復する（Phase 1 §12。Phase 3 §20.2 は Chunk 一覧も加えて同じ位置で書く）。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。再送でのファイルの照合も finalize と同じ `pipeline.chunk_file_intact()` で行い、読めないファイル（権限など）は 500 にせず欠損として書き戻す。再送はジョブを作らないので、Phase 1 のサーバーで確定した会議（移行した DB に `finalized` のまま残る）は、`serve` の起動時に `sweeper.resume_finalized()` が `on_finalized` を呼んで回収する（§14・§22。`transcribing` に進めるので 2 回目の起動では拾わない）。回収の前に finalize と同じ規則（連番の連続と `pipeline.chunk_file_intact()`）でファイルを照合し、欠損・破損があれば `finalized` のまま残す（直せば次の起動で拾う）。
 
 ## 21.3 Phase 2 ルート `api/routes_meetings.py`
 
@@ -5072,6 +5075,7 @@ import base64
 import errno
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -5290,7 +5294,45 @@ async def test_after_finalize_new_chunk_is_rejected_but_resend_and_repair_pass(c
         assert repo.get_chunk_by_key(conn, "m-1", "mic", 0).save_status == "registered"
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root は権限に関係なく読めるため")
+async def test_resend_repairs_unreadable_chunk_file_instead_of_500(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    # Arrange: 登録済み Chunk のファイルが読めない（権限）
+    await client.post("/v1/meetings", json=MEETING)
+    assert (await _raw_put(client)).status_code == 201
+    path = recording_dir(ctx, "m-1") / "mic/000000.wav"
+    path.chmod(0)
+    try:
+        # Act: 同じ内容の再送
+        r = await _raw_put(client)
+    finally:
+        if path.exists():
+            path.chmod(0o600)
+    # Assert: 500 にせず、欠損として書き戻す
+    assert r.status_code == 200
+    assert (await finalize(client, "m-1", mic=1)).status_code == 200
+
+
 # ---- finalize ----
+
+async def test_finalize_returns_404_when_meeting_is_deleted_during_file_check(client: httpx.AsyncClient, ctx: AppContext,
+                                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: ファイルの照合（書き込みトランザクションの前）の間に会議が削除される
+    await client.post("/v1/meetings", json=MEETING)
+    assert (await _raw_put(client)).status_code == 201
+
+    def intact_then_deleted(_data_dir: object, _chunk: object) -> bool:
+        conn = sqlite3.connect(ctx.db.path)
+        try:
+            with conn:
+                conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        finally:
+            conn.close()
+        return True
+    monkeypatch.setattr("minutes_local.jobs.pipeline.chunk_file_intact", intact_then_deleted)
+    # Act
+    r = await finalize(client, "m-1", mic=1)
+    # Assert: 削除された会議を「確定した」と返さない
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"
 
 async def test_finalize_requires_both_sources_and_non_negative_counts(client: httpx.AsyncClient) -> None:
     await client.post("/v1/meetings", json=MEETING)
@@ -6355,9 +6397,9 @@ async def test_resend_does_not_duplicate_samples(client: httpx.AsyncClient, ctx:
 | Phase 1 のテスト | 引き継いだテスト |
 | --- | --- |
 | `test_health_auth_cors_and_persistent_restart` | `test_preflight_is_answered_without_token_for_dev_origin_only`、`test_error_responses_carry_cors_headers_and_api_error_body`、`test_rotate_token_changes_value_and_keeps_owner_only_permission`、§23.3 の `test_health_without_token_has_no_capabilities`・`test_health_with_token` |
-| `test_put_validation_idempotency_and_finalize` | `test_put_to_unknown_meeting_is_404`、`test_first_finalize_wins_and_resend_does_not_republish_status`、§23.3 の `test_create_meeting_idempotent`・`test_put_chunk_idempotent_and_conflict`・`test_put_chunk_rejects_invalid_wav_and_bad_hash`・`test_list_and_finalize` |
+| `test_put_validation_idempotency_and_finalize` | `test_put_to_unknown_meeting_is_404`、`test_finalize_returns_404_when_meeting_is_deleted_during_file_check`、`test_first_finalize_wins_and_resend_does_not_republish_status`、§23.3 の `test_create_meeting_idempotent`・`test_put_chunk_idempotent_and_conflict`・`test_put_chunk_rejects_invalid_wav_and_bad_hash`・`test_list_and_finalize` |
 | `test_parallel_put_same_key` | `test_parallel_put_of_same_key_registers_once` |
-| `test_hash_integrity_cors_and_storage_full` | `test_put_chunk_rejects_bad_key_and_headers`、`test_disk_full_returns_507_and_leaves_no_row`、`test_corrupt_file_blocks_finalize_until_resend_repairs_it` |
+| `test_hash_integrity_cors_and_storage_full` | `test_put_chunk_rejects_bad_key_and_headers`、`test_disk_full_returns_507_and_leaves_no_row`、`test_corrupt_file_blocks_finalize_until_resend_repairs_it`、`test_resend_repairs_unreadable_chunk_file_instead_of_500` |
 | `test_put_rejects_new_chunk_after_finalize_but_allows_retry_and_repair` | `test_after_finalize_new_chunk_is_rejected_but_resend_and_repair_pass` |
 | `test_concurrent_finalize_keeps_first_result_in_db_and_snapshot`、`test_concurrent_atomic_writes_to_same_path_do_not_share_temp_file` | 同名のテスト |
 | `test_stop_metadata_persists_across_restart_and_first_finalize_wins`、`test_invalid_stop_metadata_is_rejected_and_legacy_request_stays_unknown` | `test_stop_metadata_is_stored_and_first_finalize_wins`、`test_invalid_stop_metadata_is_rejected_and_legacy_request_stays_unknown` |
