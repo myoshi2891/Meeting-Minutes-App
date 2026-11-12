@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-12（PR #14 の 4 回目のレビュー指摘・未コミット、ブランチ `dev`。PR #13 までマージ済み）
+最終更新: 2026-11-12（PR #14 の 5 回目のレビュー指摘・未コミット、ブランチ `dev`。PR #13 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,18 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-12 の PR #14 の 4 回目の指摘の対応後：Phase 2 server 97 件・Phase 3 server 133 件・Phase 2 client 30 ファイル 545 件・Phase 3 client 34 ファイル 579 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-12 の PR #14 の 5 回目の指摘の対応後：Phase 2 server 97 件・Phase 3 server 133 件・Phase 2 client 30 ファイル 549 件・Phase 3 client 34 ファイル 584 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-12（PR #14 の 5 回目の指摘・未コミット）：CodeRabbit 5 件（nitpick 1 件を含む）を検証し、すべて有効として対応した（スキップなし）。新規テストは修正前に Red を確認（nitpick のテスト強化は現行の挙動の確認）。製品コード（`src/`・`test/`）は無変更。
+  - **Phase 2 client §15.1 W2**：テストの期待値を §4 の 1 に合わせた。ロックが `heldLocks` に入るのは、Mic か System のメモリ待機が残るときと Mic の最終保存に失敗したときだけ。Mic が保存しきり両方空なら Mic の `stop()` が解放済みで、System の失敗で reject しても `heldLocks` には入らない。
+  - **Phase 2 client §10 NotesStore**：`doSave` は保存後の控え（新しい revision）の書き込みを `await` してから返す。`dispose()` はその完了まで待つ（`void` で投げていたので、作り直したインスタンスの `load()` が古い revision の控えを読んで conflict になった）。書き込みの失敗は新規の任意 dep `onError` に渡す（サーバーには保存済みなので状態は saved のまま。未処理の reject にしない）。回帰 2 件。
+  - **Phase 2 / 3 client（`request`）**：成功応答の本文を `res.json().catch(() => null)` で読んでいた。読み取り中の中断・通信断は外の catch で TIMEOUT / NETWORK に、壊れた JSON（`SyntaxError`）は成功応答なら `MALFORMED`、エラー応答なら従来どおり status で返す。204 は本文なし。回帰 3 件（Phase 2 の 2 件は Phase 3 でも走る）。
+  - **Phase 2 / 3 server（`resume_finalized`）**：始める前に finalize と同じ規則（source ごとの連番の連続、新規 `pipeline.chunk_file_intact()`）でファイルを照合し、欠損・破損があれば `finalized` のまま残す（直れば次の起動で拾う。件数は `resume_finalized_skipped` の metric）。`chunk_file_intact` は Phase 3 の pipeline（全文差し替え）で圧縮済みを存在だけで見る形にし、両 Phase の finalize もこれを使う。sha256 は書き込みロックの外で計算。引数に `data_dir` を追加（呼び出し元は両 Phase の `__main__`）。既存テストに破損と修復の場合を追加。
+  - **Phase 3 client（nitpick）**：STORAGE の再同期テストで、積んだ 1 件がサーバーに 1 回だけ届くこと（`putCount`・`arrivalOrder`）まで確かめる。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過・Phase 1 埋め込み同期一致。`verify-design-docs.sh all`：Phase 2 server 97 件・Phase 3 server 133 件・Phase 2 client 549 件・Phase 3 client 584 件、pyflakes 指摘なし。
+  - 残り：Phase 1 の `src/api/local-saver.ts`・`meeting-registrar.ts`・`backend-health-monitor.ts` も成功応答の本文を `json().catch(() => null)` で読む（読み取り中のタイムアウトが壊れた応答と区別されない）。今回の指摘範囲外。要否を判断する。`NotesStore.setDraft` / `acceptServer` の控えの書き込みも `void` のまま（失敗が未処理の reject になりうる）。
 
 - 2026-11-12（PR #14 の 4 回目の指摘・未コミット）：CodeRabbit 8 件を検証し、すべて有効として修正した（スキップなし）。新規・変更テストは修正前に Red を確認（ルートの ACL 失敗時に配下へ触らないテストと Windows の st_mode のガードは、旧コードでも通る／mac では実行されない保存確認）。製品コード（`src/`・`test/`）は無変更。
   - **Phase 2 / 3 client（SSE の保留）**：補完の途中で再接続したら、前の接続の保留を捨てずに新しい補完を始める前に流す（「前の保留 → 新しい補完 → 新しい保留」の時間順）。捨てると補完に含まれない `progress` と、新しい補完も失敗したときの status を失った。既存テスト 1 件の期待値を更新、回帰 1 件。Phase 2 サーバーは `progress` を送らない（Phase 3 は Live の 1 種だけ）ので、切断中に落ちた `progress` を補完する経路はない。
