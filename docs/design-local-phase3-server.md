@@ -97,7 +97,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * TLS：`doctor --init-tls --host <hostname or IP>` で自己署名証明書（`cryptography`、extras `lan`）。ブラウザは初回に証明書の受け入れが必要（断定しない事項 §3）
 * 認証：`users` テーブル（`id`, `name`, `token_hash`, `created_at`）。`minutes-local user add <name>` がトークンを 1 回だけ表示する。`users` が空なら従来の `token` ファイルで `local` ユーザーとして動作（後方互換）
 * 認可：認証ミドルウェアが `/v1/meetings/{id}/...` と `/v1/jobs/{id}/...` の所有者を照合し、他人の会議は `404`（存在を漏らさない）。`GET /v1/meetings` は自分の会議のみ
-* ファイル階層：`recordings/{userId}/{meetingId}/{source}/{seq}.wav`。マイグレーション 012 が既存の `recordings/{meetingId}/` を `recordings/local/{meetingId}/` へ移動し `local_path` を更新する
+* ファイル階層：`recordings/{userId}/{meetingId}/{source}/{seq}.wav`。マイグレーション 012 が既存の `recordings/{meetingId}/` を `recordings/local/{meetingId}/` へ移動し `local_path` を更新する。旧ディレクトリは新しい階層を作る前に `{dataDir}/.migrate-012/` へ退避してから統合する（会議 ID が `local` だと旧ディレクトリと新しい階層の親が重なるため）
 * ジョブの公平性：`lease_job` を「利用者ごとの実行中ジョブ数が少ない利用者を優先」に変更（`ORDER BY running_per_user, priority, created_at`）。GPU は依然 1 台なので、同時実行数の上限は Phase 2 と同じ
 * CSP と origin：**API origin はページ origin と同一とする**（前提契約）。サーバーが `/` でアプリ自身を配信するので `connect-src 'self'` で吸収され変更不要、同一 origin なので CORS 設定も不要。LAN モードとは「ページ自体を LAN の https origin から開く」ことであり、loopback から開いたページが別ホストの API を叩く構成ではない。**別オリジン配信は対象外**で、ブラウザ側 `validateConnection()` がページ origin 以外を `NOT_PAGE_ORIGIN` で拒否して実装レベルでも強制する（クライアント側 §7.3）。将来対象化する場合は CSP `connect-src` への対象 origin 追加と、`Authorization` ヘッダを伴う preflight に対応した CORS 設定の両方が必要になる
 * インターネット公開・リバースプロキシ・OS ログイン連携は対象外
@@ -214,39 +214,56 @@ CREATE INDEX IF NOT EXISTS idx_meetings_user ON meetings(local_user_id, created_
 PHASE3_SQL: list[tuple[int, str]] = [(9, M009), (10, M010), (11, M011)]
 
 
+MIGRATE_012_STAGING = ".migrate-012"
+
+
+def _merge_tree(src: Path, dst: Path) -> None:
+    """src の中身を dst へ移し、src を消す。dst に同じパスのファイルがあれば dst を残す。src は作業場所の中だけを渡す。"""
+    for p in sorted(src.rglob("*")):
+        if p.is_file():
+            target = dst / p.relative_to(src)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.move(str(p), str(target))
+    shutil.rmtree(src)
+
+
 def _migrate_012_move_recordings(conn: sqlite3.Connection, data_dir: Path) -> int:
-    """recordings/{meetingId}/ → recordings/local/{meetingId}/。local_path を書き換える。戻り値は移動した Chunk 数。"""
-    rows = conn.execute("SELECT id, meeting_id, local_user_id_hint, local_path FROM (SELECT c.id, c.meeting_id, m.local_user_id AS local_user_id_hint, c.local_path FROM audio_chunks c JOIN meetings m ON m.id = c.meeting_id) WHERE local_path LIKE 'recordings/%'").fetchall()
+    """recordings/{meetingId}/ → recordings/{userId}/{meetingId}/。local_path を書き換える。戻り値は書き換えた Chunk 数。
+
+    旧ディレクトリは、新しい階層を作る前にすべて recordings/ の外の作業場所（{dataDir}/.migrate-012/）へ退避する。
+    会議 ID は利用者 ID（既定 "local"）と同じ値を取りうる（SAFE_ID）。その場で移すと旧ディレクトリ recordings/local/ が
+    新しい階層の親と重なり、旧ディレクトリの片付けが他の会議の録音ごと消す。
+    途中で落ちたら apply_phase3 が 012 を記録しないので再実行される。退避を終えた印（.staged）があれば退避を飛ばし、
+    新しい階層を旧ディレクトリと取り違えない。local_path の書き換えは 012 の記録と同じトランザクションで行い、
+    作業場所（印を含む）は apply_phase3 が 012 の記録をコミットした後に片付ける。
+    """
+    staging = data_dir / MIGRATE_012_STAGING
+    staged = staging / ".staged"
+    recordings = data_dir / "recordings"
+    meetings = conn.execute("SELECT id, local_user_id FROM meetings").fetchall()
+    if not staged.exists():
+        staging.mkdir(parents=True, exist_ok=True)
+        for m in meetings:
+            old_dir = recordings / m["id"]
+            if old_dir.is_dir() and not (staging / m["id"]).exists():
+                shutil.move(str(old_dir), str(staging / m["id"]))
+        staged.touch()
+    for m in meetings:
+        src = staging / m["id"]
+        if src.is_dir():
+            _merge_tree(src, recordings / m["local_user_id"] / m["id"])
+    rows = conn.execute(
+        "SELECT c.id, c.local_path, m.local_user_id FROM audio_chunks c JOIN meetings m ON m.id = c.meeting_id "
+        "WHERE c.local_path LIKE 'recordings/%'").fetchall()
     moved = 0
     for r in rows:
-        old_rel = r["local_path"]
-        parts = old_rel.split("/")
-        if len(parts) == 4:  # recordings/{meetingId}/{source}/{file}
-            new_rel = f"recordings/{r['local_user_id_hint']}/{parts[1]}/{parts[2]}/{parts[3]}"
-        else:
+        parts = r["local_path"].split("/")
+        if len(parts) != 4:  # recordings/{meetingId}/{source}/{file} 以外は移行の対象外
             continue
-        src = data_dir / old_rel
-        dst = data_dir / new_rel
-        if src.exists():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
+        new_rel = f"recordings/{r['local_user_id']}/{parts[1]}/{parts[2]}/{parts[3]}"
         conn.execute("UPDATE audio_chunks SET local_path = ? WHERE id = ?", (new_rel, r["id"]))
         moved += 1
-    # meeting.json も移動（存在すれば）
-    for m in conn.execute("SELECT id, local_user_id FROM meetings").fetchall():
-        old_dir = data_dir / "recordings" / m["id"]
-        new_dir = data_dir / "recordings" / m["local_user_id"] / m["id"]
-        if old_dir.exists() and not new_dir.exists():
-            new_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(old_dir), str(new_dir))
-        elif old_dir.exists() and new_dir.exists():
-            for p in old_dir.rglob("*"):
-                if p.is_file():
-                    target = new_dir / p.relative_to(old_dir)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    if not target.exists():
-                        shutil.move(str(p), str(target))
-            shutil.rmtree(old_dir, ignore_errors=True)
     return moved
 
 
@@ -265,6 +282,11 @@ def apply_phase3(db: Database, data_dir: Path) -> int:
             _migrate_012_move_recordings(conn, data_dir)
             conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (12, ?)", (now_ms(),))
             applied += 1
+    # 012 の記録がコミットされてから片付ける。先に印を消すと、記録前に落ちた再実行が新しい階層を旧ディレクトリと取り違える
+    staging = data_dir / MIGRATE_012_STAGING
+    if staging.exists():
+        (staging / ".staged").unlink(missing_ok=True)
+        staging.rmdir()      # 統合で空になっている。残っていれば想定外なので OSError で止める
     return applied
 ```
 
@@ -2434,13 +2456,16 @@ async def create_meeting(req: CreateMeetingRequest, request: Request) -> JSONRes
         if created:
             repo.update_meeting(conn, m.id, live_stt_enabled=int(live.default_live_enabled(ctx)))
         current = repo.get_meeting(conn, req.meetingId)
+        chunks_now = repo.list_chunks(conn, req.meetingId)
     assert current is not None
     # 録音メタデータの控え（Phase 1 §13）。作成時に書き、再送時はファイルが失われているときだけ書き直す
-    # （finalize 後の再送で、確定値を持つ meeting.json を作成時の内容へ戻さない）
+    # （finalize 後の再送で、確定値を持つ meeting.json を作成時の内容へ戻さない）。
+    # 書くときは finalize と同じ write_meeting_json で DB の会議行と Chunk から書く。作成時の要求から書くと、
+    # 確定後に控えが失われて再送されたとき、確定値と Chunk 一覧のない控えに戻る
     rel = f"{meeting_dir(current.id, current.local_user_id)}/meeting.json"
     if created or not (ctx.settings.data_dir / rel).is_file():
         try:
-            write_atomic(ctx.settings.data_dir, rel, json.dumps(req.model_dump(), ensure_ascii=False).encode())
+            write_meeting_json(ctx.settings.data_dir, current, chunks_now)
         except OSError as e:
             if e.errno == errno.ENOSPC:
                 return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
@@ -2643,6 +2668,12 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
             transitioned = True
         snapshot = repo.get_meeting(conn, meeting_id)
         chunks_now = repo.list_chunks(conn, meeting_id)
+    # 状態の遷移はコミット済みなので、控えの書き出しより先に通知する。書き出しが 507 で終わると、
+    # 再送は transitioned が False になり、この遷移を通知する機会がなくなる（Phase 2 §21.2 と同じ）。
+    # 再送（確定済み会議への 2 回目以降の POST）では状態を進めていないので通知しない。
+    # 毎回 transcribing を流すと、completed の会議の画面が再送のたびに処理中へ戻る
+    if transitioned and snapshot is not None:
+        ctx.events.publish(meeting_id, {"type": "meeting_status", "status": snapshot.status})
     # コミット後に確定値から書き、meeting.json が DB より先行しないようにする。再送でも毎回書き直す（Phase 1 §12）
     if snapshot is not None:
         try:
@@ -2651,10 +2682,6 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
             if e.errno == errno.ENOSPC:
                 return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
             raise
-    # 再送（確定済み会議への 2 回目以降の POST）では状態を進めていないので通知しない。
-    # 毎回 transcribing を流すと、completed の会議の画面が再送のたびに処理中へ戻る
-    if transitioned and snapshot is not None:
-        ctx.events.publish(meeting_id, {"type": "meeting_status", "status": snapshot.status})
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 ```
 
@@ -3107,18 +3134,21 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         existing = repo_phase3.segments_of_chunk(conn, chunk.id)
         meeting = repo.get_meeting(conn, job.meeting_id)
     if existing:
-        # Live STT の結果を再利用（§2.1）
+        # Live STT の結果を再利用（§2.1）。完了にするのは lease の現行の所有者だけ（Phase 2 基本設計 §9.3）
         async with ctx.db.write() as conn:
+            if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                return None
             pipeline.on_transcribe_completed(conn, chunk, ctx.diarization_active)
             repo.record_metric(conn, "stt_reused_live", 1, meeting_id=chunk.meeting_id)
         return None
     result, prefix_ms, model_name, language, guess = await _run_stt(ctx, job, chunk, with_overlap=True)
     segments = _segments_from(result, chunk, prefix_ms, language)
     async with ctx.db.write() as conn:
-        # lease が失効していれば 0 件で戻り、以降の集計も行わない（Phase 2 基本設計 §9.3）。
-        written = repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
-        if written == 0 and segments:
+        # lease が失効していれば書かず、以降の集計と完了処理も行わない（Phase 2 基本設計 §9.3）。
+        # 書いた件数では判定しない。無音で segments が空だと失効していても 0 件になり、旧ワーカーが Chunk を完了にしてしまう
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return model_name
+        repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
         if meeting is not None and meeting.stt_model_used is None:
             repo.update_meeting(conn, chunk.meeting_id, stt_model_used=model_name)
         repo.record_metric(conn, "stt_seconds", chunk.duration_ms / 1000, model_name=model_name, meeting_id=chunk.meeting_id)
@@ -3141,9 +3171,9 @@ async def handle_live_transcribe(ctx: AppContext, job: Job) -> str | None:
     segments = _segments_from(result, chunk, prefix_ms, language)
     async with ctx.db.write() as conn:
         # 確定 STT と同じ fencing（Phase 2 基本設計 §9.3）。失効したワーカーの結果は書かず、SSE にも流さない。
-        written = repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
-        if written == 0 and segments:
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return model_name
+        repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
         repo.record_metric(conn, "live_lag_ms", now_ms() - chunk.created_at, meeting_id=chunk.meeting_id)
     for s in segments:
         ctx.events.publish(chunk.meeting_id, {"type": "live_segment", "segment": {
@@ -3325,6 +3355,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import socket
 from pathlib import Path
 
 from .auth.users import user_count
@@ -3356,12 +3387,26 @@ def rotate_token(path: Path) -> str:
     token = secrets.token_hex(32)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.fchmod(fd, 0o600)          # 既存ファイルの権限が緩かった場合も締める
+        # 既存ファイルの権限が緩かった場合も締める。Windows の Python 3.12 以前には fchmod がないのでパスで行う
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:
+            os.chmod(path, 0o600)
         os.write(fd, token.encode("ascii"))
         os.fsync(fd)
     finally:
         os.close(fd)
     return token
+
+
+def bind_listen_socket(host: str, port: int) -> socket.socket:
+    """待ち受けポートを確保する。`serve` はこれが成功してからトークンを作り直す（Phase 2 §22 と同じ）。
+
+    先にトークンを書くと、ポートが使用中で起動に失敗したとき、動いている既存のサーバーが受け付けるトークンと
+    ファイル（`minutes-local token` の表示）が食い違う。確保できなければ OSError（EADDRINUSE など）を送出する。
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    return socket.create_server((host, port), family=family)
 
 
 def read_token(path: Path) -> str | None:
@@ -3463,7 +3508,7 @@ import argparse
 import asyncio
 import sys
 
-from .bootstrap import build_context, read_token, rotate_token
+from .bootstrap import bind_listen_socket, build_context, read_token, rotate_token
 from .config import settings_from_env
 
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
@@ -3548,8 +3593,16 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print(f"ERROR: TLS files not found under {s.tls_cert_path.parent}. Run `doctor --init-tls --host <hostname>`.", file=sys.stderr)
         return 2
 
-    async def main() -> None:
+    async def main() -> int:
         ctx = await build_context(s, tls_enabled=bool(args.tls))
+        try:
+            sock = bind_listen_socket(args.bind, s.port)
+        except OSError as e:
+            # ポートの確保に失敗したらトークンを書き換えない（既存のサーバーが動いていれば、そのトークンが有効なまま）
+            print(f"ERROR: cannot listen on {args.bind}:{s.port} ({e}). The token was not changed.", file=sys.stderr)
+            ctx.stt.shutdown()
+            ctx.db.close()
+            return 1
         token = rotate_token(s.token_path)      # 起動のたびに作り直す（Phase 1 §4.3）。利用者別トークン（users テーブル）は作り直さない
         if not ctx.multi_user:
             print(f"token: {token}")
@@ -3564,7 +3617,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         config = uvicorn.Config(app, host=args.bind, port=s.port, log_level="info", **kwargs)
         server = uvicorn.Server(config)
         try:
-            await server.serve()
+            await server.serve(sockets=[sock])
         finally:
             stop.set()
             for r in runners:
@@ -3573,9 +3626,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 t.cancel()
             ctx.stt.shutdown()
             ctx.db.close()
+        return 0
 
-    asyncio.run(main())
-    return 0
+    return asyncio.run(main())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3942,6 +3995,35 @@ def test_apply_phase3_moves_files_and_extends_job_types(tmp_path: Path) -> None:
         assert repo.insert_job(conn, "m", "diarize_meeting") is not None       # 新しい job_type が CHECK を通る
         assert repo.insert_job(conn, "m", "diarize_meeting") is None           # uq_diarize_job
     assert apply_phase3(db, data_dir) == 0                                      # 冪等
+    db.close()
+
+
+def test_apply_phase3_keeps_other_recordings_when_meeting_id_equals_user_id(tmp_path: Path) -> None:
+    """会議 ID "local" の旧ディレクトリ recordings/local/ は新しい階層の親と重なる。他の会議の録音を消さずに移す。"""
+    data_dir = tmp_path / "data"
+    db = Database(data_dir / "minutes.sqlite")
+    migrate(db)
+    t = now_ms()
+    with db.write_sync() as conn:
+        for mid in ("local", "m"):
+            repo.insert_meeting(conn, Meeting(id=mid, title="t", status="completed", session_start_epoch_ms=0, native_sample_rate=48000,
+                                              consent_confirmed_at=1, created_at=t, updated_at=t))
+            rel = f"recordings/{mid}/mic/000000.wav"
+            (data_dir / rel).parent.mkdir(parents=True)
+            (data_dir / rel).write_bytes(build_wav(sine_pcm(1)))
+            (data_dir / f"recordings/{mid}/meeting.json").write_text(mid)
+            repo.upsert_chunk(conn, AudioChunk(id=f"c-{mid}", meeting_id=mid, source="mic", sequence_no=0, start_offset_ms=0,
+                                               end_offset_ms=1000, duration_ms=1000, sample_count=16000, local_path=rel,
+                                               size_bytes=1, sha256="x", created_at=t))
+
+    apply_phase3(db, data_dir)
+    with db.read() as conn:
+        for mid in ("local", "m"):
+            chunk = repo.get_chunk(conn, f"c-{mid}")
+            assert chunk.local_path == f"recordings/local/{mid}/mic/000000.wav"
+            assert (data_dir / chunk.local_path).is_file()
+            assert (data_dir / f"recordings/local/{mid}/meeting.json").read_text() == mid
+    assert not (data_dir / ".migrate-012").exists()
     db.close()
 ```
 
@@ -4480,7 +4562,7 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | 圧縮の往復検証・不一致時の保持 | `test_compress_replaces_wav_after_roundtrip`、`test_compress_keeps_wav_when_roundtrip_mismatches` |
 | バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
-| マイグレーション 009〜012 | `test_apply_phase3_moves_files_and_extends_job_types` |
+| マイグレーション 009〜012 | `test_apply_phase3_moves_files_and_extends_job_types`、`test_apply_phase3_keeps_other_recordings_when_meeting_id_equals_user_id` |
 | Phase 2 の回帰 | Phase 2 §23 の 87 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
 
 ---

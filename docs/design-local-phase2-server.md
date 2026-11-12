@@ -3520,10 +3520,11 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         for i, a in enumerate(absolute)
     ]
     async with ctx.db.write() as conn:
-        # lease が失効していれば 0 件で戻り、以降の集計も行わない（基本設計 §9.3）。
-        written = repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
-        if written == 0 and segments:
+        # lease が失効していれば書かず、以降の集計と完了処理も行わない（基本設計 §9.3）。
+        # 書いた件数では判定しない。無音で segments が空だと失効していても 0 件になり、旧ワーカーが Chunk を完了にしてしまう
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return model_name
+        repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
         if meeting.stt_model_used is None:
             repo.update_meeting(conn, chunk.meeting_id, stt_model_used=model_name)
         repo.record_metric(conn, "stt_seconds", chunk.duration_ms / 1000, model_name=model_name, meeting_id=chunk.meeting_id)
@@ -3720,7 +3721,7 @@ def _check_token(request: Request, token: str) -> bool:
 
 **配信元を切り替えるときの注意：** IndexedDB はオリジンごとに別なので、`http://127.0.0.1:5173`（開発サーバー）で録音した未確定の会議は `http://127.0.0.1:43117/`（サーバー配信）からは見えない。確定待ちの会議が残っている間は配信元を切り替えない。
 
-トークンは `serve` が起動のたびに `rotate_token()` で作り直す（Phase 1 §4.3 の短命性。§22）。`token` コマンドは現在の値を表示するだけで、作り直さない。
+トークンは `serve` が起動のたびに `rotate_token()` で作り直す（Phase 1 §4.3 の短命性。§22）。作り直すのは待ち受けポートを確保した後で、確保に失敗したら（既存のサーバーが動いているなど）トークンファイルに触れずに終了する。`token` コマンドは現在の値を表示するだけで、作り直さない。
 
 ## 21.2 Phase 1 互換ルート `api/routes_phase1.py`
 
@@ -3739,9 +3740,9 @@ Phase 1 §12 の 5 エンドポイント。リクエスト／レスポンス形�
 | 登録済み Chunk の再送 | sha256 が同じでファイルも無事なら `200`。**ファイルが失われた・壊れていれば書き戻して `200`**（確定後の会議でも受け付ける） | sha256 が違えば `409 CONFLICT_HASH_MISMATCH` |
 | 確定の本文 | `expectedChunkCounts` のキーはちょうど `mic` と `system`、値は 0 以上 | `422 VALIDATION` |
 | 確定の照合 | 件数一致に加え、source ごとの連番が `0..n-1` で連続 | `409 CONFLICT_CHUNKS_MISSING` |
-| `meeting.json` | 会議の作成時に書く。再送時はファイルがないときだけ書き直す。確定時に確定値で上書きする | ディスク不足は `507 INSUFFICIENT_STORAGE` |
+| `meeting.json` | 会議の作成時に書く。再送時はファイルがないときだけ書き直す。確定時に確定値で上書きする。どの経路も DB の会議行から同じ形（`_meeting_json`、確定前の確定値は `null`）で書く | ディスク不足は `507 INSUFFICIENT_STORAGE` |
 
-Phase 2 で加えた挙動：`frameClockDriftMs` の保存（基本設計 §16.3.1。欠落・非数値は無視）、確定時のジョブ生成（§12）、`meeting_status` の通知。通知は**この要求が状態を進めたときだけ**流す（確定済み会議への再送で `transcribing` を流すと、`completed` の会議の画面が処理中へ戻る）。Chunk が 0 件の会議も確定でき、vad ジョブがないので `on_finalized` がその場で merge を判定する（§12）。
+Phase 2 で加えた挙動：`frameClockDriftMs` の保存（基本設計 §16.3.1。欠落・非数値は無視）、確定時のジョブ生成（§12）、`meeting_status` の通知。通知は**この要求が状態を進めたときだけ**流す（確定済み会議への再送で `transcribing` を流すと、`completed` の会議の画面が処理中へ戻る）。通知は `meeting.json` の書き出しより先に行う（書き出しが `507` で終わっても遷移はコミット済みで、再送では状態を進めないため通知の機会がなくなる）。Chunk が 0 件の会議も確定でき、vad ジョブがないので `on_finalized` がその場で merge を判定する（§12）。
 
 ```python
 # minutes_local/api/routes_phase1.py
@@ -3825,6 +3826,19 @@ async def health(request: Request) -> dict[str, Any]:
     return body
 
 
+def _meeting_json(m: Meeting) -> bytes:
+    """meeting.json（録音メタデータの控え、Phase 1 §13）。作成・再送・確定のどこで書いても同じ形にする。
+
+    作成時の要求（req）から書くと、確定後に控えが失われて再送されたとき確定値のない控えに戻る。DB の会議行を正とする。
+    """
+    return json.dumps({
+        "meetingId": m.id, "title": m.title, "sessionStartEpochMs": m.session_start_epoch_ms,
+        "nativeSampleRate": m.native_sample_rate, "consentConfirmedAt": m.consent_confirmed_at,
+        "endedAtEpochMs": m.ended_at, "totalAudioFrames": m.total_audio_frames,
+        "stopReason": m.stop_reason, "stopDetectedAtEpochMs": m.stop_detected_at,
+    }, ensure_ascii=False).encode()
+
+
 @router.post("/meetings")
 async def create_meeting(req: CreateMeetingRequest, request: Request) -> JSONResponse:
     ctx = get_ctx(request)
@@ -3842,7 +3856,7 @@ async def create_meeting(req: CreateMeetingRequest, request: Request) -> JSONRes
     rel = f"recordings/{current.id}/meeting.json"
     if created or not (ctx.settings.data_dir / rel).is_file():
         try:
-            write_atomic(ctx.settings.data_dir, rel, json.dumps(req.model_dump(), ensure_ascii=False).encode())
+            write_atomic(ctx.settings.data_dir, rel, _meeting_json(current))
         except OSError as e:
             if e.errno == errno.ENOSPC:
                 return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
@@ -4026,23 +4040,20 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
             pipeline.on_finalized(conn, meeting_id)
             transitioned = True
         snapshot = repo.get_meeting(conn, meeting_id)
-    # コミット後に確定値から書き、meeting.json が DB より先行しないようにする。再送でも毎回書き直す（Phase 1 §12）
-    if snapshot is not None:
-        try:
-            write_atomic(ctx.settings.data_dir, f"recordings/{meeting_id}/meeting.json", json.dumps({
-                "meetingId": meeting_id, "title": snapshot.title, "sessionStartEpochMs": snapshot.session_start_epoch_ms,
-                "nativeSampleRate": snapshot.native_sample_rate, "consentConfirmedAt": snapshot.consent_confirmed_at,
-                "endedAtEpochMs": snapshot.ended_at, "totalAudioFrames": snapshot.total_audio_frames,
-                "stopReason": snapshot.stop_reason, "stopDetectedAtEpochMs": snapshot.stop_detected_at,
-            }, ensure_ascii=False).encode())
-        except OSError as e:
-            if e.errno == errno.ENOSPC:
-                return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
-            raise
+    # 状態の遷移はコミット済みなので、控えの書き出しより先に通知する。書き出しが 507 で終わると、
+    # 再送は transitioned が False になり、この遷移を通知する機会がなくなる。
     # 再送（確定済み会議への 2 回目以降の POST）では状態を進めていないので通知しない。
     # 毎回 transcribing を流すと、completed の会議の画面が再送のたびに処理中へ戻る
     if transitioned and snapshot is not None:
         ctx.events.publish(meeting_id, {"type": "meeting_status", "status": snapshot.status})
+    # コミット後に確定値から書き、meeting.json が DB より先行しないようにする。再送でも毎回書き直す（Phase 1 §12）
+    if snapshot is not None:
+        try:
+            write_atomic(ctx.settings.data_dir, f"recordings/{meeting_id}/meeting.json", _meeting_json(snapshot))
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
+            raise
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 ```
 
@@ -4421,6 +4432,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import socket
 from pathlib import Path
 
 from .config import Settings
@@ -4446,12 +4458,26 @@ def rotate_token(path: Path) -> str:
     token = secrets.token_hex(32)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.fchmod(fd, 0o600)          # 既存ファイルの権限が緩かった場合も締める
+        # 既存ファイルの権限が緩かった場合も締める。Windows の Python 3.12 以前には fchmod がないのでパスで行う
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:
+            os.chmod(path, 0o600)
         os.write(fd, token.encode("ascii"))
         os.fsync(fd)
     finally:
         os.close(fd)
     return token
+
+
+def bind_listen_socket(host: str, port: int) -> socket.socket:
+    """待ち受けポートを確保する。`serve` はこれが成功してからトークンを作り直す。
+
+    先にトークンを書くと、ポートが使用中で起動に失敗したとき、動いている既存のサーバーが受け付けるトークンと
+    ファイル（`minutes-local token` の表示）が食い違う。確保できなければ OSError（EADDRINUSE など）を送出する。
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    return socket.create_server((host, port), family=family)
 
 
 def read_token(path: Path) -> str | None:
@@ -4521,7 +4547,7 @@ import argparse
 import asyncio
 import sys
 
-from .bootstrap import build_context, read_token, rotate_token
+from .bootstrap import bind_listen_socket, build_context, read_token, rotate_token
 from .config import settings_from_env
 
 
@@ -4562,8 +4588,16 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     if args.bind != "127.0.0.1":
         print("WARNING: binding to a non-loopback address is a Phase 3 feature; TLS and per-user tokens are not implemented.", file=sys.stderr)
 
-    async def main() -> None:
+    async def main() -> int:
         ctx = await build_context(s)
+        try:
+            sock = bind_listen_socket(args.bind, s.port)
+        except OSError as e:
+            # ポートの確保に失敗したらトークンを書き換えない（既存のサーバーが動いていれば、そのトークンが有効なまま）
+            print(f"ERROR: cannot listen on {args.bind}:{s.port} ({e}). The token was not changed.", file=sys.stderr)
+            ctx.stt.shutdown()
+            ctx.db.close()
+            return 1
         token = rotate_token(s.token_path)      # 起動のたびに作り直す（Phase 1 §4.3）。ブラウザは 401 を受けて再入力へ誘導する
         print(f"token: {token}")
         app = create_app(ctx, token)
@@ -4575,7 +4609,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         config = uvicorn.Config(app, host=args.bind, port=s.port, log_level="info")
         server = uvicorn.Server(config)
         try:
-            await server.serve()
+            await server.serve(sockets=[sock])
         finally:
             stop.set()
             for r in runners:
@@ -4584,9 +4618,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 t.cancel()
             ctx.stt.shutdown()
             ctx.db.close()
+        return 0
 
-    asyncio.run(main())
-    return 0
+    return asyncio.run(main())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4912,7 +4946,7 @@ import httpx
 import pytest
 
 from minutes_local.api.app import DEV_ORIGIN, create_app
-from minutes_local.bootstrap import read_token, rotate_token
+from minutes_local.bootstrap import bind_listen_socket, read_token, rotate_token
 from minutes_local.db import repo
 from minutes_local.jobs.context import AppContext
 from minutes_local.jobs.runner import JobRunner
@@ -4996,13 +5030,16 @@ async def test_create_meeting_rejects_negative_or_zero_numbers(client: httpx.Asy
 async def test_create_meeting_writes_meeting_json_and_resend_does_not_overwrite_finalized_snapshot(client: httpx.AsyncClient, ctx: AppContext) -> None:
     path = recording_dir(ctx, "m-1") / "meeting.json"
     assert (await client.post("/v1/meetings", json=MEETING)).status_code == 201
-    assert json.loads(path.read_text()) == MEETING
+    created = json.loads(path.read_text())
+    assert {k: created[k] for k in MEETING} == MEETING
+    assert created["endedAtEpochMs"] is None and created["stopReason"] is None      # 確定時と同じ形（確定値は null）
     await finalize(client, "m-1", mic=0)
     assert (await client.post("/v1/meetings", json=MEETING)).status_code == 200     # 確定後の再送
-    assert json.loads(path.read_text())["endedAtEpochMs"] == 1                       # 確定値を持つ控えのまま
+    finalized = json.loads(path.read_text())
+    assert finalized["endedAtEpochMs"] == 1                                          # 確定値を持つ控えのまま
     path.unlink()
     assert (await client.post("/v1/meetings", json=MEETING)).status_code == 200     # 失われていれば書き直す
-    assert json.loads(path.read_text()) == MEETING
+    assert json.loads(path.read_text()) == finalized                                 # 作成時の内容ではなく、DB の確定値から書く
 
 
 async def test_put_chunk_rejects_bad_key_and_headers(client: httpx.AsyncClient) -> None:
@@ -5061,6 +5098,30 @@ async def test_disk_full_returns_507_and_leaves_no_row(client: httpx.AsyncClient
     monkeypatch.undo()
     assert (await client.get("/v1/meetings/m-1/chunks")).json()["chunks"] == []
     assert (await _raw_put(client)).status_code == 201
+
+
+async def test_finalize_publishes_status_even_when_snapshot_write_fails(client: httpx.AsyncClient, ctx: AppContext,
+                                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    """状態の遷移はコミット済み。控えの書き出しが 507 でも通知し、再送（transitioned=False）で 2 度目は流さない。"""
+    from minutes_local.api import routes_phase1
+    await client.post("/v1/meetings", json=MEETING)
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(ctx.events, "publish", lambda _m, ev: published.append(ev))
+
+    def full(*_args: object) -> Path:
+        raise OSError(errno.ENOSPC, "disk full")
+    body = {"expectedChunkCounts": {"mic": 0, "system": 0}, "endedAtEpochMs": 2000, "totalAudioFrames": 0}
+    with monkeypatch.context() as m:
+        m.setattr(routes_phase1, "write_atomic", full)
+        if hasattr(routes_phase1, "write_meeting_json"):      # Phase 3 は控えを write_meeting_json で書く（Phase 3 §20.2）
+            m.setattr(routes_phase1, "write_meeting_json", full)
+        r = await client.post("/v1/meetings/m-1/finalize", json=body)
+    assert r.status_code == 507 and r.json()["code"] == "INSUFFICIENT_STORAGE"
+    assert [e["type"] for e in published] == ["meeting_status"]
+
+    assert (await client.post("/v1/meetings/m-1/finalize", json=body)).status_code == 200   # 再送で控えを書き直す
+    assert [e["type"] for e in published] == ["meeting_status"]                              # 同じ遷移を 2 度流さない
+    assert json.loads((recording_dir(ctx, "m-1") / "meeting.json").read_text())["endedAtEpochMs"] == 2000
 
 
 async def test_corrupt_file_blocks_finalize_until_resend_repairs_it(client: httpx.AsyncClient, ctx: AppContext) -> None:
@@ -5229,6 +5290,14 @@ def test_rotate_token_changes_value_and_keeps_owner_only_permission(tmp_path: Pa
     second = rotate_token(path)
     assert first != second and len(second) == 64 and read_token(path) == second
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_bind_listen_socket_fails_while_port_is_in_use() -> None:
+    """serve はこの確保が成功してからトークンを作り直す。使用中なら OSError で止まり、トークンファイルに触れない。"""
+    with bind_listen_socket("127.0.0.1", 0) as first:
+        port = first.getsockname()[1]
+        with pytest.raises(OSError):
+            bind_listen_socket("127.0.0.1", port)
 
 
 async def test_web_dir_is_served_at_root_without_token_and_does_not_shadow_api(ctx: AppContext, tmp_path: Path) -> None:
@@ -5444,7 +5513,9 @@ from __future__ import annotations
 import httpx
 
 from minutes_local.db import repo
+from minutes_local.db.connection import now_ms
 from minutes_local.jobs.context import AppContext
+from minutes_local.jobs.handlers import handle_transcribe
 from minutes_local.jobs.retry import InvalidAudioError
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.stt.fake_provider import FakeSTTProvider
@@ -5487,6 +5558,30 @@ async def test_all_silent_meeting_still_completes(client: httpx.AsyncClient, ctx
     await runner.run_until_idle()
     with ctx.db.read() as conn:
         assert repo.get_meeting(conn, "m-1").status == "completed"
+
+
+async def test_expired_worker_with_no_segments_does_not_complete_chunk(client: httpx.AsyncClient, ctx: AppContext,
+                                                                       stt_provider: FakeSTTProvider) -> None:
+    """無音で segments が空でも、lease を失った旧ワーカーは Chunk を完了にしない（基本設計 §9.3）。現行の所有者は完了できる。"""
+    await create_meeting(client)
+    await put_chunk(client, "m-1", 0, sine_pcm(1))
+    stt_provider.script = lambda _req: []
+    async with ctx.db.write() as conn:
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+        assert chunk is not None
+        repo.insert_job(conn, "m-1", "transcribe_chunk", chunk_id=chunk.id)
+        old = repo.lease_job(conn, "worker-old", ["transcribe_chunk"], now_ms())
+        repo.sweep_expired(conn, now_ms() + 10**7)                 # 旧ワーカーの lease を回収
+        new = repo.lease_job(conn, "worker-new", ["transcribe_chunk"], now_ms())
+    assert old is not None and new is not None and new.attempts == old.attempts + 1
+
+    await handle_transcribe(ctx, old)
+    with ctx.db.read() as conn:
+        assert repo.get_chunk_by_key(conn, "m-1", "mic", 0).stt_status != "completed"
+
+    await handle_transcribe(ctx, new)
+    with ctx.db.read() as conn:
+        assert repo.get_chunk_by_key(conn, "m-1", "mic", 0).stt_status == "completed"
 
 
 async def test_failed_chunk_blocks_until_excluded(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,

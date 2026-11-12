@@ -319,7 +319,7 @@ export class Phase3Client {
 
 ## 3.1 SSE クライアント `src/api/events.ts`（変更）
 
-`live_segment` を受け取り `onLiveSegment` に渡す。既存の 5 種は Phase 2 と同じ経路。認証と transport も Phase 2 §8 と同一で、`fetch` + `ReadableStream` に Bearer を載せる。Phase 3 のマルチユーザー（サーバー側 §19）は利用者ごとに別トークンを持つため、Cookie 1 本では表現できず、ヘッダを付けられる transport が前提になる。
+`live_segment` を受け取り `onLiveSegment` に渡す。既存の 5 種は Phase 2 と同じ経路（接続のたびの補完、補完中の live の保留、接続期限と無通信の監視を含む。Phase 2 §8）。認証と transport も Phase 2 §8 と同一で、`fetch` + `ReadableStream` に Bearer を載せる。Phase 3 のマルチユーザー（サーバー側 §19）は利用者ごとに別トークンを持つため、Cookie 1 本では表現できず、ヘッダを付けられる transport が前提になる。
 
 ```typescript
 // src/api/events.ts
@@ -353,8 +353,10 @@ const EVENT_TYPES = ["job", "meeting_status", "transcript_version", "summary_ver
 
 export class MeetingEventsClient {
   private source: EventSourceLike | null = null;
-  private everConnected = false;
-  private disconnected = false;
+  /** 補完中に届いたイベント。補完の後に、届いた順で流す。null は補完中でない */
+  private held: string[] | null = null;
+  /** 補完の世代。接続（open）と close のたびに進め、古い接続の補完の結果を捨てる */
+  private generation = 0;
 
   constructor(private readonly deps: EventsClientDeps, private readonly meetingId: string) {}
 
@@ -365,24 +367,31 @@ export class MeetingEventsClient {
     const es = this.deps.createEventSource(url, this.deps.token);
     this.source = es;
 
-    es.addEventListener("open", () => {
-      const isReconnect = this.everConnected && this.disconnected;
-      this.everConnected = true;
-      this.disconnected = false;
-      if (isReconnect) void this.backfill();
-    });
-    es.addEventListener("error", () => {
-      // 再接続は transport 側に任せる。ここでは切断状態を記録するだけ。
-      this.disconnected = true;
-    });
+    // 初回接続も補完する。確定から購読開始までに出たイベントは SSE に乗らない。
+    // 再接続は transport 側に任せ、再接続の open で同じ補完を行う
+    es.addEventListener("open", () => void this.backfill());
     for (const type of EVENT_TYPES) {
-      es.addEventListener(type, (event: MessageEvent<string>) => this.handle(event.data));
+      es.addEventListener(type, (event: MessageEvent<string>) => this.receive(event.data));
     }
   }
 
   close(): void {
     this.source?.close();
     this.source = null;
+    this.generation++;
+    this.held = null;
+  }
+
+  /**
+   * 補完中は保留し、補完の後に流す。補完は接続時点の状態なので、先に届いた live の値（新しい status・版）の後に
+   * 流すと古い値で上書きしてしまう。購読は補完の要求より先に始まっているので、保留分を後から流せば最新に追いつく。
+   */
+  private receive(data: string): void {
+    if (this.held !== null) {
+      this.held.push(data);
+      return;
+    }
+    this.handle(data);
   }
 
   /** テストと再接続補完で使う。JSON を MeetingEvent に変換して通知する。 */
@@ -412,18 +421,30 @@ export class MeetingEventsClient {
    * Live セグメントは LiveTranscriptStore.poll() が cursor 以降を取り直すので、ここでは扱わない（§3.2）。
    */
   private async backfill(): Promise<void> {
+    const generation = ++this.generation;
+    // 接続ごとに保留をやり直す。前の接続で保留した分は、この接続の補完（再接続後の状態）に含まれている。
+    // 持ち越すと、補完の後に古い status を流して巻き戻す（Live セグメントは LiveTranscriptStore.poll() が cursor で取り直す）
+    this.held = [];
     try {
       const meeting = await this.deps.fetchMeeting();
+      // 補完中に再接続・close した。新しい接続の補完が保留分を流す
+      if (generation !== this.generation) return;
       this.deps.onEvent({ type: "meeting_status", status: meeting.status });
       this.deps.onEvent({ type: "transcript_version", transcriptVersion: meeting.transcriptVersion });
       if (meeting.latestSummaryVersion !== null) {
         this.deps.onEvent({ type: "summary_version", version: meeting.latestSummaryVersion });
       }
       const list = await this.deps.fetchJobs();
+      if (generation !== this.generation) return;
       for (const job of list.jobs) this.deps.onEvent({ type: "job", job });
     } catch (error) {
+      if (generation !== this.generation) return;
       this.deps.onError(error instanceof Error ? error : new Error(String(error)));
     }
+    // 補完に失敗しても保留分は流す（live を失わない）
+    const held = this.held ?? [];
+    this.held = null;
+    for (const data of held) this.handle(data);
   }
 }
 
@@ -440,6 +461,10 @@ export function normalizeEvent(value: unknown): MeetingEvent | null {
 
 const INITIAL_RETRY_MS = 1_000;
 const MAX_RETRY_MS = 30_000;
+/** 応答ヘッダが届くまでの期限 */
+export const SSE_CONNECT_TIMEOUT_MS = 10_000;
+/** 無通信の許容時間。サーバーは無通信が 15 秒続くと keep-alive コメントを送る（サーバー側 api/sse.py の KEEPALIVE_S）ので、3 回分待つ */
+export const SSE_IDLE_TIMEOUT_MS = 45_000;
 
 /**
  * SSE を fetch + ReadableStream で読む。`EventSource` を使わない理由は 2 つある。
@@ -480,6 +505,13 @@ export class FetchEventSource implements EventSourceLike {
     while (!this.closed) {
       const controller = new AbortController();
       this.controller = controller;
+      // 接続やストリームが止まったまま（スリープ復帰・経路の切断）だと read() が返らず再接続しない。
+      // 期限を過ぎたら abort して下の catch → error → 再接続（MeetingEventsClient の補完）へ流す
+      let watchdog = setTimeout(() => controller.abort(), SSE_CONNECT_TIMEOUT_MS);
+      const kick = (): void => {
+        clearTimeout(watchdog);
+        watchdog = setTimeout(() => controller.abort(), SSE_IDLE_TIMEOUT_MS);
+      };
       try {
         // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
         const fetchImpl = this.fetchImpl;
@@ -491,10 +523,13 @@ export class FetchEventSource implements EventSourceLike {
         });
         if (!res.ok || res.body === null) throw new Error(`SSE HTTP ${res.status}`);
         this.retryMs = INITIAL_RETRY_MS;            // 接続できたらバックオフを初期値へ戻す
+        kick();
         this.emit("open", "");
-        await this.pump(res.body);
+        await this.pump(res.body, kick);
       } catch {
         // 中断も切断も同じ扱い。close() 済みならこの下で抜ける。
+      } finally {
+        clearTimeout(watchdog);
       }
       this.controller = null;
       if (this.closed) return;
@@ -503,7 +538,8 @@ export class FetchEventSource implements EventSourceLike {
     }
   }
 
-  private async pump(body: ReadableStream<Uint8Array>): Promise<void> {
+  /** onData は読み取りのたびに呼ぶ（keep-alive コメントも含めて無通信の監視を延ばす） */
+  private async pump(body: ReadableStream<Uint8Array>, onData: () => void): Promise<void> {
     // TextDecoderStream を pipeThrough で繋ぐと、DOM 型定義の writable（BufferSource）と Uint8Array の不一致で型が通らない。
     // 同じ結果になる TextDecoder の stream モードで、マルチバイト文字が読み取り単位をまたいでも壊れないように復号する
     const reader = body.getReader();
@@ -512,6 +548,7 @@ export class FetchEventSource implements EventSourceLike {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) return;
+      onData();
       buffer += decoder.decode(value, { stream: true });
       // イベントは空行区切り。LF / CRLF の両方を受ける。
       for (;;) {

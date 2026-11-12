@@ -1525,7 +1525,13 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   try {
     listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", redirect: "error", signal: listAbort.signal });
     // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
-    list = listRes.ok ? await listRes.json().catch(() => null) : null;
+    // 本文の読み取り中の abort（タイムアウト）は壊れた応答ではなく network として下の catch へ流す
+    list = listRes.ok
+      ? await listRes.json().catch((error: unknown) => {
+        if (listAbort.signal.aborted) throw error;
+        return null;
+      })
+      : null;
   } catch (error) {
     return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}`, reason: "network" };
   } finally {
@@ -1669,7 +1675,7 @@ function errorMessage(error: unknown): string {
 
 # 8. SSE クライアント `src/api/events.ts`
 
-SSE は `fetch` + `ReadableStream` で読む。`EventSource` はリクエストヘッダを付けられず、トークンが IndexedDB にある本設計（Phase 1 §4.3）では認証できないためである。自動再接続は失われるので指数バックオフで自前に持ち、切断中に取りこぼしたイベントは再接続時の `GET /meetings/{id}` と `GET /jobs` で補完する（基本設計 §14）。
+SSE は `fetch` + `ReadableStream` で読む。`EventSource` はリクエストヘッダを付けられず、トークンが IndexedDB にある本設計（Phase 1 §4.3）では認証できないためである。自動再接続は失われるので指数バックオフで自前に持ち、接続（応答ヘッダ）の期限と無通信の監視（サーバーの keep-alive 15 秒の 3 回分）を持ち、止まった接続は中断して再接続する。購読前と切断中に取りこぼしたイベントは、初回接続と再接続の `open` のたびに `GET /meetings/{id}` と `GET /jobs` で補完する（基本設計 §14）。補完中に届いた live イベントは保留し、補完の後に届いた順で流す（接続時点の補完の値が、新しい live の値を上書きしないため）。
 
 ```typescript
 // src/api/events.ts
@@ -1700,8 +1706,10 @@ const EVENT_TYPES = ["job", "meeting_status", "transcript_version", "summary_ver
 
 export class MeetingEventsClient {
   private source: EventSourceLike | null = null;
-  private everConnected = false;
-  private disconnected = false;
+  /** 補完中に届いたイベント。補完の後に、届いた順で流す。null は補完中でない */
+  private held: string[] | null = null;
+  /** 補完の世代。接続（open）と close のたびに進め、古い接続の補完の結果を捨てる */
+  private generation = 0;
 
   constructor(private readonly deps: EventsClientDeps, private readonly meetingId: string) {}
 
@@ -1712,24 +1720,31 @@ export class MeetingEventsClient {
     const es = this.deps.createEventSource(url, this.deps.token);
     this.source = es;
 
-    es.addEventListener("open", () => {
-      const isReconnect = this.everConnected && this.disconnected;
-      this.everConnected = true;
-      this.disconnected = false;
-      if (isReconnect) void this.backfill();
-    });
-    es.addEventListener("error", () => {
-      // 再接続は transport 側に任せる。ここでは切断状態を記録するだけ。
-      this.disconnected = true;
-    });
+    // 初回接続も補完する。確定から購読開始までに出たイベントは SSE に乗らない。
+    // 再接続は transport 側に任せ、再接続の open で同じ補完を行う
+    es.addEventListener("open", () => void this.backfill());
     for (const type of EVENT_TYPES) {
-      es.addEventListener(type, (event: MessageEvent<string>) => this.handle(event.data));
+      es.addEventListener(type, (event: MessageEvent<string>) => this.receive(event.data));
     }
   }
 
   close(): void {
     this.source?.close();
     this.source = null;
+    this.generation++;
+    this.held = null;
+  }
+
+  /**
+   * 補完中は保留し、補完の後に流す。補完は接続時点の状態なので、先に届いた live の値（新しい status・版）の後に
+   * 流すと古い値で上書きしてしまう。購読は補完の要求より先に始まっているので、保留分を後から流せば最新に追いつく。
+   */
+  private receive(data: string): void {
+    if (this.held !== null) {
+      this.held.push(data);
+      return;
+    }
+    this.handle(data);
   }
 
   /** テストと再接続補完で使う。JSON を MeetingEvent に変換して通知する。 */
@@ -1753,18 +1768,30 @@ export class MeetingEventsClient {
    * staleSummaryVersion が立ち、UI が必要になった時点で本文を取得する（再接続のたびに全文を引かない）。
    */
   private async backfill(): Promise<void> {
+    const generation = ++this.generation;
+    // 接続ごとに保留をやり直す。前の接続で保留した分は、この接続の補完（再接続後の状態）に含まれている。
+    // 持ち越すと、補完の後に古い status を流して巻き戻す（Live セグメントは LiveTranscriptStore.poll() が cursor で取り直す）
+    this.held = [];
     try {
       const meeting = await this.deps.fetchMeeting();
+      // 補完中に再接続・close した。新しい接続の補完が保留分を流す
+      if (generation !== this.generation) return;
       this.deps.onEvent({ type: "meeting_status", status: meeting.status });
       this.deps.onEvent({ type: "transcript_version", transcriptVersion: meeting.transcriptVersion });
       if (meeting.latestSummaryVersion !== null) {
         this.deps.onEvent({ type: "summary_version", version: meeting.latestSummaryVersion });
       }
       const list = await this.deps.fetchJobs();
+      if (generation !== this.generation) return;
       for (const job of list.jobs) this.deps.onEvent({ type: "job", job });
     } catch (error) {
+      if (generation !== this.generation) return;
       this.deps.onError(error instanceof Error ? error : new Error(String(error)));
     }
+    // 補完に失敗しても保留分は流す（live を失わない）
+    const held = this.held ?? [];
+    this.held = null;
+    for (const data of held) this.handle(data);
   }
 }
 
@@ -1781,6 +1808,10 @@ export function normalizeEvent(value: unknown): MeetingEvent | null {
 
 const INITIAL_RETRY_MS = 1_000;
 const MAX_RETRY_MS = 30_000;
+/** 応答ヘッダが届くまでの期限 */
+export const SSE_CONNECT_TIMEOUT_MS = 10_000;
+/** 無通信の許容時間。サーバーは無通信が 15 秒続くと keep-alive コメントを送る（サーバー側 api/sse.py の KEEPALIVE_S）ので、3 回分待つ */
+export const SSE_IDLE_TIMEOUT_MS = 45_000;
 
 /**
  * SSE を fetch + ReadableStream で読む。`EventSource` を使わない理由は 2 つある。
@@ -1821,6 +1852,13 @@ export class FetchEventSource implements EventSourceLike {
     while (!this.closed) {
       const controller = new AbortController();
       this.controller = controller;
+      // 接続やストリームが止まったまま（スリープ復帰・経路の切断）だと read() が返らず再接続しない。
+      // 期限を過ぎたら abort して下の catch → error → 再接続（MeetingEventsClient の補完）へ流す
+      let watchdog = setTimeout(() => controller.abort(), SSE_CONNECT_TIMEOUT_MS);
+      const kick = (): void => {
+        clearTimeout(watchdog);
+        watchdog = setTimeout(() => controller.abort(), SSE_IDLE_TIMEOUT_MS);
+      };
       try {
         // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
         const fetchImpl = this.fetchImpl;
@@ -1832,10 +1870,13 @@ export class FetchEventSource implements EventSourceLike {
         });
         if (!res.ok || res.body === null) throw new Error(`SSE HTTP ${res.status}`);
         this.retryMs = INITIAL_RETRY_MS;            // 接続できたらバックオフを初期値へ戻す
+        kick();
         this.emit("open", "");
-        await this.pump(res.body);
+        await this.pump(res.body, kick);
       } catch {
         // 中断も切断も同じ扱い。close() 済みならこの下で抜ける。
+      } finally {
+        clearTimeout(watchdog);
       }
       this.controller = null;
       if (this.closed) return;
@@ -1844,7 +1885,8 @@ export class FetchEventSource implements EventSourceLike {
     }
   }
 
-  private async pump(body: ReadableStream<Uint8Array>): Promise<void> {
+  /** onData は読み取りのたびに呼ぶ（keep-alive コメントも含めて無通信の監視を延ばす） */
+  private async pump(body: ReadableStream<Uint8Array>, onData: () => void): Promise<void> {
     // TextDecoderStream を pipeThrough で繋ぐと、DOM 型定義の writable（BufferSource）と Uint8Array の不一致で型が通らない。
     // 同じ結果になる TextDecoder の stream モードで、マルチバイト文字が読み取り単位をまたいでも壊れないように復号する
     const reader = body.getReader();
@@ -1853,6 +1895,7 @@ export class FetchEventSource implements EventSourceLike {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) return;
+      onData();
       buffer += decoder.decode(value, { stream: true });
       // イベントは空行区切り。LF / CRLF の両方を受ける。
       for (;;) {
@@ -2085,6 +2128,7 @@ export class NotesStore {
   private state: NotesState;
   private timer: unknown = null;
   private inflight: Promise<void> | null = null;
+  private disposed = false;
 
   constructor(private readonly deps: NotesStoreDeps, meetingId: string) {
     this.state = { meetingId, json: null, revision: 0, lastAppliedSummaryVersion: null, sync: "idle", serverNotes: null };
@@ -2172,7 +2216,19 @@ export class NotesStore {
     await this.save();
   }
 
+  /**
+   * setToken で作り直す前に呼ぶ。保留中の debounce を止め、古いトークンの PUT が新しいインスタンスと競合しないようにする。
+   * 未送信の編集は IndexedDB の下書き（saved: false）に残っており、新しいインスタンスの load() が dirty として拾い直す。
+   */
+  dispose(): void {
+    this.disposed = true;
+    if (this.timer !== null) this.deps.clearTimer(this.timer);
+    this.timer = null;
+  }
+
   private schedule(): void {
+    // 送信中の保存が dispose の後に終わり、保存中の編集を送り直そうとしても予約しない（新しいインスタンスが下書きから送る）
+    if (this.disposed) return;
     if (this.timer !== null) this.deps.clearTimer(this.timer);
     this.timer = this.deps.setTimer(() => {
       this.timer = null;
@@ -2312,14 +2368,15 @@ function applyEvent(state: UiState, event: MeetingEvent): UiState {
     }
     case "meeting_status":
       return { ...state, status: event.status };
+    // 版の印は大きい方を残す。補完（接続時点の版）が live の新しい版の後に届いても、印を古い版へ戻さない
     case "transcript_version":
       return state.transcript !== null && state.transcript.transcriptVersion >= event.transcriptVersion
         ? state
-        : { ...state, staleTranscriptVersion: event.transcriptVersion };
+        : { ...state, staleTranscriptVersion: Math.max(state.staleTranscriptVersion ?? 0, event.transcriptVersion) };
     case "summary_version":
       return state.summary !== null && state.summary.version >= event.version
         ? state
-        : { ...state, staleSummaryVersion: event.version };
+        : { ...state, staleSummaryVersion: Math.max(state.staleSummaryVersion ?? 0, event.version) };
     case "progress":
       return { ...state, progress: { ...state.progress, [event.jobType]: { done: event.done, total: event.total } } };
   }
@@ -2714,8 +2771,8 @@ describe("finalize（mic + system）", () => {
 
 ```typescript
 // test/events.test.ts
-import { describe, expect, it } from "vitest";
-import { MeetingEventsClient, normalizeEvent, type EventSourceLike } from "../src/api/events";
+import { describe, expect, it, vi } from "vitest";
+import { FetchEventSource, MeetingEventsClient, SSE_CONNECT_TIMEOUT_MS, SSE_IDLE_TIMEOUT_MS, normalizeEvent, type EventSourceLike } from "../src/api/events";
 import type { JobListResponse, MeetingDetailResponse, MeetingEvent } from "../src/api/contracts-phase2";
 
 class FakeEventSource implements EventSourceLike {
@@ -2766,7 +2823,7 @@ describe("MeetingEventsClient", () => {
     expect(normalizeEvent({ type: "progress", jobType: "vad_chunk", done: 1, total: 2 })).toEqual({ type: "progress", jobType: "vad_chunk", done: 1, total: 2 });
   });
 
-  it("再接続後に会議状態と jobs を補完し、初回接続では補完しない", async () => {
+  it("初回接続と再接続のたびに会議状態と jobs を補完する", async () => {
     let es: FakeEventSource | null = null;
     const received: MeetingEvent[] = [];
     let jobsCount = 0;
@@ -2799,9 +2856,12 @@ describe("MeetingEventsClient", () => {
     if (es === null) throw new Error("no es");
     const source: FakeEventSource = es;
     expect(passedToken).toBe("tok");
+    // 初回：確定から購読開始までに出たイベントは SSE に乗らないので、初回も補完する
     source.emit("open");
-    expect(jobsCount).toBe(0);
-    expect(meetingCount).toBe(0);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(meetingCount).toBe(1);
+    expect(jobsCount).toBe(1);
+    received.length = 0;
     source.emit("job", JSON.stringify({ type: "job", job: serverJobRow }));
     source.emit("summary_version", JSON.stringify({ type: "summary_version", version: 1 }));
     expect(received.map((e) => e.type)).toEqual(["job", "summary_version"]);
@@ -2810,8 +2870,8 @@ describe("MeetingEventsClient", () => {
     source.emit("error");
     source.emit("open");
     await new Promise((r) => setTimeout(r, 0));
-    expect(meetingCount).toBe(1);
-    expect(jobsCount).toBe(1);
+    expect(meetingCount).toBe(2);
+    expect(jobsCount).toBe(2);
     // 切断中に落ちた status と各版が戻る。jobs だけでは status が古いままになる。
     expect(received).toEqual([
       { type: "meeting_status", status: "transcribing" },
@@ -2821,6 +2881,103 @@ describe("MeetingEventsClient", () => {
     ]);
     client.close();
     expect(source.closed).toBe(true);
+  });
+
+  it("補完中に届いた live イベントは補完の後に流し、古い補完の値で上書きしない", async () => {
+    // Arrange: 補完の GET /meetings を止めておく
+    let es: FakeEventSource | null = null;
+    const received: MeetingEvent[] = [];
+    let resolveMeeting: (m: MeetingDetailResponse) => void = () => undefined;
+    const client = new MeetingEventsClient({
+      baseUrl: "http://127.0.0.1:43117",
+      token: "tok",
+      createEventSource: () => (es = new FakeEventSource()),
+      fetchJobs: async () => emptyJobs,
+      fetchMeeting: () => new Promise((resolve) => (resolveMeeting = resolve)),
+      onEvent: (e) => received.push(e),
+      onError: (e) => {
+        throw e;
+      },
+    }, "m");
+    client.connect();
+    const source = es as unknown as FakeEventSource;
+    source.emit("open");
+    // Act: 補完の応答より先に、新しい live の値が届く
+    source.emit("meeting_status", JSON.stringify({ type: "meeting_status", status: "completed" }));
+    source.emit("transcript_version", JSON.stringify({ type: "transcript_version", transcriptVersion: 4 }));
+    expect(received).toEqual([]);
+    resolveMeeting(meetingDetail);                       // 補完は接続時点の transcribing / 版 3
+    await new Promise((r) => setTimeout(r, 0));
+    // Assert: 補完の後に live を流すので、最後に残るのは live の値
+    expect(received).toEqual([
+      { type: "meeting_status", status: "transcribing" },
+      { type: "transcript_version", transcriptVersion: 3 },
+      { type: "summary_version", version: 2 },
+      { type: "meeting_status", status: "completed" },
+      { type: "transcript_version", transcriptVersion: 4 },
+    ]);
+    // 補完の後は保留しない
+    source.emit("summary_version", JSON.stringify({ type: "summary_version", version: 3 }));
+    expect(received.at(-1)).toEqual({ type: "summary_version", version: 3 });
+  });
+
+  it("補完中に再接続したら、古い接続の補完の結果は捨てる", async () => {
+    let es: FakeEventSource | null = null;
+    const received: MeetingEvent[] = [];
+    const pending: Array<(m: MeetingDetailResponse) => void> = [];
+    const client = new MeetingEventsClient({
+      baseUrl: "http://127.0.0.1:43117",
+      token: "tok",
+      createEventSource: () => (es = new FakeEventSource()),
+      fetchJobs: async () => emptyJobs,
+      fetchMeeting: () => new Promise((resolve) => pending.push(resolve)),
+      onEvent: (e) => received.push(e),
+      onError: (e) => {
+        throw e;
+      },
+    }, "m");
+    client.connect();
+    const source = es as unknown as FakeEventSource;
+    source.emit("open");
+    source.emit("error");
+    source.emit("open");
+    pending[1]({ ...meetingDetail, status: "completed", latestSummaryVersion: null });
+    await new Promise((r) => setTimeout(r, 0));
+    pending[0]({ ...meetingDetail, latestSummaryVersion: null });   // 古い接続の補完が遅れて返る
+    await new Promise((r) => setTimeout(r, 0));
+    expect(received).toEqual([
+      { type: "meeting_status", status: "completed" },
+      { type: "transcript_version", transcriptVersion: 3 },
+    ]);
+  });
+
+  it("前の接続の補完中に保留した live イベントは、再接続後の補完の後に流さない", async () => {
+    // Arrange
+    let es: FakeEventSource | null = null;
+    const received: MeetingEvent[] = [];
+    const pending: Array<(m: MeetingDetailResponse) => void> = [];
+    const client = new MeetingEventsClient({
+      baseUrl: "http://127.0.0.1:43117",
+      token: "tok",
+      createEventSource: () => (es = new FakeEventSource()),
+      fetchJobs: async () => emptyJobs,
+      fetchMeeting: () => new Promise((resolve) => pending.push(resolve)),
+      onEvent: (e) => received.push(e),
+      onError: (e) => {
+        throw e;
+      },
+    }, "m");
+    client.connect();
+    const source = es as unknown as FakeEventSource;
+    source.emit("open");
+    source.emit("meeting_status", JSON.stringify({ type: "meeting_status", status: "transcribing" }));   // 保留される
+    // Act: 補完が返る前に切れて再接続し、再接続後の補完は completed
+    source.emit("error");
+    source.emit("open");
+    pending[1]({ ...meetingDetail, status: "completed", latestSummaryVersion: null });
+    await new Promise((r) => setTimeout(r, 0));
+    // Assert
+    expect(received.filter((e) => e.type === "meeting_status")).toEqual([{ type: "meeting_status", status: "completed" }]);
   });
 
   it("要約がまだ無い会議では summary_version を流さない", async () => {
@@ -2881,6 +3038,76 @@ describe("MeetingEventsClient", () => {
     expect(() => client.connect()).toThrow(/disallowed host/);
   });
 });
+
+/**
+ * 止まったままの SSE。headers が false なら応答ヘッダも返さない。true なら keep-alive を 1 つ送った後に止まる。
+ * 実際の fetch と同じく、signal の abort で fetch も本文の読み取りも失敗する。
+ */
+function stalledFetch(calls: { count: number }, headers: boolean): typeof fetch {
+  return (_input, init) => {
+    calls.count++;
+    const signal = init?.signal;
+    return new Promise((resolve, reject) => {
+      if (!headers) {
+        signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        return;
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(": keepalive\n\n"));
+          signal?.addEventListener("abort", () => controller.error(new Error("aborted")));
+        },
+      });
+      resolve(new Response(body, { status: 200 }));
+    });
+  };
+}
+
+describe("FetchEventSource の停止検知", () => {
+  const url = new URL("http://127.0.0.1:43117/v1/meetings/m/events");
+
+  it("応答ヘッダが期限内に届かなければ中断し、error を出して再接続する", async () => {
+    vi.useFakeTimers();
+    try {
+      // Arrange
+      const calls = { count: 0 };
+      const es = new FetchEventSource(url, "tok", stalledFetch(calls, false));
+      const seen: string[] = [];
+      es.addEventListener("open", () => seen.push("open"));
+      es.addEventListener("error", () => seen.push("error"));
+      // Act / Assert
+      await vi.advanceTimersByTimeAsync(SSE_CONNECT_TIMEOUT_MS - 1);
+      expect(seen).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(seen).toEqual(["error"]);
+      await vi.advanceTimersByTimeAsync(1_000);            // 初回のバックオフの後に再接続
+      expect(calls.count).toBe(2);
+      es.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("接続後に keep-alive も届かないまま許容時間を過ぎたら中断し、再接続する", async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = { count: 0 };
+      const es = new FetchEventSource(url, "tok", stalledFetch(calls, true));
+      const seen: string[] = [];
+      es.addEventListener("open", () => seen.push("open"));
+      es.addEventListener("error", () => seen.push("error"));
+      await vi.advanceTimersByTimeAsync(SSE_IDLE_TIMEOUT_MS - 1);
+      expect(seen).toEqual(["open"]);                      // 許容時間内は切らない
+      await vi.advanceTimersByTimeAsync(1);
+      expect(seen).toEqual(["open", "error"]);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(calls.count).toBe(2);
+      es.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 ```
 
 ## 12.5 ノートの Autosave
@@ -2930,10 +3157,41 @@ function build(opts: { serverRevision?: number; offline?: boolean } = {}) {
     if (t) t.fn();
     for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
   };
-  return { store: new NotesStore(deps, "m"), drafts, timers, states, puts, fire, setOffline: (v: boolean) => (offline = v), bumpServer: () => { revision++; serverJson = ["other-tab"]; } };
+  return { deps, store: new NotesStore(deps, "m"), drafts, timers, states, puts, fire, setOffline: (v: boolean) => (offline = v), bumpServer: () => { revision++; serverJson = ["other-tab"]; } };
 }
 
 describe("NotesStore", () => {
+  it("dispose で保留中の保存を止め、作り直したインスタンスが load で未送信の編集を引き継いで 1 回だけ送る", async () => {
+    // Arrange: 編集して debounce 待ちのまま、トークン変更で作り直す（§15.1 W8）
+    const b = build();
+    await b.store.load();
+    b.store.setDraft(["edited"]);
+    expect(b.timers).toHaveLength(1);
+    // Act
+    b.store.dispose();
+    const next = new NotesStore(b.deps, "m");
+    await next.load();
+    while (b.timers.length > 0) await b.fire();
+    // Assert: 古いインスタンスは送らず（送ると同じ revision の PUT が 2 回になり、後の方が 409）、新しいインスタンスが下書きから送る
+    expect(b.puts).toEqual([{ json: ["edited"], revision: 0 }]);
+    expect(next.current.sync).toBe("saved");
+  });
+
+  it("送信中に編集して dispose したら、送信の完了後も古いインスタンスは送り直しを予約しない", async () => {
+    // Arrange: 保存を始め、応答前に編集する
+    const b = build();
+    await b.store.load();
+    b.store.setDraft(["a"]);
+    b.timers.shift()?.fn();
+    b.store.setDraft(["ab"]);
+    // Act
+    b.store.dispose();
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+    // Assert: 保存中の編集（stillSame=false）でも予約しない
+    expect(b.timers).toHaveLength(0);
+    expect(b.puts).toEqual([{ json: ["a"], revision: 0 }]);
+  });
+
   it("debounce 後に 1 回だけ PUT し、revision が進む", async () => {
     const b = build();
     await b.store.load();
@@ -3059,6 +3317,15 @@ describe("UI reducer", () => {
     expect(s.staleTranscriptVersion).toBeNull();
   });
 
+  it("未取得のまま古い版の通知が後から届いても、stale の印を戻さない", () => {
+    let s = reduce(INITIAL_UI_STATE, { type: "event", event: { type: "transcript_version", transcriptVersion: 4 } });
+    s = reduce(s, { type: "event", event: { type: "transcript_version", transcriptVersion: 3 } });
+    expect(s.staleTranscriptVersion).toBe(4);
+    s = reduce(s, { type: "event", event: { type: "summary_version", version: 2 } });
+    s = reduce(s, { type: "event", event: { type: "summary_version", version: 1 } });
+    expect(s.staleSummaryVersion).toBe(2);
+  });
+
   it("confidence が閾値未満のセグメントだけ薄字にする", () => {
     const tr: TranscriptResponse = {
       meetingId: "m", transcriptVersion: 1, gaps: [],
@@ -3104,7 +3371,7 @@ describe("UI reducer", () => {
 | System Audio 取得不可でも録音継続 | `system-audio.test.ts`、`multi-source.test.ts`（Mic-only） |
 | Mic/System 同期誤差 P95/P99 | `multi-source.test.ts`（集計ロジック。実測は実機） |
 | finalize の 2 source | `finalizer-two-sources.test.ts` |
-| SSE 切断中の取りこぼし補完 | `events.test.ts` |
+| SSE 購読前・切断中の取りこぼし補完、補完中の live の保留、止まった接続の再接続 | `events.test.ts` |
 | Manual Notes 保護・楽観ロック・オフライン下書き | `notes-store.test.ts` |
 | Hallucination 除外項目の表示 | `ui-state.test.ts` |
 | 外部通信ゼロ（allowlist） | `events.test.ts`（外部ホスト拒否）。`Phase2Client` と `finalizer` は `assertLocalHost` を通る |
@@ -3119,7 +3386,7 @@ describe("UI reducer", () => {
 | 1 Live STT failure ≠ Recording failure | Phase 3。Phase 2 のブラウザ側は STT 結果を表示するだけで、録音経路（§4・§6）は SSE / fetch の失敗を参照しない |
 | 2 AI failure ≠ Transcript loss | §11 `summary_loaded` は `transcript` を触らない。`staleSummaryVersion` は通知のみ |
 | 3 STT failure ≠ Recording loss | §11 `TranscriptResponse.gaps` を失敗区間として表示するだけ。IndexedDB の Chunk は Phase 1 §26 の保持期間まで残る |
-| 4 Queue failure ≠ Job metadata loss | §8 再接続補完は `GET /meetings/{id}`（status と各版）と `GET /jobs`（SQLite）から復元。ブラウザは進捗を SSE だけに依存しない |
+| 4 Queue failure ≠ Job metadata loss | §8 接続・再接続時の補完は `GET /meetings/{id}`（status と各版）と `GET /jobs`（SQLite）から復元。ブラウザは進捗を SSE だけに依存しない |
 | 5 Duplicate delivery ≠ Duplicate transcript | §11 `applyEvent` と `jobs_loaded` の両方が `updatedAt` で古い job 行を捨て、`jobs` は `jobId` キーの Map。SSE と一覧取得のどちらが先に解決しても巻き戻らない |
 | 6 AI regeneration ≠ Manual note overwrite | §10 `NotesStore` は AI 出力を書かない。`409` は `conflict` にして自動上書きしない |
 | 7 VAD false negative ≠ Original audio loss | §9 `transcribeSilentChunk` で無音判定 Chunk を手動 STT できる。Chunk は削除されない |
@@ -3137,7 +3404,7 @@ describe("UI reducer", () => {
 | 共有停止（`track.ended`）で System のみ停止 | 設計済・テスト済 | §5（`SYSTEM_TRACK_ENDED`）、§6 `dropSystem` |
 | 同意文言に System Audio を追加 | 設計済（UI 文言） | 基本設計 §16.1。`consentConfirmedAt` は Phase 1 と同じ |
 | Mic/System ドリフトの 30 秒ごとの記録と P95/P99 表示 | 設計済・テスト済（集計）・実機（実測） | §6、`frameClockDriftMs` を `X-Chunk-Meta` に載せる（§4） |
-| SSE で進捗を反映し、再接続後に欠落を補完 | 設計済・テスト済 | §8（`fetchMeeting` で status と各版、`fetchJobs` で job）、§11 |
+| SSE で進捗を反映し、接続・再接続のたびに欠落を補完 | 設計済・テスト済 | §8（`fetchMeeting` で status と各版、`fetchJobs` で job）、§11 |
 | transcript の薄字表示・失敗区間の表示・根拠リンク | 設計済（状態）・手動（描画） | §11 `dimmedSegmentIds`、`TranscriptResponse.gaps`、`sourceSegmentIds` |
 | `rejected` の折りたたみ表示とモデル注記 | 設計済・テスト済 | §11 `visibleRejected`、`MeetingSummary.modelCaveats` |
 | AI 再生成が手動ノートを上書きしない | 設計済・テスト済（サーバー側 §23.5）・本書 §10（クライアントは AI 出力をノートに書かない） | Invariant 6 |
@@ -3160,13 +3427,13 @@ describe("UI reducer", () => {
 | # | 配線 | 変更するファイル | 根拠 | テストで確かめること |
 | --- | --- | --- | --- | --- |
 | W1 | 録音の開始・停止を `MultiSourceRecorder` 経由にする。System を使わない会議は Mic の Controller だけを持ち、Phase 1 と同じ経路になる | `app.ts` | §6 | System なしで Phase 1 の `app.test.ts` が通る。System ありで `PUT …/chunks/system/0` が届く |
-| W2 | 停止は System → Mic の順。Mic の `stop()` の直後に `takeMeetingLock()` でロックを受け取る | `app.ts` | §4 の 2・3 | System の停止が失敗しても Mic が止まり、停止理由が IDB に残る |
+| W2 | 停止は System → Mic の順。ロックを持つのは Mic の `RecordingController`（App が `MultiSourceDeps.createController("mic", …)` で生成したもの。`MultiSourceRecorder` と `SourceController` はロックを公開しない）。App は生成時にその参照を保持し、`recorder.stop()` を `try/finally` で囲んで `finally` で Mic Controller の `takeMeetingLock()` を呼ぶ。`stop()` が reject（System・Mic・両方の失敗）しても受け渡しを飛ばさない。Mic の `stop()` は失敗しても `finally` で Worklet を切り離すので、`takeMeetingLock()` は保持中のロックを返せる | `app.ts` | §4 の 2・3 | System の停止が失敗しても Mic が止まり、停止理由が IDB に残る。System の失敗・Mic の最終保存の失敗のそれぞれで `stop()` が reject しても、ロックが App の `heldLocks` に入る |
 | W3 | `memoryBacklogCount(meetingId)`・`releaseHeldLockIfDrained()`・離脱確認（`releaseLifecycleIfSettled`）は Mic と System の件数の合計で判定する | `app.ts` | §4 の 3 | System だけにメモリ待機が残る間、ロックと離脱確認が外れない |
 | W4 | `finalizeMeeting` の `unpersistedChunkCount` に Mic と System の合計を渡す | `app.ts` | §7 | System のメモリ待機が残っていれば `waiting_local_save` |
 | W5 | drain（サーバー復帰・`setToken`・確定再試行）と破棄・WAV 書き出しを Mic と System の両方の Controller に行う | `app.ts`・`main.ts` | §4 の 4、Phase 1 §31 | 確定中止後の書き出しに System の WAV も入る。破棄で両方が空になりロックが外れる |
 | W6 | 起動時復旧（Phase 1 §23）。`recovery.ts` が `listByMeeting(id, "mic")` で読むのは `audioFrameCount` を補うためで、Mic の時計の値なので **mic のままでよい**。未送信 Chunk の再投入は保存状態の索引で拾うので source を問わない | 変更なし（テストを追加） | Phase 1 §23 | System の未送信 Chunk も再送される。`audioFrameCount` は System の Chunk の `endFrame` では補われない |
-| W7 | 確定に成功した会議で `MeetingEvents`（§8）を開始し、`UiAction` に変換して `reduce`（§11）へ渡す。画面を離れたら `stop()` | `app.ts` | §8・§11 | `transcript_version` を受けて `GET /transcript` を取り直す。再接続時に `GET /jobs` で補完する |
-| W8 | `Phase2Client`（§9）と `NotesStore`（§10）を、トークン・`baseUrl` を共有して生成する。`setToken` で作り直す | `app.ts` | §9・§10 | トークン変更後の要求が新しいトークンで出る |
+| W7 | 確定に成功した会議で `MeetingEvents`（§8）を開始し、`UiAction` に変換して `reduce`（§11）へ渡す。画面を離れたら `stop()` | `app.ts` | §8・§11 | `transcript_version` を受けて `GET /transcript` を取り直す。初回接続でも `GET /meetings/{id}` と `GET /jobs` で状態を補完し（確定から購読開始までのイベントを失わない）、再接続でも同じく補完する |
+| W8 | `Phase2Client`（§9）と `NotesStore`（§10）を、トークン・`baseUrl` を共有して生成する。`setToken` で作り直す。作り直す前に古い `NotesStore` の `dispose()` で保留中の debounce を `deps.clearTimer` で止め（古いトークンの PUT を新しいインスタンスと競合させない）、新しいインスタンスは `load()` を終えてから編集を受け付ける（未送信の編集は IndexedDB の下書きから引き継ぐ） | `app.ts` | §9・§10 | トークン変更後の要求が新しいトークンで出る。変更前の未送信の編集が 1 回だけ送られる |
 | W9 | 同期誤差（`MultiSourceRecorder` の集計と `GET /meetings/{id}` の `syncDriftMs`）をヘッダに出す | `main.ts` | 基本設計 §16.3・§18 | 表示文言の純関数をテストする（Phase 1 の `recording-view.ts` と同じ方式） |
 | W10 | System Audio の取得ボタンと、取得できなかったとき（拒否・音声トラックなし）の Mic のみへの切り替え表示 | `main.ts`・`index.html` | §5、基本設計 §16.1 | `DegradedReason` の 2 値（§2）ごとの文言 |
 | W11 | 確定待ちの内訳（`main.ts` の `listByMeeting(id, "mic")` → `pendingCountsText`）に System の Chunk も含める | `main.ts`・`recording-view.ts` | Phase 1 §31.4 | System の未送信が残る会議で件数に出る。欠番・末尾の判定は source ごと |
@@ -3199,4 +3466,4 @@ Phase 1 から変えない規則：ローカル以外へ通信しない（URL �
 | 2-d2 | §11 UI 状態、§15.1 W7・W8、transcript の表示 | `ui-state.test.ts`。1 時間会議の transcript が画面に出る（基本設計 Step 2-d） |
 | 2-f1 | 要約と `rejected` の表示、再生成 | 偽 ID を返すモックで `rejected` が折りたたみ表示される |
 | 2-g1 | §10 NotesStore、ノートの編集（§15.2 D2 の決定後） | `notes-store.test.ts`。別タブ編集で `409` → 上書きしない |
-| 2-h1 | §5 System Audio、§6 MultiSourceRecorder、§15.1 W1〜W6・W9・W10 | `system-audio.test.ts`・`multi-source.test.ts`。Mic のみへのフォールバック、P95/P99 の表示 |
+| 2-h1 | §5 System Audio、§6 MultiSourceRecorder、§15.1 W1〜W6・W9〜W11 | `system-audio.test.ts`・`multi-source.test.ts`、W11 の確定待ちの内訳（System の未送信が件数に出る）。Mic のみへのフォールバック、P95/P99 の表示 |
