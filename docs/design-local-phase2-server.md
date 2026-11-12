@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── ブラウザ側（`docs/design-local-phase2-client.md`）。
 **配置:** `docs/design-local-phase2-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。
-**検証状態:** 本書のコードブロック（58 ファイル：`pyproject.toml`・実装 46・テスト 11）はパッケージとして抽出でき、Fake Provider による pytest 11 ファイル 87 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
+**検証状態:** 本書のコードブロック（58 ファイル：`pyproject.toml`・実装 46・テスト 11）はパッケージとして抽出でき、Fake Provider による pytest 11 ファイル 94 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
 
 ---
 
@@ -3739,7 +3739,7 @@ Phase 1 §12 の 5 エンドポイント。リクエスト／レスポンス形�
 | `X-Chunk-Meta` | `meetingId` / `source` / `sequenceNo` が URL と、`sampleCount` が WAV と一致。`startOffsetMs` / `endOffsetMs` は整数で 0 ≤ start ≤ end。`vadScore` は有限の数、`hasVoice` は真偽値。`sha256` / `sizeBytes` / `sampleRate` / `channels` は載っていれば実体と一致 | `422 VALIDATION`。既定値で補わない（時刻がずれた transcript になる） |
 | 登録済み Chunk の再送 | sha256 が同じでファイルも無事なら `200`。**ファイルが失われた・壊れていれば書き戻して `200`**（確定後の会議でも受け付ける） | sha256 が違えば `409 CONFLICT_HASH_MISMATCH` |
 | 確定の本文 | `expectedChunkCounts` のキーはちょうど `mic` と `system`、値は 0 以上 | `422 VALIDATION` |
-| 確定の照合 | 件数一致に加え、source ごとの連番が `0..n-1` で連続 | `409 CONFLICT_CHUNKS_MISSING` |
+| 確定の照合 | 件数一致に加え、source ごとの連番が `0..n-1` で連続し、登録済み Chunk に欠損・破損（ファイルなし・sha256 不一致）が 1 件もない | `409 CONFLICT_CHUNKS_MISSING` |
 | `meeting.json` | 会議の作成時に書く。再送時はファイルがないときだけ書き直す。確定時に確定値で上書きする。どの経路も DB の会議行から同じ形（`_meeting_json`、確定前の確定値は `null`）で書く | ディスク不足は `507 INSUFFICIENT_STORAGE` |
 
 Phase 2 で加えた挙動：`frameClockDriftMs` の保存（基本設計 §16.3.1。欠落・非数値は無視）、確定時のジョブ生成（§12）、`meeting_status` の通知。通知は**この要求が状態を進めたときだけ**流す（確定済み会議への再送で `transcribing` を流すと、`completed` の会議の画面が処理中へ戻る）。通知は `meeting.json` の書き出しより先に行う（書き出しが `507` で終わっても遷移はコミット済みで、再送では状態を進めないため通知の機会がなくなる）。Chunk が 0 件の会議も確定でき、vad ジョブがないので `on_finalized` がその場で merge を判定する（§12）。
@@ -4026,6 +4026,9 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
         seqs = sorted(c.sequence_no for c in chunks if c.source == source)
         if seqs != list(range(len(seqs))):
             return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", f"{source}: sequence gap"), status_code=409)
+    # 件数が期待と合っていても、登録済みで欠損・破損した Chunk があれば確定しない（期待より多く登録されていて、余りが壊れた場合）
+    if missing:
+        return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "missing or corrupted chunks", ", ".join(missing)), status_code=409)
     transitioned = False
     async with ctx.db.write() as conn:
         for c in chunks:
@@ -4430,9 +4433,13 @@ async def events(meeting_id: str, request: Request) -> StreamingResponse:
 """AppContext の組み立て。テストは Provider を差し替えて同じ関数を使う。基本設計 §5.3。"""
 from __future__ import annotations
 
+import csv
 import os
+import re
 import secrets
 import socket
+import subprocess
+import sys
 from pathlib import Path
 
 from .config import Settings
@@ -4501,11 +4508,35 @@ def select_models(settings: Settings, hw: Hardware, available_llm: list[str], ol
     )
 
 
+def restrict_to_current_user(path: Path) -> None:
+    """ディレクトリを現在の OS ユーザーだけが使えるようにする（録音・トークン・DB を置く）。
+
+    Unix は 0700。Windows の os.chmod は読み取り専用属性しか変えず ACL に効かないので、icacls で親から継承した
+    ACE を外し（/inheritance:r）、現在のユーザーの SID にだけフルコントロールを与える（配下にも継承させる）。
+    付与先を名前や Administrators でなくトークンのユーザー SID にするのは、管理者として昇格して起動しても
+    付与先が変わらず、昇格せずに起動したときに本人が締め出されないため（昇格時の既定の所有者は Administrators になりうる）。
+    ACL を設定できなければ例外で起動を止める（緩い権限のまま録音を置かない）。
+    """
+    if not sys.platform.startswith("win"):
+        os.chmod(path, 0o700)
+        return
+    system32 = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32"
+    # PATH 上の同名の実行ファイルを拾わないよう、System32 の絶対パスで呼ぶ
+    out = subprocess.run([str(system32 / "whoami.exe"), "/user", "/fo", "csv", "/nh"],
+                         check=True, capture_output=True, text=True).stdout
+    row = next(csv.reader([out.strip()]), [])
+    sid = row[1] if len(row) == 2 else ""
+    if not re.fullmatch(r"S-1-\d+(-\d+)+", sid):
+        raise RuntimeError(f"cannot determine current user SID: {out.strip()!r}")
+    subprocess.run([str(system32 / "icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
+                   check=True, capture_output=True, text=True)
+
+
 async def build_context(settings: Settings, *, stt_provider: STTProvider | None = None,
                         vad_provider: VADProvider | None = None, llm_provider: SummaryProvider | None = None,
                         hardware: Hardware | None = None) -> AppContext:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(settings.data_dir, 0o700)       # 録音・トークン・DB を置く。他の OS ユーザーに読ませない
+    restrict_to_current_user(settings.data_dir)   # 録音・トークン・DB を置く。他の OS ユーザーに読ませない
     db = Database(settings.db_path)
     migrate(db)
     with db.read() as conn:
@@ -4937,6 +4968,8 @@ import base64
 import errno
 import json
 import os
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -4946,7 +4979,7 @@ import httpx
 import pytest
 
 from minutes_local.api.app import DEV_ORIGIN, create_app
-from minutes_local.bootstrap import bind_listen_socket, read_token, rotate_token
+from minutes_local.bootstrap import bind_listen_socket, read_token, restrict_to_current_user, rotate_token
 from minutes_local.db import repo
 from minutes_local.jobs.context import AppContext
 from minutes_local.jobs.runner import JobRunner
@@ -5173,6 +5206,22 @@ async def test_finalize_rejects_sequence_gap_even_when_count_matches(client: htt
     assert r.status_code == 409 and r.json()["code"] == "CONFLICT_CHUNKS_MISSING"
 
 
+async def test_finalize_rejects_missing_chunk_even_when_remaining_count_matches(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    # Arrange: 3 件登録した後、末尾の 1 件のファイルが壊れる。ブラウザの期待件数は残りの 2 件と一致する
+    await client.post("/v1/meetings", json=MEETING)
+    for seq in range(3):
+        assert (await _raw_put(client, seq=seq)).status_code == 201
+    with ctx.db.read() as conn:
+        broken = repo.get_chunk_by_key(conn, "m-1", "mic", 2)
+    (ctx.settings.data_dir / broken.local_path).write_bytes(b"corrupted")
+    # Act
+    r = await finalize(client, "m-1", mic=2)
+    # Assert: 壊れた Chunk を抱えたまま確定しない
+    assert r.status_code == 409 and r.json()["code"] == "CONFLICT_CHUNKS_MISSING"
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").status not in ("finalized", "transcribing")
+
+
 async def test_first_finalize_wins_and_resend_does_not_republish_status(client: httpx.AsyncClient, ctx: AppContext,
                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
     await client.post("/v1/meetings", json=MEETING)
@@ -5290,6 +5339,46 @@ def test_rotate_token_changes_value_and_keeps_owner_only_permission(tmp_path: Pa
     second = rotate_token(path)
     assert first != second and len(second) == 64 and read_token(path) == second
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_restrict_to_current_user_sets_owner_only_mode_on_unix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange
+    monkeypatch.setattr(sys, "platform", "linux")
+    target = tmp_path / "data"
+    target.mkdir(mode=0o755)
+    # Act
+    restrict_to_current_user(target)
+    # Assert
+    assert target.stat().st_mode & 0o777 == 0o700
+
+
+def test_restrict_to_current_user_sets_windows_acl_by_user_sid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows の os.chmod は ACL に効かない。継承を外し、昇格の有無で変わらないユーザー SID にだけ付与する。"""
+    # Arrange
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        out = '"pc\\alice","S-1-5-21-1-2-3-1001"\r\n' if args[0].lower().endswith("whoami.exe") else ""
+        return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("SystemRoot", "C:\\Windows")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # Act
+    restrict_to_current_user(tmp_path)
+    # Assert
+    icacls = [c for c in calls if c[0].lower().endswith("icacls.exe")]
+    assert icacls == [[icacls[0][0], str(tmp_path), "/inheritance:r", "/grant:r", "*S-1-5-21-1-2-3-1001:(OI)(CI)F"]]
+
+
+def test_restrict_to_current_user_fails_closed_on_unexpected_sid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: whoami の出力が SID の形でない
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(subprocess, "run", lambda args, **_: subprocess.CompletedProcess(args, 0, stdout='"pc\\alice","Everyone"\r\n', stderr=""))
+    # Act / Assert: ACL を緩いまま起動しない
+    with pytest.raises(RuntimeError, match="SID"):
+        restrict_to_current_user(tmp_path)
 
 
 def test_bind_listen_socket_fails_while_port_is_in_use() -> None:

@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── サーバー側（`docs/design-local-phase2-server.md`）。API 契約はそちらの §21 と 1 対 1。
 **配置:** `docs/design-local-phase2-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** ブラウザ標準 API（`MediaStream` / `AudioContext` / `AudioWorklet` / `IndexedDB` / `fetch` / `EventSource`）と TypeScript のみ。UI フレームワークは本書で選定せず、状態モデル（§11）をフレームワーク非依存の reducer として定義する。
-**検証状態:** 本書の全 `typescript` コードブロック（17 ファイル）を Phase 1 の現行ソースへ上書き・追加した状態で、`tsc --noEmit`（strict）と Vitest 30 ファイル 527 件が全件通過することを確認している（2026-11-12）。詳細と再現手順は §1.2。**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**（§15）。
+**検証状態:** 本書の全 `typescript` コードブロック（17 ファイル）を Phase 1 の現行ソースへ上書き・追加した状態で、`tsc --noEmit`（strict）と Vitest 30 ファイル 541 件が全件通過することを確認している（2026-11-12）。詳細と再現手順は §1.2。**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**（§15）。
 
 ---
 
@@ -41,7 +41,7 @@ Phase 2 のブラウザ側の責務は次の 3 つである。
 
 ## 1.2 検証状態
 
-本書の `// src/...` と `// test/...` のコードブロックを Phase 1 の現行ソース（2026-11-12 時点）へ上書き・追加した状態で、`npm run typecheck` が通り、Vitest 30 ファイル 527 件が全件通過することを確認している（Phase 1 の 24 ファイルを含む。Phase 1 側の変更は §7 に記した `test/app.test.ts` の 1 か所）。確認の手順は `scripts/verify-design-docs.sh`。実ブラウザ（`getDisplayMedia`・SSE の実接続）では実行していない。
+本書の `// src/...` と `// test/...` のコードブロックを Phase 1 の現行ソース（2026-11-12 時点）へ上書き・追加した状態で、`npm run typecheck` が通り、Vitest 30 ファイル 541 件が全件通過することを確認している（Phase 1 の 24 ファイルを含む。Phase 1 側の変更は §7 に記した `test/app.test.ts` の 1 か所）。確認の手順は `scripts/verify-design-docs.sh`。実ブラウザ（`getDisplayMedia`・SSE の実接続）では実行していない。
 
 Phase 1 のファイルを全文で載せているブロック（`recording-controller.ts`・`finalizer.ts`・`types/recording.ts`）は、**Phase 1 の現行ソースに Phase 2 の差分を当てたもの**である。Phase 1 側を直したら、同じ修正を本書のブロックにも当てて上の検証をやり直す（CLAUDE.md ルール 3）。
 
@@ -1525,11 +1525,12 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   try {
     listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", redirect: "error", signal: listAbort.signal });
     // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
-    // 本文の読み取り中の abort（タイムアウト）は壊れた応答ではなく network として下の catch へ流す
+    // null（壊れた応答）にするのは JSON の構文エラーだけ。本文の読み取り中の abort（タイムアウト）や
+    // 通信エラーは network として下の catch へ流す
     list = listRes.ok
       ? await listRes.json().catch((error: unknown) => {
-        if (listAbort.signal.aborted) throw error;
-        return null;
+        if (error instanceof SyntaxError && !listAbort.signal.aborted) return null;
+        throw error;
       })
       : null;
   } catch (error) {
@@ -1694,9 +1695,12 @@ export interface EventsClientDeps {
   /** IndexedDB の settings ストアに入っているトークン（Phase 1 §4.3）。 */
   readonly token: string;
   readonly createEventSource: (url: URL, token: string) => EventSourceLike;
-  /** 再接続後の補完用。失敗は無視せず onError に渡す。 */
+  /**
+   * 再接続後の補完用。失敗は無視せず onError に渡す。
+   * 期限（Phase2Client の timeoutMs）までに必ず resolve か reject すること。終わらないと補完中に保留したイベントが流れない
+   */
   readonly fetchJobs: () => Promise<JobListResponse>;
-  /** 再接続後の補完用。会議の status と各版を取り戻す。 */
+  /** 再接続後の補完用。会議の status と各版を取り戻す。fetchJobs と同じく期限までに必ず resolve か reject すること */
   readonly fetchMeeting: () => Promise<MeetingDetailResponse>;
   readonly onEvent: (event: MeetingEvent) => void;
   readonly onError: (error: Error) => void;
@@ -1708,8 +1712,10 @@ export class MeetingEventsClient {
   private source: EventSourceLike | null = null;
   /** 補完中に届いたイベント。補完の後に、届いた順で流す。null は補完中でない */
   private held: string[] | null = null;
-  /** 補完の世代。接続（open）と close のたびに進め、古い接続の補完の結果を捨てる */
+  /** 補完の世代。補完の開始と close のたびに進め、古い補完の結果を捨てる */
   private generation = 0;
+  /** 補完に失敗した後の取り直しの予約。補完を始め直すときと close で取り消す */
+  private backfillRetry: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly deps: EventsClientDeps, private readonly meetingId: string) {}
 
@@ -1733,6 +1739,7 @@ export class MeetingEventsClient {
     this.source = null;
     this.generation++;
     this.held = null;
+    this.cancelBackfillRetry();
   }
 
   /**
@@ -1767,11 +1774,13 @@ export class MeetingEventsClient {
    * transcript / summary の本文は取りに行かない。版だけ流せば §11 の staleTranscriptVersion /
    * staleSummaryVersion が立ち、UI が必要になった時点で本文を取得する（再接続のたびに全文を引かない）。
    */
-  private async backfill(): Promise<void> {
+  private async backfill(attempt = 0): Promise<void> {
+    this.cancelBackfillRetry();
     const generation = ++this.generation;
     // 接続ごとに保留をやり直す。前の接続で保留した分は、この接続の補完（再接続後の状態）に含まれている。
     // 持ち越すと、補完の後に古い status を流して巻き戻す（Live セグメントは LiveTranscriptStore.poll() が cursor で取り直す）
     this.held = [];
+    let failed = false;
     try {
       const meeting = await this.deps.fetchMeeting();
       // 補完中に再接続・close した。新しい接続の補完が保留分を流す
@@ -1787,11 +1796,25 @@ export class MeetingEventsClient {
     } catch (error) {
       if (generation !== this.generation) return;
       this.deps.onError(error instanceof Error ? error : new Error(String(error)));
+      failed = true;
     }
     // 補完に失敗しても保留分は流す（live を失わない）
     const held = this.held ?? [];
     this.held = null;
     for (const data of held) this.handle(data);
+    // 接続が開いたままだと次の open は来ず、切断中の変化（確定した status など）が戻らない。
+    // 同じ接続のまま有限回だけ取り直す。取り直しも保留からやり直すので、先に流した live を古い値で巻き戻さない
+    const delay = BACKFILL_RETRY_DELAYS_MS[attempt];
+    if (!failed || delay === undefined) return;
+    this.backfillRetry = setTimeout(() => {
+      this.backfillRetry = null;
+      if (generation === this.generation) void this.backfill(attempt + 1);
+    }, delay);
+  }
+
+  private cancelBackfillRetry(): void {
+    if (this.backfillRetry !== null) clearTimeout(this.backfillRetry);
+    this.backfillRetry = null;
   }
 }
 
@@ -1808,6 +1831,8 @@ export function normalizeEvent(value: unknown): MeetingEvent | null {
 
 const INITIAL_RETRY_MS = 1_000;
 const MAX_RETRY_MS = 30_000;
+/** 補完に失敗した後、同じ接続のまま取り直すまでの間隔。要素数が取り直しの上限回数 */
+export const BACKFILL_RETRY_DELAYS_MS: readonly number[] = [1_000, 5_000, 15_000];
 /** 応答ヘッダが届くまでの期限 */
 export const SSE_CONNECT_TIMEOUT_MS = 10_000;
 /** 無通信の許容時間。サーバーは無通信が 15 秒続くと keep-alive コメントを送る（サーバー側 api/sse.py の KEEPALIVE_S）ので、3 回分待つ */
@@ -2219,11 +2244,15 @@ export class NotesStore {
   /**
    * setToken で作り直す前に呼ぶ。保留中の debounce を止め、古いトークンの PUT が新しいインスタンスと競合しないようにする。
    * 未送信の編集は IndexedDB の下書き（saved: false）に残っており、新しいインスタンスの load() が dirty として拾い直す。
+   * 送信中の PUT があれば、その完了を待って返る。新しいインスタンスの load() はこの完了を待ってから呼ぶ。
+   * 待たずに load() すると、古い PUT が確定する前の revision と下書きを読み、確定後に送った編集が 409 で競合になる。
    */
-  dispose(): void {
+  async dispose(): Promise<void> {
     this.disposed = true;
     if (this.timer !== null) this.deps.clearTimer(this.timer);
     this.timer = null;
+    // doSave は失敗を Result で扱い reject しない。完了時には控え（新しい revision）の書き込みも依頼済み
+    if (this.inflight !== null) await this.inflight;
   }
 
   private schedule(): void {
@@ -2772,7 +2801,7 @@ describe("finalize（mic + system）", () => {
 ```typescript
 // test/events.test.ts
 import { describe, expect, it, vi } from "vitest";
-import { FetchEventSource, MeetingEventsClient, SSE_CONNECT_TIMEOUT_MS, SSE_IDLE_TIMEOUT_MS, normalizeEvent, type EventSourceLike } from "../src/api/events";
+import { BACKFILL_RETRY_DELAYS_MS, FetchEventSource, MeetingEventsClient, SSE_CONNECT_TIMEOUT_MS, SSE_IDLE_TIMEOUT_MS, normalizeEvent, type EventSourceLike } from "../src/api/events";
 import type { JobListResponse, MeetingDetailResponse, MeetingEvent } from "../src/api/contracts-phase2";
 
 class FakeEventSource implements EventSourceLike {
@@ -3024,6 +3053,88 @@ describe("MeetingEventsClient", () => {
     source.emit("open");
     await new Promise((r) => setTimeout(r, 0));
     expect(errors.map((e) => e.message)).toEqual(["server down"]);
+    client.close();
+  });
+
+  it("補完に失敗したら同じ接続のまま間隔を空けて取り直し、成功した状態を流す", async () => {
+    vi.useFakeTimers();
+    try {
+      // Arrange: 1 回目の補完だけ失敗する
+      let es: FakeEventSource | null = null;
+      let calls = 0;
+      const received: MeetingEvent[] = [];
+      const errors: Error[] = [];
+      const client = new MeetingEventsClient({
+        baseUrl: "http://127.0.0.1:43117",
+        token: "tok",
+        createEventSource: () => (es = new FakeEventSource()),
+        fetchJobs: async () => emptyJobs,
+        fetchMeeting: async () => {
+          if (++calls === 1) throw new Error("server down");
+          return meetingDetail;
+        },
+        onEvent: (e) => received.push(e),
+        onError: (e) => errors.push(e),
+      }, "m");
+      client.connect();
+      (es as unknown as FakeEventSource).emit("open");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(errors.map((e) => e.message)).toEqual(["server down"]);
+      expect(received).toEqual([]);
+      // Act: 再接続（open）を待たずに取り直す
+      await vi.advanceTimersByTimeAsync(BACKFILL_RETRY_DELAYS_MS[0]);
+      // Assert
+      expect(calls).toBe(2);
+      expect(received).toContainEqual({ type: "meeting_status", status: "transcribing" });
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("補完の取り直しは上限回数で止まり、close や再接続の後は古い接続の分を取り直さない", async () => {
+    vi.useFakeTimers();
+    try {
+      // Arrange: 補完が常に失敗する
+      let es: FakeEventSource | null = null;
+      let calls = 0;
+      const client = new MeetingEventsClient({
+        baseUrl: "http://127.0.0.1:43117",
+        token: "tok",
+        createEventSource: () => (es = new FakeEventSource()),
+        fetchJobs: async () => emptyJobs,
+        fetchMeeting: async () => {
+          calls++;
+          throw new Error("server down");
+        },
+        onEvent: () => undefined,
+        onError: () => undefined,
+      }, "m");
+      client.connect();
+      const source = es as unknown as FakeEventSource;
+      const total = BACKFILL_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0);
+      // Act 1: 上限まで取り直させる
+      source.emit("open");
+      await vi.advanceTimersByTimeAsync(total * 2);
+      // Assert 1: 初回 + 取り直しの回数だけ
+      expect(calls).toBe(1 + BACKFILL_RETRY_DELAYS_MS.length);
+      // Act 2: 再接続の補完が失敗した直後に、もう一度再接続する（取り直しの予約は 1 つだけ残る）
+      calls = 0;
+      source.emit("open");
+      await vi.advanceTimersByTimeAsync(0);
+      source.emit("open");
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(BACKFILL_RETRY_DELAYS_MS[0]);
+      // Assert 2: 2 回の open と、最後の接続の取り直し 1 回だけ
+      expect(calls).toBe(3);
+      // Act 3: close の後は取り直さない
+      client.close();
+      await vi.advanceTimersByTimeAsync(total * 2);
+      // Assert 3
+      expect(calls).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("壊れた JSON は onError に渡し、例外にしない", () => {
@@ -3174,6 +3285,29 @@ describe("NotesStore", () => {
     while (b.timers.length > 0) await b.fire();
     // Assert: 古いインスタンスは送らず（送ると同じ revision の PUT が 2 回になり、後の方が 409）、新しいインスタンスが下書きから送る
     expect(b.puts).toEqual([{ json: ["edited"], revision: 0 }]);
+    expect(next.current.sync).toBe("saved");
+  });
+
+  it("送信中に dispose したら送信の完了を待ってから作り直し、保存中の編集を競合にせず 1 回だけ送る", async () => {
+    // Arrange: 古いインスタンスの PUT を応答前で止め、その間に編集する
+    const b = build();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    const deps: NotesStoreDeps = { ...b.deps, putNotes: async (...args) => { await gate; return b.deps.putNotes(...args); } };
+    const store = new NotesStore(deps, "m");
+    await store.load();
+    store.setDraft(["a"]);
+    b.timers.shift()?.fn();
+    store.setDraft(["ab"]);
+    // Act: 作り直す。古い PUT は新しいインスタンスの load の前に確定する
+    const disposed = store.dispose();
+    release();
+    await disposed;
+    const next = new NotesStore(deps, "m");
+    await next.load();
+    while (b.timers.length > 0) await b.fire();
+    // Assert: 古い PUT で進んだ revision から編集を送り、競合にしない
+    expect(b.puts).toEqual([{ json: ["a"], revision: 0 }, { json: ["ab"], revision: 1 }]);
     expect(next.current.sync).toBe("saved");
   });
 
@@ -3433,7 +3567,7 @@ describe("UI reducer", () => {
 | W5 | drain（サーバー復帰・`setToken`・確定再試行）と破棄・WAV 書き出しを Mic と System の両方の Controller に行う | `app.ts`・`main.ts` | §4 の 4、Phase 1 §31 | 確定中止後の書き出しに System の WAV も入る。破棄で両方が空になりロックが外れる |
 | W6 | 起動時復旧（Phase 1 §23）。`recovery.ts` が `listByMeeting(id, "mic")` で読むのは `audioFrameCount` を補うためで、Mic の時計の値なので **mic のままでよい**。未送信 Chunk の再投入は保存状態の索引で拾うので source を問わない | 変更なし（テストを追加） | Phase 1 §23 | System の未送信 Chunk も再送される。`audioFrameCount` は System の Chunk の `endFrame` では補われない |
 | W7 | 確定に成功した会議で `MeetingEvents`（§8）を開始し、`UiAction` に変換して `reduce`（§11）へ渡す。画面を離れたら `stop()` | `app.ts` | §8・§11 | `transcript_version` を受けて `GET /transcript` を取り直す。初回接続でも `GET /meetings/{id}` と `GET /jobs` で状態を補完し（確定から購読開始までのイベントを失わない）、再接続でも同じく補完する |
-| W8 | `Phase2Client`（§9）と `NotesStore`（§10）を、トークン・`baseUrl` を共有して生成する。`setToken` で作り直す。作り直す前に古い `NotesStore` の `dispose()` で保留中の debounce を `deps.clearTimer` で止め（古いトークンの PUT を新しいインスタンスと競合させない）、新しいインスタンスは `load()` を終えてから編集を受け付ける（未送信の編集は IndexedDB の下書きから引き継ぐ） | `app.ts` | §9・§10 | トークン変更後の要求が新しいトークンで出る。変更前の未送信の編集が 1 回だけ送られる |
+| W8 | `Phase2Client`（§9）と `NotesStore`（§10）を、トークン・`baseUrl` を共有して生成する。`setToken` で作り直す。作り直す前に古い `NotesStore` の `dispose()` で保留中の debounce を `deps.clearTimer` で止め（古いトークンの PUT を新しいインスタンスと競合させない）、`dispose()` の完了（送信中の PUT の完了）を待ってから新しいインスタンスの `load()` を呼ぶ（待たないと古い PUT の確定前の revision を読み、保存中の編集が競合になる）。新しいインスタンスは `load()` を終えてから編集を受け付ける（未送信の編集は IndexedDB の下書きから引き継ぐ） | `app.ts` | §9・§10 | トークン変更後の要求が新しいトークンで出る。変更前の未送信の編集が 1 回だけ送られる |
 | W9 | 同期誤差（`MultiSourceRecorder` の集計と `GET /meetings/{id}` の `syncDriftMs`）をヘッダに出す | `main.ts` | 基本設計 §16.3・§18 | 表示文言の純関数をテストする（Phase 1 の `recording-view.ts` と同じ方式） |
 | W10 | System Audio の取得ボタンと、取得できなかったとき（拒否・音声トラックなし）の Mic のみへの切り替え表示 | `main.ts`・`index.html` | §5、基本設計 §16.1 | `DegradedReason` の 2 値（§2）ごとの文言 |
 | W11 | 確定待ちの内訳（`main.ts` の `listByMeeting(id, "mic")` → `pendingCountsText`）に System の Chunk も含める | `main.ts`・`recording-view.ts` | Phase 1 §31.4 | System の未送信が残る会議で件数に出る。欠番・末尾の判定は source ごと |

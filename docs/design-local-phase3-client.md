@@ -4,7 +4,7 @@
 **上位文書:** Phase 3 詳細設計書 ── サーバー側（`docs/design-local-phase3-server.md`）§2 の設計判断と §20 の API。
 **配置:** `docs/design-local-phase3-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** Phase 1・2 と同じ（ブラウザ標準 API と TypeScript のみ、UI フレームワーク非依存の状態モデル）。
-**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 34 ファイル 560 件（Phase 1・2 の 30 ファイル 527 件を含む）が全件通過することを確認している（2026-11-12、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
+**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 34 ファイル 574 件（Phase 1・2 の 30 ファイル 541 件を含む）が全件通過することを確認している（2026-11-12、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
 
 ---
 
@@ -339,9 +339,12 @@ export interface EventsClientDeps {
   /** IndexedDB の settings ストアに入っているトークン（Phase 1 §4.3）。 */
   readonly token: string;
   readonly createEventSource: (url: URL, token: string) => EventSourceLike;
-  /** 再接続後の補完用。失敗は無視せず onError に渡す。 */
+  /**
+   * 再接続後の補完用。失敗は無視せず onError に渡す。
+   * 期限（Phase2Client の timeoutMs）までに必ず resolve か reject すること。終わらないと補完中に保留したイベントが流れない
+   */
   readonly fetchJobs: () => Promise<JobListResponse>;
-  /** 再接続後の補完用。会議の status と各版を取り戻す。 */
+  /** 再接続後の補完用。会議の status と各版を取り戻す。fetchJobs と同じく期限までに必ず resolve か reject すること */
   readonly fetchMeeting: () => Promise<MeetingDetailResponse>;
   readonly onEvent: (event: MeetingEvent) => void;
   /** Phase 3：Live セグメント。未指定なら捨てる */
@@ -355,8 +358,10 @@ export class MeetingEventsClient {
   private source: EventSourceLike | null = null;
   /** 補完中に届いたイベント。補完の後に、届いた順で流す。null は補完中でない */
   private held: string[] | null = null;
-  /** 補完の世代。接続（open）と close のたびに進め、古い接続の補完の結果を捨てる */
+  /** 補完の世代。補完の開始と close のたびに進め、古い補完の結果を捨てる */
   private generation = 0;
+  /** 補完に失敗した後の取り直しの予約。補完を始め直すときと close で取り消す */
+  private backfillRetry: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly deps: EventsClientDeps, private readonly meetingId: string) {}
 
@@ -380,6 +385,7 @@ export class MeetingEventsClient {
     this.source = null;
     this.generation++;
     this.held = null;
+    this.cancelBackfillRetry();
   }
 
   /**
@@ -420,11 +426,13 @@ export class MeetingEventsClient {
    * staleSummaryVersion が立ち、UI が必要になった時点で本文を取得する（再接続のたびに全文を引かない）。
    * Live セグメントは LiveTranscriptStore.poll() が cursor 以降を取り直すので、ここでは扱わない（§3.2）。
    */
-  private async backfill(): Promise<void> {
+  private async backfill(attempt = 0): Promise<void> {
+    this.cancelBackfillRetry();
     const generation = ++this.generation;
     // 接続ごとに保留をやり直す。前の接続で保留した分は、この接続の補完（再接続後の状態）に含まれている。
     // 持ち越すと、補完の後に古い status を流して巻き戻す（Live セグメントは LiveTranscriptStore.poll() が cursor で取り直す）
     this.held = [];
+    let failed = false;
     try {
       const meeting = await this.deps.fetchMeeting();
       // 補完中に再接続・close した。新しい接続の補完が保留分を流す
@@ -440,11 +448,25 @@ export class MeetingEventsClient {
     } catch (error) {
       if (generation !== this.generation) return;
       this.deps.onError(error instanceof Error ? error : new Error(String(error)));
+      failed = true;
     }
     // 補完に失敗しても保留分は流す（live を失わない）
     const held = this.held ?? [];
     this.held = null;
     for (const data of held) this.handle(data);
+    // 接続が開いたままだと次の open は来ず、切断中の変化（確定した status など）が戻らない。
+    // 同じ接続のまま有限回だけ取り直す。取り直しも保留からやり直すので、先に流した live を古い値で巻き戻さない
+    const delay = BACKFILL_RETRY_DELAYS_MS[attempt];
+    if (!failed || delay === undefined) return;
+    this.backfillRetry = setTimeout(() => {
+      this.backfillRetry = null;
+      if (generation === this.generation) void this.backfill(attempt + 1);
+    }, delay);
+  }
+
+  private cancelBackfillRetry(): void {
+    if (this.backfillRetry !== null) clearTimeout(this.backfillRetry);
+    this.backfillRetry = null;
   }
 }
 
@@ -461,6 +483,8 @@ export function normalizeEvent(value: unknown): MeetingEvent | null {
 
 const INITIAL_RETRY_MS = 1_000;
 const MAX_RETRY_MS = 30_000;
+/** 補完に失敗した後、同じ接続のまま取り直すまでの間隔。要素数が取り直しの上限回数 */
+export const BACKFILL_RETRY_DELAYS_MS: readonly number[] = [1_000, 5_000, 15_000];
 /** 応答ヘッダが届くまでの期限 */
 export const SSE_CONNECT_TIMEOUT_MS = 10_000;
 /** 無通信の許容時間。サーバーは無通信が 15 秒続くと keep-alive コメントを送る（サーバー側 api/sse.py の KEEPALIVE_S）ので、3 回分待つ */

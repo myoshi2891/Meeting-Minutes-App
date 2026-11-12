@@ -5,7 +5,7 @@
 **対となる文書:** Phase 3 詳細設計書 ── ブラウザ側（`docs/design-local-phase3-client.md`）。
 **配置:** `docs/design-local-phase3-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。LAN 共有は「利用者自身が管理する LAN 内」に限定し、インターネット公開は対象外。
-**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 87 件と本書の 28 件（計 18 ファイル 115 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
+**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 94 件と本書の 36 件（計 18 ファイル 130 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
 
 ---
 
@@ -1729,6 +1729,7 @@ class AudioCodec(Protocol):
     @property
     def extension(self) -> str: ...
     def encode(self, pcm: bytes) -> bytes: ...
+    # 壊れた入力は ValueError で返す（read_pcm が InvalidWavError に包む）
     def decode(self, data: bytes) -> bytes: ...
 
 
@@ -1745,7 +1746,7 @@ class FakeCodec:
         return self.MAGIC + struct.pack("<I", len(pcm)) + pcm
 
     def decode(self, data: bytes) -> bytes:
-        if data[:4] != self.MAGIC:
+        if len(data) < 8 or data[:4] != self.MAGIC:
             raise ValueError("not a fake container")
         n, = struct.unpack_from("<I", data, 4)
         pcm = data[8:8 + n]
@@ -1768,7 +1769,12 @@ class FlacCodec:
     def decode(self, data: bytes) -> bytes:
         import numpy as np  # type: ignore[import-not-found]
         import soundfile as sf  # type: ignore[import-not-found]
-        audio, sr = sf.read(io.BytesIO(data), dtype="int16")
+        try:
+            audio, sr = sf.read(io.BytesIO(data), dtype="int16")
+        except RuntimeError as e:
+            # 壊れたファイルの libsndfile の例外（RuntimeError 系）を、AudioCodec.decode の約束どおり ValueError にそろえる。
+            # read_pcm はこれを InvalidWavError に変えるので、呼び出し側（修復判定・STT）は 1 種類の例外だけを扱えばよい
+            raise ValueError(f"flac decode failed: {e}") from e
         if sr != 16000:
             raise ValueError(f"unexpected sample rate {sr}")
         if audio.ndim > 1:
@@ -1995,7 +2001,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from ..db import repo
 from ..db.connection import now_ms
@@ -2054,9 +2060,15 @@ def _stop_metadata(meta: dict[str, Any]) -> tuple[str | None, int | None]:
     """meeting.json の停止理由と検出時刻を組で検証する。片方でも不正なら両方 None（Meeting の検証で rebuild 全体を止めない）。"""
     reason, detected = meta.get("stopReason"), meta.get("stopDetectedAtEpochMs")
     # bool は int のサブクラスなので明示的に除く。範囲は確定 API と同じ SQLite INTEGER（範囲外は insert で OverflowError）
-    if reason in ("manual", "mic_ended") and isinstance(detected, int) and not isinstance(detected, bool) and 0 <= detected <= 2**63 - 1:
+    if reason in ("manual", "mic_ended") and _is_sqlite_epoch_ms(detected):
         return reason, detected
     return None, None
+
+
+def _is_sqlite_epoch_ms(value: object) -> TypeGuard[int]:
+    """確定 API と同じく 0 以上の整数で、SQLite INTEGER に収まるか（範囲外は insert で OverflowError）。"""
+    # bool は int のサブクラスなので明示的に除く
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2**63 - 1
 
 
 def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) -> RebuildReport:
@@ -2076,12 +2088,15 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
         t = now_ms()
         if repo.get_meeting(conn, meeting_id) is None:
             stop_reason, stop_detected_at = _stop_metadata(meta)
+            # 不正な終了時刻（範囲外・整数でない）は None にし、Meeting の検証や insert で rebuild 全体を止めない
+            ended_raw = meta.get("endedAtEpochMs")
+            ended_at = ended_raw if _is_sqlite_epoch_ms(ended_raw) else None
             repo.insert_meeting(conn, Meeting(
                 id=meeting_id, local_user_id=str(meta.get("localUserId", user_id)), title=str(meta.get("title", "復元された会議")),
                 status="finalized", session_start_epoch_ms=int(meta.get("sessionStartEpochMs", 0)),
                 native_sample_rate=int(meta.get("nativeSampleRate", 0)), consent_confirmed_at=int(meta.get("consentConfirmedAt", 0)),
                 # 終了時刻のキーは全フェーズで endedAtEpochMs。会議の作成時に書いた控え（確定前）にはなく、その場合は None
-                ended_at=meta.get("endedAtEpochMs"), total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
+                ended_at=ended_at, total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
                 stop_reason=stop_reason, stop_detected_at=stop_detected_at,
             ))
             report.meetings_created += 1
@@ -2375,7 +2390,9 @@ from ..db import repo
 from ..db.connection import now_ms
 from ..db.models import AudioChunk, Meeting
 from ..jobs import live, pipeline
-from ..storage.files import InvalidWavError, chunk_relative_path, meeting_dir, parse_wav_header, sha256_file, sha256_hex, write_atomic
+from ..jobs.context import AppContext
+from ..storage.files import (InvalidWavError, chunk_relative_path, meeting_dir, parse_wav_header, read_pcm, sha256_file, sha256_hex,
+                             write_atomic)
 from ..storage.rebuild import write_meeting_json
 from .common import error_body, get_ctx
 
@@ -2506,6 +2523,15 @@ def _validate_meta(header: str, meeting_id: str, source: str, sequence_no: int, 
     return meta
 
 
+def _stored_chunk_intact(ctx: AppContext, chunk: AudioChunk) -> bool:
+    """保存済みファイルを read_pcm で読み、WAV の sha256 まで一致するか。"""
+    try:
+        read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec)
+    except InvalidWavError:        # 欠損・sha256 不一致・復号の失敗（コーデックは失敗を ValueError で返し、read_pcm が包む）
+        return False
+    return True
+
+
 @router.put("/meetings/{meeting_id}/chunks/{source}/{sequence_no}")
 async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Request,
                     x_chunk_sha256: str | None = Header(default=None),
@@ -2538,8 +2564,8 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
         if existing.sha256 != sha:
             return JSONResponse(error_body("CONFLICT_HASH_MISMATCH", "chunk exists with different content"), status_code=409)
         path = ctx.settings.data_dir / existing.local_path
-        # 圧縮済み（codec != wav）のファイルは WAV の sha256 と直接は比べられないので存在だけを見る（中身は read_pcm が復元して照合する）
-        intact = path.is_file() and (existing.codec != "wav" or sha256_file(path) == sha)
+        # 圧縮済み（codec != wav）も復号して WAV の sha256 と照合する（read_pcm と同じ検証）。存在だけを見ると壊れた控えを修復しない
+        intact = path.is_file() and _stored_chunk_intact(ctx, existing)
         if not intact:
             # 修復・逆同期（§2.4）：登録済みだがファイルが失われた・壊れた。内容は同じ（sha256 一致）なので WAV として書き戻す。
             # 圧縮済みだった Chunk も WAV に戻る。確定後の会議でも受け付ける
@@ -2655,6 +2681,9 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
         seqs = sorted(c.sequence_no for c in chunks if c.source == source)
         if seqs != list(range(len(seqs))):
             return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", f"{source}: sequence gap"), status_code=409)
+    # 件数が期待と合っていても、登録済みで欠損・破損した Chunk があれば確定しない（期待より多く登録されていて、余りが壊れた場合）
+    if missing:
+        return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "missing or corrupted chunks", ", ".join(missing)), status_code=409)
     transitioned = False
     async with ctx.db.write() as conn:
         # 先に確定した値を正とする。書き込みロック下で状態と件数を確かめ直し、2 回目以降は更新しない
@@ -3353,9 +3382,13 @@ def exclude_failed(conn: sqlite3.Connection, meeting_id: str, diarize: bool = Fa
 """AppContext の組み立て。Phase 3 で integrity_check / Phase 3 マイグレーション / 新 Provider / 利用者モードを追加。"""
 from __future__ import annotations
 
+import csv
 import os
+import re
 import secrets
 import socket
+import subprocess
+import sys
 from pathlib import Path
 
 from .auth.users import user_count
@@ -3447,12 +3480,36 @@ def _default_codec() -> AudioCodec | None:
     return FlacCodec()
 
 
+def restrict_to_current_user(path: Path) -> None:
+    """ディレクトリを現在の OS ユーザーだけが使えるようにする（録音・トークン・DB を置く）。
+
+    Unix は 0700。Windows の os.chmod は読み取り専用属性しか変えず ACL に効かないので、icacls で親から継承した
+    ACE を外し（/inheritance:r）、現在のユーザーの SID にだけフルコントロールを与える（配下にも継承させる）。
+    付与先を名前や Administrators でなくトークンのユーザー SID にするのは、管理者として昇格して起動しても
+    付与先が変わらず、昇格せずに起動したときに本人が締め出されないため（昇格時の既定の所有者は Administrators になりうる）。
+    ACL を設定できなければ例外で起動を止める（緩い権限のまま録音を置かない）。
+    """
+    if not sys.platform.startswith("win"):
+        os.chmod(path, 0o700)
+        return
+    system32 = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32"
+    # PATH 上の同名の実行ファイルを拾わないよう、System32 の絶対パスで呼ぶ
+    out = subprocess.run([str(system32 / "whoami.exe"), "/user", "/fo", "csv", "/nh"],
+                         check=True, capture_output=True, text=True).stdout
+    row = next(csv.reader([out.strip()]), [])
+    sid = row[1] if len(row) == 2 else ""
+    if not re.fullmatch(r"S-1-\d+(-\d+)+", sid):
+        raise RuntimeError(f"cannot determine current user SID: {out.strip()!r}")
+    subprocess.run([str(system32 / "icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
+                   check=True, capture_output=True, text=True)
+
+
 async def build_context(settings: Settings, *, stt_provider: STTProvider | None = None, vad_provider: VADProvider | None = None,
                         llm_provider: SummaryProvider | None = None, hardware: Hardware | None = None,
                         diarization_provider: DiarizationProvider | None = None, language_detector: LanguageDetector | None = None,
                         codec: AudioCodec | None = None, tls_enabled: bool = False) -> AppContext:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(settings.data_dir, 0o700)       # 録音・トークン・DB を置く。他の OS ユーザーに読ませない
+    restrict_to_current_user(settings.data_dir)   # 録音・トークン・DB を置く。他の OS ユーザーに読ませない
     db, _restored = open_database_with_recovery(settings)
     migrate(db)
     apply_phase3(db, settings.data_dir)
@@ -3664,7 +3721,7 @@ if __name__ == "__main__":
 
 ## 23.1 ハーネス（変更）と Phase 2 テストの回帰
 
-Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 87 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
+Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 94 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
 
 ```python
 # tests/conftest.py
@@ -4354,6 +4411,29 @@ async def test_compress_replaces_wav_after_roundtrip(client3: httpx.AsyncClient,
     assert (await client3.get("/v1/meetings/m-1/transcript")).status_code == 200
 
 
+@pytest.mark.parametrize("corrupt", ["truncated", "garbage"])
+async def test_resend_repairs_corrupted_compressed_chunk(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                         corrupt: str) -> None:
+    """圧縮済みファイルが残っていても、復号した WAV の sha256 が合わなければ再 PUT で WAV に書き戻す（§2.4 修復）。"""
+    # Arrange: 圧縮した後、Chunk 0 の圧縮ファイルを壊す
+    await _completed_meeting(client3, runner3, ctx3)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    with ctx3.db.read() as conn:
+        c = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    path = ctx3.settings.data_dir / c.local_path
+    data = path.read_bytes()
+    path.write_bytes(data[:-100] if corrupt == "truncated" else b"xx")
+    # Act: ブラウザが同じ内容を再送する
+    r = await put_chunk(client3, "m-1", 0, sine_pcm(30))
+    # Assert
+    assert r.status_code == 200 and r.json()["registered"] is True
+    with ctx3.db.read() as conn:
+        repaired = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    assert repaired.codec == "wav" and repaired.save_status == "registered"
+    assert len(read_pcm(ctx3.settings.data_dir, repaired.local_path, repaired.sha256)) == 960000
+
+
 async def test_compress_keeps_wav_when_roundtrip_mismatches(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
     await _completed_meeting(client3, runner3, ctx3)
     ctx3.codec = FakeCodec(corrupt=True)
@@ -4450,6 +4530,17 @@ async def test_rebuild_drops_malformed_stop_pair(client3: httpx.AsyncClient, ctx
     report, m = _rewrite_snapshot_and_rebuild(ctx3, stopReason=reason, stopDetectedAtEpochMs=detected)
     assert report.meetings_created == 1 and report.chunks_created == 2
     assert m is not None and m.status == "finalized" and m.stop_reason is None and m.stop_detected_at is None
+
+
+@pytest.mark.parametrize("ended", [-1, 2**63, True, "1700000000000", 1.5])
+async def test_rebuild_drops_malformed_end_time(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner, ended: object) -> None:
+    """SQLite INTEGER に入らない・整数でない終了時刻は None にし、rebuild 全体を止めない（会議と Chunk は復元する）。"""
+    # Arrange / Act
+    await _completed_meeting(client3, runner3, ctx3)
+    report, m = _rewrite_snapshot_and_rebuild(ctx3, endedAtEpochMs=ended)
+    # Assert
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert m is not None and m.status == "finalized" and m.ended_at is None
 
 
 async def test_missing_chunk_is_reported_for_resync(client3: httpx.AsyncClient, ctx3: AppContext) -> None:
@@ -4563,7 +4654,7 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
 | マイグレーション 009〜012 | `test_apply_phase3_moves_files_and_extends_job_types`、`test_apply_phase3_keeps_other_recordings_when_meeting_id_equals_user_id` |
-| Phase 2 の回帰 | Phase 2 §23 の 87 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
+| Phase 2 の回帰 | Phase 2 §23 の 94 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
 
 ---
 
