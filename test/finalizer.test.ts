@@ -315,6 +315,23 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     expect(result).toMatchObject({ ok: false, stage: "verify" });
   });
 
+  it("GET /chunks の本文の読み取り中に timeoutMs を過ぎたら、壊れた応答ではなく network の失敗 Result を返す", async () => {
+    // Arrange: ヘッダは返るが本文が abort まで届かない
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    const hang = hangingFetch();
+    const bodyHangs: typeof fetch = (input, init) => {
+      if (!String(input).endsWith("/chunks")) return h.server.fetch(input, init);
+      const res = new Response(null, { status: 200 });
+      Object.defineProperty(res, "json", { value: () => hang.fetch(init) });
+      return Promise.resolve(res);
+    };
+    // Act
+    const result = await withFakeTimeout(() => finalizeMeeting({ ...deps(h, bodyHangs), timeoutMs: 20 }, MEETING_ID), hang.reached, 20);
+    // Assert
+    expect(result).toMatchObject({ ok: false, stage: "verify", reason: "network" });
+  });
+
   it("POST /finalize が応答しなければ timeoutMs で finalize の失敗 Result を返し、stop_requested に戻る", async () => {
     const h = await createHarness();
     await recordAndSave(h, 1);
