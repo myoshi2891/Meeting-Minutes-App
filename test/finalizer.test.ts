@@ -332,6 +332,33 @@ describe("finalizeMeeting（Finalization Barrier）", () => {
     expect(result).toMatchObject({ ok: false, stage: "verify", reason: "network" });
   });
 
+  it("GET /chunks の本文の読み取り中に接続が切れたら、壊れた応答ではなく network の失敗 Result を返す", async () => {
+    // Arrange: ヘッダは返るが、本文の読み取りが通信エラーで失敗する（abort ではない）
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    const bodyDrops: typeof fetch = (input, init) => {
+      if (!String(input).endsWith("/chunks")) return h.server.fetch(input, init);
+      const res = new Response(null, { status: 200 });
+      Object.defineProperty(res, "json", { value: () => Promise.reject(new TypeError("network error")) });
+      return Promise.resolve(res);
+    };
+    // Act
+    const result = await finalizeMeeting(deps(h, bodyDrops), MEETING_ID);
+    // Assert
+    expect(result).toMatchObject({ ok: false, stage: "verify", reason: "network" });
+  });
+
+  it("GET /chunks の本文が JSON として壊れていたら、network ではなく契約違反の verify 失敗 Result を返す", async () => {
+    // Arrange
+    const h = await createHarness();
+    await recordAndSave(h, 1);
+    const brokenJson: typeof fetch = async (input, init) => (String(input).endsWith("/chunks") ? new Response("{not json", { status: 200 }) : h.server.fetch(input, init));
+    // Act
+    const result = await finalizeMeeting(deps(h, brokenJson), MEETING_ID);
+    // Assert
+    expect(result).toEqual({ ok: false, stage: "verify", detail: "malformed ChunkListResponse" });
+  });
+
   it("POST /finalize が応答しなければ timeoutMs で finalize の失敗 Result を返し、stop_requested に戻る", async () => {
     const h = await createHarness();
     await recordAndSave(h, 1);
