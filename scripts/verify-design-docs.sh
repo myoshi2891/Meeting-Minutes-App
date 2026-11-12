@@ -9,16 +9,24 @@
 # Phase 1 の設計書は scripts/sync-design-code.mjs --check（src と一字一句一致）で確かめる。こちらは対象外。
 #
 # 前提: uv（サーバー側。検証用の仮想環境を作業ディレクトリに作り、PyPI から依存を入れる）、npm ci 済みの node_modules（クライアント側）
-# 作業ディレクトリは既定で一時ディレクトリ。VERIFY_DIR を指定すると残る（失敗の調査用）。
+# 作業ディレクトリは既定で一時ディレクトリで、終了時（失敗・中断を含む）に消す。VERIFY_DIR を指定すると残る（失敗の調査用）。
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WORK=${VERIFY_DIR:-$(mktemp -d)}
 TARGET=${1:-all}
 # 打ち間違いの対象で何も検査せずに OK と出さない
 case "$TARGET" in
   server|client|all) ;;
   *) echo "使い方: $0 [server|client|all]（不明な対象: ${TARGET}）" >&2; exit 2 ;;
 esac
+if [ -n "${VERIFY_DIR:-}" ]; then
+  WORK=$VERIFY_DIR   # 利用者が指定した作業ディレクトリは調査用に残す
+else
+  # 自前の一時ディレクトリは成功・失敗を問わず消す。node_modules はシンボリックリンクなので rm -rf は実体をたどらない
+  TMPWORK=$(mktemp -d)
+  WORK=$TMPWORK
+  trap 'rm -rf -- "${TMPWORK:?}"' EXIT
+  trap 'exit 130' INT TERM   # シグナルでも EXIT の trap を通す
+fi
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)   # 相対パスの VERIFY_DIR でも、下の cd 後に venv を指せるよう絶対パスにする
 extract() { python3 "$ROOT/scripts/extract-design-code.py" "$@"; }
@@ -26,7 +34,8 @@ echo "作業ディレクトリ: $WORK"
 status=0
 
 init_packages() {  # 設計書は空の __init__.py を載せていない（Phase 2 server §23.1）
-  find "$1/minutes_local" -type d -exec sh -c 'touch "$0/__init__.py"' {} \;
+  pkg_root=$1   # 展開先のディレクトリ（p2s / p3s）
+  find "$pkg_root/minutes_local" -type d -exec sh -c 'touch "$0/__init__.py"' {} \;
 }
 
 if [ "$TARGET" = server ] || [ "$TARGET" = all ]; then
