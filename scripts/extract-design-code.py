@@ -8,6 +8,7 @@
 --list は書き出さずに、パス・開始行・行数を表示する。
 未実装フェーズ（Phase 2 / 3）の設計書を、実際にコンパイル・テストして確かめるために使う（scripts/verify-design-docs.sh）。
 """
+import argparse
 import os
 import re
 import sys
@@ -18,12 +19,14 @@ HEAD = re.compile(r"^(?://|#) ((?:src|test|tests|minutes_local)/\S+|pyproject\.t
 
 
 def main() -> int:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    if len(args) != 2:
-        print(__doc__)
-        return 2
-    doc, out = args[0], os.path.realpath(args[1])
-    listing = "--list" in sys.argv
+    # 引数はファイルを開く前に解釈する。--help・不明なオプションは argparse が何も書き出さずに終了させる（終了コード 2）
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("doc", help="設計書（.md）")
+    parser.add_argument("out", help="出力先ディレクトリ")
+    parser.add_argument("--list", action="store_true", help="書き出さずに、パス・開始行・行数を表示する")
+    args = parser.parse_args()
+    doc, out = args.doc, os.path.realpath(args.out)
+    listing = args.list
     text = open(doc, encoding="utf-8").read()
     seen: dict[str, int] = {}
     for m in BLOCK.finditer(text):
