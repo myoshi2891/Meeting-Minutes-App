@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-12（PR #14 の 3 回目のレビュー指摘・SonarCloud の確認・未コミット、ブランチ `dev`。PR #13 までマージ済み）
+最終更新: 2026-11-12（PR #14 の 4 回目のレビュー指摘・未コミット、ブランチ `dev`。PR #13 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,20 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-12 の PR #14 の 3 回目の指摘の対応後：Phase 2 server 94 件・Phase 3 server 130 件・Phase 2 client 30 ファイル 542 件・Phase 3 client 34 ファイル 576 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-12 の PR #14 の 4 回目の指摘の対応後：Phase 2 server 97 件・Phase 3 server 133 件・Phase 2 client 30 ファイル 545 件・Phase 3 client 34 ファイル 579 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-12（PR #14 の 4 回目の指摘・未コミット）：CodeRabbit 8 件を検証し、すべて有効として修正した（スキップなし）。新規・変更テストは修正前に Red を確認（ルートの ACL 失敗時に配下へ触らないテストと Windows の st_mode のガードは、旧コードでも通る／mac では実行されない保存確認）。製品コード（`src/`・`test/`）は無変更。
+  - **Phase 2 / 3 client（SSE の保留）**：補完の途中で再接続したら、前の接続の保留を捨てずに新しい補完を始める前に流す（「前の保留 → 新しい補完 → 新しい保留」の時間順）。捨てると補完に含まれない `progress` と、新しい補完も失敗したときの status を失った。既存テスト 1 件の期待値を更新、回帰 1 件。Phase 2 サーバーは `progress` を送らない（Phase 3 は Live の 1 種だけ）ので、切断中に落ちた `progress` を補完する経路はない。
+  - **Phase 2 / 3 client（バックオフ）**：`FetchEventSource` は 200 を受けただけではバックオフを戻さない。`SSE_STABLE_MS`（30 秒、keep-alive 2 回分）切れずに続き、その間にデータを 1 回以上受け取った接続の後で戻す（判定タイマーは finally で止める）。回帰 1 件。
+  - **Phase 2 client（reducer）**：`meeting_loaded` で別の会議を開いたら会議ごとの状態（transcript・summary・jobs・progress・stale の印）を捨て、表示設定（backend・showRejected・confidenceDimBelow）は残す。transcript / summary の応答は表示中の会議と違えば捨て、版の比較は同じ会議の中だけで行う。**前回入れた版の比較の退行**（会議 A の v3 を表示中に B を開くと B の v1 を捨てた）を直したもの。回帰 1 件。
+  - **Phase 2 / 3 server（icacls）**：ルートを先に `/inheritance:r /grant:r *SID:(OI)(CI)F` で締め、既存の配下を名前順に 1 件ずつ `/reset`（ディレクトリは `/T`）。ルートには `/reset` も再帰もかけない（前回の「`/reset /T` を先に」は、再起動のたびに締めたルートを親の継承へ戻し、2 回目が失敗すると緩いまま残った）。**前回分を一部戻した**：ルート自身に付いた他の主体への明示 ACE は消えない（付けられるのは所有者か管理者だけで、ACL では防げない。docstring に記載）。テストを順序検証に変更、ルート失敗時に配下へ触らないテストを追加。
+  - **Phase 2 / 3 server（トークン）**：新規 `acquire_data_dir_lock()`（`data_dir/serve.lock` を flock / msvcrt で排他）。`serve` は migrate より前に取り、取れなければトークンを作り直さずに終了（別ポートの 2 つ目の `serve` が動いているサーバーのトークンを壊さない）。回帰 1 件。
+  - **Phase 2 / 3 server（移行した会議）**：新規 `sweeper.resume_finalized()`。`serve` の起動時に `finalized` のまま止まった会議（Phase 1 で確定した会議、Phase 3 の `doctor --rebuild` が復元した会議）へ `on_finalized` を呼ぶ（`transcribing` に進むので 2 回目は拾わない。`insert_job` は冪等）。Phase 3 では diarize が既定の False になる。回帰 1 件。
+  - **Phase 2 server（テスト）**：トークンの st_mode の assert を Windows 以外に限定、Unix 用の restrict のテストは Windows で skip。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過・Phase 1 埋め込み同期一致。`verify-design-docs.sh all`：Phase 2 server 97 件・Phase 3 server 133 件・Phase 2 client 545 件・Phase 3 client 579 件、pyflakes 指摘なし。設計書冒頭の件数も実測値に更新。
+  - 残り：icacls・msvcrt のロックは Windows 実機で未確認。SonarCloud の S8707 3 件は前回の判断待ちのまま。
 
 - 2026-11-12（PR #14 の 3 回目の指摘・未コミット）：CodeRabbit 5 件を検証し、すべて有効として修正した（スキップなし）。新規・変更テスト 3 件はすべて修正前に Red を確認。製品コード（`src/`・`test/`）は無変更。
   - **Phase 2 client §15.3**：Step 2-d2 の W8 が `NotesStore` を生成するのに、§10 NotesStore は後の 2-g1 にあった。§10 と `notes-store.test.ts` を 2-d2 へ移し、2-g1 はノートの編集 UI（D2 の決定後）だけにした（§15.2「W1〜W8 は D2 を待たずに進められる」と一致）。
