@@ -4,7 +4,7 @@
 **上位文書:** Phase 3 詳細設計書 ── サーバー側（`docs/design-local-phase3-server.md`）§2 の設計判断と §20 の API。
 **配置:** `docs/design-local-phase3-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** Phase 1・2 と同じ（ブラウザ標準 API と TypeScript のみ、UI フレームワーク非依存の状態モデル）。
-**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 34 ファイル 584 件（Phase 1・2 の 30 ファイル 549 件を含む）が全件通過することを確認している（2026-11-12、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
+**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 35 ファイル 592 件（Phase 1・2 の 31 ファイル 557 件を含む）が全件通過することを確認している（2026-11-13、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
 
 ---
 
@@ -189,7 +189,7 @@ export function decodeUserMeResponse(value: unknown): UserMeResponse | null {
 }
 
 /**
- * 会議詳細は Phase 2 の MeetingDetailResponse を継承する。Phase 2 側に型ガードは存在せず、
+ * 会議詳細は Phase 2 の MeetingDetailResponse を継承する。Phase 2 側のデコーダ（decodeMeetingDetail）は Phase 3 の追加フィールドを見ず、
  * §1 の通り contracts-phase2.ts は変更しないので、ここでは Phase 3 のクライアントコードが
  * 実際に読むフィールドを検証する。`status` と `latestSummaryVersion` は §4 の backfill() が
  * そのまま MeetingEvent に載せて配信するため、未検証のまま通すと壊れた値が

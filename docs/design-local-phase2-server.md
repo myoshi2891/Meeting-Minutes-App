@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── ブラウザ側（`docs/design-local-phase2-client.md`）。
 **配置:** `docs/design-local-phase2-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。
-**検証状態:** 本書のコードブロック（58 ファイル：`pyproject.toml`・実装 46・テスト 11）はパッケージとして抽出でき、Fake Provider による pytest 11 ファイル 100 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
+**検証状態:** 本書のコードブロック（61 ファイル：`pyproject.toml`・実装 47・テスト 13）はパッケージとして抽出でき、Fake Provider による pytest 13 ファイル 128 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-13、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。Fake Provider のテストが通らない経路（実行デバイスの選定、faster-whisper の呼び出し、プロセスプールの作り直し、起動後のモデルの選び直し、モデルの取得、SSE の keepalive）は §23.8.2 がスタブと実プロセスで確かめる。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
 
 ---
 
@@ -99,7 +99,11 @@ testpaths = ["tests"]
 | 同期 `sqlite3` を asyncio ループ内で呼ぶことによるブロッキング | 1 トランザクションは数 ms だが、`VACUUM INTO` 等は長い | 書き込みは短いトランザクションに限定。長い処理（バックアップ）は `asyncio.to_thread` |
 | Ollama の `format` パラメータに JSON Schema を渡せる | Ollama のバージョンに依存（0.5 以降） | `GET /api/version` を起動時に記録。古い場合は `format: "json"` にフォールバックし、Schema Validation で吸収 |
 | faster-whisper の `word_timestamps=True` が全モデルで動く | CTranslate2 のアラインメントヘッドに依存 | 例外時は `word_timestamps=False` で再試行（同一ジョブ内） |
-| CUDA OOM が `RuntimeError` として捕捉できる | CTranslate2 / torch のバージョンで例外型が異なる | メッセージに `out of memory` / `CUDA` を含む例外を `OOMError` に正規化（§13） |
+| CUDA OOM が `RuntimeError` として捕捉できる | CTranslate2 / torch のバージョンで例外型が異なる | メッセージに `out of memory` / `cuda error` / `cublas` を含む例外を `OOMError` に正規化（§11 `is_oom_message`）。`CUDA` という語だけでは OOM にしない（非対応ビルド・ドライバ未導入は、モデルを落としても直らない） |
+| 固まった・落ちた STT ワーカーを止められる | `ProcessPoolExecutor` は実行中のタスクを cancel できず、ワーカーを止める公開 API は Python 3.14 の `kill_workers()` から。それより前は非公開の `_processes` を使う | タイムアウトとワーカーの異常終了でプールを作り直す（§16.2）。§23.8.2 が実プロセスで確かめるので、Python の版を上げて動かなくなればテストが落ちる |
+| ワーカーの突然死の原因がメモリ不足である | OS の kill とネイティブ層のクラッシュを親プロセスから区別できない | 最初に気づいたジョブを `OOM` として 1 段落とす（§16.2）。別の原因なら最小モデルまで落ちた後に `failed` になり、`last_error` に残る |
+| モデル配布元のファイル構成とリダイレクト先 | 配布元（Hugging Face）の都合で変わる。2026-11-13 に確認した内容を §10.2 に固定している | 変わると取得は失敗として `GET /v1/models` の `downloads` に理由つきで出る（許可外のホストへは要求を出さない）。黙って別のホストへ通信することはない |
+| 起動後に Ollama・モデルが使えるようになる時期 | 利用者の操作順による（サーバーを先に起動する・後から `ollama pull` する） | 選定を起動時に固定せず、必要な時点で選び直す（§13.1 `jobs/selection.py`） |
 
 ---
 
@@ -985,6 +989,18 @@ def retry_job(conn: sqlite3.Connection, job_id: str) -> bool:
     return cur.rowcount == 1
 
 
+def delete_finished_job(conn: sqlite3.Connection, meeting_id: str, job_type: JobType) -> None:
+    """会議単位のジョブ（merge / summary）のうち終端のものを消す。次の insert_job が作り直せるようにする。
+
+    会議単位のジョブは一意制約で 1 行しか持てない。完了済みの行が残っていると、後から Chunk が増減しても
+    ensure_merge_job の insert_job が「既存」で何もせず、transcript が作り直されない。
+    """
+    conn.execute(
+        "DELETE FROM processing_jobs WHERE meeting_id = ? AND job_type = ? AND status IN ('completed','failed','cancelled')",
+        (meeting_id, job_type),
+    )
+
+
 def reset_job_for_rerun(conn: sqlite3.Connection, meeting_id: str, job_type: JobType) -> None:
     """merge / summary の再実行：同じ行を pending に戻す（基本設計 §8.5）。"""
     conn.execute(
@@ -1176,6 +1192,8 @@ def record_metric(conn: sqlite3.Connection, metric: str, amount: float, *, model
 
 基本設計 §7.1〜§7.2 の実装。検出は失敗しても例外を上げず、保守的な区分（`cpu_only`）に落ちる。
 
+**区分（`tier`）と実行デバイス（`device`）は別のもの**として扱う。区分は「どの大きさのモデルを候補にするか」で、Apple Silicon は物理メモリから `gpu_*` になる。実行デバイスは「faster-whisper をどこで動かすか」で、CUDA があるときだけ `cuda`、それ以外（Apple Silicon・GPU なし）は `cpu` の `int8` になる（基本設計 §7.2。faster-whisper は Metal を使わない）。`SttCandidate.device` が `STTRequest.device` を経て `WhisperModel(device=...)` まで届く。`compute_type` から `device` を推測する箇所を作らない（`int8` は CUDA でも CPU でも動くので推測できない）。
+
 ```python
 # minutes_local/hw/detect.py
 """起動時のハードウェア検出。すべての検出は失敗時にフォールバック値を返す。"""
@@ -1266,13 +1284,14 @@ def detect(data_dir: Path) -> Hardware:
 """基本設計 §7.2 の区分表とモデル選定規則。数値は候補を絞る閾値であり精度の保証ではない。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from .detect import Hardware
 
 Tier = Literal["gpu_large", "gpu_medium", "gpu_small", "cpu_only"]
 GIB = 1024 ** 3
+CPU_COMPUTE_TYPE = "int8"
 
 
 @dataclass(frozen=True)
@@ -1280,6 +1299,7 @@ class SttCandidate:
     name: str
     compute_type: str
     estimated_memory_bytes: int
+    device: str = "cpu"     # "cuda" | "cpu"。compute_type からは推測しない（int8 は CUDA でも CPU でも動く）
 
 
 @dataclass(frozen=True)
@@ -1291,19 +1311,19 @@ class LlmCandidate:
 # 優先順。installed かつ予算内の最初のものを採用する。
 STT_CANDIDATES: dict[Tier, tuple[SttCandidate, ...]] = {
     "gpu_large": (
-        SttCandidate("large-v3", "float16", 3 * GIB),
-        SttCandidate("medium", "float16", int(1.5 * GIB)),
-        SttCandidate("small", "float16", int(0.6 * GIB)),
+        SttCandidate("large-v3", "float16", 3 * GIB, "cuda"),
+        SttCandidate("medium", "float16", int(1.5 * GIB), "cuda"),
+        SttCandidate("small", "float16", int(0.6 * GIB), "cuda"),
     ),
     "gpu_medium": (
-        SttCandidate("medium", "int8_float16", 1 * GIB),
-        SttCandidate("small", "int8_float16", int(0.5 * GIB)),
-        SttCandidate("base", "int8_float16", int(0.3 * GIB)),
+        SttCandidate("medium", "int8_float16", 1 * GIB, "cuda"),
+        SttCandidate("small", "int8_float16", int(0.5 * GIB), "cuda"),
+        SttCandidate("base", "int8_float16", int(0.3 * GIB), "cuda"),
     ),
     "gpu_small": (
-        SttCandidate("small", "int8", int(0.5 * GIB)),
-        SttCandidate("base", "int8", int(0.3 * GIB)),
-        SttCandidate("tiny", "int8", int(0.15 * GIB)),
+        SttCandidate("small", "int8", int(0.5 * GIB), "cuda"),
+        SttCandidate("base", "int8", int(0.3 * GIB), "cuda"),
+        SttCandidate("tiny", "int8", int(0.15 * GIB), "cuda"),
     ),
     "cpu_only": (
         SttCandidate("base", "int8", int(0.3 * GIB)),
@@ -1348,23 +1368,35 @@ def max_concurrent_stt(tier: Tier, cpu_cores: int) -> int:
     return 1
 
 
-def select_stt(tier: Tier, installed: set[str], budget_bytes: int | None, forced: str | None) -> SttCandidate | None:
-    """installed かつ予算内の最初の候補。forced は予算を無視して採用（警告は呼び出し側）。"""
+def for_backend(c: SttCandidate, backend: str | None) -> SttCandidate:
+    """候補を実行デバイスに合わせる。CUDA 以外（Apple Silicon・GPU なし）は CPU の int8（基本設計 §7.2）。
+
+    faster-whisper（CTranslate2）は Metal を使わない。区分表の device="cuda" と float16 / int8_float16 を
+    そのまま渡すと、Apple Silicon ではモデルのロードが必ず失敗する（区分は物理メモリで gpu_* になる）。
+    """
+    if backend == "cuda":
+        return c
+    return replace(c, device="cpu", compute_type=CPU_COMPUTE_TYPE)
+
+
+def select_stt(tier: Tier, installed: set[str], budget_bytes: int | None, forced: str | None,
+               backend: str | None) -> SttCandidate | None:
+    """installed かつ予算内の最初の候補。forced は予算を無視して採用（警告は呼び出し側）。backend は Hardware.gpu.backend。"""
     candidates = STT_CANDIDATES[tier]
     if forced is not None:
         for c in candidates:
             if c.name == forced and forced in installed:
-                return c
+                return for_backend(c, backend)
         # 区分外のモデルが強制指定された場合も候補として返す
         if forced in installed:
-            return SttCandidate(forced, candidates[-1].compute_type, 0)
+            return for_backend(SttCandidate(forced, candidates[-1].compute_type, 0, candidates[-1].device), backend)
         return None
     for c in candidates:
         if c.name not in installed:
             continue
         if budget_bytes is not None and c.estimated_memory_bytes > budget_bytes:
             continue
-        return c
+        return for_backend(c, backend)
     return None
 
 
@@ -1517,20 +1549,39 @@ def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = N
 
 基本設計 §7.4。`httpx` を使う 2 モジュールのうちの 1 つ。allowlist 外のホストには接続しない。
 
+| 規則 | 内容 |
+| --- | --- |
+| 取得するファイル | モデルごとに違う（`whisper_files`）。`large-v3` だけ `vocabulary.json` と `preprocessor_config.json` を持つ |
+| 順序 | `model.bin` を最後に取る。配置済みの判定は `model.bin` の有無なので、途中で失敗したモデルが配置済みに見えない |
+| リダイレクト | 1 段ずつ自前でたどり、要求を出す前に行き先を allowlist（https のみ）で確かめる。最大 5 段 |
+| 結果の伝え方 | `ModelDownloads`（`AppContext.downloads`）に状態を持ち、`GET /v1/models` の `downloads` で返す。失敗（許可外のホストを含む）は理由つきの `failed` |
+| 取得後 | `refresh_stt` で選定に入れる。再起動は要らない |
+
+基本設計 §7.4 の「ダウンロード中は `/v1/health.status = "degraded"`」は本書では実装していない（Phase 1 のクライアントが `degraded` をどう扱うかの確認が先。§26 の残課題）。
+
 ```python
 # minutes_local/storage/models_dir.py
 """モデルファイルの配置確認と、明示操作によるダウンロード（Zero External Data Egress の唯一の例外）。"""
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
 WHISPER_MODELS = ("tiny", "base", "small", "medium", "large-v3")
-# faster-whisper の CTranslate2 モデル配布元。実装時に配布元 CDN の変更を確認する（基本設計 §28）。
-DOWNLOAD_ALLOWLIST: frozenset[str] = frozenset({"huggingface.co", "cdn-lfs.huggingface.co", "cdn-lfs-us-1.huggingface.co"})
+# faster-whisper の CTranslate2 モデル配布元（Systran/faster-whisper-*）と、そのリダイレクト先。
+# 2026-11-13 に確認：huggingface.co の resolve/main/model.bin は us.aws.cdn.hf.co へ 302 する。cdn-lfs* は以前の配布先。
+# 配布元が CDN を変えると、取得は「許可外のホスト」として失敗する（黙って通さない）。そのときはここに足す（基本設計 §28）。
+DOWNLOAD_ALLOWLIST: frozenset[str] = frozenset({
+    "huggingface.co", "us.aws.cdn.hf.co", "cdn-lfs.huggingface.co", "cdn-lfs-us-1.huggingface.co",
+})
+MAX_REDIRECTS = 5
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
 class DisallowedHostError(RuntimeError):
@@ -1539,6 +1590,19 @@ class DisallowedHostError(RuntimeError):
 
 def whisper_model_dir(models_dir: Path, name: str) -> Path:
     return models_dir / "whisper" / name
+
+
+def whisper_files(name: str) -> tuple[str, ...]:
+    """モデルごとの取得ファイル（2026-11-13 に配布元のファイル一覧で確認）。model.bin は必ず最後。
+
+    large-v3 だけ語彙が vocabulary.json で、preprocessor_config.json（メル 128 本）を持つ。これがないと
+    faster-whisper は 80 本の既定値で特徴量を作り、モデルと合わない。
+    配置済みの判定は model.bin の有無（installed_whisper_models）なので、model.bin を最後に取れば、
+    途中で失敗したモデルが配置済みに見えることがない。
+    """
+    if name == "large-v3":
+        return ("config.json", "tokenizer.json", "vocabulary.json", "preprocessor_config.json", "model.bin")
+    return ("config.json", "tokenizer.json", "vocabulary.txt", "model.bin")
 
 
 def installed_whisper_models(models_dir: Path) -> set[str]:
@@ -1556,37 +1620,93 @@ def silero_model_path(models_dir: Path) -> Path | None:
 
 
 def assert_allowed_host(url: str) -> None:
-    host = urlparse(url).hostname or ""
-    if host not in DOWNLOAD_ALLOWLIST:
-        raise DisallowedHostError(f"download host not allowed: {host}")
+    """https かつ allowlist のホストだけを通す。"""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if parsed.scheme != "https" or host not in DOWNLOAD_ALLOWLIST:
+        raise DisallowedHostError(f"download url not allowed: {parsed.scheme}://{host}")
 
 
 def download_file(url: str, dest: Path, *, client: httpx.Client | None = None,
                   progress: Callable[[int, int | None], None] | None = None) -> Path:
-    """allowlist 検査 → .part にストリーム書き込み → rename。会議データは一切送らない。"""
-    assert_allowed_host(url)
+    """allowlist 検査 → .part にストリーム書き込み → rename。会議データは一切送らない（ヘッダも本文も付けない）。
+
+    リダイレクトは httpx に任せず 1 段ずつたどり、**要求を出す前に**行き先を allowlist で確かめる。
+    任せると、許可外のホストへ要求を出した後でしか行き先を検査できない（外向き通信の例外を allowlist の外へ広げる）。
+    失敗したら .part を消す。
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
     own_client = client is None
-    c = client or httpx.Client(follow_redirects=True, timeout=60.0)
+    c = client or httpx.Client(timeout=60.0)
     try:
-        with c.stream("GET", url) as r:
-            r.raise_for_status()
-            # リダイレクト先も allowlist に含まれることを確認する
-            assert_allowed_host(str(r.url))
-            total = int(r.headers.get("content-length", "0")) or None
-            done = 0
-            with part.open("wb") as f:
-                for block in r.iter_bytes(1024 * 1024):
-                    f.write(block)
-                    done += len(block)
-                    if progress is not None:
-                        progress(done, total)
-        part.replace(dest)
-        return dest
+        current = url
+        for _ in range(MAX_REDIRECTS + 1):
+            assert_allowed_host(current)
+            with c.stream("GET", current, follow_redirects=False) as r:
+                if r.status_code in REDIRECT_STATUSES:
+                    location = r.headers.get("location")
+                    if not location:
+                        raise RuntimeError(f"redirect without Location from {urlparse(current).hostname}")
+                    current = urljoin(current, location)
+                    continue
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", "0")) or None
+                done = 0
+                with part.open("wb") as f:
+                    for block in r.iter_bytes(1024 * 1024):
+                        f.write(block)
+                        done += len(block)
+                        if progress is not None:
+                            progress(done, total)
+            part.replace(dest)
+            return dest
+        raise RuntimeError(f"too many redirects (> {MAX_REDIRECTS})")
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
     finally:
         if own_client:
             c.close()
+
+
+@dataclass
+class DownloadState:
+    name: str
+    status: str                 # "running" | "completed" | "failed"
+    error: str | None = None
+
+
+class ModelDownloads:
+    """明示操作で始めたモデル取得の状態（AppContext.downloads）。GET /v1/models が返す。
+
+    SSE は会議単位の購読しかなく、取得の結果を届ける先がない。状態として持ち、設定画面が GET /v1/models を
+    取り直して見る。タスクの参照もここで持つ（asyncio は実行中のタスクを弱参照でしか持たず、参照がないと途中で消えうる）。
+    """
+
+    def __init__(self) -> None:
+        self._states: dict[str, DownloadState] = {}
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+
+    def is_running(self, name: str) -> bool:
+        return name in self._tasks
+
+    def start(self, name: str, work: Coroutine[Any, Any, None]) -> None:
+        """work は自分で finish() を呼んで終わること（例外を外へ出さない）。"""
+        self._states[name] = DownloadState(name, "running")
+        task = asyncio.create_task(work)
+        self._tasks[name] = task
+        task.add_done_callback(lambda _t: self._tasks.pop(name, None))
+
+    def finish(self, name: str, error: str | None) -> None:
+        self._states[name] = DownloadState(name, "failed" if error is not None else "completed", error)
+
+    def view(self) -> list[dict[str, Any]]:
+        return [{"name": s.name, "status": s.status, "error": s.error} for _, s in sorted(self._states.items())]
+
+    async def wait(self) -> None:
+        """進行中の取得がすべて終わるまで待つ（テスト・終了処理用）。"""
+        await asyncio.gather(*list(self._tasks.values()))
 ```
 
 ---
@@ -1661,13 +1781,22 @@ def backoff_ms(attempts: int, rng: random.Random | None = None) -> int:
     return int(base + (r.random() * 2 - 1) * 0.2 * base)
 
 
+def is_oom_message(message: str) -> bool:
+    """メモリ不足を示す例外メッセージか（§3）。Provider と normalize_exception が同じ規則で判定する。
+
+    「cuda」という語だけでは OOM にしない。CUDA 非対応のビルド・ドライバ未導入は、モデルを 1 段落としても直らない
+    （OOM にすると tiny まで落とし続けたうえで失敗する）。
+    """
+    lowered = message.lower()
+    return "out of memory" in lowered or "cuda error" in lowered or "cublas" in lowered
+
+
 def normalize_exception(exc: BaseException) -> JobError:
     """任意の例外を JobError に正規化する。CUDA OOM はメッセージで判定（§3）。"""
     if isinstance(exc, JobError):
         return exc
     msg = str(exc)
-    lowered = msg.lower()
-    if "out of memory" in lowered or "cuda error" in lowered or "cublas" in lowered:
+    if is_oom_message(msg):
         return OOMError(msg)
     if isinstance(exc, TimeoutError):
         return JobTimeoutError(msg or "timeout")
@@ -1816,16 +1945,11 @@ def request_regenerate_summary(conn: sqlite3.Connection, meeting_id: str) -> Non
 
 def request_rerun_stt(conn: sqlite3.Connection, meeting_id: str, stt_model: str | None) -> int:
     """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。"""
-    conn.execute(
-        "UPDATE processing_jobs SET status = 'cancelled' WHERE meeting_id = ? AND status IN ('pending','retrying','failed','leased','processing')",
-        (meeting_id,),
-    )
+    # ジョブは行ごと消す。実行中のハンドラは lease の検査（行がない）で結果を書けなくなる（§8 lease_is_current）
     conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ?", (meeting_id,))
-    n = 0
     for chunk in repo.list_chunks(conn, meeting_id):
         repo.delete_segments_of_chunk(conn, chunk.id)
         repo.update_chunk(conn, chunk.id, stt_status="pending")
-        n += 1
     repo.update_meeting(conn, meeting_id, stt_model_used=stt_model, status="transcribing")
     return on_finalized(conn, meeting_id)
 
@@ -1860,6 +1984,7 @@ from ..hw.detect import Hardware
 from ..hw.tiers import SttCandidate, Tier
 from ..llm.provider import SummaryProvider
 from ..stt.executor import STTExecutor
+from ..storage.models_dir import ModelDownloads
 from ..vad.provider import VADProvider
 from .events import EventBroker
 
@@ -1886,6 +2011,7 @@ class AppContext:
     vad: VADProvider | None
     llm: SummaryProvider
     events: EventBroker = field(default_factory=lambda: EventBroker())
+    downloads: ModelDownloads = field(default_factory=lambda: ModelDownloads())   # モデル取得の状態（§10.2）
     server_version: str = "0.2.0"
 ```
 
@@ -1914,17 +2040,92 @@ class EventBroker:
                     pass
             q.put_nowait(event)
 
-    async def subscribe(self, meeting_id: str) -> AsyncIterator[dict[str, Any]]:
+    def attach(self, meeting_id: str) -> asyncio.Queue[dict[str, Any]]:
+        """購読を始め、イベントが届くキューを返す。使い終わったら必ず detach() する。
+
+        タイムアウト付きで待つ側（SSE の keepalive）はこちらを使う。`wait_for(q.get())` はキャンセルしても
+        キューが残るが、subscribe() の `__anext__()` をキャンセルするとジェネレータごと終わる。
+        """
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(self._max_queue)
         self._subs.setdefault(meeting_id, set()).add(q)
+        return q
+
+    def detach(self, meeting_id: str, q: asyncio.Queue[dict[str, Any]]) -> None:
+        subs = self._subs.get(meeting_id)
+        if subs is None:
+            return
+        subs.discard(q)
+        if not subs:
+            del self._subs[meeting_id]   # 開いた会議の数だけ空の集合が残らないようにする
+
+    async def subscribe(self, meeting_id: str) -> AsyncIterator[dict[str, Any]]:
+        """タイムアウトなしで順に受け取る用（テスト・内部利用）。`__anext__()` を wait_for で包まないこと。"""
+        q = self.attach(meeting_id)
         try:
             while True:
                 yield await q.get()
         finally:
-            self._subs[meeting_id].discard(q)
+            self.detach(meeting_id, q)
 
     def subscriber_count(self, meeting_id: str) -> int:
         return len(self._subs.get(meeting_id, ()))
+```
+
+`ModelSelection` は起動時に 1 回作るだけでは足りない。サーバーの起動後に変わるもの（後から起動した Ollama、後から配置・取得した Whisper モデル、`PUT /v1/settings` の変更）を選び直す関数を `jobs/selection.py` に置く。呼ぶ場所は次のとおり。
+
+| 関数 | 呼ぶ場所 | 理由 |
+| --- | --- | --- |
+| `select_models` | `build_context`（起動時） | 最初の選定 |
+| `refresh_stt` | `handle_transcribe`（`models.stt` が `None` のとき）、モデル取得の完了時、`PUT /v1/settings`（`sttModel` を変えたとき）、`GET /v1/models` | モデル未配置で `MODEL_MISSING` の待機に入ったジョブが、配置後の再試行で進む |
+| `refresh_llm` | `handle_summary`（毎回）、`PUT /v1/settings`（`llmModel` を変えたとき）、`GET /v1/models` | Ollama をサーバーより後に起動しても、`PROVIDER_UNREACHABLE` の待機から再起動なしで進む |
+
+`max_concurrent_stt` と `tier` は選び直さない（Runner とプロセスプールの本数は起動時に決まる。ハードウェアは変わらない）。
+
+```python
+# minutes_local/jobs/selection.py
+"""モデルの選定（起動時）と選び直し（起動後）。基本設計 §5.3・§7.2。"""
+from __future__ import annotations
+
+from ..config import Settings
+from ..hw import tiers
+from ..hw.detect import Hardware
+from ..storage.models_dir import installed_whisper_models
+from .context import AppContext, ModelSelection
+
+
+def _select_stt(settings: Settings, hw: Hardware, tier: tiers.Tier, installed: set[str]) -> tiers.SttCandidate | None:
+    budget = hw.gpu.vram_bytes if hw.gpu.available else hw.total_memory_bytes // 2
+    return tiers.select_stt(tier, installed, budget, settings.stt_model, hw.gpu.backend)
+
+
+def select_models(settings: Settings, hw: Hardware, available_llm: list[str], ollama_reachable: bool) -> ModelSelection:
+    tier = tiers.classify(hw)
+    installed = installed_whisper_models(settings.models_dir)
+    stt = _select_stt(settings, hw, tier, installed)
+    llm = tiers.select_llm(tier, available_llm, settings.llm_model)
+    return ModelSelection(
+        tier=tier, stt=stt, llm=llm, installed_stt=installed, available_llm=available_llm,
+        ollama_reachable=ollama_reachable,
+        max_concurrent_stt=settings.max_concurrent_stt or tiers.max_concurrent_stt(tier, hw.cpu_cores),
+        allow_concurrent_stt_and_llm=tiers.allow_concurrent_stt_and_llm(tier, hw, stt, None),
+    )
+
+
+def refresh_stt(ctx: AppContext) -> None:
+    """配置済みの Whisper モデルを読み直し、STT モデルを選び直す（ctx.models をその場で書き換える）。"""
+    m = ctx.models
+    m.installed_stt = installed_whisper_models(ctx.settings.models_dir)
+    m.stt = _select_stt(ctx.settings, ctx.hardware, m.tier, m.installed_stt)
+    m.allow_concurrent_stt_and_llm = tiers.allow_concurrent_stt_and_llm(m.tier, ctx.hardware, m.stt, None)
+
+
+async def refresh_llm(ctx: AppContext) -> None:
+    """Provider のモデル一覧を取り直し、LLM を選び直す。届かなければ ollama_reachable を False にする。"""
+    listed = await ctx.llm.list_models()
+    m = ctx.models
+    m.ollama_reachable = listed is not None
+    m.available_llm = listed or []
+    m.llm = tiers.select_llm(m.tier, m.available_llm, ctx.settings.llm_model)
 ```
 
 ## 13.2 Runner
@@ -2050,7 +2251,7 @@ class JobRunner:
             if not d.consume_attempt:
                 conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
             if err.error_class == "OOM" and job.job_type == "transcribe_chunk":
-                self._downgrade_stt(conn, job.meeting_id)
+                self._downgrade_stt(conn, job.meeting_id, job.model_name)
             if d.next_status == "failed":
                 if job.job_type == "transcribe_chunk":
                     pipeline.on_transcribe_failed(conn, pipeline.job_of_chunk(conn, job))
@@ -2062,14 +2263,23 @@ class JobRunner:
             repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
         self._publish_job(job.id)
 
-    def _downgrade_stt(self, conn, meeting_id: str) -> None:  # type: ignore[no-untyped-def]
-        """会議単位でモデルを 1 段落とす（基本設計 §7.3）。"""
+    def _downgrade_stt(self, conn, meeting_id: str, ran_with: str | None) -> None:  # type: ignore[no-untyped-def]
+        """会議単位でモデルを 1 段落とす（基本設計 §7.3）。ran_with は失敗したジョブが使ったモデル（lease 時点の model_name）。
+
+        落とすのは「モデル 1 つにつき 1 段」。同じモデルで並行して走っていた 2 件がどちらも OOM になっても、
+        2 件目は既に落とした後なので何もしない（失敗 1 件につき 1 段にすると small → tiny まで落ちる）。
+        落とす先は配置済みのモデルに限る（未配置の段を選ぶと MODEL_MISSING で待ち続ける）。
+        """
         from ..hw.tiers import downgrade_stt
         m = repo.get_meeting(conn, meeting_id)
         current = (m.stt_model_used if m and m.stt_model_used else (self.ctx.models.stt.name if self.ctx.models.stt else None))
         if current is None:
             return
+        if ran_with is not None and ran_with != current:
+            return
         nxt = downgrade_stt(current)
+        while nxt is not None and nxt not in self.ctx.models.installed_stt:
+            nxt = downgrade_stt(nxt)
         if nxt is None:
             return
         repo.update_meeting(conn, meeting_id, stt_model_used=nxt)
@@ -2241,6 +2451,7 @@ class STTRequest:
     beam_size: int = 5
     word_timestamps: bool = True
     initial_prompt: str | None = None
+    device: str = "cpu"             # "cuda" | "cpu"。SttCandidate.device をそのまま渡す（§9）
 
 
 @dataclass(frozen=True)
@@ -2307,9 +2518,30 @@ class FakeSTTProvider(STTProvider):
                 continue
             out.append(STTSegment(start / 32000, end / 32000, f"{req.model_name}-seg{i}", -0.2, 0.05))
         return out
+
+
+def probe_in_worker(req: STTRequest) -> STTResult:
+    """PoolExecutor のテスト用のワーカー関数（§23.8.2）。model_name で挙動を選ぶ。
+
+    spawn したプロセスが import できるよう、テストファイルではなくパッケージ内のトップレベルに置く。
+    """
+    import os
+    import time
+    if req.model_name == "hang":
+        time.sleep(60)          # 固まった推論
+    if req.model_name == "die":
+        os._exit(1)             # OS に殺された・ネイティブ層で落ちた
+    return STTResult(segments=(), language=None, model_name=req.model_name)
 ```
 
 ## 16.2 Executor（プロセスプールと inline）
+
+`PoolExecutor` はプールを作り直せる（基本設計 §5.1「STT がクラッシュしても API は生き残るが、プールの再生成が必要」）。作り直すのはタイムアウトとワーカーの異常終了の 2 つで、どちらも放置すると以後の STT が進まない。ジョブから見た結果は次のとおり。
+
+| 起きたこと | このジョブの結果 | 同じプールで走っていた他のジョブ |
+| --- | --- | --- |
+| タイムアウト | `TIMEOUT`（`handle_transcribe` が `JobTimeoutError` にする）。プールを作り直す | `INTERNAL`（巻き込まれただけ。モデルは落とさない） |
+| ワーカーの異常終了 | 最初に気づいたジョブが `OOM`（1 段落として再試行）。プールを作り直す | `INTERNAL` |
 
 ```python
 # minutes_local/stt/executor.py
@@ -2317,9 +2549,12 @@ class FakeSTTProvider(STTProvider):
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Protocol
 
+from ..jobs.retry import JobError, OOMError
 from .provider import STTProvider, STTRequest, STTResult
 
 
@@ -2342,21 +2577,74 @@ class InlineExecutor:
 
 
 class PoolExecutor:
-    """faster-whisper をワーカープロセスで実行する（基本設計 §5.1）。ワーカーは DB を触らない。"""
+    """faster-whisper をワーカープロセスで実行する（基本設計 §5.1）。ワーカーは DB を触らない。
 
-    def __init__(self, max_workers: int) -> None:
+    プールは壊れたら作り直す（基本設計 §5.1「プールの再生成が必要」）。作り直すのは次の 2 つの場合：
+    - タイムアウト：実行中のタスクは cancel できない。放置すると固まった推論がワーカーと GPU を握り続け、
+      ワーカーが 1 本なら後続のジョブも順番待ちのままタイムアウトする。
+    - ワーカーの異常終了（OS のメモリ不足による kill、ネイティブ層のクラッシュ）：ProcessPoolExecutor は
+      BrokenProcessPool になり、以後の submit がすべて失敗する。
+    作り直しは同じプールを使っていた他のジョブも巻き込む（max_workers が 2 のとき）。巻き込まれた側は
+    原因ではないので OOM にせず、通常の再試行（INTERNAL）にする。
+    """
+
+    def __init__(self, max_workers: int, fn: Callable[[STTRequest], STTResult] | None = None) -> None:
+        if fn is None:
+            from .worker import transcribe_in_worker
+            fn = transcribe_in_worker
+        self._fn = fn                    # spawn で渡すので、モジュールのトップレベル関数であること
+        self._max_workers = max_workers
+        self._pool = self._new_pool()
+        self.recycle_count = 0           # 作り直した回数（doctor・テスト用）
+
+    def _new_pool(self) -> ProcessPoolExecutor:
         import multiprocessing as mp
-        from .worker import transcribe_in_worker
-        self._fn = transcribe_in_worker
-        self._pool = ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn"))
+        return ProcessPoolExecutor(max_workers=self._max_workers, mp_context=mp.get_context("spawn"))
 
     async def transcribe(self, req: STTRequest, timeout_s: float) -> STTResult:
+        pool = self._pool
         loop = asyncio.get_running_loop()
-        fut = loop.run_in_executor(self._pool, self._fn, req)
-        return await asyncio.wait_for(fut, timeout=timeout_s)
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(pool, self._fn, req), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            self._recycle(pool)
+            raise                        # 呼び出し側（handle_transcribe）が JobTimeoutError にする
+        except BrokenProcessPool as e:
+            if not self._recycle(pool):
+                # 他のジョブのタイムアウト・異常終了で作り直された。このジョブは原因ではない
+                raise JobError("stt worker pool was restarted while this job was running") from e
+            # 最初に気づいたジョブを原因として扱う。ワーカーの突然死の大半はメモリ不足なので、1 段落として再試行する
+            raise OOMError("stt worker process died (killed by the OS or crashed)") from e
+
+    def _recycle(self, pool: ProcessPoolExecutor) -> bool:
+        """pool が現行なら止めて作り直し True。他の呼び出しが作り直し済みなら何もせず False。"""
+        if pool is not self._pool:
+            return False
+        self._pool = self._new_pool()
+        self.recycle_count += 1
+        _stop_pool(pool)
+        return True
 
     def shutdown(self) -> None:
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        _stop_pool(self._pool)           # 推論の途中でもサーバーの終了を待たせない（未完了のジョブは次の起動で Sweeper が戻す）
+
+
+def _stop_pool(pool: ProcessPoolExecutor) -> None:
+    """ワーカープロセスを止めてからプールを閉じる。shutdown(cancel_futures=True) は実行中のタスクを止めない。
+
+    Python 3.14 以降は公開 API の kill_workers()。それより前は公開 API がないので、非公開の `_processes`
+    （pid → Process）を使う（§3。§23.8.2 のテストが実プロセスで確かめる）。
+    """
+    kill_workers = getattr(pool, "kill_workers", None)
+    if kill_workers is not None:
+        try:
+            kill_workers()
+        except Exception:  # noqa: BLE001 - 既に壊れている・閉じているプールは下の shutdown に任せる
+            pass
+    else:
+        for p in list((getattr(pool, "_processes", None) or {}).values()):
+            p.kill()
+    pool.shutdown(wait=False, cancel_futures=True)
 ```
 
 ```python
@@ -2384,22 +2672,27 @@ def transcribe_in_worker(req: STTRequest) -> STTResult:
 """faster-whisper の実 Provider。import はメソッド内で行い、extras 未導入環境でもモジュール自体は読み込める。"""
 from __future__ import annotations
 
+import gc
 import time
 from pathlib import Path
 from typing import Any
 
-from ..jobs.retry import ModelMissingError, OOMError
+from ..jobs.retry import ModelMissingError, OOMError, is_oom_message
 from .provider import STTProvider, STTRequest, STTResult, STTSegment
 
 
 class FasterWhisperProvider(STTProvider):
     def __init__(self) -> None:
-        self._models: dict[tuple[str, str], Any] = {}
+        self._models: dict[tuple[str, str, str], Any] = {}
 
     def _load(self, req: STTRequest) -> tuple[Any, int]:
-        key = (req.model_name, req.compute_type)
+        key = (req.model_name, req.compute_type, req.device)
         if key in self._models:
             return self._models[key], 0
+        # ワーカー 1 プロセスが持つモデルは 1 つ。OOM で 1 段落とした後に前のモデルを握ったままだと、
+        # メモリが空かず小さいモデルもロードできない
+        self._models.clear()
+        gc.collect()
         model_dir = Path(req.models_dir) / "whisper" / req.model_name
         if not (model_dir / "model.bin").exists():
             raise ModelMissingError(f"whisper model not installed: {req.model_name}")
@@ -2408,11 +2701,11 @@ class FasterWhisperProvider(STTProvider):
         except ImportError as e:
             raise ModelMissingError(f"faster-whisper not installed: {e}") from e
         started = time.monotonic()
-        device = "cuda" if req.compute_type in ("float16", "int8_float16") else "cpu"
         try:
-            model = WhisperModel(str(model_dir), device=device, compute_type=req.compute_type)
+            # device は選定（hw/tiers.py）が決めた値をそのまま使う。compute_type から推測しない
+            model = WhisperModel(str(model_dir), device=req.device, compute_type=req.compute_type)
         except Exception as e:  # noqa: BLE001 - OOM とその他を分類する
-            if "out of memory" in str(e).lower():
+            if is_oom_message(str(e)):
                 raise OOMError(str(e)) from e
             raise
         self._models[key] = model
@@ -2435,8 +2728,7 @@ class FasterWhisperProvider(STTProvider):
             segments_iter, info = model.transcribe(audio, **kwargs)
             segments = list(segments_iter)
         except Exception as e:  # noqa: BLE001
-            msg = str(e).lower()
-            if "out of memory" in msg or "cuda" in msg:
+            if is_oom_message(str(e)):
                 raise OOMError(str(e)) from e
             if req.word_timestamps:
                 # アラインメント非対応モデル：word_timestamps なしで 1 回だけ再試行（§3）
@@ -2909,6 +3201,10 @@ class LLMResponse:
 
 class SummaryProvider(Protocol):
     async def generate(self, req: LLMRequest) -> LLMResponse: ...
+
+    async def list_models(self) -> list[str] | None:
+        """使えるモデル名の一覧。Provider に届かなければ None、届くがモデルがなければ []（区別して表示・分類する）。"""
+        ...
 ```
 
 ```python
@@ -2927,6 +3223,10 @@ class FakeSummaryProvider(SummaryProvider):
     def __init__(self, responses: list[Responder]) -> None:
         self._responses = list(responses)
         self.requests: list[LLMRequest] = []
+        self.models: list[str] | None = ["fake-llm"]   # None = 届かない（Ollama 未起動）、[] = モデルなし
+
+    async def list_models(self) -> list[str] | None:
+        return None if self.models is None else list(self.models)
 
     async def generate(self, req: LLMRequest) -> LLMResponse:
         self.requests.append(req)
@@ -2950,7 +3250,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from ..jobs.retry import JobTimeoutError, OOMError, ProviderUnreachableError
+from ..jobs.retry import JobTimeoutError, ModelMissingError, OOMError, ProviderUnreachableError
 from .provider import LLMRequest, LLMResponse, SummaryProvider
 
 ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -2971,14 +3271,16 @@ class OllamaProvider(SummaryProvider):
         self.supports_schema_format = supports_schema_format
         self._timeout = httpx.Timeout(connect=connect_timeout_s, read=read_timeout_s, write=30.0, pool=10.0)
 
-    async def list_models(self) -> list[str]:
+    async def list_models(self) -> list[str] | None:
+        """/api/tags のモデル名。届かない・応答が壊れていれば None（[] は「届くがモデルがない」）。"""
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as c:
                 r = await c.get(f"{self.base_url}/api/tags")
                 r.raise_for_status()
-                return [m["name"] for m in r.json().get("models", []) if "name" in m]
-        except (httpx.HTTPError, ValueError, KeyError):
-            return []
+                models = r.json().get("models", [])
+                return [m["name"] for m in models if isinstance(m, dict) and isinstance(m.get("name"), str)]
+        except (httpx.HTTPError, ValueError, AttributeError, TypeError):
+            return None
 
     async def generate(self, req: LLMRequest) -> LLMResponse:
         body = {
@@ -3002,6 +3304,9 @@ class OllamaProvider(SummaryProvider):
             if "memory" in text or "oom" in text:
                 raise OOMError(f"ollama {r.status_code}: {r.text[:200]}")
             raise ProviderUnreachableError(f"ollama {r.status_code}: {r.text[:200]}")
+        if r.status_code == 404:
+            # モデルが消された・名前が変わった。届いてはいるので「未到達」にしない（次の実行で選び直す）
+            raise ModelMissingError(f"ollama model not found: {req.model}")
         if r.status_code >= 400:
             raise ProviderUnreachableError(f"ollama {r.status_code}: {r.text[:200]}")
         try:
@@ -3495,6 +3800,7 @@ from ..storage.files import InvalidWavError, read_pcm
 from . import pipeline
 from .context import AppContext
 from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError
+from .selection import refresh_llm, refresh_stt
 
 DEFAULT_LLM_CTX_TOKENS = 8192
 
@@ -3539,10 +3845,13 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         prev = repo.get_chunk_by_key(conn, chunk.meeting_id, chunk.source, chunk.sequence_no - 1)
     if meeting is None:
         raise InvalidAudioError("meeting missing")
+    if ctx.models.stt is None:
+        refresh_stt(ctx)   # 起動後に配置・取得したモデルを拾う。起動時の選定のままだと、再起動するまで待ち続ける
     model_name = job.model_name or meeting.stt_model_used or (ctx.models.stt.name if ctx.models.stt else None)
     if model_name is None:
         raise ModelMissingError("no STT model available")
     compute = ctx.models.stt.compute_type if ctx.models.stt else "int8"
+    device = ctx.models.stt.device if ctx.models.stt else "cpu"
 
     try:
         pcm = read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256)
@@ -3557,7 +3866,7 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
     language = None if ctx.settings.language == "auto" else ctx.settings.language
     factor = th.stt_timeout_factor_cpu if ctx.models.tier == "cpu_only" else th.stt_timeout_factor_gpu
     timeout_s = max(30.0, chunk.duration_ms / 1000 * factor)
-    req = STTRequest(pcm=stt_input, model_name=model_name, compute_type=compute, models_dir=str(ctx.settings.models_dir),
+    req = STTRequest(pcm=stt_input, model_name=model_name, compute_type=compute, device=device, models_dir=str(ctx.settings.models_dir),
                      language=language, beam_size=1 if ctx.models.tier == "cpu_only" else 5)
     try:
         result = await ctx.stt.transcribe(req, timeout_s)
@@ -3597,6 +3906,7 @@ async def handle_merge(ctx: AppContext, job: Job) -> str | None:
 
 
 async def handle_summary(ctx: AppContext, job: Job) -> str | None:
+    await refresh_llm(ctx)   # サーバーより後に起動した Ollama・後から pull したモデルを拾う（/api/tags を 1 回、期限 2 秒）
     llm_model = ctx.models.llm
     if llm_model is None:
         if not ctx.models.ollama_reachable:
@@ -3660,9 +3970,18 @@ HANDLERS = {
 """ルータが共有するヘルパー。app.py を import しない。"""
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import Request
 
 from ..jobs.context import AppContext
+from ..storage.models_dir import WHISPER_MODELS
+
+SETTING_LANGUAGES = ("ja", "en", "auto")
+# 確定後（ジョブが作られた後）の会議の状態。STT の再実行はここでだけ受ける
+POST_FINALIZE_STATUSES = ("transcribing", "transcribed", "summarizing", "completed", "failed")
+# merge が 1 回以上終わっている状態。無音 Chunk の手動 STT はここでだけ受ける
+MERGED_STATUSES = ("transcribed", "summarizing", "completed", "failed")
 
 
 def error_body(code: str, error: str, detail: str | None = None) -> dict[str, str]:
@@ -3677,6 +3996,27 @@ def get_ctx(request: Request) -> AppContext:
     if not isinstance(ctx, AppContext):
         raise RuntimeError("app context not initialised")
     return ctx
+
+
+def clean_settings(values: dict[str, Any]) -> str | None:
+    """PUT /v1/settings の値を検査し、その場で整える。問題があれば理由（422 で返す）、なければ None。
+
+    キーは settings テーブルの名前。stt_model / llm_model の空文字は「指定を外して自動選定に戻す」で、None に直す
+    （リクエストの null は「変更しない」なので、外す手段が別に要る）。フェーズ固有のキーは呼び出し側が検査する。
+    """
+    for key in ("stt_model", "llm_model"):
+        if isinstance(values.get(key), str) and values[key] == "":
+            values[key] = None
+    if "language" in values and values["language"] not in SETTING_LANGUAGES:
+        return "language must be one of ja, en, auto"
+    if values.get("stt_model") is not None and values["stt_model"] not in WHISPER_MODELS:
+        return "sttModel must be one of " + ", ".join(WHISPER_MODELS)
+    if values.get("llm_model") is not None and not values["llm_model"].strip():
+        return "llmModel must not be blank"
+    ratio = values.get("vad_sampling_ratio")
+    if ratio is not None and not 0.0 <= ratio <= 1.0:
+        return "vadSamplingRatio must be between 0 and 1"
+    return None
 ```
 
 ```python
@@ -4128,6 +4468,15 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
 
 ## 21.3 Phase 2 ルート `api/routes_meetings.py`
 
+状態を書き換える操作は、前提を満たさない呼び出しを 4xx で断り、何も変えない（§23.8.3）。
+
+| エンドポイント | 前提 | 満たさないとき | 理由 |
+| --- | --- | --- | --- |
+| `POST …/transcript/rerun` | 会議が確定後（`transcribing`〜`failed`）。`sttModel` は `null` か配置済みのモデル | 422 `VALIDATION` | 確定前に通すと会議が `transcribing` に進み、以後の Chunk の PUT が 409 になる（録音の保存が止まる）。未配置のモデルは、既存の transcript を消した後で全 Chunk が `MODEL_MISSING` の待機に入る |
+| `POST …/chunks/{source}/{seq}/transcribe` | 会議が merge 済み（`transcribed`〜`failed`）。Chunk の `stt_status` が `skipped` | 422 `VALIDATION`（Chunk がなければ 404） | `skipped` 以外には transcribe ジョブが既にあり（一意制約）、ジョブなしで `queued` にすると merge が永久に止まる。受け付けたら完了済みの merge ジョブを消し、STT の完了後に transcript の版が上がる。要約は自動では作り直さず、会議は `transcribed` に戻る |
+| `PUT /v1/settings` | `language` は `ja` / `en` / `auto`、`sttModel` は Whisper のモデル名、`vadSamplingRatio` は 0〜1（`common.clean_settings`） | 422 `VALIDATION`。1 つも保存しない | `sttModel` / `llmModel` の空文字は「指定を外して自動選定に戻す」。変更したら `refresh_stt` / `refresh_llm` で選定をやり直す（§13.1） |
+| `POST …/jobs/exclude-failed`（§21.4） | 会議が存在する | 404 `NOT_FOUND` | 確かめないと外部キー違反で 500 になる |
+
 ```python
 # minutes_local/api/routes_meetings.py
 """基本設計 §14 の会議・transcript・summary・notes・settings。"""
@@ -4143,7 +4492,8 @@ from pydantic import BaseModel
 
 from ..db import repo
 from ..jobs import pipeline
-from .common import error_body, get_ctx
+from ..jobs.selection import refresh_llm, refresh_stt
+from .common import MERGED_STATUSES, POST_FINALIZE_STATUSES, clean_settings, error_body, get_ctx
 
 router = APIRouter(prefix="/v1")
 
@@ -4263,8 +4613,15 @@ async def regenerate(meeting_id: str, request: Request) -> Any:
 async def rerun(meeting_id: str, req: RerunRequest, request: Request) -> Any:
     ctx = get_ctx(request)
     async with ctx.db.write() as conn:
-        if repo.get_meeting(conn, meeting_id) is None:
+        m = repo.get_meeting(conn, meeting_id)
+        if m is None:
             return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
+        if m.status not in POST_FINALIZE_STATUSES:
+            # 確定前（録音中）に通すと会議が transcribing に進み、以後の Chunk の PUT が「確定済み」の 409 になる
+            return JSONResponse(error_body("VALIDATION", "meeting is not finalized"), status_code=422)
+        if req.sttModel is not None and req.sttModel not in ctx.models.installed_stt:
+            # 未配置のモデルで作り直すと、全 Chunk が MODEL_MISSING の待機に入る（既存の transcript は消した後）
+            return JSONResponse(error_body("VALIDATION", "stt model is not installed"), status_code=422)
         n = pipeline.request_rerun_stt(conn, meeting_id, req.sttModel)
     return {"jobsCreated": n}
 
@@ -4300,11 +4657,24 @@ async def transcribe_silent_chunk(meeting_id: str, source: str, sequence_no: int
     """has_voice=0 の Chunk を手動で STT（基本設計 §13.2）。"""
     ctx = get_ctx(request)
     async with ctx.db.write() as conn:
+        m = repo.get_meeting(conn, meeting_id)
         c = repo.get_chunk_by_key(conn, meeting_id, source, sequence_no)
-        if c is None:
+        if m is None or c is None:
             return JSONResponse(error_body("NOT_FOUND", "chunk not found"), status_code=404)
-        repo.update_chunk(conn, c.id, stt_status="queued", has_voice=True)
+        if m.status not in MERGED_STATUSES:
+            # merge の前（録音中・transcribing）は受けない。実行待ちの merge が、この Chunk の STT より先に走りうる
+            return JSONResponse(error_body("VALIDATION", "transcript is not ready"), status_code=422)
+        if c.stt_status != "skipped":
+            # 対象は VAD が無音と判定した Chunk だけ。それ以外は transcribe ジョブが既にあり（一意制約）、
+            # ジョブを作れないまま queued にすると、終端にならない Chunk が残って merge が永久に止まる
+            return JSONResponse(error_body("VALIDATION", "chunk is not a skipped chunk"), status_code=422)
         job_id = repo.insert_job(conn, meeting_id, "transcribe_chunk", chunk_id=c.id)
+        if job_id is None:
+            return JSONResponse(error_body("VALIDATION", "chunk already has a transcribe job"), status_code=422)
+        repo.update_chunk(conn, c.id, stt_status="queued", has_voice=True)
+        # 完了済みの merge ジョブを消す。この Chunk の STT が終わると ensure_merge_job が作り直し、transcript の版が上がる。
+        # 要約は自動では作り直さない（会議は transcribed に戻る。利用者が再生成を選ぶ）
+        repo.delete_finished_job(conn, meeting_id, "merge_transcript")
         repo.record_metric(conn, "vad_manual_transcribe", 1, meeting_id=meeting_id)
     return {"jobId": job_id}
 
@@ -4314,10 +4684,18 @@ async def put_settings(req: SettingsPutRequest, request: Request) -> Any:
     ctx = get_ctx(request)
     values = {k: v for k, v in {"language": req.language, "stt_model": req.sttModel, "llm_model": req.llmModel,
                                 "vad_sampling_ratio": req.vadSamplingRatio}.items() if v is not None}
+    error = clean_settings(values)      # 検査に通らなければ 1 つも保存しない
+    if error is not None:
+        return JSONResponse(error_body("VALIDATION", error), status_code=422)
     async with ctx.db.write() as conn:
         for k, v in values.items():
             repo.put_setting(conn, k, v)
     ctx.settings = ctx.settings.with_overrides(values)
+    # モデルの指定を変えたら選定をやり直す（やり直さないと再起動するまで前のモデルで走る）
+    if "stt_model" in values:
+        refresh_stt(ctx)
+    if "llm_model" in values:
+        await refresh_llm(ctx)
     return {"updated": sorted(values)}
 ```
 
@@ -4375,6 +4753,9 @@ async def retry(job_id: str, request: Request) -> Any:
 async def exclude_failed(meeting_id: str, request: Request) -> Any:
     ctx = get_ctx(request)
     async with ctx.db.write() as conn:
+        if repo.get_meeting(conn, meeting_id) is None:
+            # 確かめないと、merge ジョブの挿入が外部キー違反になり 500 を返す
+            return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
         n = pipeline.exclude_failed(conn, meeting_id)
     return {"meetingId": meeting_id, "excluded": n}
 ```
@@ -4390,14 +4771,14 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from ..storage.models_dir import WHISPER_MODELS, DisallowedHostError, download_file, whisper_model_dir
+from ..jobs.selection import refresh_llm, refresh_stt
+from ..storage.models_dir import WHISPER_MODELS, download_file, whisper_files, whisper_model_dir
 from .common import error_body, get_ctx
 
 router = APIRouter(prefix="/v1")
 
-# CTranslate2 変換済みモデルの配布元（実装時に URL を確認する。基本設計 §28）
+# CTranslate2 変換済みモデルの配布元。ファイル名はモデルごとに違う（storage/models_dir.py の whisper_files）
 WHISPER_DOWNLOAD_BASE = "https://huggingface.co/Systran/faster-whisper-{name}/resolve/main/"
-WHISPER_FILES = ("model.bin", "config.json", "tokenizer.json", "vocabulary.txt")
 
 
 class DownloadRequest(BaseModel):
@@ -4408,12 +4789,16 @@ class DownloadRequest(BaseModel):
 @router.get("/models")
 async def models(request: Request) -> Any:
     ctx = get_ctx(request)
+    # 設定画面を開いた時点の状態を返す：後から手で配置したモデル、後から起動した Ollama を拾う（§13.1）
+    refresh_stt(ctx)
+    await refresh_llm(ctx)
     m = ctx.models
     return {
         "stt": [{"name": n, "installed": n in m.installed_stt, "selected": bool(m.stt and m.stt.name == n),
                  "recommended": bool(m.stt and m.stt.name == n)} for n in WHISPER_MODELS],
         "llm": [{"name": n, "selected": n == m.llm, "recommended": n == m.llm} for n in m.available_llm],
         "ollamaReachable": m.ollama_reachable,
+        "downloads": ctx.downloads.view(),      # 取得の進行・結果（失敗の理由を含む）
     }
 
 
@@ -4423,21 +4808,21 @@ async def download(req: DownloadRequest, request: Request) -> Any:
     ctx = get_ctx(request)
     if req.kind != "stt" or req.name not in WHISPER_MODELS:
         return JSONResponse(error_body("VALIDATION", "unknown model"), status_code=422)
+    if ctx.downloads.is_running(req.name):
+        return {"accepted": True, "name": req.name}     # 同じモデルを取得中。二重に走らせない（同じ .part へ書き合う）
     dest_dir = whisper_model_dir(ctx.settings.models_dir, req.name)
 
     async def run() -> None:
         try:
-            for fname in WHISPER_FILES:
+            for fname in whisper_files(req.name):
                 await asyncio.to_thread(download_file, WHISPER_DOWNLOAD_BASE.format(name=req.name) + fname, dest_dir / fname)
-            ctx.models.installed_stt.add(req.name)
-        except DisallowedHostError:
-            raise
-        except Exception as e:  # noqa: BLE001 - 進捗イベントとして通知し、握りつぶさない
-            ctx.events.publish("_models", {"type": "download_failed", "name": req.name, "error": str(e)})
+        except Exception as e:  # noqa: BLE001 - 失敗（許可外のホストを含む）は状態として残し、GET /v1/models で見せる
+            ctx.downloads.finish(req.name, str(e) or type(e).__name__)
             return
-        ctx.events.publish("_models", {"type": "download_completed", "name": req.name})
+        refresh_stt(ctx)        # 取得したモデルを選定に入れる。MODEL_MISSING で待っているジョブは次の再試行で進む
+        ctx.downloads.finish(req.name, None)
 
-    asyncio.create_task(run())
+    ctx.downloads.start(req.name, run())
     return {"accepted": True, "name": req.name}
 ```
 
@@ -4470,19 +4855,21 @@ async def events(meeting_id: str, request: Request) -> StreamingResponse:
     ctx = get_ctx(request)
 
     async def stream() -> AsyncIterator[bytes]:
-        gen = ctx.events.subscribe(meeting_id)
+        # キューを直接待つ。subscribe()（非同期ジェネレータ）の __anext__() を wait_for で包むと、
+        # タイムアウトのキャンセルでジェネレータが終わり、最初の keepalive の次の周回で接続が落ちる
+        q = ctx.events.attach(meeting_id)
         try:
             while True:
                 if await request.is_disconnected():
                     break
                 try:
-                    ev = await asyncio.wait_for(gen.__anext__(), timeout=KEEPALIVE_S)
+                    ev = await asyncio.wait_for(q.get(), timeout=KEEPALIVE_S)
                 except asyncio.TimeoutError:
                     yield b": keepalive\n\n"
                     continue
                 yield format_event(ev).encode("utf-8")
         finally:
-            await gen.aclose()
+            ctx.events.detach(meeting_id, q)
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
@@ -4510,13 +4897,13 @@ from .config import Settings
 from .db import repo
 from .db.connection import Database
 from .db.migrate import migrate
-from .hw import tiers
 from .hw.detect import Hardware, detect
-from .jobs.context import AppContext, ModelSelection
+from .jobs.context import AppContext
+from .jobs.selection import select_models
 from .llm.provider import SummaryProvider
 from .stt.executor import InlineExecutor, PoolExecutor, STTExecutor
 from .stt.provider import STTProvider
-from .storage.models_dir import installed_whisper_models, silero_model_path
+from .storage.models_dir import silero_model_path
 from .vad.provider import VADProvider
 
 
@@ -4556,20 +4943,6 @@ def read_token(path: Path) -> str | None:
     if not path.is_file():
         return None
     return path.read_text(encoding="ascii").strip() or None
-
-
-def select_models(settings: Settings, hw: Hardware, available_llm: list[str], ollama_reachable: bool) -> ModelSelection:
-    tier = tiers.classify(hw)
-    installed = installed_whisper_models(settings.models_dir)
-    budget = hw.gpu.vram_bytes if hw.gpu.available else hw.total_memory_bytes // 2
-    stt = tiers.select_stt(tier, installed, budget, settings.stt_model)
-    llm = tiers.select_llm(tier, available_llm, settings.llm_model)
-    return ModelSelection(
-        tier=tier, stt=stt, llm=llm, installed_stt=installed, available_llm=available_llm,
-        ollama_reachable=ollama_reachable,
-        max_concurrent_stt=settings.max_concurrent_stt or tiers.max_concurrent_stt(tier, hw.cpu_cores),
-        allow_concurrent_stt_and_llm=tiers.allow_concurrent_stt_and_llm(tier, hw, stt, None),
-    )
 
 
 def restrict_to_current_user(path: Path) -> None:
@@ -4645,14 +5018,10 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
     if llm_provider is None:
         from .llm.ollama_provider import OllamaProvider
         th = settings.thresholds
-        ollama = OllamaProvider(settings.ollama_base_url, th.llm_connect_timeout_s, th.llm_read_timeout_s)
-        available_llm = await ollama.list_models()
-        llm_provider = ollama
-        ollama_reachable = bool(available_llm)
-    else:
-        available_llm, ollama_reachable = ["fake-llm"], True
-
-    models = select_models(settings, hw, available_llm, ollama_reachable)
+        llm_provider = OllamaProvider(settings.ollama_base_url, th.llm_connect_timeout_s, th.llm_read_timeout_s)
+    # None = 届かない（Ollama 未起動）、[] = 届くがモデルがない。起動は止めず、後で選び直す（jobs/selection.py）
+    listed = await llm_provider.list_models()
+    models = select_models(settings, hw, listed or [], listed is not None)
 
     stt: STTExecutor = InlineExecutor(stt_provider) if stt_provider is not None else PoolExecutor(models.max_concurrent_stt)
 
@@ -4660,9 +5029,14 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
     if vad is None:
         p = silero_model_path(settings.models_dir)
         if p is not None:
-            from .vad.silero_provider import SileroVADProvider
             th = settings.thresholds
-            vad = SileroVADProvider(p, th.vad_threshold, th.vad_min_speech_ms, th.vad_min_voiced_ms)
+            try:
+                from .vad.silero_provider import SileroVADProvider
+                vad = SileroVADProvider(p, th.vad_threshold, th.vad_min_speech_ms, th.vad_min_voiced_ms)
+            except ImportError:
+                # モデルは置いてあるが onnxruntime（extras の vad）が入っていない。起動を止めず、未配置と同じく
+                # ブラウザ側の VAD で進める（doctor の vad 行に NOT INSTALLED と出る）
+                vad = None
 
     return AppContext(settings=settings, db=db, hardware=hw, models=models, stt=stt, vad=vad, llm=llm_provider)
 ```
@@ -6291,6 +6665,39 @@ async def test_event_broker_delivers_and_drops_when_full() -> None:
     assert broker.subscriber_count("m") == 0
 
 
+async def test_sse_stream_survives_keepalive(ctx: AppContext, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """無通信の keepalive を挟んでも購読が続く。
+
+    wait_for で非同期ジェネレータの __anext__() を待つと、タイムアウトのキャンセルでジェネレータごと終わり、
+    最初の keepalive の次の周回で接続が落ちた（15 秒静かな会議は必ず切れた）。
+    """
+    from types import SimpleNamespace
+
+    from minutes_local.api import sse
+
+    monkeypatch.setattr(sse, "KEEPALIVE_S", 0.02)
+    disconnected = False
+
+    async def is_disconnected() -> bool:
+        return disconnected
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(ctx=ctx)), is_disconnected=is_disconnected)
+    response = await sse.events("m-1", request)  # type: ignore[arg-type]
+    body = response.body_iterator
+    assert await asyncio.wait_for(body.__anext__(), 1) == b": keepalive\n\n"
+    assert await asyncio.wait_for(body.__anext__(), 1) == b": keepalive\n\n"      # 2 回目の周回でも落ちない
+    assert ctx.events.subscriber_count("m-1") == 1                                 # 購読は外れていない
+    ctx.events.publish("m-1", {"type": "meeting_status", "status": "transcribing"})
+    chunk = await asyncio.wait_for(body.__anext__(), 1)
+    while chunk == b": keepalive\n\n":
+        chunk = await asyncio.wait_for(body.__anext__(), 1)
+    assert chunk.startswith(b"event: meeting_status\n")
+    disconnected = True
+    async for _ in body:                                                           # 切断を見て抜け、購読を外す
+        pass
+    assert ctx.events.subscriber_count("m-1") == 0
+
+
 def test_format_event() -> None:
     assert format_event({"type": "meeting_status", "status": "completed"}) == 'event: meeting_status\ndata: {"type": "meeting_status", "status": "completed"}\n\n'
 
@@ -6407,19 +6814,438 @@ async def test_resend_does_not_duplicate_samples(client: httpx.AsyncClient, ctx:
         assert conn.execute("SELECT COUNT(*) AS n FROM sync_samples WHERE meeting_id='m-1'").fetchone()["n"] == 1
 ```
 
+### 23.8.2 実モデルの経路（デバイス・プールの作り直し・モデルの選び直し・取得）
+
+Fake Provider のテストは、実行デバイスの選定、faster-whisper の呼び出し、プロセスプール、起動後のモデルの選び直し、モデルの取得を通らない。ここは実モデルなしで確かめられる範囲を固定する（`faster_whisper` はスタブに差し替え、プールは実プロセスを起こす）。
+
+```python
+# tests/test_stt_runtime.py
+"""Fake Provider のテストが通らない経路：デバイスの選定、faster-whisper の呼び出し、プールの作り直し、モデルの選び直し、取得。"""
+from __future__ import annotations
+
+import asyncio
+import sys
+import types
+from pathlib import Path
+
+import httpx
+import pytest
+
+from minutes_local.db import repo
+from minutes_local.db.connection import now_ms
+from minutes_local.hw import tiers
+from minutes_local.jobs.context import AppContext
+from minutes_local.jobs.handlers import HANDLERS
+from minutes_local.jobs.retry import ModelMissingError, OOMError, is_oom_message
+from minutes_local.jobs.runner import LEASE_MS, JobRunner
+from minutes_local.jobs.selection import refresh_llm
+from minutes_local.llm.fake_provider import FakeSummaryProvider
+from minutes_local.storage import models_dir
+from minutes_local.stt.executor import PoolExecutor
+from minutes_local.stt.fake_provider import probe_in_worker
+from minutes_local.stt.faster_whisper_provider import FasterWhisperProvider
+from minutes_local.stt.provider import STTRequest
+from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm
+
+GIB = 1024 ** 3
+
+
+# ---- デバイスの選定（基本設計 §7.2） ----
+
+def test_apple_silicon_runs_whisper_on_cpu_int8() -> None:
+    # Apple Silicon は区分こそ gpu_large だが、faster-whisper は Metal を使わない。float16 / cuda を渡すとロードで失敗する
+    c = tiers.select_stt("gpu_large", {"large-v3"}, 16 * GIB, None, "apple")
+    assert c is not None and (c.name, c.device, c.compute_type) == ("large-v3", "cpu", "int8")
+
+
+def test_cuda_keeps_tier_compute_type_and_small_gpu_uses_the_gpu() -> None:
+    large = tiers.select_stt("gpu_large", {"large-v3"}, 16 * GIB, None, "cuda")
+    small = tiers.select_stt("gpu_small", {"small"}, 4 * GIB, None, "cuda")
+    assert large is not None and (large.device, large.compute_type) == ("cuda", "float16")
+    assert small is not None and (small.device, small.compute_type) == ("cuda", "int8")   # int8 でも GPU で動かす
+
+
+def test_cpu_only_and_forced_model_follow_the_backend() -> None:
+    cpu = tiers.select_stt("cpu_only", {"base"}, 8 * GIB, None, None)
+    forced = tiers.select_stt("gpu_medium", {"large-v3"}, 8 * GIB, "large-v3", "apple")   # 区分外の強制指定
+    assert cpu is not None and (cpu.device, cpu.compute_type) == ("cpu", "int8")
+    assert forced is not None and (forced.name, forced.device, forced.compute_type) == ("large-v3", "cpu", "int8")
+
+
+# ---- faster-whisper の呼び出し（スタブ） ----
+
+class _StubWhisperModel:
+    created: list[tuple[str, str, str]] = []
+    fail: Exception | None = None
+
+    def __init__(self, path: str, device: str, compute_type: str) -> None:
+        if _StubWhisperModel.fail is not None:
+            raise _StubWhisperModel.fail
+        _StubWhisperModel.created.append((Path(path).name, device, compute_type))
+
+
+@pytest.fixture
+def whisper_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    _StubWhisperModel.created, _StubWhisperModel.fail = [], None
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=_StubWhisperModel))
+    for name in ("large-v3", "medium"):
+        (tmp_path / "whisper" / name).mkdir(parents=True)
+        (tmp_path / "whisper" / name / "model.bin").write_bytes(b"x")
+    return tmp_path
+
+
+def _req(models: Path, name: str, device: str = "cuda", compute_type: str = "float16") -> STTRequest:
+    return STTRequest(pcm=b"", model_name=name, compute_type=compute_type, models_dir=str(models), language="ja", device=device)
+
+
+def test_provider_loads_on_the_requested_device_and_keeps_one_model(whisper_dir: Path) -> None:
+    p = FasterWhisperProvider()
+    p._load(_req(whisper_dir, "large-v3", "cpu", "int8"))
+    p._load(_req(whisper_dir, "large-v3", "cpu", "int8"))             # 2 回目はキャッシュ
+    assert _StubWhisperModel.created == [("large-v3", "cpu", "int8")]  # compute_type から cuda を推測しない
+    p._load(_req(whisper_dir, "medium", "cpu", "int8"))               # OOM で 1 段落とした後
+    assert list(p._models) == [("medium", "int8", "cpu")]             # 大きい方を手放す（握ったままだと落としても空かない）
+
+
+def test_provider_classifies_load_errors(whisper_dir: Path) -> None:
+    p = FasterWhisperProvider()
+    _StubWhisperModel.fail = RuntimeError("CUDA failed with error out of memory")
+    with pytest.raises(OOMError):
+        p._load(_req(whisper_dir, "large-v3"))
+    # CUDA という語だけでは OOM にしない。非対応ビルド・ドライバ未導入はモデルを落としても直らない
+    _StubWhisperModel.fail = RuntimeError("This CTranslate2 package was not compiled with CUDA support")
+    with pytest.raises(RuntimeError) as e:
+        p._load(_req(whisper_dir, "large-v3"))
+    assert not isinstance(e.value, OOMError) and not is_oom_message(str(e.value))
+    _StubWhisperModel.fail = None
+    with pytest.raises(ModelMissingError):
+        p._load(_req(whisper_dir, "small"))                           # model.bin がない
+
+
+# ---- プロセスプール（実プロセス。基本設計 §5.1「プールの再生成が必要」） ----
+
+def _probe(mode: str) -> STTRequest:
+    return STTRequest(pcm=b"", model_name=mode, compute_type="int8", models_dir="", language=None)
+
+
+async def test_pool_is_rebuilt_after_a_timeout() -> None:
+    ex = PoolExecutor(1, fn=probe_in_worker)
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await ex.transcribe(_probe("hang"), 1.0)                  # ワーカーは 60 秒眠る
+        # 固まったワーカーを止めて作り直す。直さないと 1 本しかないワーカーが塞がり、次のジョブも待ち時間で落ちる
+        result = await ex.transcribe(_probe("ok"), 30.0)
+        assert result.model_name == "ok" and ex.recycle_count == 1
+    finally:
+        ex.shutdown()
+
+
+async def test_pool_is_rebuilt_after_a_worker_crash() -> None:
+    ex = PoolExecutor(1, fn=probe_in_worker)
+    try:
+        with pytest.raises(OOMError):                                 # OS に殺された・ネイティブ層で落ちた
+            await ex.transcribe(_probe("die"), 30.0)
+        # 作り直さないと BrokenProcessPool のまま、以後の STT が再起動まで全部失敗する
+        result = await ex.transcribe(_probe("ok"), 30.0)
+        assert result.model_name == "ok" and ex.recycle_count == 1
+    finally:
+        ex.shutdown()
+
+
+# ---- ダウングレード（基本設計 §7.3） ----
+
+async def _two_leased_transcribe_jobs(client: httpx.AsyncClient, ctx: AppContext) -> tuple[JobRunner, JobRunner, list]:  # type: ignore[type-arg]
+    await create_meeting(client)
+    for seq in range(2):
+        await put_chunk(client, "m-1", seq, sine_pcm(30))
+    await finalize(client, "m-1", mic=2)
+    r1, r2 = JobRunner(ctx, HANDLERS, 0), JobRunner(ctx, HANDLERS, 1)
+    assert await r1.run_once() and await r1.run_once()                # vad 2 件 → transcribe 2 件（model_name は small）
+    jobs = []
+    async with ctx.db.write() as conn:
+        for r in (r1, r2):
+            jobs.append(repo.lease_job(conn, r.owner, ["transcribe_chunk"], now_ms(), LEASE_MS))
+    assert all(j is not None and j.model_name == "small" for j in jobs)
+    return r1, r2, jobs
+
+
+async def test_two_jobs_failing_with_oom_on_the_same_model_downgrade_once(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    r1, r2, (j1, j2) = await _two_leased_transcribe_jobs(client, ctx)
+    await r1._on_failure(j1, OOMError("out of memory"), 0)
+    await r2._on_failure(j2, OOMError("out of memory"), 0)            # small で走っていた。base の失敗ではない
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").stt_model_used == "base"  # tiny まで 2 段落とさない
+
+
+async def test_downgrade_skips_models_that_are_not_installed(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    ctx.models.installed_stt = {"small", "tiny"}                     # base は未配置
+    r1, _, (j1, _j2) = await _two_leased_transcribe_jobs(client, ctx)
+    await r1._on_failure(j1, OOMError("out of memory"), 0)
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").stt_model_used == "tiny"  # 未配置の base を選ぶと MODEL_MISSING で止まる
+
+
+# ---- モデルの選び直し（起動後に状況が変わる） ----
+
+async def _summary_job(ctx: AppContext):  # type: ignore[no-untyped-def]
+    with ctx.db.read() as conn:
+        return [j for j in repo.list_jobs(conn, "m-1") if j.job_type == "synthesize_minutes"][0]
+
+
+async def test_summary_runs_once_ollama_is_started_after_the_server(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                                                  llm_provider: FakeSummaryProvider) -> None:
+    llm_provider.models = None                                       # 起動時は Ollama が動いていない
+    await refresh_llm(ctx)
+    assert ctx.models.llm is None and ctx.models.ollama_reachable is False
+    await create_meeting(client)
+    await put_chunk(client, "m-1", 0, sine_pcm(30))
+    await finalize(client, "m-1", mic=1)
+    await runner.run_until_idle()
+    job = await _summary_job(ctx)
+    assert job.status == "retrying" and job.error_class == "PROVIDER_UNREACHABLE"
+    llm_provider.models = ["fake-llm"]                               # 利用者が後から Ollama を起動した
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET next_run_at = 0 WHERE id = ?", (job.id,))
+    await runner.run_until_idle()                                    # サーバーを再起動しなくても拾う
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").status == "completed"
+    assert ctx.models.llm == "fake-llm" and ctx.models.ollama_reachable is True
+
+
+async def test_ollama_without_models_is_model_missing(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                                     llm_provider: FakeSummaryProvider) -> None:
+    llm_provider.models = []                                         # 届くがモデルが 1 つもない（ollama pull 前）
+    await create_meeting(client)
+    await put_chunk(client, "m-1", 0, sine_pcm(30))
+    await finalize(client, "m-1", mic=1)
+    await runner.run_until_idle()
+    job = await _summary_job(ctx)
+    assert job.error_class == "MODEL_MISSING" and ctx.models.ollama_reachable is True   # 「未起動」と表示しない
+
+
+async def test_transcribe_runs_once_a_model_is_placed_after_the_server(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
+    ctx.models.stt, ctx.models.installed_stt = None, set()           # 起動時はモデル未配置
+    await create_meeting(client)
+    await put_chunk(client, "m-1", 0, sine_pcm(30))
+    await finalize(client, "m-1", mic=1)
+    await runner.run_until_idle()
+    with ctx.db.read() as conn:
+        job = [j for j in repo.list_jobs(conn, "m-1") if j.job_type == "transcribe_chunk"][0]
+    assert job.status == "retrying" and job.error_class == "MODEL_MISSING"
+    d = models_dir.whisper_model_dir(ctx.settings.models_dir, "base")
+    d.mkdir(parents=True)
+    (d / "model.bin").write_bytes(b"x")                              # 利用者が後から配置した
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET next_run_at = 0 WHERE id = ?", (job.id,))
+    await runner.run_until_idle()
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").stt_model_used == "base"
+        assert repo.get_meeting(conn, "m-1").status == "completed"
+
+
+# ---- モデルの取得（基本設計 §7.4：外向き通信の唯一の例外） ----
+
+def test_whisper_files_per_model() -> None:
+    small, large = models_dir.whisper_files("small"), models_dir.whisper_files("large-v3")
+    assert small == ("config.json", "tokenizer.json", "vocabulary.txt", "model.bin")
+    # large-v3 は語彙が JSON で、メル 128 本の設定（preprocessor_config.json）がないと特徴量が合わない
+    assert large == ("config.json", "tokenizer.json", "vocabulary.json", "preprocessor_config.json", "model.bin")
+    assert small[-1] == large[-1] == "model.bin"                      # 配置済みの目印は最後に置く（途中で止まっても配置済みに見えない）
+
+
+def _mock_client(routes: dict[str, httpx.Response], seen: list[str]) -> httpx.Client:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.host)
+        return routes[str(request.url)]
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_download_checks_the_redirect_target_before_requesting_it(tmp_path: Path) -> None:
+    src = "https://huggingface.co/Systran/faster-whisper-tiny/resolve/main/model.bin"
+    seen: list[str] = []
+    evil = _mock_client({src: httpx.Response(302, headers={"Location": "https://evil.example/model.bin"})}, seen)
+    with pytest.raises(models_dir.DisallowedHostError):
+        models_dir.download_file(src, tmp_path / "model.bin", client=evil)
+    assert seen == ["huggingface.co"] and not (tmp_path / "model.bin").exists()   # 許可外のホストへは要求自体を出さない
+    with pytest.raises(models_dir.DisallowedHostError):
+        models_dir.download_file("http://huggingface.co/x", tmp_path / "x", client=evil)   # https 以外も拒否
+
+
+def test_download_follows_the_hf_cdn_redirect(tmp_path: Path) -> None:
+    src = "https://huggingface.co/Systran/faster-whisper-tiny/resolve/main/model.bin"
+    cdn = "https://us.aws.cdn.hf.co/xet-bridge-us/abc"
+    seen: list[str] = []
+    client = _mock_client({src: httpx.Response(302, headers={"Location": cdn}), cdn: httpx.Response(200, content=b"weights")}, seen)
+    dest = models_dir.download_file(src, tmp_path / "model.bin", client=client)
+    assert dest.read_bytes() == b"weights" and seen == ["huggingface.co", "us.aws.cdn.hf.co"]
+    assert not (tmp_path / "model.bin.part").exists()
+
+
+async def test_download_result_is_visible_and_reselects_the_model(client: httpx.AsyncClient, ctx: AppContext,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx.models.stt, ctx.models.installed_stt = None, set()
+    fetched: list[str] = []
+
+    def fake_download(url: str, dest: Path, **_: object) -> Path:
+        fetched.append(url.rsplit("/", 1)[-1])
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"x")
+        return dest
+
+    monkeypatch.setattr("minutes_local.api.routes_models.download_file", fake_download)
+    assert (await client.post("/v1/models/download", json={"kind": "stt", "name": "base"})).status_code == 202
+    await ctx.downloads.wait()
+    assert fetched == list(models_dir.whisper_files("base"))
+    body = (await client.get("/v1/models")).json()
+    assert body["downloads"] == [{"name": "base", "status": "completed", "error": None}]
+    assert [m["name"] for m in body["stt"] if m["installed"] and m["selected"]] == ["base"]   # 再起動なしで使える
+    assert ctx.models.stt is not None and ctx.models.stt.name == "base"
+
+
+async def test_download_failure_is_reported_not_lost(client: httpx.AsyncClient, ctx: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    def refused(url: str, dest: Path, **_: object) -> Path:
+        raise models_dir.DisallowedHostError("download host not allowed: evil.example")
+
+    monkeypatch.setattr("minutes_local.api.routes_models.download_file", refused)
+    assert (await client.post("/v1/models/download", json={"kind": "stt", "name": "tiny"})).status_code == 202
+    await ctx.downloads.wait()                                       # バックグラウンドのタスクの例外として消えない
+    downloads = (await client.get("/v1/models")).json()["downloads"]
+    assert downloads == [{"name": "tiny", "status": "failed", "error": "download host not allowed: evil.example"}]
+```
+
+### 23.8.3 操作系エンドポイントの前提条件
+
+STT の再実行・無音 Chunk の手動 STT・設定の変更・失敗の除外は、会議の状態を直接書き換える。前提を満たさない呼び出しを通すと、録音の保存（Recording-First）やジョブの進行を壊す。
+
+```python
+# tests/test_route_guards.py
+"""状態を書き換えるエンドポイントが、前提を満たさない呼び出しを 4xx で断り、何も変えないこと。"""
+from __future__ import annotations
+
+import httpx
+
+from minutes_local.db import repo
+from minutes_local.jobs.context import AppContext
+from minutes_local.jobs.runner import JobRunner
+from minutes_local.vad.fake_provider import FakeVADProvider
+from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm
+
+
+async def _detail(client: httpx.AsyncClient) -> dict:  # type: ignore[type-arg]
+    return (await client.get("/v1/meetings/m-1")).json()
+
+
+async def test_rerun_is_refused_while_recording_and_upload_continues(client: httpx.AsyncClient) -> None:
+    await create_meeting(client)
+    assert (await put_chunk(client, "m-1", 0, sine_pcm(30))).status_code in (200, 201)
+    r = await client.post("/v1/meetings/m-1/transcript/rerun", json={"sttModel": None})
+    assert r.status_code == 422 and r.json()["code"] == "VALIDATION"
+    # 通すと会議が transcribing に進み、以後の Chunk の PUT が「確定済み」の 409 になる（録音の保存が止まる）
+    assert (await _detail(client))["status"] not in ("transcribing", "transcribed")
+    assert (await put_chunk(client, "m-1", 1, sine_pcm(30))).status_code in (200, 201)
+
+
+async def test_rerun_rejects_a_model_that_is_not_installed(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
+    await create_meeting(client)
+    await put_chunk(client, "m-1", 0, sine_pcm(30))
+    await finalize(client, "m-1", mic=1)
+    await runner.run_until_idle()
+    r = await client.post("/v1/meetings/m-1/transcript/rerun", json={"sttModel": "large-v3"})   # 配置済みは small / base / tiny
+    assert r.status_code == 422 and (await _detail(client))["status"] == "completed"           # 何も消していない
+    r = await client.post("/v1/meetings/m-1/transcript/rerun", json={"sttModel": "base"})
+    assert r.status_code == 202 and r.json()["jobsCreated"] == 1
+    await runner.run_until_idle()
+    assert (await _detail(client))["sttModelUsed"] == "base"
+
+
+async def _all_skipped_meeting(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
+    ctx.vad = FakeVADProvider(rms_threshold=0.9)          # サーバー VAD がすべて無音と判定する（false negative の再現）
+    await create_meeting(client)
+    for seq in range(2):
+        await put_chunk(client, "m-1", seq, sine_pcm(30))
+    await finalize(client, "m-1", mic=2)
+    await runner.run_until_idle()
+    d = await _detail(client)
+    assert d["sttStatusCounts"]["skipped"] == 2 and d["transcriptVersion"] == 1
+
+
+async def test_manual_transcribe_of_skipped_chunk_reaches_the_transcript(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
+    await _all_skipped_meeting(client, ctx, runner)
+    assert (await client.get("/v1/meetings/m-1/transcript")).json()["segments"] == []
+    r = await client.post("/v1/meetings/m-1/chunks/mic/1/transcribe")
+    assert r.status_code == 202 and isinstance(r.json()["jobId"], str)
+    await runner.run_until_idle()
+    d = await _detail(client)
+    assert d["sttStatusCounts"] == {"pending": 0, "queued": 0, "processing": 0, "completed": 1, "skipped": 1, "failed": 0}
+    # merge をやり直して版が上がる（完了済みの merge ジョブが残ったままだと、STT の結果が transcript に入らない）
+    assert d["transcriptVersion"] == 2
+    t = (await client.get("/v1/meetings/m-1/transcript")).json()
+    assert t["segments"] and {s["chunkSequenceNo"] for s in t["segments"]} == {1}
+    # 要約は自動では作り直さない（transcribed に戻る。利用者が再生成を押す）
+    assert d["status"] == "transcribed" and d["latestSummaryVersion"] == 1
+
+
+async def test_manual_transcribe_is_refused_unless_the_chunk_is_skipped(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
+    await _all_skipped_meeting(client, ctx, runner)
+    assert (await client.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+    # 2 回目：もう skipped ではない。通すと、ジョブを作れない（一意制約）まま Chunk だけ queued になり、merge が永久に止まる
+    r = await client.post("/v1/meetings/m-1/chunks/mic/1/transcribe")
+    assert r.status_code == 422 and r.json()["code"] == "VALIDATION"
+    await runner.run_until_idle()
+    assert (await _detail(client))["sttStatusCounts"]["queued"] == 0
+    assert (await client.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 422   # completed の Chunk も同じ
+    assert (await client.post("/v1/meetings/m-1/chunks/mic/9/transcribe")).status_code == 404
+
+
+async def test_manual_transcribe_is_refused_before_the_transcript_exists(client: httpx.AsyncClient) -> None:
+    await create_meeting(client)
+    await put_chunk(client, "m-1", 0, sine_pcm(30))
+    assert (await client.post("/v1/meetings/m-1/chunks/mic/0/transcribe")).status_code == 422   # 録音中
+    await finalize(client, "m-1", mic=1)
+    assert (await client.post("/v1/meetings/m-1/chunks/mic/0/transcribe")).status_code == 422   # transcribing（merge 前）
+
+
+async def test_settings_are_validated_and_model_can_be_reset_to_auto(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    for bad in ({"language": "xx"}, {"sttModel": "bogus"}, {"vadSamplingRatio": 7}, {"vadSamplingRatio": -0.1}, {"llmModel": "  "}):
+        r = await client.put("/v1/settings", json=bad)
+        assert r.status_code == 422 and r.json()["code"] == "VALIDATION", bad
+    with ctx.db.read() as conn:
+        assert repo.get_settings(conn) == {}                          # 1 つも保存していない
+    assert ctx.settings.language == "ja" and ctx.settings.stt_model is None
+    r = await client.put("/v1/settings", json={"language": "auto", "sttModel": "tiny", "vadSamplingRatio": 0.1})
+    assert r.status_code == 200 and r.json()["updated"] == ["language", "stt_model", "vad_sampling_ratio"]
+    assert ctx.settings.stt_model == "tiny"
+    r = await client.put("/v1/settings", json={"sttModel": ""})       # 空文字 = 指定を外して自動選定に戻す
+    assert r.status_code == 200 and ctx.settings.stt_model is None
+    with ctx.db.read() as conn:
+        assert repo.get_settings(conn)["stt_model"] is None
+
+
+async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClient) -> None:
+    r = await client.post("/v1/meetings/nope/jobs/exclude-failed")
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"     # 外部キー違反の 500 にしない
+```
+
 ## 23.9 テストと基本設計 §26 の対応
 
 | 基本設計 §26 の項目 | テスト |
 | --- | --- |
 | faster-whisper 正常処理 | `test_full_pipeline_with_silent_chunk` |
-| GPU OOM retry + ダウングレード | `test_oom_downgrades_model_per_meeting` |
-| ワーカークラッシュ → Sweeper → 再 lease | `test_sweeper_recovers_expired_lease_and_ignores_stale_owner` |
+| GPU OOM retry + ダウングレード | `test_oom_downgrades_model_per_meeting`、`test_two_jobs_failing_with_oom_on_the_same_model_downgrade_once`、`test_downgrade_skips_models_that_are_not_installed`、`test_provider_loads_on_the_requested_device_and_keeps_one_model` |
+| ワーカークラッシュ → Sweeper → 再 lease | `test_sweeper_recovers_expired_lease_and_ignores_stale_owner`、`test_pool_is_rebuilt_after_a_worker_crash`、`test_pool_is_rebuilt_after_a_timeout` |
 | invalid audio no-retry | `test_failed_chunk_blocks_until_excluded`、`test_retry_decisions` |
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
 | DLQ = failed + 再試行 | `test_retry_failed_job_via_api`、`test_failed_chunk_blocks_until_excluded` |
 | Structured Output / sourceSegmentIds / assignee 検出 | `test_validate_stage3_to_7`、`test_synthesize_single_window_retries_schema_once` |
 | AI 再生成 / Manual Notes 保護 | `test_regenerate_creates_new_version_and_keeps_notes` |
-| Ollama 停止中に transcript まで完了 | `test_ollama_outage_leaves_transcribed_then_completes` |
+| Ollama 停止中に transcript まで完了 | `test_ollama_outage_leaves_transcribed_then_completes`、`test_summary_runs_once_ollama_is_started_after_the_server`、`test_ollama_without_models_is_model_missing` |
+| ハードウェア区分と実行デバイス（Apple Silicon は CPU の int8） | `test_apple_silicon_runs_whisper_on_cpu_int8`、`test_cuda_keeps_tier_compute_type_and_small_gpu_uses_the_gpu`、`test_cpu_only_and_forced_model_follow_the_backend` |
+| モデル未配置で待機 → 配置後に再開 | `test_transcribe_runs_once_a_model_is_placed_after_the_server`、`test_download_result_is_visible_and_reselects_the_model` |
+| モデル取得の allowlist（外向き通信の唯一の例外） | `test_download_checks_the_redirect_target_before_requesting_it`、`test_download_follows_the_hf_cdn_redirect`、`test_whisper_files_per_model`、`test_download_failure_is_reported_not_lost` |
+| SSE の長時間接続（keepalive） | `test_sse_stream_survives_keepalive` |
+| VAD false negative の手動 STT | `test_manual_transcribe_of_skipped_chunk_reaches_the_transcript`、`test_manual_transcribe_is_refused_unless_the_chunk_is_skipped`、`test_manual_transcribe_is_refused_before_the_transcript_exists` |
+| 録音中の操作が保存を止めない | `test_rerun_is_refused_while_recording_and_upload_continues`、`test_rerun_rejects_a_model_that_is_not_installed` |
+| 設定値の検証・存在しない会議 | `test_settings_are_validated_and_model_can_be_reset_to_auto`、`test_exclude_failed_on_unknown_meeting_is_404` |
 | STT 実行中は要約を lease しない | `test_allowed_types_excludes_summary_while_stt_running` |
 | 外部通信ゼロ（モジュール規則） | `test_httpx_only_in_allowed_modules` |
 | 既存 DB のアップグレード（列補完） | `test_phase1_db_gains_missing_columns_and_keeps_rows`、`test_migrate_is_idempotent` |
@@ -6468,13 +7294,28 @@ async def test_resend_does_not_duplicate_samples(client: httpx.AsyncClient, ctx:
 | Step | 本書のセクション | 通過すべきテスト |
 | --- | --- | --- |
 | 2-a | §1.2（移行手順）、§5〜§8、§21.1・§21.2 | `test_phase1_contract.py`、`test_phase1_server_compat.py`、`test_imports.py`。移行前は既存の `server_tests` 10 件も通ったまま |
-| 2-b | §9、§21.4、§22 | `doctor` の出力確認 |
+| 2-b | §9、§10.2、§13.1（`jobs/selection.py`）、§21.4、§22 | `doctor` の出力確認。`test_stt_runtime.py` のうちデバイスの選定とモデル取得の 7 件（`test_apple_silicon_*`・`test_cuda_*`・`test_cpu_only_*`・`test_whisper_files_*`・`test_download_*`）。**Apple Silicon の実機では `doctor` の `stt` 行が `<モデル名>/int8` になること**を確かめる |
 | 2-c | §11〜§15、§17 | `test_jobs.py` |
-| 2-d | §16、§20（`handle_transcribe`）、§21.3、§21.5 | `test_pipeline.py`、`test_sse_and_outage.py` |
+| 2-d | §16、§20（`handle_transcribe`）、§21.3、§21.5 | `test_pipeline.py`、`test_sse_and_outage.py`、`test_stt_runtime.py` の残り（Provider・プール・ダウングレード・モデルの選び直し）、`test_route_guards.py` |
 | 2-e | §18 | `test_overlap_and_merge.py` |
 | 2-f | §19、§20（`handle_summary`） | `test_summary.py` |
 | 2-g | §21.3（notes） | `test_regenerate_creates_new_version_and_keeps_notes` |
 | 2-h〜2-i | ブラウザ側文書 | 実機 |
+
+---
+
+# 26. 残課題（本書に未反映の事項）
+
+2026-11-13 のレビューで見つけ、本書では直していないもの。実装の前に要否を判断する。
+
+| # | 事項 | 現状 | 影響 |
+| --- | --- | --- | --- |
+| R1 | モデル取得中の `/v1/health.status = "degraded"`（基本設計 §7.4） | 未実装。取得の状態は `GET /v1/models` の `downloads` でだけ分かる | Phase 1 のクライアント（`BackendHealthMonitor`）が `degraded` を「保存できない」と扱うなら、録音中の取得で Chunk の送信が止まる。扱いを確かめてから決める |
+| R2 | 無音 Chunk のサンプリング STT（基本設計 §13.2、設定 `vad_sampling_ratio`） | 設定の保存と検証だけがあり、値を読むコードがない | 設定しても何も起きない。実装するか、設定項目を外すかを決める |
+| R3 | LLM の OOM 時に `num_ctx` を縮める・1 段小さい LLM に落とす（基本設計 §5.2） | 未実装。`OOM` は同じ条件のまま再試行し、上限で `failed` | VRAM が足りない構成では要約が必ず失敗する。利用者は `PUT /v1/settings` の `llmModel` で小さいモデルを選べる |
+| R4 | SSE の `job` イベントの形 | `JobRunner` は DB 行（snake_case）を流し、`GET /jobs` は camelCase（`job_view`）。ブラウザ側 §3 の `jobFromServerRow` が両方を受ける | 動作はするが契約が 2 つある。`job_view` を共有の場所へ移して SSE もそれを流せば 1 つにできる |
+| R5 | `PUT /notes` の `If-Match` なし | 無条件の上書きとして受ける（本書のクライアントは必ず付ける） | 他のクライアントが付け忘れると楽観ロックが効かない。必須（428）にするかを決める |
+| R6 | `transcribe_chunk` 実行中の排他は片方向 | STT 実行中は要約を lease しないが、要約の実行中に別の会議の STT は始まる（基本設計 §5.2 の規則どおり） | `gpu_small` で要約と STT が重なり OOM になりうる（どちらも retryable） |
 
 ---
 

@@ -290,7 +290,7 @@ GPU OOM で STT ジョブが失敗した場合、次の候補に落として再�
 
 例外の設計上の扱い：
 
-* サーバーの外向き通信はこのエンドポイントの処理中に限り、接続先ホストを `huggingface.co` / `cdn-lfs.huggingface.co` の allowlist に固定する（Phase 1 §4.4 のサーバー側 allowlist を実装する初めての箇所）
+* サーバーの外向き通信はこのエンドポイントの処理中に限り、接続先ホストを allowlist（`huggingface.co` とそのリダイレクト先の CDN。ホスト名の一覧はサーバー側詳細設計 §10.2 の `DOWNLOAD_ALLOWLIST` が正）に固定する。リダイレクトは 1 段ずつたどり、要求を出す前に行き先を確かめる（Phase 1 §4.4 のサーバー側 allowlist を実装する初めての箇所）
 * ダウンロード中は `/v1/health.status = "degraded"` とし、理由を `downloading_model` として返す
 * 音声・transcript・要約のいかなるデータも、この通信に含まれない。送信するのはモデル名だけである
 * ブラウザ側の CSP `connect-src` は変更しない（ブラウザは Hugging Face と通信しない）

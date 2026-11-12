@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── サーバー側（`docs/design-local-phase2-server.md`）。API 契約はそちらの §21 と 1 対 1。
 **配置:** `docs/design-local-phase2-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** ブラウザ標準 API（`MediaStream` / `AudioContext` / `AudioWorklet` / `IndexedDB` / `fetch` / `EventSource`）と TypeScript のみ。UI フレームワークは本書で選定せず、状態モデル（§11）をフレームワーク非依存の reducer として定義する。
-**検証状態:** 本書の全 `typescript` コードブロック（17 ファイル）を Phase 1 の現行ソースへ上書き・追加した状態で、`tsc --noEmit`（strict）と Vitest 30 ファイル 549 件が全件通過することを確認している（2026-11-12）。詳細と再現手順は §1.2。**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**（§15）。
+**検証状態:** 本書の全 `typescript` コードブロック（18 ファイル）を Phase 1 の現行ソースへ上書き・追加した状態で、`tsc --noEmit`（strict）と Vitest 31 ファイル 557 件が全件通過することを確認している（2026-11-13）。詳細と再現手順は §1.2。**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**（§15）。
 
 ---
 
@@ -41,7 +41,7 @@ Phase 2 のブラウザ側の責務は次の 3 つである。
 
 ## 1.2 検証状態
 
-本書の `// src/...` と `// test/...` のコードブロックを Phase 1 の現行ソース（2026-11-12 時点）へ上書き・追加した状態で、`npm run typecheck` が通り、Vitest 30 ファイル 549 件が全件通過することを確認している（Phase 1 の 24 ファイルを含む。Phase 1 側の変更は §7 に記した `test/app.test.ts` の 1 か所）。確認の手順は `scripts/verify-design-docs.sh`。実ブラウザ（`getDisplayMedia`・SSE の実接続）では実行していない。
+本書の `// src/...` と `// test/...` のコードブロックを Phase 1 の現行ソース（2026-11-13 時点）へ上書き・追加した状態で、`npm run typecheck` が通り、Vitest 31 ファイル 557 件が全件通過することを確認している（Phase 1 の 24 ファイルを含む。Phase 1 側の変更は §7 に記した `test/app.test.ts` の 1 か所）。確認の手順は `scripts/verify-design-docs.sh`。実ブラウザ（`getDisplayMedia`・SSE の実接続）では実行していない。
 
 Phase 1 のファイルを全文で載せているブロック（`recording-controller.ts`・`finalizer.ts`・`types/recording.ts`）は、**Phase 1 の現行ソースに Phase 2 の差分を当てたもの**である。Phase 1 側を直したら、同じ修正を本書のブロックにも当てて上の検証をやり直す（CLAUDE.md ルール 3）。
 
@@ -316,6 +316,8 @@ export function isWorkletEvent(value: unknown): value is WorkletEvent {
 
 基本設計 §7.1・§12.4・§14 を統合した確定版。サーバー側 §21 のレスポンスと 1 対 1。
 
+**型だけでなく、エンドポイントごとのデコーダ（`decodeMeetingDetail` など）をここに置く。** サーバー応答は外部入力なので、`Phase2Client`（§9）は成功応答を `as T` で通さず、必ずデコーダに通す（形が違えば `MALFORMED`）。デコーダは、会議に属する応答について `meetingId` が要求と一致することまで確かめる。応答の型を足す・変えるときは、デコーダと §12.4.1 のテスト（サーバーの実応答をフィクスチャにしている）を同じ作業の中で直す。
+
 ```typescript
 // src/api/contracts-summary.ts
 export interface SummaryTopic {
@@ -392,14 +394,17 @@ export interface SummaryValidationReport {
 export function isMeetingSummary(value: unknown): value is MeetingSummary {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return typeof v.summary === "string" && Array.isArray(v.topics) && Array.isArray(v.rejected) && typeof v.modelName === "string";
+  // 描画と reducer が .map / .filter / .length で触る配列は、すべて配列であることまで確かめる
+  return typeof v.summary === "string" && typeof v.modelName === "string" && typeof v.transcriptVersion === "number"
+    && Array.isArray(v.topics) && Array.isArray(v.decisions) && Array.isArray(v.actionItems)
+    && Array.isArray(v.rejected) && Array.isArray(v.modelCaveats);
 }
 ```
 
 ```typescript
 // src/api/contracts-phase2.ts
 import type { LocalBackendCapabilities } from "../types/recording";
-import type { MeetingSummary, SummaryValidationReport } from "./contracts-summary";
+import { isMeetingSummary, type MeetingSummary, type SummaryValidationReport } from "./contracts-summary";
 
 export type HardwareTier = "gpu_large" | "gpu_medium" | "gpu_small" | "cpu_only";
 
@@ -508,10 +513,18 @@ export interface NotesResponse {
   readonly lastAppliedSummaryVersion: number | null;
 }
 
+/** モデル取得（POST /v1/models/download）の状態。サーバー側 §10.2 `ModelDownloads`。結果は GET /v1/models を取り直して見る */
+export interface ModelDownload {
+  readonly name: string;
+  readonly status: "running" | "completed" | "failed";
+  readonly error: string | null;
+}
+
 export interface ModelsResponse {
   readonly stt: ReadonlyArray<{ readonly name: string; readonly installed: boolean; readonly selected: boolean; readonly recommended: boolean }>;
   readonly llm: ReadonlyArray<{ readonly name: string; readonly selected: boolean; readonly recommended: boolean }>;
   readonly ollamaReachable: boolean;
+  readonly downloads: ReadonlyArray<ModelDownload>;
 }
 
 export type MeetingEvent =
@@ -550,6 +563,137 @@ export function isMeetingEvent(value: unknown): value is MeetingEvent {
     default:
       return false;
   }
+}
+
+/**
+ * エンドポイント別のデコーダ。Phase2Client.request() は成功応答を `as T` で通さず、必ずここを経由する（§9）。
+ * サーバー応答は外部入力（CLAUDE.md「既知の落とし穴」）。形の違う応答を値として返すと、失敗が reducer や描画の
+ * .map / .filter まで先送りされて TypeError になる。検証するのは後段が触るフィールドで、失敗は null（呼び出し側が MALFORMED）。
+ * meetingId は「要求した会議のものであること」まで確かめる（会議の切り替え中に遅れて届いた前の会議の応答を通さない）。
+ * jobType は列挙で絞らない（Phase 3 のサーバーはジョブ種別を増やす）。
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isForMeeting(value: Record<string, unknown>, expectedMeetingId: string): boolean {
+  return typeof value.meetingId === "string" && value.meetingId === expectedMeetingId;
+}
+
+function isNullOr(value: unknown, type: "string" | "number"): boolean {
+  return value === null || typeof value === type;
+}
+
+const JOB_STATUSES: ReadonlyArray<string> = ["pending", "leased", "processing", "retrying", "completed", "failed", "cancelled"];
+const STT_STATUSES: ReadonlyArray<string> = ["pending", "queued", "processing", "completed", "skipped", "failed"];
+
+function hasCounts(value: unknown, keys: ReadonlyArray<string>): boolean {
+  return isRecord(value) && keys.every((k) => typeof value[k] === "number");
+}
+
+function isSource(value: unknown): value is "mic" | "system" {
+  return value === "mic" || value === "system";
+}
+
+export function isJobSummary(value: unknown): value is JobSummary {
+  if (!isRecord(value)) return false;
+  return typeof value.jobId === "string" && typeof value.jobType === "string"
+    && typeof value.status === "string" && JOB_STATUSES.includes(value.status)
+    && isNullOr(value.chunkId, "string") && typeof value.attempts === "number"
+    && isNullOr(value.errorClass, "string") && isNullOr(value.lastError, "string") && isNullOr(value.modelName, "string")
+    && isNullOr(value.durationMs, "number") && typeof value.updatedAt === "number";
+}
+
+function isTranscriptSegmentView(value: unknown): value is TranscriptSegmentView {
+  if (!isRecord(value)) return false;
+  return typeof value.id === "string" && isSource(value.source)
+    && typeof value.startMs === "number" && typeof value.endMs === "number" && typeof value.text === "string"
+    && isNullOr(value.confidence, "number") && isNullOr(value.language, "string")
+    && typeof value.chunkSequenceNo === "number" && isNullOr(value.speakerId, "string");
+}
+
+function isTranscriptGap(value: unknown): value is TranscriptGap {
+  return isRecord(value) && isSource(value.source) && typeof value.startMs === "number" && typeof value.endMs === "number";
+}
+
+export function decodeMeetingDetail(value: unknown, expectedMeetingId: string): MeetingDetailResponse | null {
+  if (!isRecord(value) || !isForMeeting(value, expectedMeetingId)) return null;
+  if (typeof value.title !== "string" || typeof value.status !== "string" || !MEETING_STATUSES.includes(value.status)) return null;
+  if (!hasCounts(value.chunkCounts, ["mic", "system"]) || !hasCounts(value.sttStatusCounts, STT_STATUSES)) return null;
+  if (typeof value.transcriptVersion !== "number" || !isNullOr(value.latestSummaryVersion, "number")) return null;
+  if (!isNullOr(value.sttModelUsed, "string") || !isNullOr(value.llmModelUsed, "string")) return null;
+  if (!(value.syncDriftMs === null || hasCounts(value.syncDriftMs, ["p95", "p99"]))) return null;
+  return value as unknown as MeetingDetailResponse;
+}
+
+export function decodeTranscript(value: unknown, expectedMeetingId: string): TranscriptResponse | null {
+  if (!isRecord(value) || !isForMeeting(value, expectedMeetingId) || typeof value.transcriptVersion !== "number") return null;
+  if (!Array.isArray(value.segments) || !value.segments.every(isTranscriptSegmentView)) return null;
+  if (!Array.isArray(value.gaps) || !value.gaps.every(isTranscriptGap)) return null;
+  return value as unknown as TranscriptResponse;
+}
+
+export function decodeSummary(value: unknown, expectedMeetingId: string): SummaryResponse | null {
+  if (!isRecord(value) || !isForMeeting(value, expectedMeetingId) || typeof value.version !== "number") return null;
+  if (!isMeetingSummary(value.summary)) return null;
+  const report = value.validation;
+  if (!isRecord(report) || typeof report.schemaValid !== "boolean" || !Array.isArray(report.unresolvedSegmentIds)) return null;
+  if (!hasCounts(report, ["schemaRetries", "mapWindows", "totalItems", "rejectedItems"])) return null;
+  return value as unknown as SummaryResponse;
+}
+
+export function decodeJobList(value: unknown, expectedMeetingId: string): JobListResponse | null {
+  if (!isRecord(value) || !isForMeeting(value, expectedMeetingId)) return null;
+  if (!Array.isArray(value.jobs) || !value.jobs.every(isJobSummary) || !hasCounts(value.counts, JOB_STATUSES)) return null;
+  return value as unknown as JobListResponse;
+}
+
+/** blocknoteJson は不透明な値（§10）。キーがあることだけを確かめる */
+export function decodeNotes(value: unknown, expectedMeetingId: string): NotesResponse | null {
+  if (!isRecord(value) || !isForMeeting(value, expectedMeetingId) || !("blocknoteJson" in value)) return null;
+  if (typeof value.revision !== "number" || !isNullOr(value.lastAppliedSummaryVersion, "number")) return null;
+  return value as unknown as NotesResponse;
+}
+
+function isModelDownload(value: unknown): value is ModelDownload {
+  return isRecord(value) && typeof value.name === "string" && isNullOr(value.error, "string")
+    && (value.status === "running" || value.status === "completed" || value.status === "failed");
+}
+
+/** downloads は後から足したフィールド。ない応答は空の一覧として読む */
+export function decodeModels(value: unknown): ModelsResponse | null {
+  if (!isRecord(value) || typeof value.ollamaReachable !== "boolean") return null;
+  const flags = (item: unknown, keys: ReadonlyArray<string>): boolean =>
+    isRecord(item) && typeof item.name === "string" && keys.every((k) => typeof item[k] === "boolean");
+  if (!Array.isArray(value.stt) || !value.stt.every((m) => flags(m, ["installed", "selected", "recommended"]))) return null;
+  if (!Array.isArray(value.llm) || !value.llm.every((m) => flags(m, ["selected", "recommended"]))) return null;
+  const downloads = value.downloads === undefined ? [] : value.downloads;
+  if (!Array.isArray(downloads) || !downloads.every(isModelDownload)) return null;
+  return { ...(value as unknown as ModelsResponse), downloads };
+}
+
+export function decodeJobRetry(value: unknown): { jobId: string; status: string } | null {
+  if (!isRecord(value) || typeof value.jobId !== "string" || typeof value.status !== "string") return null;
+  return { jobId: value.jobId, status: value.status };
+}
+
+export function decodeExcluded(value: unknown): { excluded: number } | null {
+  return isRecord(value) && typeof value.excluded === "number" ? { excluded: value.excluded } : null;
+}
+
+export function decodeJobId(value: unknown): { jobId: string | null } | null {
+  if (!isRecord(value) || !(typeof value.jobId === "string" || value.jobId === null)) return null;
+  return { jobId: value.jobId };
+}
+
+export function decodeJobsCreated(value: unknown): { jobsCreated: number } | null {
+  return isRecord(value) && typeof value.jobsCreated === "number" ? { jobsCreated: value.jobsCreated } : null;
+}
+
+export function decodeUpdated(value: unknown): { updated: string[] } | null {
+  if (!isRecord(value) || !Array.isArray(value.updated)) return null;
+  const updated = value.updated.filter((k): k is string => typeof k === "string");
+  return updated.length === value.updated.length ? { updated } : null;
 }
 
 /** サーバー側 §13.2：JobRunner が publish する job は snake_case の DB 行なので、ここで camelCase に変換する。 */
@@ -2028,6 +2172,10 @@ export function defaultCreateEventSource(url: URL, token: string): EventSourceLi
 ```typescript
 // src/api/phase2-client.ts
 import { assertLocalHost } from "./local-saver";
+import {
+  decodeExcluded, decodeJobId, decodeJobList, decodeJobRetry, decodeJobsCreated, decodeMeetingDetail, decodeModels,
+  decodeNotes, decodeSummary, decodeTranscript, decodeUpdated,
+} from "./contracts-phase2";
 import type {
   JobListResponse, MeetingDetailResponse, ModelsResponse, NotesResponse, SummaryResponse, TranscriptResponse,
 } from "./contracts-phase2";
@@ -2050,62 +2198,73 @@ export class Phase2Client {
     assertLocalHost(this.base);
   }
 
+  // デコーダには要求した meetingId を束ねて渡す。応答の meetingId が要求と違えば、形が正しくても MALFORMED（§3）
   getMeeting(meetingId: string): Promise<ApiResult<MeetingDetailResponse>> {
-    return this.request("GET", `/v1/meetings/${enc(meetingId)}`);
+    return this.request("GET", `/v1/meetings/${enc(meetingId)}`, (v) => decodeMeetingDetail(v, meetingId));
   }
 
   getTranscript(meetingId: string, version?: number): Promise<ApiResult<TranscriptResponse>> {
     const q = version === undefined ? "" : `?version=${version}`;
-    return this.request("GET", `/v1/meetings/${enc(meetingId)}/transcript${q}`);
+    return this.request("GET", `/v1/meetings/${enc(meetingId)}/transcript${q}`, (v) => decodeTranscript(v, meetingId));
   }
 
   getSummary(meetingId: string, version?: number): Promise<ApiResult<SummaryResponse>> {
     const q = version === undefined ? "" : `?version=${version}`;
-    return this.request("GET", `/v1/meetings/${enc(meetingId)}/summary${q}`);
+    return this.request("GET", `/v1/meetings/${enc(meetingId)}/summary${q}`, (v) => decodeSummary(v, meetingId));
   }
 
   getJobs(meetingId: string): Promise<ApiResult<JobListResponse>> {
-    return this.request("GET", `/v1/meetings/${enc(meetingId)}/jobs`);
+    return this.request("GET", `/v1/meetings/${enc(meetingId)}/jobs`, (v) => decodeJobList(v, meetingId));
   }
 
   retryJob(jobId: string): Promise<ApiResult<{ jobId: string; status: string }>> {
-    return this.request("POST", `/v1/jobs/${enc(jobId)}/retry`);
+    return this.request("POST", `/v1/jobs/${enc(jobId)}/retry`, decodeJobRetry);
   }
 
   excludeFailed(meetingId: string): Promise<ApiResult<{ excluded: number }>> {
-    return this.request("POST", `/v1/meetings/${enc(meetingId)}/jobs/exclude-failed`);
+    return this.request("POST", `/v1/meetings/${enc(meetingId)}/jobs/exclude-failed`, decodeExcluded);
   }
 
   regenerateSummary(meetingId: string): Promise<ApiResult<{ jobId: string | null }>> {
-    return this.request("POST", `/v1/meetings/${enc(meetingId)}/summary/regenerate`);
+    return this.request("POST", `/v1/meetings/${enc(meetingId)}/summary/regenerate`, decodeJobId);
   }
 
+  /** 確定前の会議・未配置のモデルは 422（サーバー側 §21.3）。 */
   rerunTranscript(meetingId: string, sttModel: string | null): Promise<ApiResult<{ jobsCreated: number }>> {
-    return this.request("POST", `/v1/meetings/${enc(meetingId)}/transcript/rerun`, { sttModel });
+    return this.request("POST", `/v1/meetings/${enc(meetingId)}/transcript/rerun`, decodeJobsCreated, { sttModel });
   }
 
+  /** 対象は無音判定（skipped）の Chunk だけ。それ以外と merge 前の会議は 422（サーバー側 §21.3）。 */
   transcribeSilentChunk(meetingId: string, source: "mic" | "system", seq: number): Promise<ApiResult<{ jobId: string | null }>> {
-    return this.request("POST", `/v1/meetings/${enc(meetingId)}/chunks/${source}/${seq}/transcribe`);
+    return this.request("POST", `/v1/meetings/${enc(meetingId)}/chunks/${source}/${seq}/transcribe`, decodeJobId);
   }
 
   getNotes(meetingId: string): Promise<ApiResult<NotesResponse>> {
-    return this.request("GET", `/v1/meetings/${enc(meetingId)}/notes`);
+    return this.request("GET", `/v1/meetings/${enc(meetingId)}/notes`, (v) => decodeNotes(v, meetingId));
   }
 
   /** If-Match に revision を載せる。不一致は status 409 の失敗として返る。 */
   putNotes(meetingId: string, blocknoteJson: unknown, revision: number, lastAppliedSummaryVersion: number | null): Promise<ApiResult<NotesResponse>> {
-    return this.request("PUT", `/v1/meetings/${enc(meetingId)}/notes`, { blocknoteJson, lastAppliedSummaryVersion }, { "If-Match": String(revision) });
+    return this.request("PUT", `/v1/meetings/${enc(meetingId)}/notes`, (v) => decodeNotes(v, meetingId),
+      { blocknoteJson, lastAppliedSummaryVersion }, { "If-Match": String(revision) });
   }
 
+  /** 取得（POST /v1/models/download）の進行と結果も `downloads` に入る。設定画面はこれを取り直して見る。 */
   getModels(): Promise<ApiResult<ModelsResponse>> {
-    return this.request("GET", "/v1/models");
+    return this.request("GET", "/v1/models", decodeModels);
   }
 
+  /** sttModel / llmModel の空文字は「指定を外して自動選定に戻す」。値の検査に通らなければ 422（サーバー側 §21.1）。 */
   putSettings(values: { language?: string; sttModel?: string; llmModel?: string }): Promise<ApiResult<{ updated: string[] }>> {
-    return this.request("PUT", "/v1/settings", values);
+    return this.request("PUT", "/v1/settings", decodeUpdated, values);
   }
 
-  private async request<T>(method: string, path: string, body?: unknown, extraHeaders: Record<string, string> = {}): Promise<ApiResult<T>> {
+  /**
+   * 成功応答は `json as T` で通さず、エンドポイントごとのデコーダ（必須引数）に通す。形が違えば MALFORMED。
+   * エラー応答の本文は検証しない（code と error を文字列のときだけ使う）。
+   */
+  private async request<T>(method: string, path: string, decode: (value: unknown) => T | null, body?: unknown,
+    extraHeaders: Record<string, string> = {}): Promise<ApiResult<T>> {
     const url = new URL(path, this.base);
     assertLocalHost(url);
     const controller = new AbortController();
@@ -2134,7 +2293,11 @@ export class Phase2Client {
           if (res.ok) return { ok: false, status: res.status, code: "MALFORMED", message: `malformed body for ${method} ${path}` };
         }
       }
-      if (res.ok) return { ok: true, value: json as T, status: res.status };
+      if (res.ok) {
+        const value = decode(json);
+        if (value === null) return { ok: false, status: res.status, code: "MALFORMED", message: `malformed body for ${method} ${path}` };
+        return { ok: true, value, status: res.status };
+      }
       const err = (typeof json === "object" && json !== null ? json : {}) as { code?: unknown; error?: unknown };
       return {
         ok: false,
@@ -3524,6 +3687,133 @@ describe("Phase2Client の本文の読み取り", () => {
 });
 ```
 
+### 12.4.1 型付き fetch の応答の検証
+
+`fixtures` は、サーバー側設計書（§21）のコードを展開して起動し、各エンドポイントから実際に取得した応答である（2026-11-13。値は短くしてある）。サーバー側の応答の形を変えたら、ここも取り直す。
+
+```typescript
+// test/phase2-client.test.ts
+import { describe, expect, it } from "vitest";
+import { Phase2Client } from "../src/api/phase2-client";
+
+const config = { baseUrl: "http://127.0.0.1:43117", token: "t", timeoutMs: 1000 };
+const reply = (body: unknown, status = 200) => new Phase2Client(config, async () => new Response(JSON.stringify(body), { status }));
+
+const fixtures = {
+  meeting: {
+    meetingId: "m-1", title: "t", status: "completed", chunkCounts: { mic: 1, system: 0 },
+    sttStatusCounts: { pending: 0, queued: 0, processing: 0, completed: 1, skipped: 0, failed: 0 },
+    transcriptVersion: 1, latestSummaryVersion: 1, sttModelUsed: "small", llmModelUsed: "fake-llm", syncDriftMs: null,
+  },
+  transcript: {
+    meetingId: "m-1", transcriptVersion: 1,
+    segments: [{ id: "13488271-c19b", source: "mic", startMs: 0, endMs: 5000, text: "small-seg0", confidence: 0.7778, language: "ja", chunkSequenceNo: 0, speakerId: null }],
+    gaps: [],
+  },
+  summary: {
+    meetingId: "m-1", version: 1,
+    summary: {
+      summary: "テスト会議の要約",
+      topics: [{ title: "話題A", description: "説明", sourceSegmentIds: ["13488271-c19b"] }],
+      decisions: [{ text: "small-seg0", sourceSegmentIds: ["13488271-c19b"], quote: "small-seg0", evidenceSpan: { segmentId: "13488271", start: 0, end: 10 } }],
+      actionItems: [{ task: "small-seg0", assignee: null, deadline: null, sourceSegmentIds: ["13488271-c19b"], quote: "small-seg0", evidenceSpan: { segmentId: "13488271", start: 0, end: 10 } }],
+      rejected: [], modelName: "fake-llm", promptVersion: "v1", transcriptVersion: 1, generatedAt: 1794500378275,
+      modelCaveats: ["各項目の根拠（sourceSegmentIds）を必ず確認してください。"],
+    },
+    validation: { schemaValid: true, schemaRetries: 0, mapWindows: 1, totalItems: 3, rejectedItems: 0, unresolvedSegmentIds: [] },
+  },
+  jobs: {
+    meetingId: "m-1",
+    jobs: [{ jobId: "5914360f", jobType: "vad_chunk", status: "completed", chunkId: "3c999eb0", attempts: 1, errorClass: null, lastError: null, modelName: null, durationMs: 6, updatedAt: 1794500378262 }],
+    counts: { pending: 0, leased: 0, processing: 0, retrying: 0, completed: 4, failed: 0, cancelled: 0 },
+  },
+  notes: { meetingId: "m-1", blocknoteJson: [{ type: "paragraph" }], revision: 1, lastAppliedSummaryVersion: null },
+  models: {
+    stt: [{ name: "tiny", installed: false, selected: false, recommended: false }],
+    llm: [{ name: "fake-llm", selected: true, recommended: true }],
+    ollamaReachable: true,
+    downloads: [{ name: "base", status: "failed", error: "download url not allowed: https://evil.example" }],
+  },
+};
+
+describe("Phase2Client の応答の検証", () => {
+  it("サーバーの実応答は、どのエンドポイントも検証を通る", async () => {
+    // Act
+    const results = [
+      await reply(fixtures.meeting).getMeeting("m-1"),
+      await reply(fixtures.transcript).getTranscript("m-1"),
+      await reply(fixtures.summary).getSummary("m-1"),
+      await reply(fixtures.jobs).getJobs("m-1"),
+      await reply(fixtures.notes).getNotes("m-1"),
+      await reply(fixtures.notes).putNotes("m-1", [], 0, null),
+      await reply(fixtures.models).getModels(),
+      await reply({ jobId: "j", status: "pending" }).retryJob("j"),
+      await reply({ meetingId: "m-1", excluded: 0 }).excludeFailed("m-1"),
+      await reply({ jobId: "8eddc5bf" }).regenerateSummary("m-1"),
+      await reply({ jobsCreated: 1 }).rerunTranscript("m-1", null),
+      await reply({ jobId: "j" }).transcribeSilentChunk("m-1", "mic", 0),
+      await reply({ updated: ["language"] }).putSettings({ language: "ja" }),
+    ];
+    // Assert
+    expect(results.map((r) => r.ok)).toEqual(results.map(() => true));
+    expect(results[0]).toEqual({ ok: true, status: 200, value: fixtures.meeting });
+  });
+
+  it("形の違う成功応答は値として返さず MALFORMED にする", async () => {
+    // Arrange: それぞれ、後段（reducer・描画）が .map / .filter / Map のキーに使うフィールドが壊れた応答
+    const cases: ReadonlyArray<[string, () => Promise<{ ok: boolean }>]> = [
+      ["会議の status が未知", () => reply({ ...fixtures.meeting, status: "weird" }).getMeeting("m-1")],
+      ["segments が配列でない", () => reply({ ...fixtures.transcript, segments: null }).getTranscript("m-1")],
+      ["segment の startMs が文字列", () => reply({ ...fixtures.transcript, segments: [{ ...fixtures.transcript.segments[0], startMs: "0" }] }).getTranscript("m-1")],
+      ["summary の本体が欠落", () => reply({ meetingId: "m-1", version: 1, validation: fixtures.summary.validation }).getSummary("m-1")],
+      ["summary.rejected が配列でない", () => reply({ ...fixtures.summary, summary: { ...fixtures.summary.summary, rejected: {} } }).getSummary("m-1")],
+      ["job の status が未知", () => reply({ ...fixtures.jobs, jobs: [{ ...fixtures.jobs.jobs[0], status: "weird" }] }).getJobs("m-1")],
+      ["notes の revision が文字列", () => reply({ ...fixtures.notes, revision: "1" }).getNotes("m-1")],
+      ["models.stt が配列でない", () => reply({ ...fixtures.models, stt: {} }).getModels()],
+      ["jobsCreated が欠落", () => reply({}).rerunTranscript("m-1", null)],
+      ["本文が null", () => reply(null).getMeeting("m-1")],
+    ];
+    for (const [name, call] of cases) {
+      // Act
+      const result = await call();
+      // Assert
+      expect(result, name).toMatchObject({ ok: false, status: 200, code: "MALFORMED" });
+    }
+  });
+
+  it("要求した会議と違う meetingId の応答は MALFORMED にする", async () => {
+    // Arrange: 会議の切り替え中に遅れて届いた前の会議の応答・取り違えた応答
+    const other = { meetingId: "m-2" };
+    // Act
+    const results = [
+      await reply({ ...fixtures.meeting, ...other }).getMeeting("m-1"),
+      await reply({ ...fixtures.transcript, ...other }).getTranscript("m-1"),
+      await reply({ ...fixtures.summary, ...other }).getSummary("m-1"),
+      await reply({ ...fixtures.jobs, ...other }).getJobs("m-1"),
+      await reply({ ...fixtures.notes, ...other }).getNotes("m-1"),
+    ];
+    // Assert
+    for (const r of results) expect(r).toMatchObject({ ok: false, code: "MALFORMED" });
+  });
+
+  it("エラー応答は本文の形を検証せず、code と status で返す", async () => {
+    // Act
+    const result = await reply({ error: "revision mismatch", code: "CONFLICT_HASH_MISMATCH" }, 409).putNotes("m-1", [], 3, null);
+    // Assert
+    expect(result).toEqual({ ok: false, status: 409, code: "CONFLICT_HASH_MISMATCH", message: "revision mismatch" });
+  });
+
+  it("downloads のない古い応答でも models は通る", async () => {
+    // Arrange
+    const { downloads: _unused, ...legacy } = fixtures.models;
+    // Act
+    const result = await reply(legacy).getModels();
+    // Assert
+    expect(result.ok && result.value.downloads).toEqual([]);
+  });
+});
+```
+
 ## 12.5 ノートの Autosave
 
 ```typescript
@@ -3911,6 +4201,7 @@ describe("UI reducer", () => {
 | SSE 購読前・切断中の取りこぼし補完、補完中の live の保留、止まった接続の再接続 | `events.test.ts` |
 | Manual Notes 保護・楽観ロック・オフライン下書き | `notes-store.test.ts` |
 | Hallucination 除外項目の表示 | `ui-state.test.ts` |
+| サーバー応答の検証（形の違う応答・別の会議の応答を値として返さない） | `phase2-client.test.ts` |
 | 外部通信ゼロ（allowlist） | `events.test.ts`（外部ホスト拒否）。`Phase2Client` と `finalizer` は `assertLocalHost` を通る |
 | Phase 1 の回帰 | Phase 1 §24 の 11 テストを同じツリーで実行 |
 
@@ -3996,10 +4287,10 @@ Phase 1 から変えない規則：ローカル以外へ通信しない（URL �
 
 | Step | 内容 | 完了判定 |
 | --- | --- | --- |
-| 2-c1 | §2 型の追加、§3 契約型と型ガード | 既存テストが通る。型ガードのテスト（正常・欠落・型違い）を追加 |
+| 2-c1 | §2 型の追加、§3 契約型とデコーダ | 既存テストが通る。`isMeetingEvent` のテスト（正常・欠落・型違い）を追加。デコーダは 2-d1 の `phase2-client.test.ts` が通す |
 | 2-c2 | §4 RecordingController の変更 | Phase 1 の `recording-controller.test.ts` が無変更で通る |
 | 2-c3 | §7 Finalizer の差分 | `finalizer-two-sources.test.ts`。Phase 1 のテストは §7 の 1 か所だけ直して通る |
-| 2-d1 | §8 SSE クライアント、§9 型付き fetch | `events.test.ts`。Phase 2 サーバー（Step 2-d）に対する実接続で `job` / `progress` を受ける |
+| 2-d1 | §8 SSE クライアント、§9 型付き fetch | `events.test.ts`、`phase2-client.test.ts`（§12.4.1）。Phase 2 サーバー（Step 2-d）に対する実接続で `job` / `progress` を受ける |
 | 2-d2 | §10 NotesStore、§11 UI 状態、§15.1 W7・W8、transcript の表示 | `notes-store.test.ts`（別タブ編集で `409` → 上書きしない、W8 のトークン変更）・`ui-state.test.ts`。1 時間会議の transcript が画面に出る（基本設計 Step 2-d）。W8 が `NotesStore` を生成するので §10 をここで入れる。`blocknoteJson` は不透明な文字列なので D2 に依存しない（§15.2） |
 | 2-f1 | 要約と `rejected` の表示、再生成 | 偽 ID を返すモックで `rejected` が折りたたみ表示される |
 | 2-g1 | ノートの編集 UI（§15.2 D2 の決定後。保存経路は 2-d2 の `NotesStore`） | 編集が autosave で保存される。別タブ編集の `409` で上書きせず競合を表示する |

@@ -5,7 +5,7 @@
 **対となる文書:** Phase 3 詳細設計書 ── ブラウザ側（`docs/design-local-phase3-client.md`）。
 **配置:** `docs/design-local-phase3-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。LAN 共有は「利用者自身が管理する LAN 内」に限定し、インターネット公開は対象外。
-**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 100 件と本書の 36 件（計 18 ファイル 136 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
+**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 128 件と本書の 36 件（計 20 ファイル 164 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-13、§23）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
 
 ---
 
@@ -757,6 +757,7 @@ from ..llm.provider import SummaryProvider
 from ..storage.codec import AudioCodec
 from ..stt.executor import STTExecutor
 from ..stt.language import LanguageDetector
+from ..storage.models_dir import ModelDownloads
 from ..vad.provider import VADProvider
 from .events import EventBroker
 
@@ -783,6 +784,7 @@ class AppContext:
     vad: VADProvider | None
     llm: SummaryProvider
     events: EventBroker = field(default_factory=lambda: EventBroker())
+    downloads: ModelDownloads = field(default_factory=lambda: ModelDownloads())   # モデル取得の状態（§10.2）
     server_version: str = "0.3.0"
     # Phase 3
     diarization: DiarizationProvider | None = None
@@ -947,10 +949,7 @@ def request_regenerate_summary(conn: sqlite3.Connection, meeting_id: str) -> Non
 
 def request_rerun_stt(conn: sqlite3.Connection, meeting_id: str, stt_model: str | None) -> int:
     """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。"""
-    conn.execute(
-        "UPDATE processing_jobs SET status = 'cancelled' WHERE meeting_id = ? AND status IN ('pending','retrying','failed','leased','processing')",
-        (meeting_id,),
-    )
+    # ジョブは行ごと消す。実行中のハンドラは lease の検査（行がない）で結果を書けなくなる（§8 lease_is_current）
     conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ?", (meeting_id,))
     for chunk in repo.list_chunks(conn, meeting_id):
         repo.delete_segments_of_chunk(conn, chunk.id)
@@ -1106,7 +1105,7 @@ class JobRunner:
             if not d.consume_attempt:
                 conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
             if err.error_class == "OOM" and job.job_type in GPU_HEAVY and job.job_type != "diarize_meeting":
-                self._downgrade_stt(conn, job.meeting_id)
+                self._downgrade_stt(conn, job.meeting_id, job.model_name)
             if d.next_status == "failed":
                 if job.job_type == "transcribe_chunk":
                     pipeline.on_transcribe_failed(conn, pipeline.job_of_chunk(conn, job))
@@ -1122,14 +1121,23 @@ class JobRunner:
             repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
         self._publish_job(job.id)
 
-    def _downgrade_stt(self, conn, meeting_id: str) -> None:  # type: ignore[no-untyped-def]
-        """会議単位でモデルを 1 段落とす（基本設計 §7.3）。"""
+    def _downgrade_stt(self, conn, meeting_id: str, ran_with: str | None) -> None:  # type: ignore[no-untyped-def]
+        """会議単位でモデルを 1 段落とす（基本設計 §7.3）。ran_with は失敗したジョブが使ったモデル（lease 時点の model_name）。
+
+        落とすのは「モデル 1 つにつき 1 段」。同じモデルで並行して走っていた 2 件がどちらも OOM になっても、
+        2 件目は既に落とした後なので何もしない（失敗 1 件につき 1 段にすると small → tiny まで落ちる）。
+        落とす先は配置済みのモデルに限る（未配置の段を選ぶと MODEL_MISSING で待ち続ける）。
+        """
         from ..hw.tiers import downgrade_stt
         m = repo.get_meeting(conn, meeting_id)
         current = (m.stt_model_used if m and m.stt_model_used else (self.ctx.models.stt.name if self.ctx.models.stt else None))
         if current is None:
             return
+        if ran_with is not None and ran_with != current:
+            return
         nxt = downgrade_stt(current)
+        while nxt is not None and nxt not in self.ctx.models.installed_stt:
+            nxt = downgrade_stt(nxt)
         if nxt is None:
             return
         repo.update_meeting(conn, meeting_id, stt_model_used=nxt)
@@ -1460,18 +1468,18 @@ class FakeLanguageDetector(LanguageDetector):
 class FasterWhisperLanguageDetector(LanguageDetector):
     """faster-whisper の detect_language。先頭 30 秒の特徴量で判定するため短い Chunk では確信度が下がる（§3）。"""
 
-    def __init__(self, models_dir: Path, model_name: str, compute_type: str) -> None:
+    def __init__(self, models_dir: Path, model_name: str, compute_type: str, device: str = "cpu") -> None:
         self.models_dir = models_dir
         self.model_name = model_name
         self.compute_type = compute_type
+        self.device = device           # SttCandidate.device。compute_type から推測しない（Phase 2 §9）
         self._model: Any = None
 
     def _load(self) -> Any:
         if self._model is not None:
             return self._model
         from faster_whisper import WhisperModel  # type: ignore[import-not-found]
-        device = "cuda" if self.compute_type in ("float16", "int8_float16") else "cpu"
-        self._model = WhisperModel(str(self.models_dir / "whisper" / self.model_name), device=device, compute_type=self.compute_type)
+        self._model = WhisperModel(str(self.models_dir / "whisper" / self.model_name), device=self.device, compute_type=self.compute_type)
         return self._model
 
     def detect(self, pcm: bytes) -> LanguageGuess:
@@ -2758,8 +2766,9 @@ from pydantic import BaseModel
 from ..db import repo, repo_phase3
 from ..db.connection import now_ms
 from ..jobs import live, pipeline
+from ..jobs.selection import refresh_llm, refresh_stt
 from ..storage.files import meeting_dir
-from .common import error_body, get_ctx
+from .common import MERGED_STATUSES, POST_FINALIZE_STATUSES, clean_settings, error_body, get_ctx
 
 router = APIRouter(prefix="/v1")
 
@@ -2891,8 +2900,15 @@ async def regenerate(meeting_id: str, request: Request) -> Any:
 async def rerun(meeting_id: str, req: RerunRequest, request: Request) -> Any:
     ctx = get_ctx(request)
     async with ctx.db.write() as conn:
-        if repo.get_meeting(conn, meeting_id) is None:
+        m = repo.get_meeting(conn, meeting_id)
+        if m is None:
             return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
+        if m.status not in POST_FINALIZE_STATUSES:
+            # 確定前（録音中）に通すと会議が transcribing に進み、以後の Chunk の PUT が「確定済み」の 409 になる
+            return JSONResponse(error_body("VALIDATION", "meeting is not finalized"), status_code=422)
+        if req.sttModel is not None and req.sttModel not in ctx.models.installed_stt:
+            # 未配置のモデルで作り直すと、全 Chunk が MODEL_MISSING の待機に入る（既存の transcript は消した後）
+            return JSONResponse(error_body("VALIDATION", "stt model is not installed"), status_code=422)
         n = pipeline.request_rerun_stt(conn, meeting_id, req.sttModel)
     return {"jobsCreated": n}
 
@@ -2928,11 +2944,24 @@ async def transcribe_silent_chunk(meeting_id: str, source: str, sequence_no: int
     """has_voice=0 の Chunk を手動で STT（基本設計 §13.2）。"""
     ctx = get_ctx(request)
     async with ctx.db.write() as conn:
+        m = repo.get_meeting(conn, meeting_id)
         c = repo.get_chunk_by_key(conn, meeting_id, source, sequence_no)
-        if c is None:
+        if m is None or c is None:
             return JSONResponse(error_body("NOT_FOUND", "chunk not found"), status_code=404)
-        repo.update_chunk(conn, c.id, stt_status="queued", has_voice=True)
+        if m.status not in MERGED_STATUSES:
+            # merge の前（録音中・transcribing）は受けない。実行待ちの merge が、この Chunk の STT より先に走りうる
+            return JSONResponse(error_body("VALIDATION", "transcript is not ready"), status_code=422)
+        if c.stt_status != "skipped":
+            # 対象は VAD が無音と判定した Chunk だけ。それ以外は transcribe ジョブが既にあり（一意制約）、
+            # ジョブを作れないまま queued にすると、終端にならない Chunk が残って merge が永久に止まる
+            return JSONResponse(error_body("VALIDATION", "chunk is not a skipped chunk"), status_code=422)
         job_id = repo.insert_job(conn, meeting_id, "transcribe_chunk", chunk_id=c.id)
+        if job_id is None:
+            return JSONResponse(error_body("VALIDATION", "chunk already has a transcribe job"), status_code=422)
+        repo.update_chunk(conn, c.id, stt_status="queued", has_voice=True)
+        # 完了済みの merge ジョブを消す。この Chunk の STT が終わると ensure_merge_job が作り直し、transcript の版が上がる。
+        # 要約は自動では作り直さない（会議は transcribed に戻る。利用者が再生成を選ぶ）
+        repo.delete_finished_job(conn, meeting_id, "merge_transcript")
         repo.record_metric(conn, "vad_manual_transcribe", 1, meeting_id=meeting_id)
     return {"jobId": job_id}
 
@@ -2944,10 +2973,18 @@ async def put_settings(req: SettingsPutRequest, request: Request) -> Any:
         "language": req.language, "stt_model": req.sttModel, "llm_model": req.llmModel, "vad_sampling_ratio": req.vadSamplingRatio,
         "live_stt_enabled": req.liveSttEnabled, "summary_language": req.summaryLanguage, "diarization_enabled": req.diarizationEnabled,
     }.items() if v is not None}
+    error = clean_settings(values)      # 検査に通らなければ 1 つも保存しない
+    if error is not None:
+        return JSONResponse(error_body("VALIDATION", error), status_code=422)
     async with ctx.db.write() as conn:
         for k, v in values.items():
             repo.put_setting(conn, k, v)
     ctx.settings = ctx.settings.with_overrides(values)
+    # モデルの指定を変えたら選定をやり直す（やり直さないと再起動するまで前のモデルで走る）
+    if "stt_model" in values:
+        refresh_stt(ctx)
+    if "llm_model" in values:
+        await refresh_llm(ctx)
     warnings: list[str] = []
     if values.get("live_stt_enabled") and ctx.models.tier in ("gpu_small", "cpu_only"):
         warnings.append("この区分では Live STT が録音に影響する可能性があります（§2.1）")
@@ -3090,6 +3127,7 @@ from ..storage.files import InvalidWavError, build_wav, read_pcm, sha256_hex, wr
 from . import pipeline
 from .context import AppContext
 from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError
+from .selection import refresh_llm, refresh_stt
 
 DEFAULT_LLM_CTX_TOKENS = 8192
 
@@ -3136,10 +3174,13 @@ async def _run_stt(ctx: AppContext, job: Job, chunk: AudioChunk, *, with_overlap
         prev = repo.get_chunk_by_key(conn, chunk.meeting_id, chunk.source, chunk.sequence_no - 1) if with_overlap else None
     if meeting is None:
         raise InvalidAudioError("meeting missing")
+    if ctx.models.stt is None:
+        refresh_stt(ctx)   # 起動後に配置・取得したモデルを拾う。起動時の選定のままだと、再起動するまで待ち続ける
     model_name = job.model_name or meeting.stt_model_used or (ctx.models.stt.name if ctx.models.stt else None)
     if model_name is None:
         raise ModelMissingError("no STT model available")
     compute = ctx.models.stt.compute_type if ctx.models.stt else "int8"
+    device = ctx.models.stt.device if ctx.models.stt else "cpu"
     try:
         pcm = read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec)
         prev_pcm = read_pcm(ctx.settings.data_dir, prev.local_path, prev.sha256, ctx.codec) if prev is not None else None
@@ -3160,7 +3201,7 @@ async def _run_stt(ctx: AppContext, job: Job, chunk: AudioChunk, *, with_overlap
 
     factor = th.stt_timeout_factor_cpu if ctx.models.tier == "cpu_only" else th.stt_timeout_factor_gpu
     timeout_s = max(30.0, chunk.duration_ms / 1000 * factor)
-    req = STTRequest(pcm=stt_input, model_name=model_name, compute_type=compute, models_dir=str(ctx.settings.models_dir),
+    req = STTRequest(pcm=stt_input, model_name=model_name, compute_type=compute, device=device, models_dir=str(ctx.settings.models_dir),
                      language=language, beam_size=1 if ctx.models.tier == "cpu_only" else 5)
     try:
         result = await ctx.stt.transcribe(req, timeout_s)
@@ -3306,6 +3347,7 @@ def _summary_language(ctx: AppContext, ratio: dict[str, float]) -> tuple[str, bo
 
 
 async def handle_summary(ctx: AppContext, job: Job) -> str | None:
+    await refresh_llm(ctx)   # サーバーより後に起動した Ollama・後から pull したモデルを拾う（/api/tags を 1 回、期限 2 秒）
     llm_model = ctx.models.llm
     if llm_model is None:
         if not ctx.models.ollama_reachable:
@@ -3422,16 +3464,16 @@ from .db.connection import Database
 from .db.migrate import migrate
 from .db.migrations_phase3 import apply_phase3
 from .diarization.provider import DiarizationProvider
-from .hw import tiers
 from .hw.detect import Hardware, detect
-from .jobs.context import AppContext, ModelSelection
+from .jobs.context import AppContext
+from .jobs.selection import select_models
 from .llm.provider import SummaryProvider
 from .storage import backup
 from .storage.codec import AudioCodec
 from .stt.executor import InlineExecutor, PoolExecutor, STTExecutor
 from .stt.language import LanguageDetector
 from .stt.provider import STTProvider
-from .storage.models_dir import installed_whisper_models, silero_model_path
+from .storage.models_dir import silero_model_path
 from .vad.provider import VADProvider
 
 
@@ -3471,20 +3513,6 @@ def read_token(path: Path) -> str | None:
     if not path.is_file():
         return None
     return path.read_text(encoding="ascii").strip() or None
-
-
-def select_models(settings: Settings, hw: Hardware, available_llm: list[str], ollama_reachable: bool) -> ModelSelection:
-    tier = tiers.classify(hw)
-    installed = installed_whisper_models(settings.models_dir)
-    budget = hw.gpu.vram_bytes if hw.gpu.available else hw.total_memory_bytes // 2
-    stt = tiers.select_stt(tier, installed, budget, settings.stt_model)
-    llm = tiers.select_llm(tier, available_llm, settings.llm_model)
-    return ModelSelection(
-        tier=tier, stt=stt, llm=llm, installed_stt=installed, available_llm=available_llm,
-        ollama_reachable=ollama_reachable,
-        max_concurrent_stt=settings.max_concurrent_stt or tiers.max_concurrent_stt(tier, hw.cpu_cores),
-        allow_concurrent_stt_and_llm=tiers.allow_concurrent_stt_and_llm(tier, hw, stt, None),
-    )
 
 
 def open_database_with_recovery(settings: Settings) -> tuple[Database, Path | None]:
@@ -3580,14 +3608,10 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
     if llm_provider is None:
         from .llm.ollama_provider import OllamaProvider
         th = settings.thresholds
-        ollama = OllamaProvider(settings.ollama_base_url, th.llm_connect_timeout_s, th.llm_read_timeout_s)
-        available_llm = await ollama.list_models()
-        llm_provider = ollama
-        ollama_reachable = bool(available_llm)
-    else:
-        available_llm, ollama_reachable = ["fake-llm"], True
-
-    models = select_models(settings, hw, available_llm, ollama_reachable)
+        llm_provider = OllamaProvider(settings.ollama_base_url, th.llm_connect_timeout_s, th.llm_read_timeout_s)
+    # None = 届かない（Ollama 未起動）、[] = 届くがモデルがない。起動は止めず、後で選び直す（jobs/selection.py）
+    listed = await llm_provider.list_models()
+    models = select_models(settings, hw, listed or [], listed is not None)
 
     stt: STTExecutor = InlineExecutor(stt_provider) if stt_provider is not None else PoolExecutor(models.max_concurrent_stt)
 
@@ -3595,9 +3619,14 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
     if vad is None:
         p = silero_model_path(settings.models_dir)
         if p is not None:
-            from .vad.silero_provider import SileroVADProvider
             th = settings.thresholds
-            vad = SileroVADProvider(p, th.vad_threshold, th.vad_min_speech_ms, th.vad_min_voiced_ms)
+            try:
+                from .vad.silero_provider import SileroVADProvider
+                vad = SileroVADProvider(p, th.vad_threshold, th.vad_min_speech_ms, th.vad_min_voiced_ms)
+            except ImportError:
+                # モデルは置いてあるが onnxruntime（extras の vad）が入っていない。起動を止めず、未配置と同じく
+                # ブラウザ側の VAD で進める（doctor の vad 行に NOT INSTALLED と出る）
+                vad = None
 
     diarization = diarization_provider
     if diarization is None and (settings.models_dir / "diarization" / "config.yaml").exists():
@@ -3607,7 +3636,7 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
     language = language_detector
     if language is None and models.stt is not None and stt_provider is None:
         from .stt.language import FasterWhisperLanguageDetector
-        language = FasterWhisperLanguageDetector(settings.models_dir, models.stt.name, models.stt.compute_type)
+        language = FasterWhisperLanguageDetector(settings.models_dir, models.stt.name, models.stt.compute_type, models.stt.device)
 
     return AppContext(settings=settings, db=db, hardware=hw, models=models, stt=stt, vad=vad, llm=llm_provider,
                       diarization=diarization, language=language, codec=codec if codec is not None else _default_codec(),
@@ -3794,7 +3823,7 @@ if __name__ == "__main__":
 
 ## 23.1 ハーネス（変更）と Phase 2 テストの回帰
 
-Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 100 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
+Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 128 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
 
 ```python
 # tests/conftest.py
@@ -4727,7 +4756,7 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
 | マイグレーション 009〜012 | `test_apply_phase3_moves_files_and_extends_job_types`、`test_apply_phase3_keeps_other_recordings_when_meeting_id_equals_user_id` |
-| Phase 2 の回帰 | Phase 2 §23 の 100 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
+| Phase 2 の回帰 | Phase 2 §23 の 128 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
 
 ---
 
