@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── サーバー側（`docs/design-local-phase2-server.md`）。API 契約はそちらの §21 と 1 対 1。
 **配置:** `docs/design-local-phase2-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** ブラウザ標準 API（`MediaStream` / `AudioContext` / `AudioWorklet` / `IndexedDB` / `fetch` / `EventSource`）と TypeScript のみ。UI フレームワークは本書で選定せず、状態モデル（§11）をフレームワーク非依存の reducer として定義する。
-**検証状態:** 本書の全 `typescript` コードブロック（17 ファイル）は Phase 1 のコードと同じツリーに抽出され、`tsc --noEmit`（strict）を通過し、Phase 1 の 11 テストと本書の 23 テスト（計 11 ファイル 34 件）が Node 22 + Vitest で全件通過することを設計時点で確認している（§12）。
+**検証状態:** 本書の全 `typescript` コードブロック（17 ファイル）を Phase 1 の現行ソースへ上書き・追加した状態で、`tsc --noEmit`（strict）と Vitest 30 ファイル 527 件が全件通過することを確認している（2026-11-12）。詳細と再現手順は §1.2。**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**（§15）。
 
 ---
 
@@ -36,6 +36,14 @@ Phase 2 のブラウザ側の責務は次の 3 つである。
 | `src/worklet/pcm-chunker.worklet.ts`、`src/audio/wav.ts`、`src/storage/idb.ts`、`src/api/local-saver.ts`、`src/api/meeting-registrar.ts`、`src/recording/local-save-scheduler.ts`、`src/api/backend-health-monitor.ts` | 変更なし | Phase 1 の会議登録を Mic/System の双方で共用 | — |
 
 変更禁止の根拠は基本設計 §2（WAV 生成・IndexedDB スキーマ・Phase 1 API 契約の不変）である。`src/storage/idb.ts` の `DB_VERSION` は 1 のままとする。
+
+上の表は「単体でテストできる部品」の一覧である。部品をアプリに組み込む作業（`src/app/app.ts`・`src/main.ts`・`index.html`・`src/ui/recording-view.ts` の変更）は §15 にまとめる。§15 には、実装着手前に利用者の判断が要る未決事項（画面の描画方式とノートのエディタ）がある。
+
+## 1.2 検証状態
+
+本書の `// src/...` と `// test/...` のコードブロックを Phase 1 の現行ソース（2026-11-12 時点）へ上書き・追加した状態で、`npm run typecheck` が通り、Vitest 30 ファイル 527 件が全件通過することを確認している（Phase 1 の 24 ファイルを含む。Phase 1 側の変更は §7 に記した `test/app.test.ts` の 1 か所）。確認の手順は `scripts/verify-design-docs.sh`。実ブラウザ（`getDisplayMedia`・SSE の実接続）では実行していない。
+
+Phase 1 のファイルを全文で載せているブロック（`recording-controller.ts`・`finalizer.ts`・`types/recording.ts`）は、**Phase 1 の現行ソースに Phase 2 の差分を当てたもの**である。Phase 1 側を直したら、同じ修正を本書のブロックにも当てて上の検証をやり直す（CLAUDE.md ルール 3）。
 
 ---
 
@@ -1388,6 +1396,20 @@ export class MultiSourceRecorder {
 
 mic / system の両方を検証する。System なしの会議は `expectedChunkCounts.system = 0`。会議の状態の検査（`finalized` なら POST せず成功を返す、`stop_requested` / `finalizing` 以外は `verify` で失敗させる）と、`GET /chunks` の応答を `isChunkListResponse` に通し `meetingId` の一致を確かめる検査は Phase 1 §22 と同じ。連続性検査をサーバー一覧の取得後に行い、IndexedDB にない連番でもサーバーに登録済みなら揃っているとみなす点（source ごとに判定）、確定に成功したら末尾の欠けを `missingTailMs` で返す点も Phase 1 §22 と同じ。会議登録の後の `GET /chunks`・`POST /finalize` が 401/403 を返したら、`unauthorized` で返す前に `onBackendUnauthorized` で Monitor へ伝える点も Phase 1 §22 と同じ。末尾の欠けは Mic だけで判定する。`totalAudioFrames` は Mic の時計で、System の `audioFrameCount` は会議レコードに残らないためである。
 
+**このファイルは「Phase 1 の現行 `src/recording/finalizer.ts` に、下表の差分だけを当てたもの」である。** 実装時は Phase 1 のファイルを書き直さず、差分を当てる。Phase 1 の Finalizer はレビュー修正を重ねており（会議登録、認証・ネットワークの分類、停止理由、直接送信した Chunk）、書き直すとそれらが抜ける。
+
+| 差分 | Phase 1 | Phase 2 |
+| --- | --- | --- |
+| IDB から読む Chunk | `listByMeeting(id, "mic")` | mic と system を別々に読み、未登録の検査・サーバー照合は両方に行う |
+| 連番の連続性 | mic の 1 系列 | source ごとに判定（連番は source ごとに 0 から振る） |
+| `expectedChunkCounts` | `{ mic: n, system: 0 }` | `{ mic: n, system: m }` |
+| `finalChunkCount` | mic の件数 | mic と system の合計 |
+| 失敗の文言 | `sequence gap at 3` / `server mismatch at seq 3, 5` | mic は同じ。system だけ `system: sequence gap at 3` / `server mismatch at seq system/3` |
+| `unpersistedChunkCount` | Mic の Controller の件数 | 呼び出し側が Mic と System の合計を渡す（§4） |
+| `FinalizeResult` | 変更なし | **変更なし**（型・`reason`・既定タイムアウト 30 秒も Phase 1 のまま） |
+
+`FinalizeResult` を変えないので、Phase 1 の `test/finalizer.test.ts`・`test/pending-actions.test.ts`・`test/recording-view.test.ts` はそのまま通る。Phase 1 のテストで直す必要があるのは 1 か所だけである：`test/app.test.ts` の「照合不一致による再送完了で確定と再送を繰り返さない」は `chunkStore.listByMeeting` の呼び出し回数を数えているので、`source === "mic"` の呼び出しだけを数えるようにする（Phase 2 は 1 回の確定で mic と system の 2 回読む）。
+
 ```typescript
 // src/recording/finalizer.ts
 import { isValidStopObservation, type ChunkStore, type MeetingStore } from "../storage/idb";
@@ -1404,60 +1426,45 @@ export interface FinalizerDeps {
   readonly scheduler: LocalSaveScheduler;
   readonly baseUrl: string;
   readonly token: string;
-  /** 既定 10000。ローカルサーバー相手でも無期限には待たない（Phase 1 §17.1 と同じ方針）。 */
-  readonly timeoutMs?: number;
   readonly fetchImpl?: typeof fetch;
-  /** mic / system 両 Controller の memoryBacklogCount の合計。0 でない限り Barrier を通さない（Phase 1 §22）。 */
-  readonly unpersistedChunkCount: () => number;
-  /** 照合の前に会議をサーバーへ登録する（MeetingRegistrar.ensure、Phase 1 §22）。未登録の会議は一覧・確定が 404 になるため */
-  readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>;
-  /** GET /chunks・POST /finalize の 401/403 を Monitor へ伝える（Phase 1 §22。会議登録の分は MeetingRegistrar が報告する） */
+  /** GET /chunks と POST /finalize それぞれのタイムアウト。既定 30000ms */
+  readonly timeoutMs?: number;
   readonly onBackendUnauthorized?: () => void;
-  /** IDB にない Mic の Chunk（このタブが直接送信した分）の endFrame。末尾を直接送ったときも末尾の欠けを測る（Phase 1 §22） */
+  /** IDB に書けずメモリ待機中の Chunk 数。mic / system 両 Controller の memoryBacklogCount の合計を渡す。0 でない限り Barrier を通さない。 */
+  readonly unpersistedChunkCount: () => number;
+  /** 照合の前に会議をサーバーへ登録する（MeetingRegistrar.ensure）。Chunk を 1 件も PUT できていない会議は一覧・確定が 404 になるため */
+  readonly ensureMeeting?: (meetingId: string) => Promise<RegistrationOutcome>;
+  /** IDB にない Mic の Chunk（このタブが直接送信した分）の endFrame。末尾を直接送ったときも末尾の欠けを測るために使う */
   readonly offIdbEndFrame?: (sequenceNo: number) => number | undefined;
 }
 
-/**
- * AbortController でタイムアウトさせる。fetch 自身にタイムアウトはない。
- * 本文の読み取り（readBody）もタイムアウトの内側で行う。ヘッダだけ返して本文が止まったサーバーを無期限に待たないため。
- */
-async function fetchWithTimeout<T>(
-  fetchImpl: typeof fetch,
-  url: URL,
-  init: RequestInit,
-  timeoutMs: number,
-  readBody: (res: Response) => Promise<T>,
-): Promise<{ readonly res: Response; readonly body: T }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetchImpl(url, { ...init, signal: controller.signal });
-    const body = await readBody(res);
-    return { res, body };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function describeFetchError(error: unknown, timeoutMs: number): string {
-  if (error instanceof DOMException && error.name === "AbortError") return `TIMEOUT after ${timeoutMs}ms`;
-  return error instanceof Error ? error.message : String(error);
-}
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 export type FinalizeResult =
-  /** missingTailMs：Mic の末尾の Chunk が欠けたまま確定した長さ（ms）。欠けがなければ省く（Phase 1 §22） */
-  | { readonly ok: true; readonly counts: Readonly<Record<AudioSource, number>>; readonly missingTailMs?: number }
+  /** missingTailMs：Mic の末尾の Chunk が欠けたまま確定した長さ（ms）。欠けがなければ省く（T1-e）。System は録音の長さの正を持たないので測らない */
+  | { readonly ok: true; readonly missingTailMs?: number }
   /**
-   * reason：トークン未設定・401/403 なら "unauthorized"。UI は detail の文字列でなくこれでトークン案内を出す（Phase 1 §22）。
-   * 応答を得られなかった（接続失敗・タイムアウト）なら "network"。App が時間をおいて確定を再試行する（Phase 1 §22）
+   * reason：失敗の分類。"unauthorized" はトークン未設定・サーバーの 401/403 で、UI はトークンの確認を案内する。
+   * "network" はサーバーへの要求が応答を得られなかった（接続失敗・タイムアウト）。ヘルス状態が変わらないこともあるので、呼び出し元が時間をおいて再試行する。
+   * detail はサーバー由来の文字列を含みうるので、分類には使わない
    */
   | { readonly ok: false; readonly stage: "waiting_local_save" | "verify" | "finalize"; readonly detail: string; readonly reason?: "unauthorized" | "network" };
 
+/**
+ * Finalization Barrier：
+ *   1. 最終 Chunk が IDB にある（呼び出し前提：RecordingController.stop() 完了）かつメモリ待機中の Chunk がない
+ *   2. IDB 上の全 Chunk が DB_REGISTERED（SAVED はサーバー一覧で登録確認できれば DB_REGISTERED に進める）
+ *   3. 会議がサーバーに登録済み（ensureMeeting。再試行のたびに通し、失敗したら一覧を取らない）
+ *   4. サーバーの一覧と件数・sha256 が一致（IDB にない連番は、サーバーに登録済みなら揃っているとみなす）
+ *   5. POST /finalize
+ * 1〜4 を満たさない限り finalizing へ遷移しない。
+ * Phase 2：2・4 は mic / system の両方に対して行う。System を録っていない会議は system が 0 件で、Phase 1 と同じ結果になる。
+ */
 const SOURCES: ReadonlyArray<AudioSource> = ["mic", "system"];
 
 export function finalizeMeeting(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
   // 同じ会議への呼び出しが重なると、両方が stop_requested を読んで二重に POST し、
-  // 後から失敗した側が finalized を stop_requested で上書きしうる。実行中の Promise を共有して 1 本にする（Phase 1 §22）
+  // 後から失敗した側が finalized を stop_requested で上書きしうる。実行中の Promise を共有して 1 本にする
   const running = inProgress.get(meetingId);
   if (running !== undefined) return running;
   const promise = finalizeMeetingOnce(deps, meetingId).finally(() => inProgress.delete(meetingId));
@@ -1470,37 +1477,35 @@ const inProgress = new Map<string, Promise<FinalizeResult>>();
 
 async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Promise<FinalizeResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const timeoutMs = deps.timeoutMs ?? 10_000;
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const meeting = await deps.meetingStore.get(meetingId);
   if (meeting === undefined) return { ok: false, stage: "verify", detail: "meeting not found" };
-  // 二重に POST /finalize して endedAt を書き換えない（Phase 1 §22）
-  if (meeting.status === "finalized") {
-    const counts = { mic: (await deps.chunkStore.listByMeeting(meetingId, "mic")).length, system: (await deps.chunkStore.listByMeeting(meetingId, "system")).length };
-    return { ok: true, counts };
-  }
-  // recording 中は stop() 完了の前提を満たさない。finalizing は POST 中に中断された会議の再試行（Phase 1 §22）
+  // 二重に POST /finalize して endedAt を書き換えない
+  if (meeting.status === "finalized") return { ok: true };
+  // recording 中は最終 Chunk が IDB にある前提（stop() 完了）を満たさない。finalizing は POST 中に中断された会議の再試行
   if (meeting.status !== "stop_requested" && meeting.status !== "finalizing") {
     return { ok: false, stage: "verify", detail: `meeting status is ${meeting.status}` };
   }
 
-  // 末尾の Chunk がメモリ待機中だと IDB 上は欠番なしに見えるため、先に弾く
+  // 末尾の Chunk がメモリ待機中だと IDB 上は欠番なしに見えるため、件数不足のまま finalize しないよう先に弾く
   const unpersisted = deps.unpersistedChunkCount();
   if (unpersisted > 0) {
     return { ok: false, stage: "waiting_local_save", detail: `${unpersisted} chunks not persisted to IDB` };
   }
 
-  const bySource: Record<AudioSource, Awaited<ReturnType<ChunkStore["listByMeeting"]>>> = { mic: [], system: [] };
-  for (const source of SOURCES) {
-    bySource[source] = await deps.chunkStore.listByMeeting(meetingId, source);
-    // SAVED はサーバー一覧で登録確認する（再送しても registered: false が続きうる）
-    const notRegistered = bySource[source].filter((c) => c.save.status !== "DB_REGISTERED" && c.save.status !== "SAVED");
-    if (notRegistered.length > 0) {
-      await deps.scheduler.resumeAll();
-      return { ok: false, stage: "waiting_local_save", detail: `${source}: ${notRegistered.length} chunks not registered` };
-    }
+  const bySource: Record<AudioSource, AudioChunkRecord[]> = {
+    mic: await deps.chunkStore.listByMeeting(meetingId, "mic"),
+    system: await deps.chunkStore.listByMeeting(meetingId, "system"),
+  };
+  const chunks = [...bySource.mic, ...bySource.system];
+  // SAVED（ファイル保存済み・DB 未登録）は再送しても registered: false が続きうるため、サーバー一覧で確認する
+  const notRegistered = chunks.filter((c) => c.save.status !== "DB_REGISTERED" && c.save.status !== "SAVED");
+  if (notRegistered.length > 0) {
+    await deps.scheduler.resumeAll();
+    return { ok: false, stage: "waiting_local_save", detail: `${notRegistered.length} chunks not registered` };
   }
 
-  // 再試行でも毎回通す。登録に失敗したら一覧を取らない（401/403 は MeetingRegistrar が Monitor へ報告済み、Phase 1 §22）
+  // 再試行でも毎回通す。登録に失敗したら一覧を取らない（401/403 は MeetingRegistrar が Monitor へ報告済み）
   if (deps.ensureMeeting !== undefined) {
     const registration = await deps.ensureMeeting(meetingId);
     if (!registration.ok) {
@@ -1512,19 +1517,19 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
 
   const listUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/chunks`, deps.baseUrl);
   assertLocalHost(listUrl);
+  // タイムアウトで abort すると fetch / json() が reject し、既存のエラー経路で Result になる
+  const listAbort = new AbortController();
+  const listTimer = setTimeout(() => listAbort.abort(), timeoutMs);
   let listRes: Response;
   let list: unknown;
   try {
-    // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す、Phase 1 §22）
-    ({ res: listRes, body: list } = await fetchWithTimeout(
-      fetchImpl,
-      listUrl,
-      { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", redirect: "error" },
-      timeoutMs,
-      (res): Promise<unknown> => (res.ok ? res.json().catch(() => null) : Promise.resolve(null)),
-    ));
+    listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", redirect: "error", signal: listAbort.signal });
+    // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
+    list = listRes.ok ? await listRes.json().catch(() => null) : null;
   } catch (error) {
-    return { ok: false, stage: "verify", detail: `list failed: ${describeFetchError(error, timeoutMs)}`, reason: "network" };
+    return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}`, reason: "network" };
+  } finally {
+    clearTimeout(listTimer);
   }
   if (listRes.status === 401 || listRes.status === 403) {
     deps.onBackendUnauthorized?.();
@@ -1535,8 +1540,9 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   // 別会議の一覧で照合すると、同一内容（無音など）の Chunk を誤って DB_REGISTERED にしうる
   if (list.meetingId !== meetingId) return { ok: false, stage: "verify", detail: `list meetingId mismatch: ${list.meetingId}` };
 
-  // sequenceNo の連続性（欠番なし）。IDB にない連番は、サーバーに登録済みなら揃っているとみなす
-  // （IDB に書けずサーバーへ直接送った Chunk、Phase 1 §15 / §22）
+  // sequenceNo の連続性（欠番なし）。IDB に書けずサーバーへ直接送った Chunk（§15 drainMemoryBacklog）は IDB に残らないので、
+  // IDB にない連番はサーバーに登録済みなら揃っているとみなす。IDB の件数で送ると、サーバーは件数不一致の 409 を返し続ける
+  // 連番は source ごとに 0 から振られるので、source ごとに判定する
   const counts: Record<AudioSource, number> = { mic: 0, system: 0 };
   for (const source of SOURCES) {
     const localSeqs = new Set(bySource[source].map((c) => c.meta.sequenceNo));
@@ -1546,40 +1552,36 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
     counts[source] = Math.max(-1, ...localSeqs, ...serverOnlySeqs) + 1;
     for (let i = 0; i < counts[source]; i++) {
       if (!localSeqs.has(i) && !serverOnlySeqs.has(i)) {
-        return { ok: false, stage: "verify", detail: `${source}: sequence gap at ${i}` };
+        // mic の文言は Phase 1 と同じ（Phase 1 のテストと UI がそのまま通る）。system だけ接頭辞を付ける
+        return { ok: false, stage: "verify", detail: `${source === "mic" ? "" : "system: "}sequence gap at ${i}` };
       }
     }
   }
 
   const serverByKey = new Map(list.chunks.map((c) => [`${c.source}:${c.sequenceNo}`, c]));
-  // 不一致を 1 件ずつ直すと Barrier の再試行が件数分かかるため、すべて洗い出してから一度に再投入する（Phase 1 §22）
+  // 不一致を 1 件ずつ直すと Barrier の再試行が件数分かかるため、すべて洗い出してから一度に再投入する
   const mismatched: string[] = [];
-  for (const source of SOURCES) {
-    for (const c of bySource[source]) {
-      const s = serverByKey.get(`${c.meta.source}:${c.meta.sequenceNo}`);
-      if (s === undefined || s.sha256 !== c.meta.sha256 || !s.registered) {
-        await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
-          r.save.status = "LOCAL_SAVE_PENDING";
-        });
-        mismatched.push(`${source}/${c.meta.sequenceNo}`);
-        continue;
-      }
-      if (c.save.status === "SAVED") {
-        await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
-          r.save.status = "DB_REGISTERED";
-        });
-      }
+  for (const c of chunks) {
+    const s = serverByKey.get(`${c.meta.source}:${c.meta.sequenceNo}`);
+    if (s === undefined || s.sha256 !== c.meta.sha256 || !s.registered) {
+      await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
+        r.save.status = "LOCAL_SAVE_PENDING";
+      });
+      mismatched.push(c.meta.source === "mic" ? String(c.meta.sequenceNo) : `system/${c.meta.sequenceNo}`);
+      continue;
+    }
+    if (c.save.status === "SAVED") {
+      await deps.chunkStore.updateSaveState(c.chunkKey, (r) => {
+        r.save.status = "DB_REGISTERED";
+      });
     }
   }
   if (mismatched.length > 0) {
     await deps.scheduler.resumeAll();
-    return { ok: false, stage: "verify", detail: `server mismatch at ${mismatched.join(", ")}` };
+    return { ok: false, stage: "verify", detail: `server mismatch at seq ${mismatched.join(", ")}` };
   }
 
-  // finalizing へ進める前の値を控える。POST が失敗・タイムアウトしたらここへ戻す。
-  // 戻さないと、IndexedDB に finalizing のまま取り残された会議ができ、再開経路がなくなる。
-  // finalizing から再試行した場合も含め、status は常に stop_requested へ戻す（Phase 1 §22）
-  // endedAt は戻さない。前回の POST がサーバーに届いていた場合と、再試行で送る値を揃える
+  // finalizing へ進める前の値を控える。POST が失敗・タイムアウトしたら status と一緒にここへ戻す
   const before = { finalChunkCount: meeting.finalChunkCount };
   const restore = async (): Promise<void> => {
     meeting.status = "stop_requested";
@@ -1588,33 +1590,40 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   };
 
   meeting.status = "finalizing";
+  // mic と system の合計。件数の内訳は確定要求の expectedChunkCounts が持つ
   meeting.finalChunkCount = counts.mic + counts.system;
+  // 再試行で終了時刻を書き換えない（前回の POST がサーバーに届いていた場合と値を揃える）
   meeting.endedAt ??= Date.now();
   await deps.meetingStore.put(meeting);
 
   const body: FinalizeRequest = {
-    expectedChunkCounts: counts,
+    expectedChunkCounts: { mic: counts.mic, system: counts.system },
     endedAtEpochMs: meeting.endedAt,
     totalAudioFrames: meeting.sessionClock.audioFrameCount,
-    // 保存済みの値がサーバーの制約を満たさなければ両方省略する（未観測、Phase 1 §22 と同じ）
+    // 保存済みの値がサーバーの制約を満たさなければ両方省略する（未観測）。422 で確定が止まり続けないようにし、録音は残す
     ...(isValidStopObservation(meeting) ? { stopReason: meeting.stopReason, stopDetectedAtEpochMs: meeting.stopDetectedAtEpochMs } : {}),
   };
   const finUrl = new URL(`/v1/meetings/${encodeURIComponent(meetingId)}/finalize`, deps.baseUrl);
   assertLocalHost(finUrl);
+  const finAbort = new AbortController();
+  const finTimer = setTimeout(() => finAbort.abort(), timeoutMs);
   let finRes: Response;
   try {
-    // finalize の応答本文は使わないので読まない
-    ({ res: finRes } = await fetchWithTimeout(fetchImpl, finUrl, {
+    finRes = await fetchImpl(finUrl, {
       method: "POST",
       headers: { Authorization: `Bearer ${deps.token}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
       credentials: "omit",
-      // リダイレクト先は assertLocalHost を通らないため追従しない（Phase 1 §4.4）
+      // リダイレクト先は assertLocalHost を通らないため追従しない（§4.4）
       redirect: "error",
-    }, timeoutMs, async () => null));
+      signal: finAbort.signal,
+    });
   } catch (error) {
+    // finalizing のまま残さない。次回の Barrier 再試行は stop_requested から行う
     await restore();
-    return { ok: false, stage: "finalize", detail: `finalize failed: ${describeFetchError(error, timeoutMs)}`, reason: "network" };
+    return { ok: false, stage: "finalize", detail: `finalize request failed: ${errorMessage(error)}`, reason: "network" };
+  } finally {
+    clearTimeout(finTimer);
   }
   const finUnauthorized = finRes.status === 401 || finRes.status === 403;
   if (finUnauthorized) deps.onBackendUnauthorized?.();
@@ -1624,14 +1633,18 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   }
   meeting.status = "finalized";
   await deps.meetingStore.put(meeting);
-  // 末尾の欠けは Mic だけで判定する。totalAudioFrames は Mic の時計で、System の audioFrameCount は会議レコードに残らない（Phase 1 §22）
+  // 欠けた音声は取り戻せないので確定は止めず、UI が警告できるよう長さを返す（T1-e）
+  // 録音の長さ（audioFrameCount）は Mic の Worklet が数えた値なので、Mic の Chunk とだけ比べる
   const missingTailMs = measureMissingTailMs(meeting.sessionClock.audioFrameCount, bySource.mic, counts.mic, deps.offIdbEndFrame);
-  return missingTailMs > 0 ? { ok: true, counts, missingTailMs } : { ok: true, counts };
+  return missingTailMs > 0 ? { ok: true, missingTailMs } : { ok: true };
 }
 
 /**
- * 末尾の欠け（ms）。最後の連番が IDB にない（サーバーへ直接送った）ときは offIdbEndFrame を使い、それも分からなければ 0。
- * Chunk が 1 件もなければ終わりを 0 とし、audioFrameCount 全体を欠けとして返す（Phase 1 §22 と同じ）
+ * 末尾の欠け（ms）。stop() が Worklet の応答を待てずに打ち切ると、最終の部分 Chunk がないまま会議が確定する。
+ * audioFrameCount は heartbeat（1 秒ごと）でも進むので、最後の Chunk の endFrame より大きければ末尾が欠けている
+ * （最後の heartbeat より後の 1 秒未満の欠けは検出できない）。
+ * 最後の連番が IDB にない（サーバーへ直接送った）ときは offIdbEndFrame の値を使い、それも分からなければ 0 を返す。
+ * Chunk が 1 件もなければ（chunkCount === 0）終わりを 0 とし、audioFrameCount 全体を欠けとして返す。
  */
 export function measureMissingTailMs(
   audioFrameCount: number,
@@ -1645,6 +1658,10 @@ export function measureMissingTailMs(
   const endFrame = chunkCount === 0 ? 0 : last?.meta.sequenceNo === lastSeq ? last.meta.endFrame : offIdbEndFrame?.(lastSeq);
   if (endFrame === undefined) return 0;
   return frameToOffsetMs(Math.max(0, audioFrameCount - endFrame));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 ```
 
@@ -1828,12 +1845,15 @@ export class FetchEventSource implements EventSourceLike {
   }
 
   private async pump(body: ReadableStream<Uint8Array>): Promise<void> {
-    const reader = body.pipeThrough(new TextDecoderStream()).getReader();
+    // TextDecoderStream を pipeThrough で繋ぐと、DOM 型定義の writable（BufferSource）と Uint8Array の不一致で型が通らない。
+    // 同じ結果になる TextDecoder の stream モードで、マルチバイト文字が読み取り単位をまたいでも壊れないように復号する
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
     let buffer = "";
     for (;;) {
       const { done, value } = await reader.read();
       if (done) return;
-      buffer += value;
+      buffer += decoder.decode(value, { stream: true });
       // イベントは空行区切り。LF / CRLF の両方を受ける。
       for (;;) {
         const match = /\r?\n\r?\n/.exec(buffer);
@@ -2622,7 +2642,6 @@ describe("finalize（mic + system）", () => {
     };
     const result = await finalizeMeeting({ chunkStore: h.chunkStore, meetingStore: h.meetingStore, scheduler: h.scheduler, baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchSpy, unpersistedChunkCount: () => 0 }, meetingId);
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.counts).toEqual({ mic: 2, system: 1 });
     expect((finalizeBody as { expectedChunkCounts: unknown }).expectedChunkCounts).toEqual({ mic: 2, system: 1 });
     expect((await h.meetingStore.get(meetingId))?.status).toBe("finalized");
   });
@@ -2678,7 +2697,8 @@ describe("finalize（mic + system）", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.stage).toBe("finalize");
-      expect(result.detail).toMatch(/TIMEOUT/);
+      // 分類は detail の文字列でなく reason で行う（Phase 1 §22）。App はこれを見て時間をおいて再試行する
+      expect(result.reason).toBe("network");
     }
 
     // finalizing 前の値へ戻っており、復帰後に再度 finalize を呼べる。endedAt は再試行で同じ値を送るため残す
@@ -3128,3 +3148,55 @@ describe("UI reducer", () => {
 ---
 
 *本書のコードは Node 上の vitest で検証済みだが、`getDisplayMedia` の実際の可否、`FetchEventSource` の長時間接続とバックオフ再接続の挙動、2 系統同時録音時の AudioWorklet 負荷は対象ブラウザの実機でのみ確認できる。基本設計 §26.4 の実機項目を通過したものだけを Phase 2 ブラウザ側の完了とする。*
+
+---
+
+# 15. アプリへの組み込み（配線）と未決事項
+
+§2〜§11 は単体でテストできる部品である。Phase 1 のアプリ（`src/app/app.ts` の `createApp` / `RecordingSession`、`src/main.ts` の DOM 層、Phase 1 §31）へ組み込む作業をここにまとめる。**コードは本書に載せていない。** Phase 1 §31 と同じく、配線表を先に確定し、テスト（`test/app.test.ts` に追加）→ 実装の順で 1 行ずつ進める。
+
+## 15.1 配線表
+
+| # | 配線 | 変更するファイル | 根拠 | テストで確かめること |
+| --- | --- | --- | --- | --- |
+| W1 | 録音の開始・停止を `MultiSourceRecorder` 経由にする。System を使わない会議は Mic の Controller だけを持ち、Phase 1 と同じ経路になる | `app.ts` | §6 | System なしで Phase 1 の `app.test.ts` が通る。System ありで `PUT …/chunks/system/0` が届く |
+| W2 | 停止は System → Mic の順。Mic の `stop()` の直後に `takeMeetingLock()` でロックを受け取る | `app.ts` | §4 の 2・3 | System の停止が失敗しても Mic が止まり、停止理由が IDB に残る |
+| W3 | `memoryBacklogCount(meetingId)`・`releaseHeldLockIfDrained()`・離脱確認（`releaseLifecycleIfSettled`）は Mic と System の件数の合計で判定する | `app.ts` | §4 の 3 | System だけにメモリ待機が残る間、ロックと離脱確認が外れない |
+| W4 | `finalizeMeeting` の `unpersistedChunkCount` に Mic と System の合計を渡す | `app.ts` | §7 | System のメモリ待機が残っていれば `waiting_local_save` |
+| W5 | drain（サーバー復帰・`setToken`・確定再試行）と破棄・WAV 書き出しを Mic と System の両方の Controller に行う | `app.ts`・`main.ts` | §4 の 4、Phase 1 §31 | 確定中止後の書き出しに System の WAV も入る。破棄で両方が空になりロックが外れる |
+| W6 | 起動時復旧（Phase 1 §23）。`recovery.ts` が `listByMeeting(id, "mic")` で読むのは `audioFrameCount` を補うためで、Mic の時計の値なので **mic のままでよい**。未送信 Chunk の再投入は保存状態の索引で拾うので source を問わない | 変更なし（テストを追加） | Phase 1 §23 | System の未送信 Chunk も再送される。`audioFrameCount` は System の Chunk の `endFrame` では補われない |
+| W7 | 確定に成功した会議で `MeetingEvents`（§8）を開始し、`UiAction` に変換して `reduce`（§11）へ渡す。画面を離れたら `stop()` | `app.ts` | §8・§11 | `transcript_version` を受けて `GET /transcript` を取り直す。再接続時に `GET /jobs` で補完する |
+| W8 | `Phase2Client`（§9）と `NotesStore`（§10）を、トークン・`baseUrl` を共有して生成する。`setToken` で作り直す | `app.ts` | §9・§10 | トークン変更後の要求が新しいトークンで出る |
+| W9 | 同期誤差（`MultiSourceRecorder` の集計と `GET /meetings/{id}` の `syncDriftMs`）をヘッダに出す | `main.ts` | 基本設計 §16.3・§18 | 表示文言の純関数をテストする（Phase 1 の `recording-view.ts` と同じ方式） |
+| W10 | System Audio の取得ボタンと、取得できなかったとき（拒否・音声トラックなし）の Mic のみへの切り替え表示 | `main.ts`・`index.html` | §5、基本設計 §16.1 | `DegradedReason` の 2 値（§2）ごとの文言 |
+| W11 | 確定待ちの内訳（`main.ts` の `listByMeeting(id, "mic")` → `pendingCountsText`）に System の Chunk も含める | `main.ts`・`recording-view.ts` | Phase 1 §31.4 | System の未送信が残る会議で件数に出る。欠番・末尾の判定は source ごと |
+
+Phase 1 のソースで source を `"mic"` に固定している箇所は、`recording-controller.ts` のメタデータ（§4 で引数化）、`finalizer.ts`（§7）、`recovery.ts`（W6。変更不要）、`main.ts`（W11）の 4 つである。実装の最後に `grep -rn '"mic"' src` で、これ以外に増えていないことを確かめる。
+
+Phase 1 から変えない規則：ローカル以外へ通信しない（URL は `assertLocalHost()` を通す）、サーバー応答は型ガードを通す、タイマーは依存注入、非同期の完了通知は要求と対応付ける（CLAUDE.md「既知の落とし穴」）。
+
+## 15.2 未決事項（実装着手前に利用者の判断が要る）
+
+次の 2 点は外部依存の追加を伴うため、本書では確定しない。決まるまで、依存しない部分（§15.1 の W1〜W8、サーバー側の全 Step）を先に進められる。
+
+| # | 論点 | 選択肢 | 影響 |
+| --- | --- | --- | --- |
+| D1 | 画面の描画方式 | (a) Phase 1 と同じ素の DOM（`main.ts` が `UiState` を見て描く）／(b) UI フレームワークを導入 | (a) は依存を増やさず CSP（`script-src 'self'`）もそのまま。transcript が数千行になる会議では差分描画を自前で持つ必要がある。(b) は D2 で BlockNote を選ぶなら事実上必要 |
+| D2 | ノートのエディタ | (a) BlockNote（基本設計 §19 の前提。React が必要）／(b) 素の `textarea`（Markdown）で始め、保存形式だけ BlockNote JSON と互換にする | (a) は React と BlockNote を devDependency ではなく実行時依存として追加する。バンドルは `'self'` から配信するので Zero External Data Egress は保てる。(b) は依存なしで §10 の Autosave・楽観ロックをそのまま検証できるが、リッチテキスト編集がない |
+
+本書の推奨は **D1 (a)・D2 (b) で Step 2-g を通し、BlockNote は別 Step で差し替える**。§10 の `NotesStore` は `blocknoteJson: string` を不透明な文字列として扱うので、エディタを差し替えても保存経路は変わらない。
+
+## 15.3 実装順序（ブラウザ側）
+
+基本設計 §29 の Step 2-d〜2-h のブラウザ側を、Phase 1 §30 と同じ粒度に分ける。前の Step のテストが通ってから次に進む。
+
+| Step | 内容 | 完了判定 |
+| --- | --- | --- |
+| 2-c1 | §2 型の追加、§3 契約型と型ガード | 既存テストが通る。型ガードのテスト（正常・欠落・型違い）を追加 |
+| 2-c2 | §4 RecordingController の変更 | Phase 1 の `recording-controller.test.ts` が無変更で通る |
+| 2-c3 | §7 Finalizer の差分 | `finalizer-two-sources.test.ts`。Phase 1 のテストは §7 の 1 か所だけ直して通る |
+| 2-d1 | §8 SSE クライアント、§9 型付き fetch | `events.test.ts`。Phase 2 サーバー（Step 2-d）に対する実接続で `job` / `progress` を受ける |
+| 2-d2 | §11 UI 状態、§15.1 W7・W8、transcript の表示 | `ui-state.test.ts`。1 時間会議の transcript が画面に出る（基本設計 Step 2-d） |
+| 2-f1 | 要約と `rejected` の表示、再生成 | 偽 ID を返すモックで `rejected` が折りたたみ表示される |
+| 2-g1 | §10 NotesStore、ノートの編集（§15.2 D2 の決定後） | `notes-store.test.ts`。別タブ編集で `409` → 上書きしない |
+| 2-h1 | §5 System Audio、§6 MultiSourceRecorder、§15.1 W1〜W6・W9・W10 | `system-audio.test.ts`・`multi-source.test.ts`。Mic のみへのフォールバック、P95/P99 の表示 |

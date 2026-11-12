@@ -1506,7 +1506,7 @@ Phase 1 §27 で「Phase 1 対象外」だった 2, 4, 5, 6 が Phase 2 で実�
 
 | Step | 内容 | 完了判定 |
 | --- | --- | --- |
-| 2-a | §8 DDL + `db/migrate` + Phase 1 §12 のサーバー実装（最小スタブを本実装に） | Phase 1 の 11 テストがこのサーバーに対して通る |
+| 2-a | §8 DDL + `db/migrate` + Phase 1 §12 のサーバー実装（Phase 1 の `minutes_local/phase1.py` を本実装に置き換える。手順は詳細設計サーバー側 §1.2） | Phase 1 のサーバーテスト 10 件の内容を引き継いだテスト（詳細設計サーバー側 §23.3.1）と、Phase 1 のブラウザ側テストが通る。検証規則・CORS・トークン再生成を Phase 1 の実装から緩めない |
 | 2-b | §7 HW 検出 + `/v1/health` v2 + `/v1/models` | `doctor` が区分とモデル候補を表示 |
 | 2-c | §9 JobRunner + Sweeper + `vad_chunk`（§13） | finalize で全 Chunk に `has_voice` が付く。`kill -9` 後に再開 |
 | 2-d | §10 `transcribe_chunk` + §14 `GET /transcript` + SSE | 1 時間会議の transcript が UI に出る。OOM ダウングレードを疑似的に検証 |

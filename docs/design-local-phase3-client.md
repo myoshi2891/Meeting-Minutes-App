@@ -4,7 +4,7 @@
 **上位文書:** Phase 3 詳細設計書 ── サーバー側（`docs/design-local-phase3-server.md`）§2 の設計判断と §20 の API。
 **配置:** `docs/design-local-phase3-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** Phase 1・2 と同じ（ブラウザ標準 API と TypeScript のみ、UI フレームワーク非依存の状態モデル）。
-**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Phase 1・2 の 41 テストと本書の 18 テスト（計 15 ファイル 59 件）が vitest で全件通過することを設計時点で確認している（§9）。
+**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 34 ファイル 560 件（Phase 1・2 の 30 ファイル 527 件を含む）が全件通過することを確認している（2026-11-12、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
 
 ---
 
@@ -327,6 +327,7 @@ import { assertLocalHost } from "./local-saver";
 import { isMeetingEvent, jobFromServerRow, type JobListResponse, type MeetingDetailResponse, type MeetingEvent } from "./contracts-phase2";
 import { isLiveSegmentEvent, type LiveSegmentEvent } from "./contracts-phase3";
 
+/** EventSource のうち使う面だけ。テストで Fake に差し替える。 */
 export interface EventSourceLike {
   addEventListener(type: string, listener: (event: MessageEvent<string>) => void): void;
   addEventListener(type: "open" | "error", listener: () => void): void;
@@ -335,11 +336,12 @@ export interface EventSourceLike {
 
 export interface EventsClientDeps {
   readonly baseUrl: string;
-  /** IndexedDB のトークン。マルチユーザーでは利用者ごとに異なる（サーバー側 §19）。 */
+  /** IndexedDB の settings ストアに入っているトークン（Phase 1 §4.3）。 */
   readonly token: string;
   readonly createEventSource: (url: URL, token: string) => EventSourceLike;
+  /** 再接続後の補完用。失敗は無視せず onError に渡す。 */
   readonly fetchJobs: () => Promise<JobListResponse>;
-  /** 再接続後の補完用。会議の status と各版を取り戻す（Phase 2 §8）。 */
+  /** 再接続後の補完用。会議の status と各版を取り戻す。 */
   readonly fetchMeeting: () => Promise<MeetingDetailResponse>;
   readonly onEvent: (event: MeetingEvent) => void;
   /** Phase 3：Live セグメント。未指定なら捨てる */
@@ -362,6 +364,7 @@ export class MeetingEventsClient {
     assertLocalHost(url);
     const es = this.deps.createEventSource(url, this.deps.token);
     this.source = es;
+
     es.addEventListener("open", () => {
       const isReconnect = this.everConnected && this.disconnected;
       this.everConnected = true;
@@ -369,6 +372,7 @@ export class MeetingEventsClient {
       if (isReconnect) void this.backfill();
     });
     es.addEventListener("error", () => {
+      // 再接続は transport 側に任せる。ここでは切断状態を記録するだけ。
       this.disconnected = true;
     });
     for (const type of EVENT_TYPES) {
@@ -381,6 +385,7 @@ export class MeetingEventsClient {
     this.source = null;
   }
 
+  /** テストと再接続補完で使う。JSON を MeetingEvent に変換して通知する。 */
   handle(data: string): void {
     let parsed: unknown;
     try {
@@ -389,6 +394,7 @@ export class MeetingEventsClient {
       this.deps.onError(error instanceof Error ? error : new Error("invalid SSE payload"));
       return;
     }
+    // Phase 3：live_segment は MeetingEvent（Phase 2 の UI 状態）に混ぜず、Live ペイン専用の経路へ渡す
     if (isLiveSegmentEvent(parsed)) {
       this.deps.onLiveSegment?.(parsed);
       return;
@@ -399,9 +405,11 @@ export class MeetingEventsClient {
   }
 
   /**
-   * 切断中に落ちたイベントを取り戻す。jobs だけでは meeting_status と各版が復元されない。
-   * transcript / summary の本文は取らず、版だけ流して Phase 2 §11 の stale 機構に委ねる。
-   * Live セグメントは LiveTranscriptStore.poll() が cursor 以降を取り直すので、ここでは扱わない。
+   * 切断中に落ちたイベントを取り戻す。jobs だけでは meeting_status と各版が復元されず、
+   * UI が古い status を表示し続ける。MeetingDetailResponse が 3 つとも持っているので 1 リクエストで足りる。
+   * transcript / summary の本文は取りに行かない。版だけ流せば §11 の staleTranscriptVersion /
+   * staleSummaryVersion が立ち、UI が必要になった時点で本文を取得する（再接続のたびに全文を引かない）。
+   * Live セグメントは LiveTranscriptStore.poll() が cursor 以降を取り直すので、ここでは扱わない（§3.2）。
    */
   private async backfill(): Promise<void> {
     try {
@@ -419,6 +427,7 @@ export class MeetingEventsClient {
   }
 }
 
+/** サーバーの job イベントは snake_case 行なので camelCase に変換する（§3）。 */
 export function normalizeEvent(value: unknown): MeetingEvent | null {
   if (typeof value !== "object" || value === null) return null;
   const v = value as Record<string, unknown>;
@@ -429,8 +438,120 @@ export function normalizeEvent(value: unknown): MeetingEvent | null {
   return isMeetingEvent(value) ? value : null;
 }
 
-// FetchEventSource の本体は Phase 2 §8 のまま（同一ファイル内にあるので再掲しない）。
-// Phase 3 での events.ts の変更は EVENT_TYPES への live_segment 追加と、その振り分けだけ。
+const INITIAL_RETRY_MS = 1_000;
+const MAX_RETRY_MS = 30_000;
+
+/**
+ * SSE を fetch + ReadableStream で読む。`EventSource` を使わない理由は 2 つある。
+ * (1) `EventSource` は Authorization ヘッダを付けられない。トークンは IndexedDB にあり、
+ *     Phase 1 §4.3 の `Set-Cookie` は「してもよい」という任意扱いなので Cookie は当てにできない。
+ * (2) Phase 3 のマルチユーザーは利用者ごとに別トークンで、Cookie 1 本では表現できない。
+ * 代償として `EventSource` の自動再接続が失われるため、指数バックオフの再接続を自前で持つ。
+ * `open` / `error` の発火タイミングは `EventSource` と揃えてあり、MeetingEventsClient 側は変わらない。
+ */
+export class FetchEventSource implements EventSourceLike {
+  private readonly listeners = new Map<string, Array<(event: MessageEvent<string>) => void>>();
+  private controller: AbortController | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryMs = INITIAL_RETRY_MS;
+  private closed = false;
+
+  constructor(private readonly url: URL, private readonly token: string, private readonly fetchImpl: typeof fetch = fetch) {
+    void this.run();
+  }
+
+  addEventListener(type: string, listener: (event: MessageEvent<string>) => void): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  close(): void {
+    this.closed = true;
+    this.controller?.abort();
+    this.controller = null;
+    if (this.retryTimer !== null) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
+  private emit(type: string, data: string): void {
+    for (const listener of this.listeners.get(type) ?? []) listener({ data } as MessageEvent<string>);
+  }
+
+  private async run(): Promise<void> {
+    while (!this.closed) {
+      const controller = new AbortController();
+      this.controller = controller;
+      try {
+        // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
+        const fetchImpl = this.fetchImpl;
+        const res = await fetchImpl(this.url, {
+          headers: { Authorization: `Bearer ${this.token}`, Accept: "text/event-stream" },
+          credentials: "omit",
+          redirect: "error",
+          signal: controller.signal,
+        });
+        if (!res.ok || res.body === null) throw new Error(`SSE HTTP ${res.status}`);
+        this.retryMs = INITIAL_RETRY_MS;            // 接続できたらバックオフを初期値へ戻す
+        this.emit("open", "");
+        await this.pump(res.body);
+      } catch {
+        // 中断も切断も同じ扱い。close() 済みならこの下で抜ける。
+      }
+      this.controller = null;
+      if (this.closed) return;
+      this.emit("error", "");
+      await this.waitBeforeRetry();
+    }
+  }
+
+  private async pump(body: ReadableStream<Uint8Array>): Promise<void> {
+    // TextDecoderStream を pipeThrough で繋ぐと、DOM 型定義の writable（BufferSource）と Uint8Array の不一致で型が通らない。
+    // 同じ結果になる TextDecoder の stream モードで、マルチバイト文字が読み取り単位をまたいでも壊れないように復号する
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      // イベントは空行区切り。LF / CRLF の両方を受ける。
+      for (;;) {
+        const match = /\r?\n\r?\n/.exec(buffer);
+        if (match === null) break;
+        const block = buffer.slice(0, match.index);
+        buffer = buffer.slice(match.index + match[0].length);
+        this.dispatchBlock(block);
+      }
+    }
+  }
+
+  /** 1 イベントぶんのブロックを解釈する。`event:` の省略時は SSE 既定の "message"。 */
+  private dispatchBlock(block: string): void {
+    let type = "message";
+    const dataLines: string[] = [];
+    for (const line of block.split(/\r?\n/)) {
+      if (line === "" || line.startsWith(":")) continue;      // コメント行（keep-alive）は捨てる
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      const raw = colon === -1 ? "" : line.slice(colon + 1);
+      const value = raw.startsWith(" ") ? raw.slice(1) : raw;
+      if (field === "event") type = value;
+      else if (field === "data") dataLines.push(value);
+    }
+    if (dataLines.length > 0) this.emit(type, dataLines.join("\n"));
+  }
+
+  private waitBeforeRetry(): Promise<void> {
+    const delay = this.retryMs;
+    this.retryMs = Math.min(this.retryMs * 2, MAX_RETRY_MS);
+    return new Promise((resolve) => {
+      this.retryTimer = setTimeout(() => {
+        this.retryTimer = null;
+        resolve();
+      }, delay);
+    });
+  }
+}
+
 export function defaultCreateEventSource(url: URL, token: string): EventSourceLike {
   return new FetchEventSource(url, token);
 }
@@ -953,7 +1074,8 @@ export function assertLocalHost(url: URL): void {
   }
   if (isLoopback(url.hostname)) return;   // loopback は http でも可（従来どおり）
   if (url.protocol !== "https:") {
-    throw new Error(`non-loopback host requires https: ${url.hostname}`);
+    // 文言は Phase 1 の "disallowed host" で始める（Phase 1 のテストと、この文言で分類する呼び出し元をそのまま通す）
+    throw new Error(`disallowed host (non-loopback requires https): ${url.hostname}`);
   }
   if (!allowedOrigins.has(url.origin)) {
     throw new Error(`disallowed host: ${url.origin}`);   // scheme/host/port のいずれかが不一致
@@ -1664,10 +1786,12 @@ describe("欠損 Chunk の逆同期", () => {
     const listAllMissing: typeof fetch = async () =>
       new Response(JSON.stringify({ meetingId, chunks: [entry(0), entry(1)] }), { status: 200 });
     let calls = 0;
+    const enqueued: string[] = [];
     const realEnqueue = h.scheduler.enqueue.bind(h.scheduler);
     h.scheduler.enqueue = async (key: string) => {
       calls++;
       if (calls === 2) throw new DOMException("quota", "QuotaExceededError");
+      enqueued.push(key);
       return await realEnqueue(key);
     };
     const result = await resyncMissingChunks(
@@ -1679,8 +1803,9 @@ describe("欠損 Chunk の逆同期", () => {
       expect(result.reason).toBe("STORAGE");
       expect(result.detail).toMatch(/after 1 requeued/);
     }
-    // 1 件目は積んだまま残す（巻き戻すより進んだ状態を保つ方が Chunk を失わない）
-    expect((await h.chunkStore.getChunk(r0.chunkKey))?.save.status).toBe("LOCAL_SAVE_PENDING");
+    // 1 件目は積んだまま残す（巻き戻すより進んだ状態を保つ方が Chunk を失わない）。
+    // 積んだ後の保存状態は Scheduler が進める（送信中・送信済みになりうる）ので、状態の値ではなく「積んだこと」を確かめる
+    expect(enqueued).toEqual([r0.chunkKey]);
   });
 
   it("一覧取得がタイムアウトしても例外を投げず、失敗として返す", async () => {

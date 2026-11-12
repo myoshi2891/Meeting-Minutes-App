@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── ブラウザ側（`docs/design-local-phase2-client.md`）。
 **配置:** `docs/design-local-phase2-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。
-**検証状態:** 本書の全 `python` コードブロック（54 ファイル）はパッケージとして抽出でき、Fake Provider による pytest 9 ファイル 34 テストが Python 3.12 + FastAPI + pydantic v2 で全件通過することを設計時点で確認している（§23）。実モデル（faster-whisper / Silero / Ollama）は設計時点では実行していない。
+**検証状態:** 本書のコードブロック（58 ファイル：`pyproject.toml`・実装 46・テスト 11）はパッケージとして抽出でき、Fake Provider による pytest 11 ファイル 87 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
 
 ---
 
@@ -30,6 +30,20 @@
 * Provider 抽象と Fake Provider（テストの決定性を担保する）
 * 7 段の要約検証のコード
 * pytest による受入テスト
+
+## 1.2 既存の Phase 1 サーバー実装からの移行
+
+リポジトリには Phase 1 の実機確認用サーバーが既にある（`minutes_local/phase1.py` 1 ファイル、`minutes_local/__main__.py`、`server_tests/test_phase1_api.py` 10 件、`pyproject.toml` の名前は `minutes-local-phase1`）。本書の実装はこれを**置き換える**。Step 2-a（§25）で次の順に行う。
+
+| # | 作業 | 完了の確かめ方 |
+| --- | --- | --- |
+| 1 | 本書のパッケージ構成（`minutes_local/api/` ほか）を `phase1.py` と並べて追加する。この時点では `phase1.py` と `__main__.py` を変えない | 既存の `server_tests` 10 件が通ったまま |
+| 2 | `tests/`（本書 §23）を追加し、`pyproject.toml` を §2 の内容にする（`testpaths = ["tests"]`、依存に `httpx`・`psutil`、dev に `pytest-asyncio`） | `tests/test_phase1_contract.py` と `tests/test_phase1_server_compat.py`（§23.3.1）が通る |
+| 3 | `__main__.py` を §22 の CLI に差し替え、`phase1.py` と `server_tests/` を削除する | `server_tests` の 10 件の内容は `tests/test_phase1_server_compat.py` に移してある（§23.3.1 の対応表）。削除後に `pytest` が全件通る |
+| 4 | 実データでの確認。**データディレクトリの既定値が変わる**：Phase 1 は `private/phase1-data/`（リポジトリ内）、本書は OS の利用者データディレクトリ（§5）。既存の録音を引き継ぐには `MINUTES_DATA_DIR=private/phase1-data` を付けて起動する | 既存会議が `GET /v1/meetings` に出る。`doctor` が `sqlite` の場所を表示する。既存 DB は §7 の列補完で上がり、行は保たれる |
+| 5 | 起動コマンドの変更を README に反映する：`python -m minutes_local` → `python -m minutes_local serve`（または `minutes-local serve`） | README の手順どおりに起動してブラウザから PUT が届く |
+
+ブラウザ側から見た挙動は変えない：CORS の許可元（`http://127.0.0.1:5173`）、起動のたびのトークン再生成、各エンドポイントの検証規則（§21.1・§21.2）。ここが緩むと Phase 1 の実機確認（T4）の前提が崩れるので、§23.3.1 のテストで固定する。
 
 ---
 
@@ -159,6 +173,7 @@ class Settings:
     max_concurrent_stt: int | None = None
     live_stt_enabled: bool = False    # Phase 3
     vad_sampling_ratio: float = 0.0   # §13.2 無音 Chunk のサンプリング STT（既定オフ）
+    web_dir: Path | None = None       # ブラウザアプリのビルド出力（index.html を含む）。None なら配信しない（§21.1）
     thresholds: Thresholds = field(default_factory=Thresholds)
 
     @property
@@ -200,6 +215,9 @@ def settings_from_env(base: Settings | None = None) -> Settings:
         kwargs["data_dir"] = Path(data_dir)
     if port and port.isdigit():
         kwargs["port"] = int(port)
+    web_dir = os.environ.get("MINUTES_WEB_DIR")
+    if web_dir:
+        kwargs["web_dir"] = Path(web_dir)
     return replace(s, **kwargs)
 ```
 
@@ -1447,6 +1465,8 @@ def parse_wav_header(data: bytes) -> WavHeader:
         raise InvalidWavError("riff size mismatch")
     if WAV_HEADER_BYTES + data_bytes != len(data):
         raise InvalidWavError(f"data size {data_bytes} != actual {len(data) - WAV_HEADER_BYTES}")
+    if data_bytes == 0 or data_bytes % 2:
+        raise InvalidWavError(f"empty or odd-sized PCM16 data: {data_bytes} bytes")
     return WavHeader(data_bytes=data_bytes, sample_count=data_bytes // 2)
 
 
@@ -1698,6 +1718,10 @@ def on_finalized(conn: sqlite3.Connection, meeting_id: str) -> int:
         if repo.insert_job(conn, meeting_id, "vad_chunk", chunk_id=chunk.id) is not None:
             created += 1
     repo.set_meeting_status(conn, meeting_id, "transcribing")
+    if created == 0:
+        # Chunk が 1 件もない会議（開始直後の停止など。Phase 1 のクライアントは 0 件でも確定する）は、
+        # 完了を契機に merge を起こす vad ジョブがない。ここで判定しないと transcribing のまま止まる
+        ensure_merge_job(conn, meeting_id)
     return created
 
 
@@ -3602,14 +3626,17 @@ def get_ctx(request: Request) -> AppContext:
 
 ```python
 # minutes_local/api/app.py
-"""FastAPI アプリ。Bearer 認証、CSP ヘッダ。127.0.0.1 bind は __main__ が行う。"""
+"""FastAPI アプリ。Bearer 認証、CORS、エラー応答の統一、CSP ヘッダ、ブラウザアプリの配信。127.0.0.1 bind は __main__ が行う。"""
 from __future__ import annotations
 
 import hmac
 from collections.abc import Awaitable, Callable
 
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from ..jobs.context import AppContext
 from .common import error_body
@@ -3618,6 +3645,12 @@ CSP = (
     "default-src 'self'; connect-src 'self' http://127.0.0.1:43117 http://localhost:43117; "
     "worker-src 'self'; script-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
 )
+
+# Vite の開発サーバー（Phase 1 §31.1）。Phase 1 §12 が CORS を許可する唯一の配信元
+DEV_ORIGIN = "http://127.0.0.1:5173"
+CORS_METHODS = ["GET", "POST", "PUT", "DELETE"]
+# Authorization を付ける要求はすべて preflight になる。If-Match はノートの楽観ロック（§21.3）
+CORS_HEADERS = ["Authorization", "Content-Type", "X-Chunk-SHA256", "X-Chunk-Meta", "If-Match"]
 
 
 def create_app(ctx: AppContext, token: str) -> FastAPI:
@@ -3631,19 +3664,38 @@ def create_app(ctx: AppContext, token: str) -> FastAPI:
     async def auth_and_headers(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         path = request.url.path
         request.state.authenticated = _check_token(request, token)
-        if path.startswith("/v1/") and path != "/v1/health" and not request.state.authenticated:
+        # OPTIONS（preflight）はトークンを運べないので認証しない（Phase 1 §12）
+        if path.startswith("/v1/") and path != "/v1/health" and request.method != "OPTIONS" and not request.state.authenticated:
             return JSONResponse(error_body("UNAUTHORIZED", "invalid or missing token"), status_code=401)
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            # ブラウザ側は応答本文を ApiErrorBody として読む（Phase 1 §12）。スタックトレースや既定の HTML を返さない
+            return JSONResponse(error_body("INTERNAL", "internal server error"), status_code=500)
         response.headers["Content-Security-Policy"] = CSP
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Cache-Control"] = "no-store"
         return response
+
+    # 後から足したミドルウェアが外側になる。CORS を最も外側に置き、401・422・500・507 にも CORS ヘッダを付ける。
+    # 付いていないと、ブラウザは応答を読めず原因を NETWORK と区別できない
+    app.add_middleware(CORSMiddleware, allow_origins=[DEV_ORIGIN], allow_methods=CORS_METHODS, allow_headers=CORS_HEADERS)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, _exc: RequestValidationError) -> JSONResponse:
+        # FastAPI 既定の {"detail": [...]} ではなく、他のエラーと同じ形で返す
+        return JSONResponse(error_body("VALIDATION", "invalid request"), status_code=422)
 
     app.include_router(routes_phase1.router)
     app.include_router(routes_meetings.router)
     app.include_router(routes_jobs.router)
     app.include_router(routes_models.router)
     app.include_router(sse.router)
+    # ブラウザアプリ（`npm run build` の出力）の配信。ルータより後に置き、/v1/ を覆わない。
+    # 認証は /v1/ だけに掛かる（アプリ本体に秘密はなく、トークンは利用者が画面で入力する）
+    web = ctx.settings.web_dir
+    if web is not None and (web / "index.html").is_file():
+        app.mount("/", StaticFiles(directory=web, html=True), name="web")
     return app
 
 
@@ -3655,26 +3707,57 @@ def _check_token(request: Request, token: str) -> bool:
     return cookie is not None and hmac.compare_digest(cookie, token)
 ```
 
-CORS ミドルウェアは付けない。ブラウザアプリは同一オリジン（サーバーが `/` で配信）で動く前提であり、別オリジン配信は Phase 1 §4.3 の Cookie 方式と併せて `doctor` の設定項目にする。
+`create_app` が担う横断的な規則（すべて Phase 1 §12 の契約で、Phase 1 の実装 `minutes_local/phase1.py` と同じ挙動）:
+
+| 規則 | 内容 | 理由 |
+| --- | --- | --- |
+| CORS | `http://127.0.0.1:5173`（Vite の開発サーバー、Phase 1 §31.1）だけを許可する。`CORSMiddleware` を認証ミドルウェアより**後に**足して最も外側に置く | 開発時のブラウザアプリは API と別オリジン。401・422・500・507 にも CORS ヘッダが付かないと、ブラウザは応答を読めず `NETWORK` と区別できない（Phase 1 のクライアントは `UNAUTHORIZED` を見てトークン再入力へ誘導する） |
+| preflight | `OPTIONS` は認証しない | preflight は `Authorization` を運べない |
+| 許可ヘッダ | `Authorization` / `Content-Type` / `X-Chunk-SHA256` / `X-Chunk-Meta` / `If-Match` | `If-Match` はノートの楽観ロック（§21.3）。足し忘れるとノート保存だけが preflight で落ちる |
+| 検証エラー | `RequestValidationError` は `422 {"error": "invalid request", "code": "VALIDATION"}` | FastAPI 既定の `{"detail": [...]}` はブラウザ側の `isApiErrorBody` を通らない |
+| 想定外の例外 | `500 {"error": "internal server error", "code": "INTERNAL"}`。詳細は本文に載せない | スタックトレースにパスや SQL が出る |
+| アプリの配信 | `Settings.web_dir`（環境変数 `MINUTES_WEB_DIR`）に `index.html` があれば `/` で配信する。認証は `/v1/` だけ | 基本設計 §15。Phase 3 の LAN モードは同一オリジン配信を前提にする |
+
+**配信元を切り替えるときの注意：** IndexedDB はオリジンごとに別なので、`http://127.0.0.1:5173`（開発サーバー）で録音した未確定の会議は `http://127.0.0.1:43117/`（サーバー配信）からは見えない。確定待ちの会議が残っている間は配信元を切り替えない。
+
+トークンは `serve` が起動のたびに `rotate_token()` で作り直す（Phase 1 §4.3 の短命性。§22）。`token` コマンドは現在の値を表示するだけで、作り直さない。
 
 ## 21.2 Phase 1 互換ルート `api/routes_phase1.py`
 
 Phase 1 §12 の 5 エンドポイント。リクエスト／レスポンス形状は変更しない。
 
+**検証規則は Phase 1 の実装（`minutes_local/phase1.py`）から緩めない。** Phase 1 のサーバーは実機確認（T4）を通した実装であり、ブラウザ側はその挙動を前提にしている。本実装が引き継ぐ規則：
+
+| 対象 | 規則 | 違反時 |
+| --- | --- | --- |
+| `meetingId`（作成の本文、PUT・一覧・確定の URL） | `[A-Za-z0-9][A-Za-z0-9_-]{0,127}` に完全一致 | `422 VALIDATION`。**ファイルパスに使う値**なので、`..` を通すと `DELETE /v1/meetings/{id}`（§21.3）の `rmtree` がデータディレクトリの外側に届く |
+| 作成の数値 | `sessionStartEpochMs` ≥ 0、`nativeSampleRate` > 0、`consentConfirmedAt` ≥ 0 | `422 VALIDATION` |
+| PUT の URL | `source` は `mic` / `system`、`sequenceNo` ≥ 0 | `422 VALIDATION` |
+| PUT のヘッダ | `Content-Type: audio/wav`、`X-Chunk-SHA256`（小文字 16 進 64 桁）、`X-Chunk-Meta` がすべて必須 | `422 VALIDATION` |
+| WAV 本体 | PCM16 / mono / 16 kHz、データ長が 0 でなく偶数 | `422 VALIDATION` |
+| `X-Chunk-Meta` | `meetingId` / `source` / `sequenceNo` が URL と、`sampleCount` が WAV と一致。`startOffsetMs` / `endOffsetMs` は整数で 0 ≤ start ≤ end。`vadScore` は有限の数、`hasVoice` は真偽値。`sha256` / `sizeBytes` / `sampleRate` / `channels` は載っていれば実体と一致 | `422 VALIDATION`。既定値で補わない（時刻がずれた transcript になる） |
+| 登録済み Chunk の再送 | sha256 が同じでファイルも無事なら `200`。**ファイルが失われた・壊れていれば書き戻して `200`**（確定後の会議でも受け付ける） | sha256 が違えば `409 CONFLICT_HASH_MISMATCH` |
+| 確定の本文 | `expectedChunkCounts` のキーはちょうど `mic` と `system`、値は 0 以上 | `422 VALIDATION` |
+| 確定の照合 | 件数一致に加え、source ごとの連番が `0..n-1` で連続 | `409 CONFLICT_CHUNKS_MISSING` |
+| `meeting.json` | 会議の作成時に書く。再送時はファイルがないときだけ書き直す。確定時に確定値で上書きする | ディスク不足は `507 INSUFFICIENT_STORAGE` |
+
+Phase 2 で加えた挙動：`frameClockDriftMs` の保存（基本設計 §16.3.1。欠落・非数値は無視）、確定時のジョブ生成（§12）、`meeting_status` の通知。通知は**この要求が状態を進めたときだけ**流す（確定済み会議への再送で `transcribing` を流すと、`completed` の会議の画面が処理中へ戻る）。Chunk が 0 件の会議も確定でき、vad ジョブがないので `on_finalized` がその場で merge を判定する（§12）。
+
 ```python
 # minutes_local/api/routes_phase1.py
-"""Phase 1 §12 の契約。変更禁止（基本設計 §2）。"""
+"""Phase 1 §12 の契約。変更禁止（基本設計 §2）。検証規則は Phase 1 の実装 `minutes_local/phase1.py` と同じにする（§21.2）。"""
 from __future__ import annotations
 
 import base64
 import errno
 import json
 import math
+import re
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, Request, Response
+from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
-from pydantic import Field, model_validator, BaseModel, ValidationError
+from pydantic import BaseModel, Field, model_validator
 
 from ..db import repo
 from ..db.connection import now_ms
@@ -3685,13 +3768,19 @@ from .common import error_body, get_ctx
 
 router = APIRouter(prefix="/v1")
 
+# meetingId はファイルパス（recordings/{meetingId}/…）に使うので形式を固定する。".." や区切り文字を通さない
+SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+# finalize 前の状態。これ以外の会議には新しい Chunk を足さず、確定値も書き換えない
+OPEN_STATUSES = ("created", "recording", "finalizing")
+
 
 class CreateMeetingRequest(BaseModel):
     meetingId: str
     title: str
-    sessionStartEpochMs: int
-    nativeSampleRate: int
-    consentConfirmedAt: int
+    sessionStartEpochMs: int = Field(ge=0)
+    nativeSampleRate: int = Field(gt=0)
+    consentConfirmedAt: int = Field(ge=0)
 
 
 class FinalizeRequest(BaseModel):
@@ -3739,6 +3828,8 @@ async def health(request: Request) -> dict[str, Any]:
 @router.post("/meetings")
 async def create_meeting(req: CreateMeetingRequest, request: Request) -> JSONResponse:
     ctx = get_ctx(request)
+    if not SAFE_ID.fullmatch(req.meetingId):
+        return JSONResponse(error_body("VALIDATION", "invalid meetingId"), status_code=422)
     t = now_ms()
     m = Meeting(id=req.meetingId, title=req.title, status="recording", session_start_epoch_ms=req.sessionStartEpochMs,
                 native_sample_rate=req.nativeSampleRate, consent_confirmed_at=req.consentConfirmedAt, created_at=t, updated_at=t)
@@ -3746,18 +3837,50 @@ async def create_meeting(req: CreateMeetingRequest, request: Request) -> JSONRes
         created = repo.insert_meeting(conn, m)
         current = repo.get_meeting(conn, req.meetingId)
     assert current is not None
+    # 録音メタデータの控え（Phase 1 §13）。作成時に書き、再送時はファイルが失われているときだけ書き直す
+    # （finalize 後の再送で、確定値を持つ meeting.json を作成時の内容へ戻さない）
+    rel = f"recordings/{current.id}/meeting.json"
+    if created or not (ctx.settings.data_dir / rel).is_file():
+        try:
+            write_atomic(ctx.settings.data_dir, rel, json.dumps(req.model_dump(), ensure_ascii=False).encode())
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
+            raise
     body = {"meetingId": current.id, "status": current.status, "dataPath": f"recordings/{current.id}"}
     return JSONResponse(body, status_code=201 if created else 200)
 
 
-def _decode_meta(header: str | None) -> dict[str, Any]:
-    if not header:
-        return {}
-    padded = header + "=" * (-len(header) % 4)
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_meta(header: str, meeting_id: str, source: str, sequence_no: int, sample_count: int, sha: str, size: int) -> dict[str, Any]:
+    """X-Chunk-Meta（Base64URL の JSON）を復号し、URL・WAV と食い違えば ValueError（→ 422）。
+
+    メタデータは録音時刻の正なので、既定値で補わない。食い違ったまま登録すると transcript の時刻がずれる。
+    """
     try:
-        return json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return {}
+        meta = json.loads(base64.urlsafe_b64decode(header + "=" * (-len(header) % 4)))
+    except ValueError as e:      # binascii.Error / JSONDecodeError / UnicodeDecodeError はすべて ValueError の派生
+        raise ValueError("invalid X-Chunk-Meta") from e
+    if not isinstance(meta, dict):
+        raise ValueError("metadata must be an object")
+    if (meta.get("meetingId") != meeting_id or meta.get("source") != source
+            or meta.get("sequenceNo") != sequence_no or meta.get("sampleCount") != sample_count):
+        raise ValueError("metadata does not match URL or WAV")
+    start, end = meta.get("startOffsetMs"), meta.get("endOffsetMs")
+    if not _is_int(start) or not _is_int(end) or start < 0 or end < start:
+        raise ValueError("invalid timing")
+    score = meta.get("vadScore", 0)
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+        raise ValueError("invalid vadScore")
+    if not isinstance(meta.get("hasVoice", True), bool):
+        raise ValueError("invalid hasVoice")
+    if (meta.get("sha256", sha) != sha or meta.get("sizeBytes", size) != size
+            or meta.get("sampleRate", 16000) != 16000 or meta.get("channels", 1) != 1):
+        raise ValueError("metadata does not match WAV")
+    return meta
 
 
 @router.put("/meetings/{meeting_id}/chunks/{source}/{sequence_no}")
@@ -3765,16 +3888,23 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
                     x_chunk_sha256: str | None = Header(default=None),
                     x_chunk_meta: str | None = Header(default=None)) -> JSONResponse:
     ctx = get_ctx(request)
-    if source not in ("mic", "system"):
-        return JSONResponse(error_body("VALIDATION", "source must be mic or system"), status_code=422)
+    if not SAFE_ID.fullmatch(meeting_id) or source not in ("mic", "system") or sequence_no < 0:
+        return JSONResponse(error_body("VALIDATION", "invalid chunk key"), status_code=422)
+    if (request.headers.get("content-type") != "audio/wav" or x_chunk_sha256 is None
+            or not SHA256_HEX.fullmatch(x_chunk_sha256) or x_chunk_meta is None):
+        return JSONResponse(error_body("VALIDATION", "invalid chunk headers"), status_code=422)
     data = await request.body()
     try:
         header = parse_wav_header(data)
     except InvalidWavError as e:
         return JSONResponse(error_body("VALIDATION", "invalid wav", str(e)), status_code=422)
     sha = sha256_hex(data)
-    if x_chunk_sha256 and x_chunk_sha256.lower() != sha:
+    if x_chunk_sha256 != sha:
         return JSONResponse(error_body("VALIDATION", "sha256 header mismatch"), status_code=422)
+    try:
+        meta = _validate_meta(x_chunk_meta, meeting_id, source, sequence_no, header.sample_count, sha, len(data))
+    except ValueError as e:
+        return JSONResponse(error_body("VALIDATION", str(e)), status_code=422)
 
     with ctx.db.read() as conn:
         meeting = repo.get_meeting(conn, meeting_id)
@@ -3784,8 +3914,21 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
     if existing is not None:
         if existing.sha256 != sha:
             return JSONResponse(error_body("CONFLICT_HASH_MISMATCH", "chunk exists with different content"), status_code=409)
-        return JSONResponse(_chunk_response(existing), status_code=200)   # 冪等再送（基本設計 §11）
-    if meeting.status not in ("created", "recording", "finalizing"):
+        path = ctx.settings.data_dir / existing.local_path
+        if path.is_file() and sha256_file(path) == sha:
+            return JSONResponse(_chunk_response(existing), status_code=200)   # 冪等再送（基本設計 §11）
+        # 修復：登録済みだがファイルが失われた・壊れた。内容は同じ（sha256 一致）なので書き戻す。
+        # 確定後の会議でも受け付ける（finalize の 409 CONFLICT_CHUNKS_MISSING からブラウザが再送して回復する経路）
+        try:
+            write_atomic(ctx.settings.data_dir, existing.local_path, data)
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
+            raise
+        async with ctx.db.write() as conn:
+            repo.update_chunk(conn, existing.id, save_status="registered")
+        return JSONResponse(_chunk_response(existing), status_code=200)
+    if meeting.status not in OPEN_STATUSES:
         # 確定後の会議には新しい Chunk を足さない（登録済み Chunk の再送・修復は上で受け付け済み）
         return JSONResponse(error_body("CONFLICT_MEETING_FINALIZED", "meeting is already finalized"), status_code=409)
 
@@ -3796,12 +3939,10 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
         if e.errno == errno.ENOSPC:
             return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
         raise
-    meta = _decode_meta(x_chunk_meta)
-    duration_ms = int(header.sample_count / 16)
-    start = int(meta.get("startOffsetMs", sequence_no * 30000))
+    duration_ms = round(header.sample_count / 16)
     chunk = AudioChunk(
         id=repo.new_id(), meeting_id=meeting_id, source=source, sequence_no=sequence_no,  # type: ignore[arg-type]
-        start_offset_ms=start, end_offset_ms=int(meta.get("endOffsetMs", start + duration_ms)),
+        start_offset_ms=meta["startOffsetMs"], end_offset_ms=meta["endOffsetMs"],
         duration_ms=duration_ms, sample_count=header.sample_count, local_path=rel, size_bytes=len(data), sha256=sha,
         vad_score=float(meta.get("vadScore", 0.0)), has_voice=bool(meta.get("hasVoice", True)), created_at=now_ms(),
     )
@@ -3809,12 +3950,13 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
     # 後から足した optional フィールドなので、欠落や非数値は 422 にせず無視する
     # （Phase 1 クライアントがそのまま Phase 2 サーバーに繋がる、§2 の後方互換）。
     drift = meta.get("frameClockDriftMs")
-    sampled_at = int(meta.get("wallClockStartEpochMs", now_ms())) + duration_ms
+    wall_start = meta.get("wallClockStartEpochMs")
+    sampled_at = (wall_start if _is_int(wall_start) else now_ms()) + duration_ms
 
     async with ctx.db.write() as conn:
         # 読み取り後に finalize が確定させた場合に備え、書き込みロック下で状態を確かめ直す
         current = repo.get_meeting(conn, meeting_id)
-        if current is None or current.status not in ("created", "recording", "finalizing"):
+        if current is None or current.status not in OPEN_STATUSES:
             return JSONResponse(error_body("CONFLICT_MEETING_FINALIZED", "meeting is already finalized"), status_code=409)
         stored = repo.upsert_chunk(conn, chunk)
         if isinstance(drift, (int, float)) and not isinstance(drift, bool) and math.isfinite(drift):
@@ -3831,6 +3973,8 @@ def _chunk_response(c: AudioChunk) -> dict[str, Any]:
 @router.get("/meetings/{meeting_id}/chunks")
 async def list_chunks(meeting_id: str, request: Request) -> Any:
     ctx = get_ctx(request)
+    if not SAFE_ID.fullmatch(meeting_id):
+        return JSONResponse(error_body("VALIDATION", "invalid meetingId"), status_code=422)
     with ctx.db.read() as conn:
         if repo.get_meeting(conn, meeting_id) is None:
             return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
@@ -3842,8 +3986,11 @@ async def list_chunks(meeting_id: str, request: Request) -> Any:
 
 @router.post("/meetings/{meeting_id}/finalize")
 async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> Any:
-    """Finalization Barrier のサーバー側：件数一致 + ファイル存在 + sha256 照合 → finalized → ジョブ生成。"""
+    """Finalization Barrier のサーバー側：件数一致 + 連番の連続 + ファイル存在 + sha256 照合 → finalized → ジョブ生成。"""
     ctx = get_ctx(request)
+    if (not SAFE_ID.fullmatch(meeting_id) or set(req.expectedChunkCounts) != {"mic", "system"}
+            or any(v < 0 for v in req.expectedChunkCounts.values())):
+        return JSONResponse(error_body("VALIDATION", "invalid finalize request"), status_code=422)
     with ctx.db.read() as conn:
         meeting = repo.get_meeting(conn, meeting_id)
         chunks = repo.list_chunks(conn, meeting_id)
@@ -3861,27 +4008,41 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
         if counts.get(source, 0) != expected:
             return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", f"{source}: have {counts.get(source, 0)}, expected {expected}",
                                            ", ".join(missing) or None), status_code=409)
+        # 件数が合っていても連番に穴があれば確定しない（0,1,3 の 3 件を「3 件そろった」と扱わない）
+        seqs = sorted(c.sequence_no for c in chunks if c.source == source)
+        if seqs != list(range(len(seqs))):
+            return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", f"{source}: sequence gap"), status_code=409)
+    transitioned = False
     async with ctx.db.write() as conn:
         for c in chunks:
             repo.update_chunk(conn, c.id, save_status="missing" if f"{c.source}/{c.sequence_no}" in missing else "verified")
         # 先に確定した値を正とする。書き込みロック下で状態と件数を確かめ直し、2 回目以降は更新しない
         current = repo.get_meeting(conn, meeting_id)
-        if current is not None and current.status in ("created", "recording", "finalizing"):
+        if current is not None and current.status in OPEN_STATUSES:
             if len(repo.list_chunks(conn, meeting_id)) != len(chunks):
                 return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "chunks changed during finalize"), status_code=409)
             repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames,
                                 stop_reason=req.stopReason, stop_detected_at=req.stopDetectedAtEpochMs)
             pipeline.on_finalized(conn, meeting_id)
+            transitioned = True
         snapshot = repo.get_meeting(conn, meeting_id)
     # コミット後に確定値から書き、meeting.json が DB より先行しないようにする。再送でも毎回書き直す（Phase 1 §12）
     if snapshot is not None:
-        write_atomic(ctx.settings.data_dir, f"recordings/{meeting_id}/meeting.json", json.dumps({
-            "meetingId": meeting_id, "title": snapshot.title, "sessionStartEpochMs": snapshot.session_start_epoch_ms,
-            "nativeSampleRate": snapshot.native_sample_rate, "consentConfirmedAt": snapshot.consent_confirmed_at,
-            "endedAtEpochMs": snapshot.ended_at, "totalAudioFrames": snapshot.total_audio_frames,
-            "stopReason": snapshot.stop_reason, "stopDetectedAtEpochMs": snapshot.stop_detected_at,
-        }, ensure_ascii=False).encode())
-    ctx.events.publish(meeting_id, {"type": "meeting_status", "status": "transcribing"})
+        try:
+            write_atomic(ctx.settings.data_dir, f"recordings/{meeting_id}/meeting.json", json.dumps({
+                "meetingId": meeting_id, "title": snapshot.title, "sessionStartEpochMs": snapshot.session_start_epoch_ms,
+                "nativeSampleRate": snapshot.native_sample_rate, "consentConfirmedAt": snapshot.consent_confirmed_at,
+                "endedAtEpochMs": snapshot.ended_at, "totalAudioFrames": snapshot.total_audio_frames,
+                "stopReason": snapshot.stop_reason, "stopDetectedAtEpochMs": snapshot.stop_detected_at,
+            }, ensure_ascii=False).encode())
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
+            raise
+    # 再送（確定済み会議への 2 回目以降の POST）では状態を進めていないので通知しない。
+    # 毎回 transcribing を流すと、completed の会議の画面が再送のたびに処理中へ戻る
+    if transitioned and snapshot is not None:
+        ctx.events.publish(meeting_id, {"type": "meeting_status", "status": snapshot.status})
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 ```
 
@@ -4258,6 +4419,7 @@ async def events(meeting_id: str, request: Request) -> StreamingResponse:
 """AppContext の組み立て。テストは Provider を差し替えて同じ関数を使う。基本設計 §5.3。"""
 from __future__ import annotations
 
+import os
 import secrets
 from pathlib import Path
 
@@ -4275,14 +4437,28 @@ from .storage.models_dir import installed_whisper_models, silero_model_path
 from .vad.provider import VADProvider
 
 
-def load_or_create_token(path: Path) -> str:
-    if path.exists():
-        return path.read_text(encoding="utf-8").strip()
+def rotate_token(path: Path) -> str:
+    """32 バイトの乱数トークンを作り直して 0600 で書く。`serve` が起動のたびに呼ぶ（Phase 1 §4.3 の短命性）。
+
+    作成時点から 0600 にする（write_text の後で chmod すると、その間だけ他者が読める）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    token = secrets.token_urlsafe(32)
-    path.write_text(token, encoding="utf-8")
-    path.chmod(0o600)
+    token = secrets.token_hex(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)          # 既存ファイルの権限が緩かった場合も締める
+        os.write(fd, token.encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     return token
+
+
+def read_token(path: Path) -> str | None:
+    """現在のトークン。`token` コマンド用。サーバーを一度も起動していなければ None。"""
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="ascii").strip() or None
 
 
 def select_models(settings: Settings, hw: Hardware, available_llm: list[str], ollama_reachable: bool) -> ModelSelection:
@@ -4303,6 +4479,7 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
                         vad_provider: VADProvider | None = None, llm_provider: SummaryProvider | None = None,
                         hardware: Hardware | None = None) -> AppContext:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(settings.data_dir, 0o700)       # 録音・トークン・DB を置く。他の OS ユーザーに読ませない
     db = Database(settings.db_path)
     migrate(db)
     with db.read() as conn:
@@ -4344,13 +4521,17 @@ import argparse
 import asyncio
 import sys
 
-from .bootstrap import build_context, load_or_create_token
+from .bootstrap import build_context, read_token, rotate_token
 from .config import settings_from_env
 
 
 def _cmd_token(args: argparse.Namespace) -> int:
     s = settings_from_env()
-    print(load_or_create_token(s.token_path))
+    token = read_token(s.token_path)
+    if token is None:
+        print("token file not found. Start the server once with `minutes-local serve`.", file=sys.stderr)
+        return 1
+    print(token)
     return 0
 
 
@@ -4383,7 +4564,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     async def main() -> None:
         ctx = await build_context(s)
-        token = load_or_create_token(s.token_path)
+        token = rotate_token(s.token_path)      # 起動のたびに作り直す（Phase 1 §4.3）。ブラウザは 401 を受けて再入力へ誘導する
         print(f"token: {token}")
         app = create_app(ctx, token)
         stop = asyncio.Event()
@@ -4542,6 +4723,11 @@ async def client(ctx: AppContext) -> AsyncIterator[httpx.AsyncClient]:
         yield c
 
 
+def recording_dir(ctx: AppContext, meeting_id: str) -> Path:
+    """会議の録音ディレクトリ。物理配置はフェーズで変わるので、テストはこの関数経由で参照する。"""
+    return ctx.settings.data_dir / "recordings" / meeting_id
+
+
 async def create_meeting(client: httpx.AsyncClient, meeting_id: str = "m-1") -> None:
     r = await client.post("/v1/meetings", json={"meetingId": meeting_id, "title": "t", "sessionStartEpochMs": 0,
                                                 "nativeSampleRate": 48000, "consentConfirmedAt": 1})
@@ -4555,7 +4741,9 @@ async def put_chunk(client: httpx.AsyncClient, meeting_id: str, seq: int, pcm: b
     duration = len(pcm) // 32
     import base64
     if meta is None:
-        body = {"startOffsetMs": seq * 30000, "endOffsetMs": seq * 30000 + duration, "vadScore": 0.5, "hasVoice": True}
+        # Phase 1 のクライアントが送る ChunkTimingMetadata のうち、サーバーが照合する項目（§21.2）
+        body = {"meetingId": meeting_id, "source": source, "sequenceNo": seq, "sampleCount": len(pcm) // 2,
+                "startOffsetMs": seq * 30000, "endOffsetMs": seq * 30000 + duration, "vadScore": 0.5, "hasVoice": True}
         meta = base64.urlsafe_b64encode(json.dumps(body).encode()).decode().rstrip("=")
     return await client.put(f"/v1/meetings/{meeting_id}/chunks/{source}/{seq}", content=wav,
                             headers={"Content-Type": "audio/wav", "X-Chunk-SHA256": sha256_hex(wav), "X-Chunk-Meta": meta})
@@ -4697,6 +4885,365 @@ async def test_list_and_finalize(client: httpx.AsyncClient, ctx: AppContext) -> 
         assert repo.count_jobs(conn, "m-1", "vad_chunk", ["pending"]) == 3  # 冪等
 ```
 
+### 23.3.1 Phase 1 の実装から引き継ぐ検証規則
+
+`server_tests/test_phase1_api.py`（Phase 1 サーバーのテスト 10 件）の各項目を、本書のハーネスへ移したもの。§21.1・§21.2 の表の各行に対応する。Step 2-a の完了条件であり、これが通るまで Phase 1 のサーバーを置き換えない（§25）。
+
+```python
+# tests/test_phase1_server_compat.py
+"""Phase 1 の実装（minutes_local/phase1.py）が持つ検証規則を、本実装が引き継いでいることの回帰。
+
+server_tests/test_phase1_api.py（Phase 1 のサーバーテスト）の各項目を、本書のハーネスへ移したもの。
+Phase 1 のサーバーを本実装へ置き換えても、ブラウザから見た挙動が緩まないことを保証する（§21.2）。
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import errno
+import json
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from pathlib import Path
+
+import httpx
+import pytest
+
+from minutes_local.api.app import DEV_ORIGIN, create_app
+from minutes_local.bootstrap import read_token, rotate_token
+from minutes_local.db import repo
+from minutes_local.jobs.context import AppContext
+from minutes_local.jobs.runner import JobRunner
+from minutes_local.storage.files import build_wav, sha256_hex, write_atomic
+from tests.conftest import BASE, TOKEN, finalize, recording_dir, sine_pcm
+
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+MEETING = {"meetingId": "m-1", "title": "定例", "sessionStartEpochMs": 1000, "nativeSampleRate": 48000, "consentConfirmedAt": 900}
+
+
+def _b64(meta: dict[str, object]) -> str:
+    return base64.urlsafe_b64encode(json.dumps(meta).encode()).decode().rstrip("=")
+
+
+def _meta(seq: int = 0, **overrides: object) -> dict[str, object]:
+    return {"meetingId": "m-1", "source": "mic", "sequenceNo": seq, "sampleCount": 16000,
+            "startOffsetMs": seq * 30000, "endOffsetMs": seq * 30000 + 1000, **overrides}
+
+
+async def _raw_put(client: httpx.AsyncClient, *, meeting_id: str = "m-1", seq: int = 0, headers: dict[str, str] | None = None,
+                   meta: dict[str, object] | None = None, drop: tuple[str, ...] = ()) -> httpx.Response:
+    """ヘッダを個別に壊せる PUT。既定は 1 秒の正しい Chunk。"""
+    wav = build_wav(sine_pcm(1))
+    h = {"Content-Type": "audio/wav", "X-Chunk-SHA256": sha256_hex(wav), "X-Chunk-Meta": _b64(meta if meta is not None else _meta(seq))}
+    h.update(headers or {})
+    for name in drop:
+        del h[name]
+    return await client.put(f"/v1/meetings/{meeting_id}/chunks/mic/{seq}", content=wav, headers=h)
+
+
+# ---- CORS とエラー応答の形（Phase 1 §12） ----
+
+async def test_preflight_is_answered_without_token_for_dev_origin_only(ctx: AppContext) -> None:
+    app = create_app(ctx, TOKEN)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as c:   # トークンなし
+        preflight = {"Origin": DEV_ORIGIN, "Access-Control-Request-Method": "PUT",
+                     "Access-Control-Request-Headers": "authorization,content-type,x-chunk-sha256,x-chunk-meta,if-match"}
+        ok = await c.options("/v1/meetings/m-1/chunks/mic/0", headers=preflight)
+        other = await c.get("/v1/health", headers={"Origin": "https://example.com"})
+    assert ok.status_code == 200 and ok.headers["access-control-allow-origin"] == DEV_ORIGIN
+    assert "access-control-allow-origin" not in other.headers
+
+
+async def test_error_responses_carry_cors_headers_and_api_error_body(ctx: AppContext) -> None:
+    app = create_app(ctx, TOKEN)
+    origin = {"Origin": DEV_ORIGIN}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as c:
+        denied = await c.post("/v1/meetings", json=MEETING, headers=origin)
+        invalid = await c.post("/v1/meetings", json={"meetingId": "bad"}, headers={**origin, **AUTH})
+    assert denied.status_code == 401 and denied.json()["code"] == "UNAUTHORIZED"
+    assert denied.headers["access-control-allow-origin"] == DEV_ORIGIN
+    # FastAPI 既定の {"detail": [...]} ではなく ApiErrorBody で返る
+    assert invalid.status_code == 422 and invalid.json() == {"error": "invalid request", "code": "VALIDATION"}
+    assert invalid.headers["access-control-allow-origin"] == DEV_ORIGIN
+
+
+async def test_unhandled_exception_becomes_internal_error_body(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("secret detail")
+    await client.post("/v1/meetings", json=MEETING)
+    monkeypatch.setattr(repo, "list_chunks", boom)
+    r = await client.get("/v1/meetings/m-1/chunks")
+    assert r.status_code == 500 and r.json() == {"error": "internal server error", "code": "INTERNAL"}
+
+
+# ---- 会議 ID と Chunk ヘッダの検証 ----
+
+@pytest.mark.parametrize("bad_id", ["..", ".hidden", "a/b", "a b", "", "x" * 129, "日本語"])
+async def test_create_meeting_rejects_unsafe_id(client: httpx.AsyncClient, ctx: AppContext, bad_id: str) -> None:
+    r = await client.post("/v1/meetings", json={**MEETING, "meetingId": bad_id})
+    assert r.status_code == 422 and r.json()["code"] == "VALIDATION"
+    with ctx.db.read() as conn:
+        assert repo.list_meetings(conn) == []
+
+
+async def test_create_meeting_rejects_negative_or_zero_numbers(client: httpx.AsyncClient) -> None:
+    for bad in ({"sessionStartEpochMs": -1}, {"nativeSampleRate": 0}, {"consentConfirmedAt": -1}):
+        assert (await client.post("/v1/meetings", json={**MEETING, **bad})).status_code == 422
+
+
+async def test_create_meeting_writes_meeting_json_and_resend_does_not_overwrite_finalized_snapshot(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    path = recording_dir(ctx, "m-1") / "meeting.json"
+    assert (await client.post("/v1/meetings", json=MEETING)).status_code == 201
+    assert json.loads(path.read_text()) == MEETING
+    await finalize(client, "m-1", mic=0)
+    assert (await client.post("/v1/meetings", json=MEETING)).status_code == 200     # 確定後の再送
+    assert json.loads(path.read_text())["endedAtEpochMs"] == 1                       # 確定値を持つ控えのまま
+    path.unlink()
+    assert (await client.post("/v1/meetings", json=MEETING)).status_code == 200     # 失われていれば書き直す
+    assert json.loads(path.read_text()) == MEETING
+
+
+async def test_put_chunk_rejects_bad_key_and_headers(client: httpx.AsyncClient) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    cases = [
+        await _raw_put(client, meeting_id=".hidden"),                                # 形式外の会議 ID（"/.." は HTTP クライアントが正規化するので別途 POST で検査）
+        await client.put("/v1/meetings/m-1/chunks/mic/-1", content=b"x", headers={"Content-Type": "audio/wav"}),
+        await _raw_put(client, headers={"Content-Type": "application/octet-stream"}),
+        await _raw_put(client, drop=("X-Chunk-SHA256",)),
+        await _raw_put(client, headers={"X-Chunk-SHA256": "0" * 64}),                # 形式は正しいが本文と不一致
+        await _raw_put(client, headers={"X-Chunk-SHA256": "ABC"}),
+        await _raw_put(client, drop=("X-Chunk-Meta",)),
+        await _raw_put(client, headers={"X-Chunk-Meta": "%%%"}),
+    ]
+    assert [r.status_code for r in cases] == [422] * len(cases)
+    assert all(r.json()["code"] == "VALIDATION" for r in cases)
+    assert (await client.get("/v1/meetings/m-1/chunks")).json()["chunks"] == []
+
+
+@pytest.mark.parametrize("meta", [
+    _meta(meetingId="m-other"), _meta(source="system"), _meta(sequenceNo=1), _meta(sampleCount=15999),
+    {k: v for k, v in _meta().items() if k != "startOffsetMs"}, _meta(startOffsetMs=-1), _meta(endOffsetMs=-1),
+    _meta(startOffsetMs=1.5), _meta(vadScore="high"), _meta(hasVoice="yes"), _meta(sampleRate=48000), _meta(channels=2),
+    _meta(sizeBytes=1), _meta(sha256="0" * 64),
+])
+async def test_put_chunk_rejects_meta_that_disagrees_with_url_or_wav(client: httpx.AsyncClient, meta: dict[str, object]) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    r = await _raw_put(client, meta=meta)
+    assert r.status_code == 422 and r.json()["code"] == "VALIDATION"
+
+
+async def test_put_chunk_rejects_empty_wav(client: httpx.AsyncClient) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    wav = build_wav(b"")
+    r = await client.put("/v1/meetings/m-1/chunks/mic/0", content=wav, headers={
+        "Content-Type": "audio/wav", "X-Chunk-SHA256": sha256_hex(wav), "X-Chunk-Meta": _b64(_meta(sampleCount=0))})
+    assert r.status_code == 422
+
+
+async def test_put_to_unknown_meeting_is_404(client: httpx.AsyncClient) -> None:
+    r = await _raw_put(client, meeting_id="m-missing", meta=_meta(meetingId="m-missing"))
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"
+
+
+# ---- 保存の失敗と修復 ----
+
+async def test_disk_full_returns_507_and_leaves_no_row(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    from minutes_local.api import routes_phase1
+    await client.post("/v1/meetings", json=MEETING)
+
+    def full(*_args: object) -> Path:
+        raise OSError(errno.ENOSPC, "disk full")
+    monkeypatch.setattr(routes_phase1, "write_atomic", full)
+    r = await _raw_put(client)
+    assert r.status_code == 507 and r.json()["code"] == "INSUFFICIENT_STORAGE"
+    monkeypatch.undo()
+    assert (await client.get("/v1/meetings/m-1/chunks")).json()["chunks"] == []
+    assert (await _raw_put(client)).status_code == 201
+
+
+async def test_corrupt_file_blocks_finalize_until_resend_repairs_it(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    assert (await _raw_put(client)).status_code == 201
+    path = recording_dir(ctx, "m-1") / "mic/000000.wav"
+    path.write_bytes(b"corrupt")
+    assert (await finalize(client, "m-1", mic=1)).status_code == 409
+    assert (await _raw_put(client)).status_code == 200                               # 同じ内容の再送で書き戻す
+    assert sha256_hex(path.read_bytes()) == sha256_hex(build_wav(sine_pcm(1)))
+    assert (await finalize(client, "m-1", mic=1)).status_code == 200
+
+
+async def test_after_finalize_new_chunk_is_rejected_but_resend_and_repair_pass(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    assert (await _raw_put(client)).status_code == 201
+    assert (await finalize(client, "m-1", mic=1)).status_code == 200
+
+    late = await _raw_put(client, seq=1)
+
+    assert late.status_code == 409 and late.json()["code"] == "CONFLICT_MEETING_FINALIZED"
+    assert not (recording_dir(ctx, "m-1") / "mic/000001.wav").exists()
+    assert [c["sequenceNo"] for c in (await client.get("/v1/meetings/m-1/chunks")).json()["chunks"]] == [0]
+    assert (await _raw_put(client)).status_code == 200
+    (recording_dir(ctx, "m-1") / "mic/000000.wav").write_bytes(b"corrupt")
+    assert (await _raw_put(client)).status_code == 200
+    with ctx.db.read() as conn:
+        assert repo.get_chunk_by_key(conn, "m-1", "mic", 0).save_status == "registered"
+
+
+# ---- finalize ----
+
+async def test_finalize_requires_both_sources_and_non_negative_counts(client: httpx.AsyncClient) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    base = {"endedAtEpochMs": 2000, "totalAudioFrames": 0}
+    for counts in ({"mic": 0}, {"mic": 0, "system": 0, "other": 0}, {"mic": -1, "system": 0}):
+        r = await client.post("/v1/meetings/m-1/finalize", json={**base, "expectedChunkCounts": counts})
+        assert r.status_code == 422 and r.json()["code"] == "VALIDATION"
+    bad_id = await client.post("/v1/meetings/.hidden/finalize", json={**base, "expectedChunkCounts": {"mic": 0, "system": 0}})
+    assert bad_id.status_code == 422
+    assert (await client.get("/v1/meetings/.hidden/chunks")).status_code == 422
+
+
+async def test_finalize_rejects_sequence_gap_even_when_count_matches(client: httpx.AsyncClient) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    for seq in (0, 2):                                                               # 1 が欠けている
+        assert (await _raw_put(client, seq=seq)).status_code == 201
+    r = await finalize(client, "m-1", mic=2)
+    assert r.status_code == 409 and r.json()["code"] == "CONFLICT_CHUNKS_MISSING"
+
+
+async def test_first_finalize_wins_and_resend_does_not_republish_status(client: httpx.AsyncClient, ctx: AppContext,
+                                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    await _raw_put(client)
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(ctx.events, "publish", lambda _meeting_id, event: published.append(event))
+    body = {"expectedChunkCounts": {"mic": 1, "system": 0}, "endedAtEpochMs": 2000, "totalAudioFrames": 16000}
+    assert (await client.post("/v1/meetings/m-1/finalize", json=body)).status_code == 200
+    assert (await client.post("/v1/meetings/m-1/finalize", json={**body, "endedAtEpochMs": 3000})).status_code == 200
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").ended_at == 2000
+    statuses = [ev["status"] for ev in published if ev.get("type") == "meeting_status"]
+    assert statuses == ["transcribing"]                                              # 再送では流さない
+
+
+async def test_meeting_without_chunks_completes(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
+    """開始直後に停止した会議（Chunk 0 件）。Phase 1 のクライアントはこれも確定する。"""
+    await client.post("/v1/meetings", json=MEETING)
+    assert (await finalize(client, "m-1", mic=0)).status_code == 200
+    await runner.run_until_idle()
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").status == "completed"
+
+
+# ---- 並行実行（Phase 1 §12.1） ----
+
+async def test_parallel_put_of_same_key_registers_once(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    results = await asyncio.gather(_raw_put(client), _raw_put(client))
+    assert sorted(r.status_code for r in results) == [200, 201]
+    assert not list(recording_dir(ctx, "m-1").rglob("*.part"))
+    with ctx.db.read() as conn:
+        assert len(repo.list_chunks(conn, "m-1")) == 1
+
+
+def test_concurrent_atomic_writes_to_same_path_do_not_share_temp_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 両スレッドが一時ファイルを書き終えてから rename するよう待ち合わせる
+    original_replace = os.replace
+    barrier = threading.Barrier(2)
+
+    def waiting_replace(src: str, dst: str | Path) -> None:
+        barrier.wait(timeout=2)
+        original_replace(src, dst)
+    monkeypatch.setattr(os, "replace", waiting_replace)
+
+    # Act
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(write_atomic, tmp_path, "recordings/m-1/meeting.json", data) for data in (b"first", b"second")]
+        errors = [f.exception() for f in futures]
+
+    # Assert: 一時ファイル名が固定だと片方が相手のファイルを rename して失敗する
+    assert errors == [None, None]
+    assert (tmp_path / "recordings/m-1/meeting.json").read_bytes() in (b"first", b"second")
+    assert not list(tmp_path.rglob("*.part"))
+
+
+async def test_concurrent_finalize_keeps_first_result_in_db_and_snapshot(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    await _raw_put(client)
+
+    def body(ended_at: int) -> dict[str, object]:
+        return {"expectedChunkCounts": {"mic": 1, "system": 0}, "endedAtEpochMs": ended_at, "totalAudioFrames": ended_at}
+    results = await asyncio.gather(*(client.post("/v1/meetings/m-1/finalize", json=body(e)) for e in (2000, 3000)))
+
+    assert [r.status_code for r in results] == [200, 200]
+    with ctx.db.read() as conn:
+        m = repo.get_meeting(conn, "m-1")
+    assert m.ended_at in (2000, 3000) and m.total_audio_frames == m.ended_at       # 片方の値だけがそろって残る
+    snapshot = json.loads((recording_dir(ctx, "m-1") / "meeting.json").read_text())
+    assert (snapshot["endedAtEpochMs"], snapshot["totalAudioFrames"]) == (m.ended_at, m.total_audio_frames)
+
+
+# ---- 停止理由（Phase 1 §12） ----
+
+async def test_stop_metadata_is_stored_and_first_finalize_wins(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    body = {"expectedChunkCounts": {"mic": 0, "system": 0}, "endedAtEpochMs": 2000, "totalAudioFrames": 0,
+            "stopReason": "mic_ended", "stopDetectedAtEpochMs": 1800}
+    assert (await client.post("/v1/meetings/m-1/finalize", json=body)).status_code == 200
+    path = recording_dir(ctx, "m-1") / "meeting.json"
+    path.unlink()                                                                    # 再送で控えを書き直すことを確かめる
+    changed = {**body, "stopReason": "manual", "stopDetectedAtEpochMs": 1900}
+    assert (await client.post("/v1/meetings/m-1/finalize", json=changed)).status_code == 200
+    with ctx.db.read() as conn:
+        m = repo.get_meeting(conn, "m-1")
+    assert (m.stop_reason, m.stop_detected_at) == ("mic_ended", 1800)
+    snapshot = json.loads(path.read_text())
+    assert (snapshot["stopReason"], snapshot["stopDetectedAtEpochMs"]) == ("mic_ended", 1800)
+
+
+async def test_invalid_stop_metadata_is_rejected_and_legacy_request_stays_unknown(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    await client.post("/v1/meetings", json=MEETING)
+    base = {"expectedChunkCounts": {"mic": 0, "system": 0}, "endedAtEpochMs": 2000, "totalAudioFrames": 0}
+    for invalid in ({"stopReason": "manual"}, {"stopDetectedAtEpochMs": 1800},
+                    {"stopReason": "cable_unplugged", "stopDetectedAtEpochMs": 1800},
+                    {"stopReason": "manual", "stopDetectedAtEpochMs": -1},
+                    {"stopReason": "manual", "stopDetectedAtEpochMs": True},
+                    {"stopReason": "manual", "stopDetectedAtEpochMs": 2**63}):
+        assert (await client.post("/v1/meetings/m-1/finalize", json={**base, **invalid})).status_code == 422
+    assert (await client.post("/v1/meetings/m-1/finalize", json=base)).status_code == 200
+    # 旧クライアントで確定済みの理由を、後から届いた値で埋めない
+    late = {**base, "stopReason": "manual", "stopDetectedAtEpochMs": 1800}
+    assert (await client.post("/v1/meetings/m-1/finalize", json=late)).status_code == 200
+    snapshot = json.loads((recording_dir(ctx, "m-1") / "meeting.json").read_text())
+    assert snapshot["stopReason"] is None and snapshot["stopDetectedAtEpochMs"] is None
+
+
+# ---- トークンと配信 ----
+
+def test_rotate_token_changes_value_and_keeps_owner_only_permission(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "token"
+    assert read_token(path) is None
+    first = rotate_token(path)
+    path.chmod(0o644)
+    second = rotate_token(path)
+    assert first != second and len(second) == 64 and read_token(path) == second
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+async def test_web_dir_is_served_at_root_without_token_and_does_not_shadow_api(ctx: AppContext, tmp_path: Path) -> None:
+    web = tmp_path / "dist"
+    web.mkdir()
+    (web / "index.html").write_text("<!doctype html><title>minutes</title>")
+    ctx.settings = replace(ctx.settings, web_dir=web)
+    app = create_app(ctx, TOKEN)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as c:
+        page = await c.get("/")
+        api = await c.get("/v1/meetings")
+    assert page.status_code == 200 and "minutes" in page.text
+    assert api.status_code == 401                                                    # /v1/ は従来どおり認証が要る
+```
+
 ## 23.4 ジョブ基盤
 
 ```python
@@ -4803,6 +5350,7 @@ from minutes_local.db import repo
 from minutes_local.db.connection import Database, now_ms
 from minutes_local.db.migrate import current_version, ensure_all_columns, migrate, MIGRATIONS
 from minutes_local.db.models import Segment
+from minutes_local.jobs.context import AppContext
 
 
 def test_phase1_db_gains_missing_columns_and_keeps_rows(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -5339,7 +5887,7 @@ from tests.conftest import create_meeting, put_chunk, sine_pcm
 
 def _meta(seq: int, source: str, drift: float | None) -> str:
     m: dict[str, object] = {
-        "meetingId": "m-1", "source": source, "sequenceNo": seq,
+        "meetingId": "m-1", "source": source, "sequenceNo": seq, "sampleCount": 480000,
         "startOffsetMs": seq * 30000, "endOffsetMs": (seq + 1) * 30000, "durationMs": 30000,
         "wallClockStartEpochMs": 1_700_000_000_000 + seq * 30000,
     }
@@ -5412,6 +5960,20 @@ async def test_resend_does_not_duplicate_samples(client: httpx.AsyncClient, ctx:
 | Mic/System 同期誤差の保存と P95/P99 | `test_drift_samples_are_stored_and_aggregated`、`test_mic_only_meeting_has_no_drift`、`test_resend_does_not_duplicate_samples` |
 | `frameClockDriftMs` 欠落時の後方互換 | `test_missing_drift_field_is_ignored_not_rejected` |
 
+§23.3.1（`tests/test_phase1_server_compat.py`）と、Phase 1 のサーバーテスト（`server_tests/test_phase1_api.py`）の対応：
+
+| Phase 1 のテスト | 引き継いだテスト |
+| --- | --- |
+| `test_health_auth_cors_and_persistent_restart` | `test_preflight_is_answered_without_token_for_dev_origin_only`、`test_error_responses_carry_cors_headers_and_api_error_body`、`test_rotate_token_changes_value_and_keeps_owner_only_permission`、§23.3 の `test_health_without_token_has_no_capabilities`・`test_health_with_token` |
+| `test_put_validation_idempotency_and_finalize` | `test_put_to_unknown_meeting_is_404`、`test_first_finalize_wins_and_resend_does_not_republish_status`、§23.3 の `test_create_meeting_idempotent`・`test_put_chunk_idempotent_and_conflict`・`test_put_chunk_rejects_invalid_wav_and_bad_hash`・`test_list_and_finalize` |
+| `test_parallel_put_same_key` | `test_parallel_put_of_same_key_registers_once` |
+| `test_hash_integrity_cors_and_storage_full` | `test_put_chunk_rejects_bad_key_and_headers`、`test_disk_full_returns_507_and_leaves_no_row`、`test_corrupt_file_blocks_finalize_until_resend_repairs_it` |
+| `test_put_rejects_new_chunk_after_finalize_but_allows_retry_and_repair` | `test_after_finalize_new_chunk_is_rejected_but_resend_and_repair_pass` |
+| `test_concurrent_finalize_keeps_first_result_in_db_and_snapshot`、`test_concurrent_atomic_writes_to_same_path_do_not_share_temp_file` | 同名のテスト |
+| `test_stop_metadata_persists_across_restart_and_first_finalize_wins`、`test_invalid_stop_metadata_is_rejected_and_legacy_request_stays_unknown` | `test_stop_metadata_is_stored_and_first_finalize_wins`、`test_invalid_stop_metadata_is_rejected_and_legacy_request_stays_unknown` |
+| `test_existing_database_gets_nullable_stop_columns_without_changing_recordings` | §23.4.1 の `test_phase1_db_gains_missing_columns_and_keeps_rows` |
+| （Phase 1 のテストにない規則） | `test_create_meeting_rejects_unsafe_id`、`test_put_chunk_rejects_meta_that_disagrees_with_url_or_wav`、`test_finalize_requires_both_sources_and_non_negative_counts`、`test_finalize_rejects_sequence_gap_even_when_count_matches`、`test_meeting_without_chunks_completes`、`test_web_dir_is_served_at_root_without_token_and_does_not_shadow_api` ほか |
+
 ---
 
 # 24. Invariant / DoD 対応（コード箇所）
@@ -5437,7 +5999,7 @@ async def test_resend_does_not_duplicate_samples(client: httpx.AsyncClient, ctx:
 
 | Step | 本書のセクション | 通過すべきテスト |
 | --- | --- | --- |
-| 2-a | §5〜§8、§21.2 | `test_phase1_contract.py`、`test_imports.py` |
+| 2-a | §1.2（移行手順）、§5〜§8、§21.1・§21.2 | `test_phase1_contract.py`、`test_phase1_server_compat.py`、`test_imports.py`。移行前は既存の `server_tests` 10 件も通ったまま |
 | 2-b | §9、§21.4、§22 | `doctor` の出力確認 |
 | 2-c | §11〜§15、§17 | `test_jobs.py` |
 | 2-d | §16、§20（`handle_transcribe`）、§21.3、§21.5 | `test_pipeline.py`、`test_sse_and_outage.py` |
