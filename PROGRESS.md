@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-12（設計書の `docs/` 移行に続き、Phase 2 / 3 設計書のレビューと修正・未コミット、ブランチ `dev`。PR #13 までマージ済み）
+最終更新: 2026-11-12（PR #14 のレビュー指摘・SonarCloud の対応・未コミット、ブランチ `dev`。PR #13 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,17 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-12：Phase 2 server 87 件・Phase 3 server 115 件・Phase 2 client 30 ファイル 527 件・Phase 3 client 34 ファイル 560 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-12 の PR #14 指摘対応後：Phase 2 server 90 件・Phase 3 server 119 件・Phase 2 client 30 ファイル 536 件・Phase 3 client 34 ファイル 569 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-12（PR #14 のレビュー指摘・SonarCloud・未コミット）：CodeRabbit 18 件と SonarCloud の Security 指摘 5 件を検証し、すべて有効として修正した（スキップなし）。
+  - **Phase 1 src**：`finalizer.ts` の `GET /chunks` で、本文の読み取り中のタイムアウト（abort）を壊れた応答（`malformed`）ではなく `network` として返す（回帰テスト 1 件、修正前に Red を確認）。Phase 1・Phase 2 client の設計書にも同じ差分を反映。
+  - **Phase 2 / 3 server**：finalize の `meeting_status` 通知を `meeting.json` の書き出し（507 になりうる）より先に行う。作成・再送の `meeting.json` を DB の会議行から書く（Phase 2 は `_meeting_json`、Phase 3 は `write_meeting_json`）。`serve` は待ち受けポートを確保（新規 `bind_listen_socket`）してからトークンを作り直す。確定・Live STT と Live 結果の再利用は lease を先に検査する（segments が空でも旧ワーカーが完了にしない）。`fchmod` がない環境（Windows の Python 3.12 以前）では `chmod`。Phase 3 の移行 012 は旧ディレクトリを `.migrate-012/` へ退避してから統合し、作業場所は 012 の記録のコミット後に片付ける（会議 ID `local` で他の会議の録音ごと消えた）。
+  - **Phase 2 / 3 client**：SSE は初回接続でも補完し、補完中の live イベントは保留して補完の後に流す（世代番号で古い接続の補完を捨てる）。`FetchEventSource` に接続期限 10 秒と無通信 45 秒の監視（新規 export `SSE_CONNECT_TIMEOUT_MS` / `SSE_IDLE_TIMEOUT_MS`）。補完中の保留は接続ごとにやり直す（前の接続の古い status を流さない）。stale の版の印は大きい方を残す。`NotesStore.dispose()` を追加（送信中の保存が終わっても送り直しを予約しない）。配線表 W2（ロックは Mic の `RecordingController`、`finally` で受け取る）・W7・W8・W11 と 2-h1 を更新。
+  - **scripts**：抽出の閉じフェンスを CommonMark どおり（同じ文字・開き以上の長さ）に、出力先の外へのパスを拒否（Sonar S8707）。verify は `VERIFY_DIR` を絶対パス化、抽出を関数化、pyflakes の指摘と失敗を NG に、`npx` をやめて `node_modules/.bin` を直接使う（Sonar S6505）。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 496 件通過。`verify-design-docs.sh all`：Phase 2 server 90 件・Phase 3 server 119 件・Phase 2 client 30 ファイル 536 件・Phase 3 client 34 ファイル 569 件、pyflakes 指摘なし。新規テストは `bind_listen_socket` 以外、修正前のコードで Red を確認。
+  - 残り：SonarCloud の再解析で S8707（`open(doc)` の 26 行目）が残る場合は、CLI 引数の読み込みなので SonarCloud 上で「Safe」とするかを利用者が判断する。
 
 - 2026-11-12（設計書レビュー・未コミット）：`docs/` の設計書を、コードブロックを実ファイルに展開して tsc・Vitest・pytest を回す方法でレビューし、見つけた不整合を修正した（製品コード `src/`・`minutes_local/`・`test/`・`server_tests/` は無変更。Phase 1 設計書も無変更で src と一致のまま）。
   - **Phase 3 server**：(1) マイグレーション番号が Phase 2 の 008（`sync_samples`）と衝突し、Phase 3 の列追加が丸ごと適用されなかった → 009〜012 に振り直し。(2) 全文差し替えの 14 ファイル＋テスト 2 ファイルが古い Phase 2 を元にしており、fencing token（`finish_job` / `insert_segments` の `attempts`）・`sync_samples`・要約の `quote` / `evidenceSpan`・docstring が巻き戻る状態だった → Phase 2 現行に Phase 3 の差分だけを載せ直した。(3) Live STT の書き込みにも fencing を適用。(4) `meeting.json` を `write_atomic`（一意な一時ファイル）で書き、終了時刻のキーを Phase 1/2 と同じ `endedAtEpochMs` に統一。(5) `on_finalized` に話者分離フラグを渡す。
