@@ -1889,6 +1889,20 @@ export class FetchEventSource implements EventSourceLike {
     for (const listener of this.listeners.get(type) ?? []) listener({ data } as MessageEvent<string>);
   }
 
+  /**
+   * 再接続の途中で error を出す。ここは run() の try の外なので、listener の例外を通すと run() が reject して
+   * waitBeforeRetry() に進まず、再接続が止まる。listener ごとに例外を受け、残りの listener も呼ぶ
+   */
+  private emitError(): void {
+    for (const listener of this.listeners.get("error") ?? []) {
+      try {
+        listener({ data: "" } as MessageEvent<string>);
+      } catch (error) {
+        console.error("[FetchEventSource] error listener threw:", error);
+      }
+    }
+  }
+
   private async run(): Promise<void> {
     while (!this.closed) {
       const controller = new AbortController();
@@ -1939,7 +1953,7 @@ export class FetchEventSource implements EventSourceLike {
       }
       this.controller = null;
       if (this.closed) return;
-      this.emit("error", "");
+      this.emitError();
       await this.waitBeforeRetry();
     }
   }
@@ -3406,6 +3420,35 @@ describe("FetchEventSource の停止検知", () => {
       expect(SSE_STABLE_MS).toBeLessThan(SSE_IDLE_TIMEOUT_MS);
       es.close();
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("error の listener が例外を投げても、残りの listener を呼び、再接続を続ける", async () => {
+    vi.useFakeTimers();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // Arrange: 接続は毎回 503。1 つ目の error listener が投げる
+      const calls = { count: 0 };
+      const fetchImpl: typeof fetch = () => {
+        calls.count++;
+        return Promise.resolve(new Response(null, { status: 503 }));
+      };
+      const es = new FetchEventSource(url, "tok", fetchImpl);
+      const seen: string[] = [];
+      es.addEventListener("error", () => { throw new Error("listener bug"); });
+      es.addEventListener("error", () => seen.push("error"));
+      // Act
+      await vi.advanceTimersByTimeAsync(0);
+      // Assert: 2 つ目の listener も呼ばれ、例外は記録され、バックオフの後に再接続する
+      expect(seen).toEqual(["error"]);
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(calls.count).toBe(2);
+      expect(seen).toEqual(["error", "error"]);
+      es.close();
+    } finally {
+      consoleError.mockRestore();
       vi.useRealTimers();
     }
   });

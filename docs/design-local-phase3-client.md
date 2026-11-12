@@ -565,6 +565,20 @@ export class FetchEventSource implements EventSourceLike {
     for (const listener of this.listeners.get(type) ?? []) listener({ data } as MessageEvent<string>);
   }
 
+  /**
+   * 再接続の途中で error を出す。ここは run() の try の外なので、listener の例外を通すと run() が reject して
+   * waitBeforeRetry() に進まず、再接続が止まる。listener ごとに例外を受け、残りの listener も呼ぶ
+   */
+  private emitError(): void {
+    for (const listener of this.listeners.get("error") ?? []) {
+      try {
+        listener({ data: "" } as MessageEvent<string>);
+      } catch (error) {
+        console.error("[FetchEventSource] error listener threw:", error);
+      }
+    }
+  }
+
   private async run(): Promise<void> {
     while (!this.closed) {
       const controller = new AbortController();
@@ -615,7 +629,7 @@ export class FetchEventSource implements EventSourceLike {
       }
       this.controller = null;
       if (this.closed) return;
-      this.emit("error", "");
+      this.emitError();
       await this.waitBeforeRetry();
     }
   }

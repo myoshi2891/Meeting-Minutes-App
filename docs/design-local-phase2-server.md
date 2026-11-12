@@ -5294,7 +5294,9 @@ async def test_after_finalize_new_chunk_is_rejected_but_resend_and_repair_pass(c
         assert repo.get_chunk_by_key(conn, "m-1", "mic", 0).save_status == "registered"
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root は権限に関係なく読めるため")
+# Windows は os.geteuid が無く、chmod(0) でも読み取りを禁止できない（読み取り専用になるだけ）
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
+                    reason="chmod で読めなくできない環境（Windows）か、権限に関係なく読める root")
 async def test_resend_repairs_unreadable_chunk_file_instead_of_500(client: httpx.AsyncClient, ctx: AppContext) -> None:
     # Arrange: 登録済み Chunk のファイルが読めない（権限）
     await client.post("/v1/meetings", json=MEETING)
