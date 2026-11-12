@@ -2,7 +2,7 @@
 """設計書内の `// src/...` `// test/...` で始まる TypeScript コードブロックを、実ファイルと照合する。
 
 使い方: python3 .claude/skills/design-doc-sync/scripts/check_design_sync.py [設計書 ...] [--diff]
-  既定の対象は design-local-phase1.md。src の不一致があれば終了コード 1。
+  既定の対象は docs/design-local-phase1.md。src の不一致があれば終了コード 1。
   test の不一致は「設計書は最低限の集合」扱いのため情報表示のみ。
 """
 import difflib
@@ -22,7 +22,7 @@ BLOCK = re.compile(
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     show_diff = "--diff" in sys.argv
-    docs = args or ["design-local-phase1.md"]
+    docs = args or ["docs/design-local-phase1.md"]
     src_mismatch = 0
     for doc in docs:
         print(f"== {doc}")
