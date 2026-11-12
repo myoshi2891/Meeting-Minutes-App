@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── サーバー側（`docs/design-local-phase2-server.md`）。API 契約はそちらの §21 と 1 対 1。
 **配置:** `docs/design-local-phase2-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** ブラウザ標準 API（`MediaStream` / `AudioContext` / `AudioWorklet` / `IndexedDB` / `fetch` / `EventSource`）と TypeScript のみ。UI フレームワークは本書で選定せず、状態モデル（§11）をフレームワーク非依存の reducer として定義する。
-**検証状態:** 本書の全 `typescript` コードブロック（17 ファイル）を Phase 1 の現行ソースへ上書き・追加した状態で、`tsc --noEmit`（strict）と Vitest 30 ファイル 541 件が全件通過することを確認している（2026-11-12）。詳細と再現手順は §1.2。**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**（§15）。
+**検証状態:** 本書の全 `typescript` コードブロック（17 ファイル）を Phase 1 の現行ソースへ上書き・追加した状態で、`tsc --noEmit`（strict）と Vitest 30 ファイル 542 件が全件通過することを確認している（2026-11-12）。詳細と再現手順は §1.2。**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**（§15）。
 
 ---
 
@@ -41,7 +41,7 @@ Phase 2 のブラウザ側の責務は次の 3 つである。
 
 ## 1.2 検証状態
 
-本書の `// src/...` と `// test/...` のコードブロックを Phase 1 の現行ソース（2026-11-12 時点）へ上書き・追加した状態で、`npm run typecheck` が通り、Vitest 30 ファイル 541 件が全件通過することを確認している（Phase 1 の 24 ファイルを含む。Phase 1 側の変更は §7 に記した `test/app.test.ts` の 1 か所）。確認の手順は `scripts/verify-design-docs.sh`。実ブラウザ（`getDisplayMedia`・SSE の実接続）では実行していない。
+本書の `// src/...` と `// test/...` のコードブロックを Phase 1 の現行ソース（2026-11-12 時点）へ上書き・追加した状態で、`npm run typecheck` が通り、Vitest 30 ファイル 542 件が全件通過することを確認している（Phase 1 の 24 ファイルを含む。Phase 1 側の変更は §7 に記した `test/app.test.ts` の 1 か所）。確認の手順は `scripts/verify-design-docs.sh`。実ブラウザ（`getDisplayMedia`・SSE の実接続）では実行していない。
 
 Phase 1 のファイルを全文で載せているブロック（`recording-controller.ts`・`finalizer.ts`・`types/recording.ts`）は、**Phase 1 の現行ソースに Phase 2 の差分を当てたもの**である。Phase 1 側を直したら、同じ修正を本書のブロックにも当てて上の検証をやり直す（CLAUDE.md ルール 3）。
 
@@ -2354,13 +2354,17 @@ export function reduce(state: UiState, action: UiAction): UiState {
   switch (action.type) {
     case "meeting_loaded":
       return { ...state, meeting: action.meeting, status: action.meeting.status };
+    // 取得の応答は要求順に解決するとは限らない。後着した古い版で新しい版を巻き戻さない
+    // （stale の印は新しい版の取得で消えているので、巻き戻ると取り直されずに古い表示が残る）。同じ版の再取得は受け入れる
     case "transcript_loaded":
+      if (state.transcript !== null && action.transcript.transcriptVersion < state.transcript.transcriptVersion) return state;
       return {
         ...state,
         transcript: action.transcript,
         staleTranscriptVersion: state.staleTranscriptVersion !== null && state.staleTranscriptVersion <= action.transcript.transcriptVersion ? null : state.staleTranscriptVersion,
       };
     case "summary_loaded":
+      if (state.summary !== null && action.summary.version < state.summary.version) return state;
       return {
         ...state,
         summary: action.summary,
@@ -3451,6 +3455,27 @@ describe("UI reducer", () => {
     expect(s.staleTranscriptVersion).toBeNull();
   });
 
+  it("後着した古い版の transcript / summary で新しい版を巻き戻さない", () => {
+    // Arrange: v3 を表示済み（stale の印は消えている）
+    const tr = (v: number): TranscriptResponse => ({ meetingId: "m", transcriptVersion: v, segments: [], gaps: [] });
+    const sum = (v: number): SummaryResponse => ({
+      meetingId: "m", version: v,
+      summary: { summary: `v${v}`, topics: [], decisions: [], actionItems: [], rejected: [], modelName: "llm", promptVersion: "v1", transcriptVersion: 1, generatedAt: 0, modelCaveats: [] },
+      validation: { schemaValid: true, schemaRetries: 0, mapWindows: 1, totalItems: 0, rejectedItems: 0, unresolvedSegmentIds: [] },
+    });
+    let s = reduce(INITIAL_UI_STATE, { type: "transcript_loaded", transcript: tr(3) });
+    s = reduce(s, { type: "summary_loaded", summary: sum(3) });
+    // Act: 先に投げた v2 の応答が後から届く
+    s = reduce(s, { type: "transcript_loaded", transcript: tr(2) });
+    s = reduce(s, { type: "summary_loaded", summary: sum(2) });
+    // Assert
+    expect(s.transcript?.transcriptVersion).toBe(3);
+    expect(s.summary?.version).toBe(3);
+    // 同じ版・新しい版は受け入れる
+    s = reduce(s, { type: "transcript_loaded", transcript: tr(4) });
+    expect(s.transcript?.transcriptVersion).toBe(4);
+  });
+
   it("未取得のまま古い版の通知が後から届いても、stale の印を戻さない", () => {
     let s = reduce(INITIAL_UI_STATE, { type: "event", event: { type: "transcript_version", transcriptVersion: 4 } });
     s = reduce(s, { type: "event", event: { type: "transcript_version", transcriptVersion: 3 } });
@@ -3597,7 +3622,7 @@ Phase 1 から変えない規則：ローカル以外へ通信しない（URL �
 | 2-c2 | §4 RecordingController の変更 | Phase 1 の `recording-controller.test.ts` が無変更で通る |
 | 2-c3 | §7 Finalizer の差分 | `finalizer-two-sources.test.ts`。Phase 1 のテストは §7 の 1 か所だけ直して通る |
 | 2-d1 | §8 SSE クライアント、§9 型付き fetch | `events.test.ts`。Phase 2 サーバー（Step 2-d）に対する実接続で `job` / `progress` を受ける |
-| 2-d2 | §11 UI 状態、§15.1 W7・W8、transcript の表示 | `ui-state.test.ts`。1 時間会議の transcript が画面に出る（基本設計 Step 2-d） |
+| 2-d2 | §10 NotesStore、§11 UI 状態、§15.1 W7・W8、transcript の表示 | `notes-store.test.ts`（別タブ編集で `409` → 上書きしない、W8 のトークン変更）・`ui-state.test.ts`。1 時間会議の transcript が画面に出る（基本設計 Step 2-d）。W8 が `NotesStore` を生成するので §10 をここで入れる。`blocknoteJson` は不透明な文字列なので D2 に依存しない（§15.2） |
 | 2-f1 | 要約と `rejected` の表示、再生成 | 偽 ID を返すモックで `rejected` が折りたたみ表示される |
-| 2-g1 | §10 NotesStore、ノートの編集（§15.2 D2 の決定後） | `notes-store.test.ts`。別タブ編集で `409` → 上書きしない |
+| 2-g1 | ノートの編集 UI（§15.2 D2 の決定後。保存経路は 2-d2 の `NotesStore`） | 編集が autosave で保存される。別タブ編集の `409` で上書きせず競合を表示する |
 | 2-h1 | §5 System Audio、§6 MultiSourceRecorder、§15.1 W1〜W6・W9〜W11 | `system-audio.test.ts`・`multi-source.test.ts`、W11 の確定待ちの内訳（System の未送信が件数に出る）。Mic のみへのフォールバック、P95/P99 の表示 |

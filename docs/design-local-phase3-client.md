@@ -4,7 +4,7 @@
 **上位文書:** Phase 3 詳細設計書 ── サーバー側（`docs/design-local-phase3-server.md`）§2 の設計判断と §20 の API。
 **配置:** `docs/design-local-phase3-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** Phase 1・2 と同じ（ブラウザ標準 API と TypeScript のみ、UI フレームワーク非依存の状態モデル）。
-**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 34 ファイル 574 件（Phase 1・2 の 30 ファイル 541 件を含む）が全件通過することを確認している（2026-11-12、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
+**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 34 ファイル 576 件（Phase 1・2 の 30 ファイル 542 件を含む）が全件通過することを確認している（2026-11-12、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
 
 ---
 
@@ -354,6 +354,15 @@ export interface EventsClientDeps {
 
 const EVENT_TYPES = ["job", "meeting_status", "transcript_version", "summary_version", "progress", "live_segment"] as const;
 
+/** 保留をすり抜けさせてよい Live セグメントか。壊れた JSON は false（保留に入り、handle() が onError に渡す） */
+function isLiveSegmentPayload(data: string): boolean {
+  try {
+    return isLiveSegmentEvent(JSON.parse(data));
+  } catch {
+    return false;
+  }
+}
+
 export class MeetingEventsClient {
   private source: EventSourceLike | null = null;
   /** 補完中に届いたイベント。補完の後に、届いた順で流す。null は補完中でない */
@@ -391,9 +400,13 @@ export class MeetingEventsClient {
   /**
    * 補完中は保留し、補完の後に流す。補完は接続時点の状態なので、先に届いた live の値（新しい status・版）の後に
    * 流すと古い値で上書きしてしまう。購読は補完の要求より先に始まっているので、保留分を後から流せば最新に追いつく。
+   * live_segment は保留しない。補完は Live セグメントを扱わず（巻き戻す古い値がない）、LiveTranscriptStore が id で
+   * 重複を吸収するので、即座に渡しても順序の問題は起きない。保留すると補完が終わるまで Live が止まり、
+   * 補完中の再接続・close で保留ごと捨てられて次の poll() まで表示されない。
+   * 判定は SSE のイベント名ではなくペイロードで行う（他の種別が保留をすり抜けないように）。
    */
   private receive(data: string): void {
-    if (this.held !== null) {
+    if (this.held !== null && !isLiveSegmentPayload(data)) {
       this.held.push(data);
       return;
     }
@@ -424,13 +437,13 @@ export class MeetingEventsClient {
    * UI が古い status を表示し続ける。MeetingDetailResponse が 3 つとも持っているので 1 リクエストで足りる。
    * transcript / summary の本文は取りに行かない。版だけ流せば §11 の staleTranscriptVersion /
    * staleSummaryVersion が立ち、UI が必要になった時点で本文を取得する（再接続のたびに全文を引かない）。
-   * Live セグメントは LiveTranscriptStore.poll() が cursor 以降を取り直すので、ここでは扱わない（§3.2）。
+   * Live セグメントは補完の対象外で、保留もしない（receive()）。切断中に落ちた分は LiveTranscriptStore.poll() が cursor 以降を取り直す（§3.2）。
    */
   private async backfill(attempt = 0): Promise<void> {
     this.cancelBackfillRetry();
     const generation = ++this.generation;
     // 接続ごとに保留をやり直す。前の接続で保留した分は、この接続の補完（再接続後の状態）に含まれている。
-    // 持ち越すと、補完の後に古い status を流して巻き戻す（Live セグメントは LiveTranscriptStore.poll() が cursor で取り直す）
+    // 持ち越すと、補完の後に古い status を流して巻き戻す（Live セグメントは保留に入らない。receive()）
     this.held = [];
     let failed = false;
     try {
@@ -1659,7 +1672,7 @@ describe("Phase3Client の応答検証", () => {
 
 ```typescript
 // test/events-live.test.ts
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MeetingEventsClient, type EventSourceLike } from "../src/api/events";
 import type { LiveSegmentEvent } from "../src/api/contracts-phase3";
 import type { MeetingDetailResponse, MeetingEvent } from "../src/api/contracts-phase2";
@@ -1717,6 +1730,41 @@ describe("SSE live_segment の振り分け", () => {
     source.emit("live_segment", JSON.stringify({ type: "live_segment", segment: full }));
     expect(live.map((e) => e.segment.id)).toEqual(["s1", "s2"]);
     expect(events).toEqual([{ type: "meeting_status", status: "recording" }]);
+  });
+
+  it("補完中も live_segment は保留せず即座に渡し、status は補完の後に流す", async () => {
+    // Arrange: 補完（fetchMeeting）を解決させずに止めておく
+    let es: FakeEventSource | null = null;
+    const events: MeetingEvent[] = [];
+    const live: LiveSegmentEvent[] = [];
+    const resolvers: Array<(m: MeetingDetailResponse) => void> = [];
+    const client = new MeetingEventsClient({
+      baseUrl: "http://127.0.0.1:43117",
+      token: "tok",
+      createEventSource: () => (es = new FakeEventSource()),
+      fetchJobs: async () => ({ meetingId: "m", jobs: [], counts: { pending: 0, leased: 0, processing: 0, retrying: 0, completed: 0, failed: 0, cancelled: 0 } }),
+      fetchMeeting: () => new Promise((resolve) => resolvers.push(resolve)),
+      onEvent: (e) => events.push(e),
+      onLiveSegment: (e) => live.push(e),
+      onError: (e) => {
+        throw e;
+      },
+    }, "m");
+    client.connect();
+    const source = es as unknown as FakeEventSource;
+    const seg = (id: string) => JSON.stringify({ type: "live_segment", segment: { id, source: "mic", startMs: 0, endMs: 1, text: id, language: null, confidence: null, createdAt: 1 } });
+    // Act: 補完中に live_segment と status が届き、補完の完了前に再接続する
+    source.emit("open");
+    source.emit("live_segment", seg("s1"));
+    source.emit("meeting_status", JSON.stringify({ type: "meeting_status", status: "transcribing" }));
+    source.emit("open");
+    source.emit("live_segment", seg("s2"));
+    // Assert: live は補完を待たず、再接続でも捨てられない。status は保留されている
+    expect(live.map((e) => e.segment.id)).toEqual(["s1", "s2"]);
+    expect(events).toEqual([]);
+    for (const resolve of resolvers) resolve(meetingDetail);
+    await vi.waitFor(() => expect(events.some((e) => e.type === "meeting_status")).toBe(true));
+    expect(live.map((e) => e.segment.id)).toEqual(["s1", "s2"]);
   });
 });
 ```

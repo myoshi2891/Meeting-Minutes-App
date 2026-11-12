@@ -4511,8 +4511,13 @@ def select_models(settings: Settings, hw: Hardware, available_llm: list[str], ol
 def restrict_to_current_user(path: Path) -> None:
     """ディレクトリを現在の OS ユーザーだけが使えるようにする（録音・トークン・DB を置く）。
 
-    Unix は 0700。Windows の os.chmod は読み取り専用属性しか変えず ACL に効かないので、icacls で親から継承した
-    ACE を外し（/inheritance:r）、現在のユーザーの SID にだけフルコントロールを与える（配下にも継承させる）。
+    Unix は 0700。Windows の os.chmod は読み取り専用属性しか変えず ACL に効かないので、icacls で設定する。
+    /inheritance:r が外すのは継承した ACE だけで、他の主体へ明示的に与えた ACE はディレクトリにも既存の配下にも残る
+    （Windows は既定で走査チェックを省くので、配下のファイルは親を読めなくてもパス指定で開ける）。そこで先に
+    /reset /T でツリー全体の明示 ACE を消して継承に戻し、次にルートの継承を外して（/inheritance:r）現在のユーザーの
+    SID にだけフルコントロールを与える（(OI)(CI) で配下へ継承し、配下は SID の ACE だけになる）。順序を逆にすると
+    /reset がルートの継承を戻してしまう。2 つの呼び出しの間は親（利用者のプロファイル配下）の ACL を継承する。
+    /C（エラーを無視して続行）は付けない。1 つでも設定できなければ例外にする。
     付与先を名前や Administrators でなくトークンのユーザー SID にするのは、管理者として昇格して起動しても
     付与先が変わらず、昇格せずに起動したときに本人が締め出されないため（昇格時の既定の所有者は Administrators になりうる）。
     ACL を設定できなければ例外で起動を止める（緩い権限のまま録音を置かない）。
@@ -4528,7 +4533,9 @@ def restrict_to_current_user(path: Path) -> None:
     sid = row[1] if len(row) == 2 else ""
     if not re.fullmatch(r"S-1-\d+(-\d+)+", sid):
         raise RuntimeError(f"cannot determine current user SID: {out.strip()!r}")
-    subprocess.run([str(system32 / "icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
+    icacls = str(system32 / "icacls.exe")
+    subprocess.run([icacls, str(path), "/reset", "/T", "/Q"], check=True, capture_output=True, text=True)
+    subprocess.run([icacls, str(path), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
                    check=True, capture_output=True, text=True)
 
 
@@ -5353,7 +5360,7 @@ def test_restrict_to_current_user_sets_owner_only_mode_on_unix(tmp_path: Path, m
 
 
 def test_restrict_to_current_user_sets_windows_acl_by_user_sid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Windows の os.chmod は ACL に効かない。継承を外し、昇格の有無で変わらないユーザー SID にだけ付与する。"""
+    """Windows の os.chmod は ACL に効かない。既存の明示 ACE を消してから継承を外し、昇格の有無で変わらないユーザー SID にだけ付与する。"""
     # Arrange
     calls: list[list[str]] = []
 
@@ -5369,7 +5376,12 @@ def test_restrict_to_current_user_sets_windows_acl_by_user_sid(tmp_path: Path, m
     restrict_to_current_user(tmp_path)
     # Assert
     icacls = [c for c in calls if c[0].lower().endswith("icacls.exe")]
-    assert icacls == [[icacls[0][0], str(tmp_path), "/inheritance:r", "/grant:r", "*S-1-5-21-1-2-3-1001:(OI)(CI)F"]]
+    # 他の主体への明示 ACE が残らないよう、ツリー全体を継承に戻してから（/reset /T）ルートを SID だけにする。順序も検証する
+    exe = icacls[0][0]
+    assert icacls == [
+        [exe, str(tmp_path), "/reset", "/T", "/Q"],
+        [exe, str(tmp_path), "/inheritance:r", "/grant:r", "*S-1-5-21-1-2-3-1001:(OI)(CI)F"],
+    ]
 
 
 def test_restrict_to_current_user_fails_closed_on_unexpected_sid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
