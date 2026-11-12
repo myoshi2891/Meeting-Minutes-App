@@ -33,7 +33,8 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
   - **Phase 2 server 修復（PUT 再送）**：照合を `pipeline.chunk_file_intact()`（`to_thread`）に替え、読めないファイルで 500 にせず書き戻す。未使用になった `sha256_file` の import を削除。Phase 3 は `_stored_chunk_intact` が `OSError` を受けていなかったので同じく欠損扱いにした。回帰 1 件（root では skip）。
   - **Phase 2 / 3 server finalize**：書き込みトランザクションで読み直した会議が `None`（照合中に削除）なら 404。従来は「finalized」の成功応答を返していた。回帰 1 件。
   - **nitpick `scripts/extract-design-code.py`**：argparse 化。不明なオプション・`--help` はファイルを開く前に終了コード 2 で止まる（従来は `--` で始まる未知の引数を黙って無視）。
-  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過。`verify-design-docs.sh all`：Phase 2 server 102 件・Phase 3 server 138 件・Phase 2 client 551 件・Phase 3 client 586 件、pyflakes 指摘なし。
+  - 追加の指摘 2 件（同日・有効）：**Phase 2 / 3 client `FetchEventSource`** の再接続で出す error を `emitError()` で listener ごとに例外を受けて配る（`run()` の try の外なので、投げると `waitBeforeRetry()` に進まず再接続が止まり、残りの listener も呼ばれなかった）。回帰 1 件。**Phase 2 server** の修復テストの skip 条件を `not hasattr(os, "geteuid") or os.geteuid() == 0` にした（Windows で収集時に AttributeError。chmod(0) で読めなくもできない）。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過。`verify-design-docs.sh all`：Phase 2 server 102 件・Phase 3 server 138 件・Phase 2 client 552 件・Phase 3 client 587 件、pyflakes 指摘なし。
 
 - 2026-11-12（PR #14 の 6 回目の指摘・244090c でコミット済み）：CodeRabbit 4 件を検証し、3 件を修正、1 件をスキップした。新規テストは修正前に Red を確認。製品コード（`src/`・`test/`）は無変更。
   - **スキップ：Phase 2 client `NotesStore.save()`**（送信の完了後に dirty なら schedule）：送信中の編集は `setDraft` がタイマーを予約し、`doSave` も `stillSame` が false なら `schedule()` を呼ぶので、dirty のまま予約なしで残る経路がない。
