@@ -2585,16 +2585,21 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
         intact = path.is_file() and _stored_chunk_intact(ctx, existing)
         if not intact:
             # 修復・逆同期（§2.4）：登録済みだがファイルが失われた・壊れた。内容は同じ（sha256 一致）なので WAV として書き戻す。
-            # 圧縮済みだった Chunk も WAV に戻る。確定後の会議でも受け付ける
+            # 圧縮済みだった Chunk も WAV に戻る。確定後の会議でも受け付ける。
+            # 照合の間に会議・Chunk が削除されていれば書き戻さない。削除は DB のコミット後に rmtree するので、
+            # 書き込みロック下で確かめ直し、書き戻しもロックの中で行う（消えた録音を作り直さない。Phase 2 server §21.2 と同じ）
             rel = chunk_relative_path(meeting_id, source, sequence_no, meeting.local_user_id)
-            try:
-                write_atomic(ctx.settings.data_dir, rel, data)
-            except OSError as e:
-                if e.errno == errno.ENOSPC:
-                    return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
-                raise
             repaired = {"local_path": rel, "codec": "wav", "sha256_flac": None, "size_bytes": len(data), "save_status": "registered"}
             async with ctx.db.write() as conn:
+                current = repo.get_chunk_by_key(conn, meeting_id, source, sequence_no)
+                if repo.get_meeting(conn, meeting_id) is None or current is None or current.id != existing.id:
+                    return JSONResponse(error_body("NOT_FOUND", "chunk not found"), status_code=404)
+                try:
+                    write_atomic(ctx.settings.data_dir, rel, data)
+                except OSError as e:
+                    if e.errno == errno.ENOSPC:
+                        return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
+                    raise
                 repo.update_chunk(conn, existing.id, **repaired)
             existing = existing.model_copy(update=repaired)
         elif existing.save_status == "missing":

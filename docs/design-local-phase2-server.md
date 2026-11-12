@@ -3988,16 +3988,21 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
         if await asyncio.to_thread(pipeline.chunk_file_intact, ctx.settings.data_dir, existing):
             return JSONResponse(_chunk_response(existing), status_code=200)   # 冪等再送（基本設計 §11）
         # 修復：登録済みだがファイルが失われた・壊れた。内容は同じ（sha256 一致）なので書き戻す。
-        # 確定後の会議でも受け付ける（finalize の 409 CONFLICT_CHUNKS_MISSING からブラウザが再送して回復する経路）
-        try:
-            write_atomic(ctx.settings.data_dir, existing.local_path, data)
-        except OSError as e:
-            if e.errno == errno.ENOSPC:
-                return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
-            raise
+        # 確定後の会議でも受け付ける（finalize の 409 CONFLICT_CHUNKS_MISSING からブラウザが再送して回復する経路）。
+        # 照合（スレッド）の間に会議・Chunk が削除されていれば書き戻さない。削除は DB のコミット後に rmtree するので、
+        # 書き込みロック下で確かめ直し、書き戻しもロックの中で行う（消えた録音を作り直さない）
         async with ctx.db.write() as conn:
-            repo.update_chunk(conn, existing.id, save_status="registered")
-        return JSONResponse(_chunk_response(existing), status_code=200)
+            current = repo.get_chunk_by_key(conn, meeting_id, source, sequence_no)
+            if repo.get_meeting(conn, meeting_id) is None or current is None or current.id != existing.id:
+                return JSONResponse(error_body("NOT_FOUND", "chunk not found"), status_code=404)
+            try:
+                write_atomic(ctx.settings.data_dir, current.local_path, data)
+            except OSError as e:
+                if e.errno == errno.ENOSPC:
+                    return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
+                raise
+            repo.update_chunk(conn, current.id, save_status="registered")
+        return JSONResponse(_chunk_response(current), status_code=200)
     if meeting.status not in OPEN_STATUSES:
         # 確定後の会議には新しい Chunk を足さない（登録済み Chunk の再送・修復は上で受け付け済み）
         return JSONResponse(error_body("CONFLICT_MEETING_FINALIZED", "meeting is already finalized"), status_code=409)
@@ -4119,7 +4124,7 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 ```
 
-`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を、会議が削除されていれば 404 を返す（確定したとは返さない）。`meeting.json` は書き込みトランザクションのコミット後に、DB に残った確定値（停止理由・検出時刻を含む）から書き出す。再送を含む成功した finalize のたびに書き直すので、書き出しに失敗しても再送で回復する（Phase 1 §12。Phase 3 §20.2 は Chunk 一覧も加えて同じ位置で書く）。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。再送でのファイルの照合も finalize と同じ `pipeline.chunk_file_intact()` で行い、読めないファイル（権限など）は 500 にせず欠損として書き戻す。再送はジョブを作らないので、Phase 1 のサーバーで確定した会議（移行した DB に `finalized` のまま残る）は、`serve` の起動時に `sweeper.resume_finalized()` が `on_finalized` を呼んで回収する（§14・§22。`transcribing` に進めるので 2 回目の起動では拾わない）。回収の前に finalize と同じ規則（連番の連続と `pipeline.chunk_file_intact()`）でファイルを照合し、欠損・破損があれば `finalized` のまま残す（直せば次の起動で拾う）。
+`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を、会議が削除されていれば 404 を返す（確定したとは返さない）。`meeting.json` は書き込みトランザクションのコミット後に、DB に残った確定値（停止理由・検出時刻を含む）から書き出す。再送を含む成功した finalize のたびに書き直すので、書き出しに失敗しても再送で回復する（Phase 1 §12。Phase 3 §20.2 は Chunk 一覧も加えて同じ位置で書く）。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。再送でのファイルの照合も finalize と同じ `pipeline.chunk_file_intact()` で行い、読めないファイル（権限など）は 500 にせず欠損として書き戻す。照合は書き込みロックの外（スレッド）で行うので、書き戻しは書き込みロック下で会議と Chunk の存在を確かめ直してからロックの中で行い、照合中に削除されていれば `404` を返す（削除は DB のコミット後に録音ディレクトリを消すので、ロックの外で書くと消えた録音を作り直す）。再送はジョブを作らないので、Phase 1 のサーバーで確定した会議（移行した DB に `finalized` のまま残る）は、`serve` の起動時に `sweeper.resume_finalized()` が `on_finalized` を呼んで回収する（§14・§22。`transcribing` に進めるので 2 回目の起動では拾わない）。回収の前に finalize と同じ規則（連番の連続と `pipeline.chunk_file_intact()`）でファイルを照合し、欠損・破損があれば `finalized` のまま残す（直せば次の起動で拾う）。
 
 ## 21.3 Phase 2 ルート `api/routes_meetings.py`
 
@@ -5075,6 +5080,7 @@ import base64
 import errno
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -5312,6 +5318,34 @@ async def test_resend_repairs_unreadable_chunk_file_instead_of_500(client: httpx
     # Assert: 500 にせず、欠損として書き戻す
     assert r.status_code == 200
     assert (await finalize(client, "m-1", mic=1)).status_code == 200
+
+
+async def test_resend_does_not_recreate_files_of_meeting_deleted_during_check(client: httpx.AsyncClient, ctx: AppContext,
+                                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 再送の照合（書き込みロックの外）の間に会議が削除され、ファイルも消える
+    from minutes_local.api import routes_phase1
+    await client.post("/v1/meetings", json=MEETING)
+    assert (await _raw_put(client)).status_code == 201
+    rec = recording_dir(ctx, "m-1")
+
+    def broken_then_deleted(*_args: object) -> bool:
+        conn = sqlite3.connect(ctx.db.path)
+        try:
+            with conn:
+                conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        finally:
+            conn.close()
+        shutil.rmtree(rec)
+        return False
+    if hasattr(routes_phase1, "_stored_chunk_intact"):   # Phase 3 は read_pcm で照合する（Phase 3 §20.2）
+        monkeypatch.setattr(routes_phase1, "_stored_chunk_intact", broken_then_deleted)
+    else:
+        monkeypatch.setattr("minutes_local.jobs.pipeline.chunk_file_intact", broken_then_deleted)
+    # Act
+    r = await _raw_put(client)
+    # Assert: 削除された録音を書き戻して作り直さない
+    assert r.status_code == 404 and r.json()["code"] == "NOT_FOUND"
+    assert not rec.exists()
 
 
 # ---- finalize ----
