@@ -14,6 +14,11 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${VERIFY_DIR:-$(mktemp -d)}
 TARGET=${1:-all}
+# 打ち間違いの対象で何も検査せずに OK と出さない
+case "$TARGET" in
+  server|client|all) ;;
+  *) echo "使い方: $0 [server|client|all]（不明な対象: ${TARGET}）" >&2; exit 2 ;;
+esac
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)   # 相対パスの VERIFY_DIR でも、下の cd 後に venv を指せるよう絶対パスにする
 extract() { python3 "$ROOT/scripts/extract-design-code.py" "$@"; }
