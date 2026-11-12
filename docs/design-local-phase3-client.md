@@ -4,7 +4,7 @@
 **上位文書:** Phase 3 詳細設計書 ── サーバー側（`docs/design-local-phase3-server.md`）§2 の設計判断と §20 の API。
 **配置:** `docs/design-local-phase3-client.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **制約:** Phase 1・2 と同じ（ブラウザ標準 API と TypeScript のみ、UI フレームワーク非依存の状態モデル）。
-**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 34 ファイル 576 件（Phase 1・2 の 30 ファイル 542 件を含む）が全件通過することを確認している（2026-11-12、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
+**検証状態:** 本書の全 `typescript` コードブロック（13 ファイル。うち 2 は Phase 1・2 ファイルの全文差し替え）は Phase 1 → Phase 2 → Phase 3 の順に同じツリーへ抽出され、`tsc --noEmit`（strict）を通過し、Vitest 34 ファイル 579 件（Phase 1・2 の 30 ファイル 545 件を含む）が全件通過することを確認している（2026-11-12、§9）。再現は `scripts/verify-design-docs.sh client`。全文差し替えの 2 ファイル（`src/api/events.ts`・`src/api/local-saver.ts`）は「Phase 2 / Phase 1 の現行ファイルに Phase 3 の差分を当てたもの」で、元のファイルを直したら本書のブロックにも同じ変更を当てる。Phase 2 と同じく、**アプリへの組み込み（`app.ts`・`main.ts`）のコードは本書に含まない**。組み込みは Phase 2 ブラウザ側 §15 と同じ進め方（配線表 → テスト → 実装）で行い、画面の描画方式は同 §15.2 の決定に従う。
 
 ---
 
@@ -442,13 +442,18 @@ export class MeetingEventsClient {
   private async backfill(attempt = 0): Promise<void> {
     this.cancelBackfillRetry();
     const generation = ++this.generation;
-    // 接続ごとに保留をやり直す。前の接続で保留した分は、この接続の補完（再接続後の状態）に含まれている。
-    // 持ち越すと、補完の後に古い status を流して巻き戻す（Live セグメントは保留に入らない。receive()）
+    // 前の接続の補完が終わらないうちに再接続した。前の接続で保留した分は、この補完を始める前に流す。
+    // 捨てると、補完に含まれない progress と、この補完も失敗したときの status・job を失う。
+    // 新しい補完の後に流すと古い status で巻き戻すが、前に流せば「前の保留 → 新しい補完 → 新しい保留」と時間の順に並ぶ
+    // （Live セグメントは保留に入らない。receive()）
+    const previous = this.held ?? [];
+    this.held = null;
+    for (const data of previous) this.handle(data);
     this.held = [];
     let failed = false;
     try {
       const meeting = await this.deps.fetchMeeting();
-      // 補完中に再接続・close した。新しい接続の補完が保留分を流す
+      // 補完中に再接続・close した。保留分は新しい接続の補完が始める前に流す（close なら捨てる）
       if (generation !== this.generation) return;
       this.deps.onEvent({ type: "meeting_status", status: meeting.status });
       this.deps.onEvent({ type: "transcript_version", transcriptVersion: meeting.transcriptVersion });
@@ -502,6 +507,12 @@ export const BACKFILL_RETRY_DELAYS_MS: readonly number[] = [1_000, 5_000, 15_000
 export const SSE_CONNECT_TIMEOUT_MS = 10_000;
 /** 無通信の許容時間。サーバーは無通信が 15 秒続くと keep-alive コメントを送る（サーバー側 api/sse.py の KEEPALIVE_S）ので、3 回分待つ */
 export const SSE_IDLE_TIMEOUT_MS = 45_000;
+/**
+ * バックオフを初期値へ戻すまでの接続の継続時間。応答ヘッダ（200）だけでは戻さない。200 を返してすぐ切れるサーバー・
+ * 経路で 1 秒間隔の再接続を繰り返さないためである。この時間（keep-alive 2 回分）切れずに続き、かつその間にデータ
+ * （keep-alive を含む）を 1 回以上受け取った接続だけを健全とみなして戻す
+ */
+export const SSE_STABLE_MS = 30_000;
 
 /**
  * SSE を fetch + ReadableStream で読む。`EventSource` を使わない理由は 2 つある。
@@ -549,6 +560,13 @@ export class FetchEventSource implements EventSourceLike {
         clearTimeout(watchdog);
         watchdog = setTimeout(() => controller.abort(), SSE_IDLE_TIMEOUT_MS);
       };
+      // 健全さの判定（SSE_STABLE_MS）。タイマーは finally で必ず止め、切れた接続が後からバックオフを戻さないようにする
+      let stableTimer: ReturnType<typeof setTimeout> | null = null;
+      let stable = false;
+      let received = false;
+      const resetBackoffIfHealthy = (): void => {
+        if (stable && received) this.retryMs = INITIAL_RETRY_MS;
+      };
       try {
         // ブラウザの fetch はメソッドとして呼ぶと Illegal invocation になるため、取り出してから呼ぶ
         const fetchImpl = this.fetchImpl;
@@ -559,14 +577,22 @@ export class FetchEventSource implements EventSourceLike {
           signal: controller.signal,
         });
         if (!res.ok || res.body === null) throw new Error(`SSE HTTP ${res.status}`);
-        this.retryMs = INITIAL_RETRY_MS;            // 接続できたらバックオフを初期値へ戻す
         kick();
+        stableTimer = setTimeout(() => {
+          stable = true;
+          resetBackoffIfHealthy();
+        }, SSE_STABLE_MS);
         this.emit("open", "");
-        await this.pump(res.body, kick);
+        await this.pump(res.body, () => {
+          kick();
+          received = true;
+          resetBackoffIfHealthy();
+        });
       } catch {
         // 中断も切断も同じ扱い。close() 済みならこの下で抜ける。
       } finally {
         clearTimeout(watchdog);
+        if (stableTimer !== null) clearTimeout(stableTimer);
       }
       this.controller = null;
       if (this.closed) return;
@@ -1732,7 +1758,7 @@ describe("SSE live_segment の振り分け", () => {
     expect(events).toEqual([{ type: "meeting_status", status: "recording" }]);
   });
 
-  it("補完中も live_segment は保留せず即座に渡し、status は補完の後に流す", async () => {
+  it("補完中も live_segment は保留せず即座に渡し、補完中の再接続でも捨てない", async () => {
     // Arrange: 補完（fetchMeeting）を解決させずに止めておく
     let es: FakeEventSource | null = null;
     const events: MeetingEvent[] = [];
@@ -1759,11 +1785,14 @@ describe("SSE live_segment の振り分け", () => {
     source.emit("meeting_status", JSON.stringify({ type: "meeting_status", status: "transcribing" }));
     source.emit("open");
     source.emit("live_segment", seg("s2"));
-    // Assert: live は補完を待たず、再接続でも捨てられない。status は保留されている
+    // Assert: live は補完を待たず、再接続でも捨てられない
     expect(live.map((e) => e.segment.id)).toEqual(["s1", "s2"]);
-    expect(events).toEqual([]);
+    // 前の接続で保留した status は、再接続後の補完を始める前に流れている（捨てない）
+    expect(events).toEqual([{ type: "meeting_status", status: "transcribing" }]);
     for (const resolve of resolvers) resolve(meetingDetail);
-    await vi.waitFor(() => expect(events.some((e) => e.type === "meeting_status")).toBe(true));
+    await vi.waitFor(() => expect(events).toHaveLength(3));
+    // 再接続後の補完（接続時点の status と版）が最後に残る
+    expect(events.at(-2)).toEqual({ type: "meeting_status", status: "recording" });
     expect(live.map((e) => e.segment.id)).toEqual(["s1", "s2"]);
   });
 });

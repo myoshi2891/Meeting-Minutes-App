@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── ブラウザ側（`docs/design-local-phase2-client.md`）。
 **配置:** `docs/design-local-phase2-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。
-**検証状態:** 本書のコードブロック（58 ファイル：`pyproject.toml`・実装 46・テスト 11）はパッケージとして抽出でき、Fake Provider による pytest 11 ファイル 94 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
+**検証状態:** 本書のコードブロック（58 ファイル：`pyproject.toml`・実装 46・テスト 11）はパッケージとして抽出でき、Fake Provider による pytest 11 ファイル 97 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
 
 ---
 
@@ -2092,15 +2092,31 @@ class JobRunner:
 
 ```python
 # minutes_local/jobs/sweeper.py
-"""lease 期限切れジョブの回収。起動時と 30 秒ごと。基本設計 §9.3。"""
+"""lease 期限切れジョブの回収。起動時と 30 秒ごと。基本設計 §9.3。起動時には確定済みで止まった会議も回収する。"""
 from __future__ import annotations
 
 import asyncio
 
 from ..db import repo
 from ..db.connection import Database, now_ms
+from . import pipeline
 
 SWEEP_INTERVAL_S = 30.0
+
+
+async def resume_finalized(db: Database) -> int:
+    """status が finalized のまま止まった会議に vad_chunk を作り、パイプラインを始める。起動時に 1 回呼ぶ。戻り値は会議数。
+
+    Phase 2 の finalize は finalized への遷移と on_finalized（transcribing への遷移）を 1 トランザクションで行うので、
+    finalized が残るのは Phase 1 のサーバーで確定した会議（移行した DB）と、Phase 3 の doctor --rebuild が復元した会議だけ。
+    finalize の再送は確定済みの会議にジョブを作らない（冪等）ので、ここで拾わないと処理されないまま残る。
+    on_finalized は transcribing に進めるので 2 回目の起動では拾わない。insert_job は既存ジョブを作り直さない（冪等）。
+    """
+    async with db.write() as conn:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM meetings WHERE status = 'finalized' ORDER BY id").fetchall()]
+        for meeting_id in ids:
+            pipeline.on_finalized(conn, meeting_id)
+    return len(ids)
 
 
 async def sweep_once(db: Database) -> int:
@@ -3721,7 +3737,7 @@ def _check_token(request: Request, token: str) -> bool:
 
 **配信元を切り替えるときの注意：** IndexedDB はオリジンごとに別なので、`http://127.0.0.1:5173`（開発サーバー）で録音した未確定の会議は `http://127.0.0.1:43117/`（サーバー配信）からは見えない。確定待ちの会議が残っている間は配信元を切り替えない。
 
-トークンは `serve` が起動のたびに `rotate_token()` で作り直す（Phase 1 §4.3 の短命性。§22）。作り直すのは待ち受けポートを確保した後で、確保に失敗したら（既存のサーバーが動いているなど）トークンファイルに触れずに終了する。`token` コマンドは現在の値を表示するだけで、作り直さない。
+トークンは `serve` が起動のたびに `rotate_token()` で作り直す（Phase 1 §4.3 の短命性。§22）。作り直すのは、データディレクトリのロック（`acquire_data_dir_lock()`）と待ち受けポートを確保した後で、どちらかに失敗したら（既存のサーバーが同じデータディレクトリで動いている、ポートが使用中など）トークンファイルに触れずに終了する。ロックは別のポートで起動した 2 つ目の `serve` が、動いているサーバーのトークンを作り直すのを防ぐ。`token` コマンドは現在の値を表示するだけで、作り直さない。
 
 ## 21.2 Phase 1 互換ルート `api/routes_phase1.py`
 
@@ -4060,7 +4076,7 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 ```
 
-`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を返す。`meeting.json` は書き込みトランザクションのコミット後に、DB に残った確定値（停止理由・検出時刻を含む）から書き出す。再送を含む成功した finalize のたびに書き直すので、書き出しに失敗しても再送で回復する（Phase 1 §12。Phase 3 §20.2 は Chunk 一覧も加えて同じ位置で書く）。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。
+`finalize` は冪等である。2 回目の呼び出しはジョブを生成せず、最初に確定した `ended_at` / `total_audio_frames` も書き換えない（書き込みロック下で `created` / `recording` / `finalizing` の会議だけを更新する。`transcribing` 以降の会議を `finalized` に戻さない）。読み取りと書き込みの間に Chunk が増えていれば 409 を返す。`meeting.json` は書き込みトランザクションのコミット後に、DB に残った確定値（停止理由・検出時刻を含む）から書き出す。再送を含む成功した finalize のたびに書き直すので、書き出しに失敗しても再送で回復する（Phase 1 §12。Phase 3 §20.2 は Chunk 一覧も加えて同じ位置で書く）。確定後の会議への新しい Chunk の PUT は `409 CONFLICT_MEETING_FINALIZED` で拒否し、登録済み Chunk の冪等再送は受け付ける。再送はジョブを作らないので、Phase 1 のサーバーで確定した会議（移行した DB に `finalized` のまま残る）は、`serve` の起動時に `sweeper.resume_finalized()` が `on_finalized` を呼んで回収する（§14・§22。`transcribing` に進めるので 2 回目の起動では拾わない）。
 
 ## 21.3 Phase 2 ルート `api/routes_meetings.py`
 
@@ -4512,12 +4528,15 @@ def restrict_to_current_user(path: Path) -> None:
     """ディレクトリを現在の OS ユーザーだけが使えるようにする（録音・トークン・DB を置く）。
 
     Unix は 0700。Windows の os.chmod は読み取り専用属性しか変えず ACL に効かないので、icacls で設定する。
-    /inheritance:r が外すのは継承した ACE だけで、他の主体へ明示的に与えた ACE はディレクトリにも既存の配下にも残る
-    （Windows は既定で走査チェックを省くので、配下のファイルは親を読めなくてもパス指定で開ける）。そこで先に
-    /reset /T でツリー全体の明示 ACE を消して継承に戻し、次にルートの継承を外して（/inheritance:r）現在のユーザーの
-    SID にだけフルコントロールを与える（(OI)(CI) で配下へ継承し、配下は SID の ACE だけになる）。順序を逆にすると
-    /reset がルートの継承を戻してしまう。2 つの呼び出しの間は親（利用者のプロファイル配下）の ACL を継承する。
-    /C（エラーを無視して続行）は付けない。1 つでも設定できなければ例外にする。
+    1. 先にルートの継承を外し（/inheritance:r）、現在のユーザーの SID にだけフルコントロールを与える（(OI)(CI) で配下へ継承）。
+       ここから後の操作は権限を狭める方向だけになる。
+    2. 既存の配下を 1 件ずつ /reset で継承に戻す（ディレクトリは /T で再帰、ファイルは単体）。/inheritance:r は
+       継承した ACE しか外さず、他の主体へ明示的に与えた ACE が配下に残るため（Windows は既定で走査チェックを省くので、
+       配下のファイルは親を読めなくてもパス指定で開ける）。戻した配下はルートの SID の ACE だけを継承する。
+       ルートには /reset も再帰の操作もかけない。かけると親の継承が戻り、失敗・中断したときに前より緩い状態で残る。
+    /C（エラーを無視して続行）は付けない。1 つでも設定できなければ例外にする（1 が失敗すれば配下に触らない。2 の途中で
+    止まってもルートは締めたまま）。ルート自身に他の主体への明示 ACE が付いていれば残るが、サーバーが作ったディレクトリに
+    それを付けられるのは所有者か管理者だけで、その相手には ACL を掃除しても防げない。
     付与先を名前や Administrators でなくトークンのユーザー SID にするのは、管理者として昇格して起動しても
     付与先が変わらず、昇格せずに起動したときに本人が締め出されないため（昇格時の既定の所有者は Administrators になりうる）。
     ACL を設定できなければ例外で起動を止める（緩い権限のまま録音を置かない）。
@@ -4534,9 +4553,33 @@ def restrict_to_current_user(path: Path) -> None:
     if not re.fullmatch(r"S-1-\d+(-\d+)+", sid):
         raise RuntimeError(f"cannot determine current user SID: {out.strip()!r}")
     icacls = str(system32 / "icacls.exe")
-    subprocess.run([icacls, str(path), "/reset", "/T", "/Q"], check=True, capture_output=True, text=True)
     subprocess.run([icacls, str(path), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
                    check=True, capture_output=True, text=True)
+    for entry in sorted(os.scandir(path), key=lambda e: e.name):
+        recurse = ["/T"] if entry.is_dir(follow_symlinks=False) else []
+        subprocess.run([icacls, entry.path, "/reset", *recurse, "/Q"], check=True, capture_output=True, text=True)
+
+
+def acquire_data_dir_lock(data_dir: Path) -> int | None:
+    """データディレクトリを使う serve を 1 つに限る。取れたらロックを持つ fd、他の serve が持っていれば None。
+
+    ポートの確保だけでは、別のポートで起動した 2 つ目の serve が同じデータディレクトリのトークンを作り直し、
+    動いている 1 つ目のサーバーのトークンと `token` の表示が食い違う（DB のジョブも 2 つのプロセスが取り合う）。
+    fd はサーバーが動いている間閉じずに持つ。プロセスが終われば OS がロックを外す（ファイルは消さない）。
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(data_dir / "serve.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if sys.platform.startswith("win"):
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 async def build_context(settings: Settings, *, stt_provider: STTProvider | None = None,
@@ -4583,9 +4626,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
-from .bootstrap import bind_listen_socket, build_context, read_token, rotate_token
+from .bootstrap import acquire_data_dir_lock, bind_listen_socket, build_context, read_token, rotate_token
 from .config import settings_from_env
 
 
@@ -4627,6 +4671,18 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print("WARNING: binding to a non-loopback address is a Phase 3 feature; TLS and per-user tokens are not implemented.", file=sys.stderr)
 
     async def main() -> int:
+        # 同じデータディレクトリの serve は 1 つだけ。migrate より前に取り、取れなければ何も変えずに終わる
+        # （別のポートで動いている既存のサーバーのトークンを作り直さない）
+        lock = acquire_data_dir_lock(s.data_dir)
+        if lock is None:
+            print(f"ERROR: another server is using {s.data_dir}. The token was not changed.", file=sys.stderr)
+            return 1
+        try:
+            return await run()
+        finally:
+            os.close(lock)
+
+    async def run() -> int:
         ctx = await build_context(s)
         try:
             sock = bind_listen_socket(args.bind, s.port)
@@ -4641,6 +4697,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         app = create_app(ctx, token)
         stop = asyncio.Event()
         await sweeper.sweep_once(ctx.db)
+        await sweeper.resume_finalized(ctx.db)  # Phase 1 で確定した会議（移行した DB）のジョブを作る
         runners = [JobRunner(ctx, HANDLERS, i) for i in range(ctx.models.max_concurrent_stt)]
         tasks = [asyncio.create_task(r.run_forever()) for r in runners]
         tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, stop)))
@@ -4677,7 +4734,7 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-起動シーケンスと基本設計 §5.3 の対応：`build_context` が「migrate → HW 検出 → モデル配置確認 → Ollama 到達確認 → プール生成」を、`_cmd_serve` が「Sweeper 起動時実行 → bind → token 表示」を担う。bind 失敗は uvicorn の例外で即終了する。
+起動シーケンスと基本設計 §5.3 の対応：`_cmd_serve` が最初にデータディレクトリのロックを取り（取れなければ migrate もトークンの作り直しもせずに終了）、`build_context` が「migrate → HW 検出 → モデル配置確認 → Ollama 到達確認 → プール生成」を、`_cmd_serve` が「bind → token 表示 → Sweeper 起動時実行 → 確定済みで止まった会議の回収（`resume_finalized`）」を担う。bind 失敗は uvicorn の例外で即終了する。
 
 ---
 
@@ -4986,7 +5043,7 @@ import httpx
 import pytest
 
 from minutes_local.api.app import DEV_ORIGIN, create_app
-from minutes_local.bootstrap import bind_listen_socket, read_token, restrict_to_current_user, rotate_token
+from minutes_local.bootstrap import acquire_data_dir_lock, bind_listen_socket, read_token, restrict_to_current_user, rotate_token
 from minutes_local.db import repo
 from minutes_local.jobs.context import AppContext
 from minutes_local.jobs.runner import JobRunner
@@ -5345,9 +5402,28 @@ def test_rotate_token_changes_value_and_keeps_owner_only_permission(tmp_path: Pa
     path.chmod(0o644)
     second = rotate_token(path)
     assert first != second and len(second) == 64 and read_token(path) == second
-    assert path.stat().st_mode & 0o777 == 0o600
+    # Windows の st_mode は ACL を表さない（権限はデータディレクトリの ACL で守る。下の Windows の ACL のテスト）
+    if not sys.platform.startswith("win"):
+        assert path.stat().st_mode & 0o777 == 0o600
 
 
+def test_acquire_data_dir_lock_allows_only_one_server(tmp_path: Path) -> None:
+    # Arrange: 1 つ目の serve がロックを持つ
+    data_dir = tmp_path / "data"
+    first = acquire_data_dir_lock(data_dir)
+    assert first is not None
+    try:
+        # Act / Assert: 2 つ目は取れない（別のポートで起動しても、動いているサーバーのトークンを作り直さない）
+        assert acquire_data_dir_lock(data_dir) is None
+    finally:
+        os.close(first)
+    # 1 つ目が終われば取れる
+    again = acquire_data_dir_lock(data_dir)
+    assert again is not None
+    os.close(again)
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="Windows の st_mode は ACL を表さない。ACL は下の Windows のテストで確かめる")
 def test_restrict_to_current_user_sets_owner_only_mode_on_unix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Arrange
     monkeypatch.setattr(sys, "platform", "linux")
@@ -5360,8 +5436,10 @@ def test_restrict_to_current_user_sets_owner_only_mode_on_unix(tmp_path: Path, m
 
 
 def test_restrict_to_current_user_sets_windows_acl_by_user_sid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Windows の os.chmod は ACL に効かない。既存の明示 ACE を消してから継承を外し、昇格の有無で変わらないユーザー SID にだけ付与する。"""
-    # Arrange
+    """Windows の os.chmod は ACL に効かない。ルートを先に SID だけにしてから、既存の配下を 1 件ずつ継承に戻す。"""
+    # Arrange: 既存の配下（ファイルとサブディレクトリ）がある
+    (tmp_path / "token").write_text("x")
+    (tmp_path / "recordings").mkdir()
     calls: list[list[str]] = []
 
     def fake_run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
@@ -5376,12 +5454,32 @@ def test_restrict_to_current_user_sets_windows_acl_by_user_sid(tmp_path: Path, m
     restrict_to_current_user(tmp_path)
     # Assert
     icacls = [c for c in calls if c[0].lower().endswith("icacls.exe")]
-    # 他の主体への明示 ACE が残らないよう、ツリー全体を継承に戻してから（/reset /T）ルートを SID だけにする。順序も検証する
+    # ルートを先に締め、配下の明示 ACE はルートに触れずに 1 件ずつ消す（ルートに /reset や再帰の操作をかけない）。順序も検証する
     exe = icacls[0][0]
     assert icacls == [
-        [exe, str(tmp_path), "/reset", "/T", "/Q"],
         [exe, str(tmp_path), "/inheritance:r", "/grant:r", "*S-1-5-21-1-2-3-1001:(OI)(CI)F"],
+        [exe, str(tmp_path / "recordings"), "/reset", "/T", "/Q"],
+        [exe, str(tmp_path / "token"), "/reset", "/Q"],
     ]
+
+
+def test_restrict_to_current_user_does_not_touch_descendants_when_root_acl_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: ルートの ACL の設定に失敗する
+    (tmp_path / "recordings").mkdir()
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if args[0].lower().endswith("whoami.exe"):
+            return subprocess.CompletedProcess(args, 0, stdout='"pc\\alice","S-1-5-21-1-2-3-1001"\r\n', stderr="")
+        raise subprocess.CalledProcessError(5, args)
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # Act / Assert: 起動を止め、配下には触らない
+    with pytest.raises(subprocess.CalledProcessError):
+        restrict_to_current_user(tmp_path)
+    assert [c[1] for c in calls if c[0].lower().endswith("icacls.exe")] == [str(tmp_path)]
 
 
 def test_restrict_to_current_user_fails_closed_on_unexpected_sid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5427,7 +5525,7 @@ from minutes_local.db.connection import now_ms
 from minutes_local.jobs.context import AppContext
 from minutes_local.jobs.retry import OOMError, decide, InvalidAudioError, ModelMissingError, normalize_exception
 from minutes_local.jobs.runner import JobRunner
-from minutes_local.jobs.sweeper import sweep_once
+from minutes_local.jobs.sweeper import resume_finalized, sweep_once
 from minutes_local.stt.fake_provider import FakeSTTProvider
 from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm
 
@@ -5460,6 +5558,28 @@ async def test_sweeper_recovers_expired_lease_and_ignores_stale_owner(client: ht
         # 旧ワーカーの完了報告は無視される（基本設計 §9.3）
         assert repo.finish_job(conn, job.id, "dead-worker", job.attempts, "completed") is False
         assert repo.get_job(conn, job.id).status == "pending"
+
+
+async def test_resume_finalized_creates_vad_jobs_for_meetings_finalized_before_migration(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    # Arrange: Phase 1 のサーバーで確定した会議（finalized でジョブなし）と、Chunk のない確定済み会議を再現する
+    await create_meeting(client, "m-1")
+    for seq in range(2):
+        await put_chunk(client, "m-1", seq, sine_pcm(1))
+    await create_meeting(client, "m-empty")
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE meetings SET status = 'finalized' WHERE id IN ('m-1', 'm-empty')")
+    # Act
+    resumed = await resume_finalized(ctx.db)
+    # Assert: vad_chunk が Chunk ごとに 1 つでき、パイプラインが始まる。Chunk のない会議は merge まで進む
+    assert resumed == 2
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").status == "transcribing"
+        assert sorted(j.job_type for j in repo.list_jobs(conn, "m-1")) == ["vad_chunk", "vad_chunk"]
+        assert [j.job_type for j in repo.list_jobs(conn, "m-empty")] == ["merge_transcript"]
+    # 2 回目の起動では拾わず、ジョブも増えない（finalize の冪等性と同じ）
+    assert await resume_finalized(ctx.db) == 0
+    with ctx.db.read() as conn:
+        assert len(repo.list_jobs(conn, "m-1")) == 2
 
 
 def test_retry_decisions() -> None:

@@ -5,7 +5,7 @@
 **対となる文書:** Phase 3 詳細設計書 ── ブラウザ側（`docs/design-local-phase3-client.md`）。
 **配置:** `docs/design-local-phase3-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。LAN 共有は「利用者自身が管理する LAN 内」に限定し、インターネット公開は対象外。
-**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 94 件と本書の 36 件（計 18 ファイル 130 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
+**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 97 件と本書の 36 件（計 18 ファイル 133 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-12、§23）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
 
 ---
 
@@ -3484,12 +3484,15 @@ def restrict_to_current_user(path: Path) -> None:
     """ディレクトリを現在の OS ユーザーだけが使えるようにする（録音・トークン・DB を置く）。
 
     Unix は 0700。Windows の os.chmod は読み取り専用属性しか変えず ACL に効かないので、icacls で設定する。
-    /inheritance:r が外すのは継承した ACE だけで、他の主体へ明示的に与えた ACE はディレクトリにも既存の配下にも残る
-    （Windows は既定で走査チェックを省くので、配下のファイルは親を読めなくてもパス指定で開ける）。そこで先に
-    /reset /T でツリー全体の明示 ACE を消して継承に戻し、次にルートの継承を外して（/inheritance:r）現在のユーザーの
-    SID にだけフルコントロールを与える（(OI)(CI) で配下へ継承し、配下は SID の ACE だけになる）。順序を逆にすると
-    /reset がルートの継承を戻してしまう。2 つの呼び出しの間は親（利用者のプロファイル配下）の ACL を継承する。
-    /C（エラーを無視して続行）は付けない。1 つでも設定できなければ例外にする。
+    1. 先にルートの継承を外し（/inheritance:r）、現在のユーザーの SID にだけフルコントロールを与える（(OI)(CI) で配下へ継承）。
+       ここから後の操作は権限を狭める方向だけになる。
+    2. 既存の配下を 1 件ずつ /reset で継承に戻す（ディレクトリは /T で再帰、ファイルは単体）。/inheritance:r は
+       継承した ACE しか外さず、他の主体へ明示的に与えた ACE が配下に残るため（Windows は既定で走査チェックを省くので、
+       配下のファイルは親を読めなくてもパス指定で開ける）。戻した配下はルートの SID の ACE だけを継承する。
+       ルートには /reset も再帰の操作もかけない。かけると親の継承が戻り、失敗・中断したときに前より緩い状態で残る。
+    /C（エラーを無視して続行）は付けない。1 つでも設定できなければ例外にする（1 が失敗すれば配下に触らない。2 の途中で
+    止まってもルートは締めたまま）。ルート自身に他の主体への明示 ACE が付いていれば残るが、サーバーが作ったディレクトリに
+    それを付けられるのは所有者か管理者だけで、その相手には ACL を掃除しても防げない。
     付与先を名前や Administrators でなくトークンのユーザー SID にするのは、管理者として昇格して起動しても
     付与先が変わらず、昇格せずに起動したときに本人が締め出されないため（昇格時の既定の所有者は Administrators になりうる）。
     ACL を設定できなければ例外で起動を止める（緩い権限のまま録音を置かない）。
@@ -3506,9 +3509,33 @@ def restrict_to_current_user(path: Path) -> None:
     if not re.fullmatch(r"S-1-\d+(-\d+)+", sid):
         raise RuntimeError(f"cannot determine current user SID: {out.strip()!r}")
     icacls = str(system32 / "icacls.exe")
-    subprocess.run([icacls, str(path), "/reset", "/T", "/Q"], check=True, capture_output=True, text=True)
     subprocess.run([icacls, str(path), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
                    check=True, capture_output=True, text=True)
+    for entry in sorted(os.scandir(path), key=lambda e: e.name):
+        recurse = ["/T"] if entry.is_dir(follow_symlinks=False) else []
+        subprocess.run([icacls, entry.path, "/reset", *recurse, "/Q"], check=True, capture_output=True, text=True)
+
+
+def acquire_data_dir_lock(data_dir: Path) -> int | None:
+    """データディレクトリを使う serve を 1 つに限る。取れたらロックを持つ fd、他の serve が持っていれば None。
+
+    ポートの確保だけでは、別のポートで起動した 2 つ目の serve が同じデータディレクトリのトークンを作り直し、
+    動いている 1 つ目のサーバーのトークンと `token` の表示が食い違う（DB のジョブも 2 つのプロセスが取り合う）。
+    fd はサーバーが動いている間閉じずに持つ。プロセスが終われば OS がロックを外す（ファイルは消さない）。
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(data_dir / "serve.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if sys.platform.startswith("win"):
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 async def build_context(settings: Settings, *, stt_provider: STTProvider | None = None, vad_provider: VADProvider | None = None,
@@ -3570,9 +3597,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
-from .bootstrap import bind_listen_socket, build_context, read_token, rotate_token
+from .bootstrap import acquire_data_dir_lock, bind_listen_socket, build_context, read_token, rotate_token
 from .config import settings_from_env
 
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
@@ -3658,6 +3686,18 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         return 2
 
     async def main() -> int:
+        # 同じデータディレクトリの serve は 1 つだけ。migrate より前に取り、取れなければ何も変えずに終わる
+        # （別のポートで動いている既存のサーバーのトークンを作り直さない）
+        lock = acquire_data_dir_lock(s.data_dir)
+        if lock is None:
+            print(f"ERROR: another server is using {s.data_dir}. The token was not changed.", file=sys.stderr)
+            return 1
+        try:
+            return await run()
+        finally:
+            os.close(lock)
+
+    async def run() -> int:
         ctx = await build_context(s, tls_enabled=bool(args.tls))
         try:
             sock = bind_listen_socket(args.bind, s.port)
@@ -3673,6 +3713,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         app = create_app(ctx, token)
         stop = asyncio.Event()
         await sweeper.sweep_once(ctx.db)
+        # Phase 1 で確定した会議と doctor --rebuild が復元した会議のジョブを作る（Phase 2 §14）。diarize は既定の False
+        await sweeper.resume_finalized(ctx.db)
         runners = [JobRunner(ctx, HANDLERS, i) for i in range(ctx.models.max_concurrent_stt)]
         tasks = [asyncio.create_task(r.run_forever()) for r in runners]
         tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, stop)))
@@ -3728,7 +3770,7 @@ if __name__ == "__main__":
 
 ## 23.1 ハーネス（変更）と Phase 2 テストの回帰
 
-Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 94 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
+Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 97 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
 
 ```python
 # tests/conftest.py
@@ -4661,7 +4703,7 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
 | マイグレーション 009〜012 | `test_apply_phase3_moves_files_and_extends_job_types`、`test_apply_phase3_keeps_other_recordings_when_meeting_id_equals_user_id` |
-| Phase 2 の回帰 | Phase 2 §23 の 94 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
+| Phase 2 の回帰 | Phase 2 §23 の 97 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
 
 ---
 
