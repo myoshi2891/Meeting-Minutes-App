@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-13（Phase 2 server 設計書のレビュー指摘 3 件・未コミット、ブランチ `dev`。PR #14 までマージ済み）
+最終更新: 2026-11-13（Phase 2 server 設計書のレビュー指摘 4 件・未コミット、ブランチ `dev`。PR #14 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -26,7 +26,15 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### 今回の変更と残課題
 
-- 2026-11-13（Phase 2 server 設計書のレビュー指摘 3 件・未コミット）：3 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md` と `docs/design-local-phase3-server.md` のみ。製品コード（`src/`・`test/`）は無変更。
+- 2026-11-13（Phase 2 server 設計書のレビュー指摘 4 件・未コミット）：4 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md` と `docs/design-local-phase3-server.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **Sweeper のコミット後の読み直し**：`_publish` がコミット後に `db.read()` でジョブと会議を読み直していた。読み取りが失敗するとイベントが失われ、次の周は回収済みのジョブを選ばないので二度と流れない。流す内容（RETURNING の行と、`on_job_failed` の後に読んだ会議）を書き込みトランザクションの中で確定させ、配信だけをコミット後に行う。`_publish(events, jobs, meetings)` に変更（sweeper 内部のみ）。読み取りを失敗させて例外になることを Red で確認。回帰 1 件。
+  - **lease 切れ後の transcribe 回収**：ハンドラが Chunk を `completed` にコミットした後、`finish_job` の前に lease が切れて回数切れで回収されると、`on_transcribe_failed` が Chunk を `failed`（gap）に上書きした。`completed` の Chunk は変えない（ジョブは `failed` のまま。再試行・除外のどちらでも gap にならない）。§14 の表と本文、§15 の表を更新。Phase 3 の `on_transcribe_failed` にも同じ修正。Red を確認。回帰 1 件。ハンドラの結果とジョブ完了を 1 トランザクションにする案は Runner とハンドラの契約が変わるので採らなかった。
+  - **`handle_vad` の lease 検査**：失効した旧ワーカーの VAD が Chunk を進め、transcribe ジョブを作っていた。2 つの書き込み（モデル未配置の分岐と通常の分岐）の先頭で `lease_is_current` を確かめる。§15 の表に行を追加。Phase 3 の `handle_vad` にも同じ修正。Chunk が `queued` に進むことを Red で確認。回帰 1 件。
+  - **テストヘルパー `_expire_exhausted`**：lease 時点の Job（attempts=1）を返していたので、要約のテストが attempts の不一致だけで弾かれていた。`repo.get_job` で読み直して返す（attempts の不一致に頼らない。回収後は `lease_owner` も NULL なので、status の検査だけを切り分けるわけではない）。
+  - 確認：`verify-design-docs.sh` 全体通過（Phase 2 server 138・Phase 3 server 200・client 559 / 594）。`npm run typecheck` 通過、`npm test` 24 ファイル / 498 件通過。
+  - **残り（未対応）**：Runner の `_publish_job` も同じくコミット後に読み直す（指摘の範囲外）。T-lease-merge と合わせて見直す。
+
+- 2026-11-13（Phase 2 server 設計書のレビュー指摘 3 件・コミット済み e891bad）：3 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md` と `docs/design-local-phase3-server.md` のみ。製品コード（`src/`・`test/`）は無変更。
   - **lease を失った要約の書き込み**：`handle_summary` が lease を確かめずに要約を書き、会議を `completed` にしていた。Sweeper が回数切れで `failed`（会議も `failed`）にした後でも書けてしまう（修正前は会議が `completed` になることを Red で確認）。書き込みトランザクションの先頭で `lease_is_current` を確かめる。Phase 3 の `handle_summary` にも同じ修正。回帰 1 件。
   - **Sweeper の配信**：回収したジョブと会議の状態を SSE に流していなかった（画面が `processing` のまま止まる）。`sweep_once(db, events)` / `run_forever(db, events, stop, …)` に変え、コミット後に `job` / `meeting_status` を流す。`repo.sweep_expired` は件数ではなく戻したジョブ（`list[Job]`）を返す。起動処理（Phase 2 / 3）とテストの呼び出しも更新。配信 0 件の Red を確認。回帰 1 件。
   - **vad / merge の失敗**：`on_job_failed` に分岐を明記し、§14 にジョブ種別ごとの失敗時の状態表を追加。どちらの失敗でも Chunk と会議は変えず（会議の `failed` は merge 済みを意味する）、失敗したジョブの再試行で進む。挙動は従来と同じなので、テストは保存確認 2 件（修正前から Green）。Phase 3 の `on_job_failed` にも同じ分岐。
@@ -197,6 +205,8 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ### T-lease-merge. `handle_merge` の lease 検査（未着手・2026-11-13 起票）
 
 Phase 2 server §20 の `handle_merge` が lease を確かめずに `run_merge` と `on_merge_completed` を書く。lease が切れて Sweeper が回収した後に旧ワーカーが書くと、transcript の版が二重に進むか、回数切れで `failed` になった merge の後に会議が `transcribed` に進む。`handle_summary` と同じく、書き込みトランザクションの先頭で `lease_is_current` を確かめる。修正前に Red になる回帰テストを付ける。Phase 3 の `handle_merge` も確認する。
+
+あわせて、Runner の `_publish_job` もコミット後に `db.read()` で読み直している（Sweeper は 2026-11-13 にトランザクション内で確定する形へ直した）。読み取りが失敗するとそのジョブのイベントが流れないので、同じ形にするかを判断する。
 
 ### T0. 2026-09-26 までの未コミット変更のコミット ✅ 完了（T10/T12 レビュー修正も 6a240d0 までコミット済み）
 
@@ -392,10 +402,15 @@ T3-c の内容（§31.4）:
 
 新しい順。1 セッション 3〜5 行まで。
 
+### 2026-11-13（Phase 2 server 設計書のレビュー指摘 4 件）
+
+- 有効 4 件：Sweeper の配信内容をトランザクション内で確定、`on_transcribe_failed` は completed の Chunk を変えない、`handle_vad` の lease 検査、`_expire_exhausted` の読み直し。Phase 3 server にも同じ変更を当てた。
+- 回帰 3 件（Red を確認）。`verify-design-docs.sh` 全体通過。未コミット。
+
 ### 2026-11-13（Phase 2 server 設計書のレビュー指摘 3 件）
 
 - 有効 3 件：`handle_summary` の lease 検査、Sweeper のコミット後の配信、vad / merge 失敗時の状態表。Phase 3 server にも同じ変更を当てた。
-- 回帰 2 件（Red を確認）と保存確認 2 件。`verify-design-docs.sh server` 通過。未コミット。
+- 回帰 2 件（Red を確認）と保存確認 2 件。`verify-design-docs.sh server` 通過。コミット済み（e891bad）。
 
 ### 2026-11-13（設計書の厳しめレビュー 3 回目）
 
