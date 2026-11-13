@@ -976,14 +976,16 @@ def fail_exhausted_expired(conn: sqlite3.Connection, now: int) -> list[Job]:
     return [_row(Job, r) for r in rows]
 
 
-def sweep_expired(conn: sqlite3.Connection, now: int) -> int:
-    cur = conn.execute(
+def sweep_expired(conn: sqlite3.Connection, now: int) -> list[Job]:
+    """lease が切れたジョブを pending に戻して返す。返したジョブは呼び出し側がコミット後に配信する（§14）。"""
+    rows = conn.execute(
         """UPDATE processing_jobs
            SET status = 'pending', lease_until = NULL, lease_owner = NULL, last_error = 'lease expired', updated_at = ?
-           WHERE status IN ('leased','processing') AND lease_until IS NOT NULL AND lease_until < ?""",
+           WHERE status IN ('leased','processing') AND lease_until IS NOT NULL AND lease_until < ?
+           RETURNING *""",
         (now, now),
-    )
-    return cur.rowcount
+    ).fetchall()
+    return [_row(Job, r) for r in rows]
 
 
 def count_jobs(conn: sqlite3.Connection, meeting_id: str | None, job_type: str, statuses: list[str]) -> int:
@@ -1909,11 +1911,20 @@ def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
 
 
 def on_job_failed(conn: sqlite3.Connection, job: Job) -> None:
-    """ジョブが failed で確定した後の後続処理。Runner（ハンドラの失敗）と Sweeper（lease 切れで回数切れ）が同じ規則を使う。"""
+    """ジョブが failed で確定した後の後続処理。Runner（ハンドラの失敗）と Sweeper（lease 切れで回数切れ）が同じ規則を使う。
+
+    状態の対応は §14 の表。vad_chunk / merge_transcript の失敗では Chunk も会議も変えない（会議の failed は
+    merge 済みを意味する。§21.1 MERGED_STATUSES）。Chunk の pending（vad）と merge の未完了が後続を止めたまま、
+    失敗したジョブの再試行（POST /jobs/{id}/retry）を待つ。exclude_failed の対象ではない。
+    """
     if job.job_type == "transcribe_chunk":
         on_transcribe_failed(conn, job_of_chunk(conn, job))
     elif job.job_type == "synthesize_minutes":
         on_summary_failed(conn, job.meeting_id)
+    elif job.job_type in ("vad_chunk", "merge_transcript"):
+        # Chunk の stt_status を failed にしない。failed は BLOCKING_STT に含まれず、他の Chunk の完了を契機に
+        # その Chunk を欠いたまま merge が作られる。pending のままなら ensure_merge_job が止まる
+        return
 
 
 def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str) -> bool:
@@ -2356,7 +2367,18 @@ lease が切れたジョブの扱いは 2 通りある（基本設計 §9.3）�
 | `attempts < max_attempts` | `pending` に戻す（`repo.sweep_expired`） | ワーカーが落ちた・固まった。別のワーカーがやり直す |
 | `attempts >= max_attempts` | `failed`（`error_class = INTERNAL`）にし、`pipeline.on_job_failed()` を呼ぶ（`repo.fail_exhausted_expired`） | lease 切れは Runner の失敗処理（`retry.decide` の回数判定）を通らない。回数を見ずに戻すと、実行するたびにプロセスごと落とすジョブが、サーバーを起動し直すたびに永久に実行される。`attempts` は lease のたびに進むので、上限と比べられる |
 
-`failed` になった `transcribe_chunk` は Chunk を `failed` にして merge を止め、利用者の再試行（`POST /jobs/{id}/retry`。`attempts` を 0 に戻す）か除外を待つ。ハンドラが失敗した場合と同じ扱いである。
+`failed` になったジョブの後続処理は、ハンドラが失敗した場合（Runner の `_on_failure`）と同じ `pipeline.on_job_failed()` を通る。ジョブ種別ごとの状態は次のとおり。
+
+| 失敗したジョブ | Chunk の `stt_status` | 会議の `status` | 後続 | 復旧 |
+| --- | --- | --- | --- | --- |
+| `vad_chunk` | 変えない（`pending` のまま） | 変えない（`transcribing`） | `pending` の Chunk が `ensure_merge_job` を止める | 失敗したジョブの再試行（`POST /jobs/{id}/retry`）。再試行で Chunk は `queued` になり、VAD の完了で `queued` / `skipped` に進む。除外（`exclude-failed`）の対象ではない |
+| `transcribe_chunk` | `failed` | 変えない（`transcribing`） | 未承認の `failed` ジョブが merge を止める | 再試行、または除外（`exclude-failed`。失敗区間は gap になる） |
+| `merge_transcript` | 変えない | 変えない（`transcribing`） | 要約ジョブを作らない | 失敗したジョブの再試行。除外の対象ではない |
+| `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2） | なし | 再試行、または要約の再生成 |
+
+再試行（`retry_job`）は `attempts` を 0 に戻す。vad / merge の失敗で会議を `failed` にしないのは、会議の `failed` が「merge が 1 回は終わった」を意味するためである（§21.1 `MERGED_STATUSES`。無音 Chunk の手動 STT などがこれで判定する）。vad の失敗で Chunk を `failed` にしないのは、`failed` が `BLOCKING_STT` に含まれず、他の Chunk の完了を契機にその Chunk を欠いたまま merge が作られるためである。
+
+回収したジョブ（`pending` に戻したもの・`failed` にしたもの）と、その会議の状態は、書き込みトランザクションのコミット後に `events` へ流す（Runner の `_publish_job` と同じ `job` / `meeting_status` の形。会議の状態は会議ごとに 1 回）。流さないと、SSE で見ている画面は `processing` のまま止まる。コミット前に流すと、受け取ったブラウザの `GET /jobs` が回収前の状態を読む。このため `sweep_once` / `run_forever` は `EventBroker` を受け取り、`repo.sweep_expired` は戻したジョブを返す。
 
 常駐ループ（`sweeper.run_forever`、`JobRunner.run_forever`）は、1 周の失敗（DB のロック、ディスク満杯）を記録して次の周へ進む。例外でループを抜けると、その `asyncio.Task` は誰も待っていないので黙って終わり、サーバーは Chunk を受け取り続けるのにジョブが 1 件も動かない状態になる。記録は標準の `logging`（`minutes_local.jobs.*`）に `ERROR` で出す。ハンドラを設定していなくても標準エラーに出る。
 
@@ -2373,6 +2395,7 @@ from ..db import repo
 from ..db.connection import Database, now_ms
 from ..db.models import AudioChunk
 from . import pipeline
+from .events import EventBroker
 
 log = logging.getLogger(__name__)
 
@@ -2415,7 +2438,7 @@ def _chunks_intact(data_dir: Path, chunks: list[AudioChunk]) -> bool:
     return all(pipeline.chunk_file_intact(data_dir, c) for c in chunks)
 
 
-async def sweep_once(db: Database) -> int:
+async def sweep_once(db: Database, events: EventBroker) -> int:
     """lease が切れたジョブを回収する。戻り値は回収した件数（pending に戻した数 + 回数切れで failed にした数）。"""
     async with db.write() as conn:
         now = now_ms()
@@ -2423,18 +2446,34 @@ async def sweep_once(db: Database) -> int:
         exhausted = repo.fail_exhausted_expired(conn, now)
         for job in exhausted:
             pipeline.on_job_failed(conn, job)
-        n = repo.sweep_expired(conn, now)
-        if n or exhausted:
-            repo.record_metric(conn, "lease_expired", n + len(exhausted))
+        requeued = repo.sweep_expired(conn, now)
+        if requeued or exhausted:
+            repo.record_metric(conn, "lease_expired", len(requeued) + len(exhausted))
         if exhausted:
             repo.record_metric(conn, "lease_expired_exhausted", len(exhausted))
-    return n + len(exhausted)
+    # 配信はコミットの後。トランザクションの中で流すと、受け取ったブラウザの GET /jobs が回収前の状態を読む
+    _publish(db, events, [j.id for j in exhausted + requeued])
+    return len(requeued) + len(exhausted)
 
 
-async def run_forever(db: Database, stop: asyncio.Event, interval_s: float = SWEEP_INTERVAL_S) -> None:
+def _publish(db: Database, events: EventBroker, job_ids: list[str]) -> None:
+    """回収したジョブと会議の状態を、Runner._publish_job と同じ形で流す。会議の状態は会議ごとに 1 回。"""
+    if not job_ids:
+        return
+    with db.read() as conn:
+        jobs = [j for j in (repo.get_job(conn, i) for i in job_ids) if j is not None]
+        meetings = {j.meeting_id: repo.get_meeting(conn, j.meeting_id) for j in jobs}
+    for job in jobs:
+        events.publish(job.meeting_id, {"type": "job", "job": job.model_dump()})
+    for meeting_id, meeting in meetings.items():
+        if meeting is not None:
+            events.publish(meeting_id, {"type": "meeting_status", "status": meeting.status})
+
+
+async def run_forever(db: Database, events: EventBroker, stop: asyncio.Event, interval_s: float = SWEEP_INTERVAL_S) -> None:
     while not stop.is_set():
         try:
-            await sweep_once(db)
+            await sweep_once(db, events)
         except Exception:  # noqa: BLE001
             # 1 回の失敗（DB のロックなど）でループを終わらせない。終わると、落ちたワーカーの lease が回収されなくなる
             log.exception("sweeper iteration failed; retrying")
@@ -2479,6 +2518,8 @@ stateDiagram-v2
 | 旧ワーカーの完了報告 | `repo.finish_job` の `lease_owner` + `attempts` 条件が 0 行 | Sweeper で回収後の二重完了を防ぐ |
 | lease 切れで回数切れ | `repo.fail_exhausted_expired` → `pipeline.on_job_failed` | `failed` の後続処理（Chunk を `failed` にする、会議を `failed` にする）は Runner の `_on_failure` と同じ関数を通る（§14） |
 | 旧ワーカーの結果書き込み | `repo.insert_segments` が `lease_is_current` で弾く | 失効した結果が UNIQUE 行を先取りし、正規の再試行の結果が捨てられるのを防ぐ |
+| 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、`failed` のジョブと `completed` の会議が組になる。`finish_job` の条件はジョブ行しか守らない |
+| 回収の配信 | `sweeper._publish`（コミット後） | §14 |
 
 ---
 
@@ -3997,6 +4038,10 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
     report = SummaryValidationReport(schemaValid=True, schemaRetries=synth.schema_retries, mapWindows=synth.map_windows,
                                      totalItems=total, rejectedItems=len(rejected), unresolvedSegmentIds=unresolved)
     async with ctx.db.write() as conn:
+        # lease が失効していれば要約も会議の completed も書かない（基本設計 §9.3）。Sweeper が回数切れで failed にした後に
+        # 書くと、failed のジョブと completed の会議が組になる。検査と書き込みは同じトランザクションで行う
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return llm_model
         version = repo.next_summary_version(conn, job.meeting_id)
         repo.insert_summary(conn, SummaryVersion(
             id=repo.new_id(), meeting_id=job.meeting_id, version=version, transcript_version=meeting.transcript_version,
@@ -5181,11 +5226,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print(f"token: {token}")
         app = create_app(ctx, token)
         stop = asyncio.Event()
-        await sweeper.sweep_once(ctx.db)
+        await sweeper.sweep_once(ctx.db, ctx.events)
         await sweeper.resume_finalized(ctx.db, s.data_dir)  # Phase 1 で確定した会議（移行した DB）のジョブを作る
         runners = [JobRunner(ctx, HANDLERS, i) for i in range(ctx.models.max_concurrent_stt)]
         tasks = [asyncio.create_task(r.run_forever()) for r in runners]
-        tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, stop)))
+        tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, ctx.events, stop)))
         config = uvicorn.Config(app, host=args.bind, port=s.port, log_level="info")
         server = uvicorn.Server(config)
         try:
@@ -6076,13 +6121,15 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from typing import Any
 
 import httpx
 import pytest
 
 from minutes_local.db import repo
 from minutes_local.db.connection import now_ms
-from minutes_local.jobs import sweeper
+from minutes_local.db.models import Job
+from minutes_local.jobs import handlers, sweeper
 from minutes_local.jobs.context import AppContext
 from minutes_local.jobs.retry import OOMError, decide, InvalidAudioError, ModelMissingError, normalize_exception
 from minutes_local.jobs.runner import JobRunner
@@ -6113,7 +6160,7 @@ async def test_sweeper_recovers_expired_lease_and_ignores_stale_owner(client: ht
     async with ctx.db.write() as conn:
         job = repo.lease_job(conn, "dead-worker", ["vad_chunk"], now_ms() - 600_000, lease_ms=1)
     assert job is not None
-    assert await sweep_once(ctx.db) == 1
+    assert await sweep_once(ctx.db, ctx.events) == 1
     async with ctx.db.write() as conn:
         assert repo.get_job(conn, job.id).status == "pending"
         # 旧ワーカーの完了報告は無視される（基本設計 §9.3）
@@ -6248,7 +6295,7 @@ async def test_sweeper_loop_survives_failed_iteration(ctx: AppContext, monkeypat
     stop = asyncio.Event()
     calls = 0
 
-    async def flaky(_db: object) -> int:
+    async def flaky(_db: object, _events: object) -> int:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -6258,7 +6305,7 @@ async def test_sweeper_loop_survives_failed_iteration(ctx: AppContext, monkeypat
 
     monkeypatch.setattr(sweeper, "sweep_once", flaky)
     # Act
-    await asyncio.wait_for(sweeper.run_forever(ctx.db, stop, interval_s=0.01), timeout=5)
+    await asyncio.wait_for(sweeper.run_forever(ctx.db, ctx.events, stop, interval_s=0.01), timeout=5)
     # Assert
     assert calls == 2
 
@@ -6277,7 +6324,7 @@ async def test_sweeper_fails_job_whose_lease_keeps_expiring(client: httpx.AsyncC
             assert job is not None and job.attempts == attempt and job.max_attempts == 5
             conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
             job_id = job.id
-        assert await sweep_once(ctx.db) == 1
+        assert await sweep_once(ctx.db, ctx.events) == 1
     # Assert: 6 回目は lease できず、Chunk は failed（利用者が再試行か除外を選ぶ。§12）
     async with ctx.db.write() as conn:
         assert repo.lease_job(conn, "w-new", ["transcribe_chunk"], now_ms()) is None
@@ -6285,6 +6332,103 @@ async def test_sweeper_fails_job_whose_lease_keeps_expiring(client: httpx.AsyncC
         chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
     assert failed is not None and (failed.status, failed.error_class) == ("failed", "INTERNAL")
     assert chunk is not None and chunk.stt_status == "failed"
+
+
+async def _run_until_job(ctx: AppContext, runner: JobRunner, job_type: str) -> None:
+    """job_type のジョブが作られるまで 1 件ずつ実行する（そのジョブ自体は実行しない）。"""
+    while True:
+        with ctx.db.read() as conn:
+            if any(j.job_type == job_type for j in repo.list_jobs(conn, "m-1")):
+                return
+        assert await runner.run_once() is True
+
+
+async def _expire_exhausted(ctx: AppContext, job_type: str) -> Job:
+    """job_type を旧ワーカーとして lease し、試行回数を使い切った状態で lease を切らす。戻り値は旧ワーカーが持つ Job。"""
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-dead", [job_type], now_ms())
+        assert job is not None
+        conn.execute("UPDATE processing_jobs SET attempts = max_attempts, lease_until = 0 WHERE id = ?", (job.id,))
+    return job
+
+
+async def test_summary_from_expired_lease_does_not_complete_failed_meeting(client: httpx.AsyncClient, ctx: AppContext,
+                                                                         runner: JobRunner) -> None:
+    """lease を失った旧ワーカーの要約は書かない。書くと failed のジョブと completed の会議の組になる（基本設計 §9.3）。"""
+    # Arrange: 要約ジョブを抱えたワーカーが落ち、回数切れで回収されて会議は failed になる
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    stale = await _expire_exhausted(ctx, "synthesize_minutes")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Act: 旧ワーカーの要約が後から終わる
+    await handlers.handle_summary(ctx, stale)
+    # Assert: 要約は書かれず、会議は failed のまま
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        job = repo.get_job(conn, stale.id)
+        n = conn.execute("SELECT COUNT(*) AS n FROM meeting_summary_versions WHERE meeting_id = 'm-1'").fetchone()["n"]
+    assert meeting is not None and meeting.status == "failed"
+    assert job is not None and job.status == "failed"
+    assert n == 0
+
+
+@pytest.mark.parametrize("job_type", ["vad_chunk", "merge_transcript"])
+async def test_vad_or_merge_failure_keeps_meeting_transcribing_until_retry(client: httpx.AsyncClient, ctx: AppContext,
+                                                                          runner: JobRunner, job_type: str) -> None:
+    """vad / merge の失敗では会議を failed にしない（failed は merge 済みを意味する。§21.1 MERGED_STATUSES）。再試行で進む（§14）。"""
+    # Arrange
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, job_type)
+    failed = await _expire_exhausted(ctx, job_type)
+    # Act
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Assert: 会議は transcribing。vad の失敗では Chunk も pending のまま残り、merge を作らない
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+        types = [j.job_type for j in repo.list_jobs(conn, "m-1")]
+    assert meeting is not None and meeting.status == "transcribing"
+    if job_type == "vad_chunk":
+        assert chunk is not None and chunk.stt_status == "pending"
+        assert "merge_transcript" not in types
+    # 除外の対象ではなく、失敗したジョブの再試行で完了まで進む
+    assert (await client.post("/v1/meetings/m-1/jobs/exclude-failed")).json()["excluded"] == 0
+    assert (await client.post(f"/v1/jobs/{failed.id}/retry")).status_code == 200
+    await runner.run_until_idle()
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").status == "completed"
+
+
+async def test_sweeper_publishes_recovered_jobs_after_commit(client: httpx.AsyncClient, ctx: AppContext,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    """回収したジョブと会議の状態を SSE に流す（流さないと画面が processing のまま止まる）。流すのはコミットの後。"""
+    # Arrange: vad ジョブ 2 件を旧ワーカーが抱えたまま落ちる。1 件は回数が残り、1 件は使い切っている
+    await _seed(client, 2)
+    async with ctx.db.write() as conn:
+        requeued = repo.lease_job(conn, "w-dead", ["vad_chunk"], now_ms())
+        exhausted = repo.lease_job(conn, "w-dead", ["vad_chunk"], now_ms())
+        assert requeued is not None and exhausted is not None
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE meeting_id = 'm-1'")
+        conn.execute("UPDATE processing_jobs SET attempts = max_attempts WHERE id = ?", (exhausted.id,))
+    # 配信した時点で、別の接続から読めた（コミット済みの）状態も記録する
+    seen: list[tuple[dict[str, Any], str | None]] = []
+
+    def spy(meeting_id: str, event: dict[str, Any]) -> None:
+        with ctx.db.read() as conn:
+            if event["type"] == "job":
+                job = repo.get_job(conn, event["job"]["id"])
+                seen.append((event, job.status if job else None))
+            else:
+                meeting = repo.get_meeting(conn, meeting_id)
+                seen.append((event, meeting.status if meeting else None))
+
+    monkeypatch.setattr(ctx.events, "publish", spy)
+    # Act
+    assert await sweep_once(ctx.db, ctx.events) == 2
+    # Assert: pending に戻したジョブと failed にしたジョブの両方を、コミット済みの状態で流す。会議の状態は 1 回
+    jobs = {e["job"]["id"]: (e["job"]["status"], committed) for e, committed in seen if e["type"] == "job"}
+    assert jobs == {requeued.id: ("pending", "pending"), exhausted.id: ("failed", "failed")}
+    assert [(e["status"], committed) for e, committed in seen if e["type"] == "meeting_status"] == [("transcribing", "transcribing")]
 ```
 
 ### 23.4.1 既存 DB のアップグレードと fencing token

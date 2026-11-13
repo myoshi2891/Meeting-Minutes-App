@@ -943,6 +943,9 @@ def on_job_failed(conn: sqlite3.Connection, job: Job) -> None:
         on_transcribe_failed(conn, job_of_chunk(conn, job))
     elif job.job_type == "synthesize_minutes":
         on_summary_failed(conn, job.meeting_id)
+    elif job.job_type in ("vad_chunk", "merge_transcript"):
+        # Chunk も会議も変えず、失敗したジョブの再試行を待つ（Phase 2 §12・§14 の表）
+        return
     elif job.job_type == "diarize_meeting":
         # 話者分離の失敗は transcript を止めない（§2.2）
         on_diarize_finished(conn, job.meeting_id)
@@ -3705,6 +3708,10 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
     report = SummaryValidationReport(schemaValid=True, schemaRetries=synth.schema_retries, mapWindows=synth.map_windows,
                                      totalItems=total, rejectedItems=len(rejected), unresolvedSegmentIds=unresolved)
     async with ctx.db.write() as conn:
+        # lease が失効していれば要約も会議の completed も書かない（基本設計 §9.3）。Sweeper が回数切れで failed にした後に
+        # 書くと、failed のジョブと completed の会議が組になる。検査と書き込みは同じトランザクションで行う
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return llm_model
         version = repo.next_summary_version(conn, job.meeting_id)
         repo.insert_summary(conn, SummaryVersion(
             id=repo.new_id(), meeting_id=job.meeting_id, version=version, transcript_version=meeting.transcript_version,
@@ -4188,12 +4195,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             print(f"token: {token}")
         app = create_app(ctx, token)
         stop = asyncio.Event()
-        await sweeper.sweep_once(ctx.db)
+        await sweeper.sweep_once(ctx.db, ctx.events)
         # Phase 1 で確定した会議と doctor --rebuild が復元した会議のジョブを作る（Phase 2 §14）。diarize は既定の False
         await sweeper.resume_finalized(ctx.db, s.data_dir)
         runners = [JobRunner(ctx, HANDLERS, i) for i in range(ctx.models.max_concurrent_stt)]
         tasks = [asyncio.create_task(r.run_forever()) for r in runners]
-        tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, stop)))
+        tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, ctx.events, stop)))
         tasks.append(asyncio.create_task(scheduler.run_forever(ctx, stop)))
         kwargs = {"ssl_certfile": str(s.tls_cert_path), "ssl_keyfile": str(s.tls_key_path)} if args.tls else {}
         config = uvicorn.Config(app, host=args.bind, port=s.port, log_level="info", **kwargs)
@@ -4919,7 +4926,7 @@ async def test_diarize_that_keeps_crashing_does_not_block_merge(client3: httpx.A
             job = repo_phase3.lease_job_fair(conn, "w-dead", ["diarize_meeting"], now_ms())
             assert job is not None
             conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
-        await sweep_once(ctx3.db)
+        await sweep_once(ctx3.db, ctx3.events)
     await runner3.run_until_idle()
     # Assert: 会議は完了し、話者ラベルは付かない
     with ctx3.db.read() as conn:
