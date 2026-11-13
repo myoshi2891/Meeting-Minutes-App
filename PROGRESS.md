@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-13（設計書の厳しめレビュー 3 回目・未コミット、ブランチ `dev`。PR #14 までマージ済み）
+最終更新: 2026-11-13（Phase 2 server 設計書のレビュー指摘 3 件・未コミット、ブランチ `dev`。PR #14 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,16 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 の設計書レビュー 3 回目の後：Phase 2 server 131 件・Phase 3 server 193 件・Phase 2 client 31 ファイル 559 件・Phase 3 client 35 ファイル 594 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 のレビュー指摘 3 件の後：`server` で Phase 2 server 135 件・Phase 3 server 197 件、pyflakes も通過。client は今回変更なし・未実行。設計書レビュー 3 回目の後：Phase 2 server 131 件・Phase 3 server 193 件・Phase 2 client 31 ファイル 559 件・Phase 3 client 35 ファイル 594 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-13（Phase 2 server 設計書のレビュー指摘 3 件・未コミット）：3 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md` と `docs/design-local-phase3-server.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **lease を失った要約の書き込み**：`handle_summary` が lease を確かめずに要約を書き、会議を `completed` にしていた。Sweeper が回数切れで `failed`（会議も `failed`）にした後でも書けてしまう（修正前は会議が `completed` になることを Red で確認）。書き込みトランザクションの先頭で `lease_is_current` を確かめる。Phase 3 の `handle_summary` にも同じ修正。回帰 1 件。
+  - **Sweeper の配信**：回収したジョブと会議の状態を SSE に流していなかった（画面が `processing` のまま止まる）。`sweep_once(db, events)` / `run_forever(db, events, stop, …)` に変え、コミット後に `job` / `meeting_status` を流す。`repo.sweep_expired` は件数ではなく戻したジョブ（`list[Job]`）を返す。起動処理（Phase 2 / 3）とテストの呼び出しも更新。配信 0 件の Red を確認。回帰 1 件。
+  - **vad / merge の失敗**：`on_job_failed` に分岐を明記し、§14 にジョブ種別ごとの失敗時の状態表を追加。どちらの失敗でも Chunk と会議は変えず（会議の `failed` は merge 済みを意味する）、失敗したジョブの再試行で進む。挙動は従来と同じなので、テストは保存確認 2 件（修正前から Green）。Phase 3 の `on_job_failed` にも同じ分岐。
+  - 確認：`verify-design-docs.sh server` 通過（Phase 2 server 135・Phase 3 server 197）。`npm run typecheck` 通過、`npm test` 24 ファイル / 498 件通過。
+  - **残り（未対応）**：`handle_merge` も lease を確かめずに書く（今回の指摘の範囲外）。次の作業の T-lease-merge に積んだ。
 
 - 2026-11-13（設計書の厳しめレビュー 3 回目・未コミット）：前回「読んでいない」と残した **Phase 3 server の固有部分**（pyannote・FLAC・scheduler・バックアップ・rebuild・CLI）を、カバレッジの低いファイルから読んだ。欠陥は実験かテストの Red で確かめてから直した。製品コード（`src/`・`test/`・`minutes_local/`）と Phase 1 設計書・クライアント設計書は無変更。
   - **Phase 2 / 3 server（lease 切れの回数上限）**：Sweeper が lease 切れのジョブを回数を見ずに `pending` へ戻していた。実行するたびにプロセスを落とすジョブ（話者分離のメモリ不足など）が、**再起動のたびに永久に実行される**（6 回目も lease できることを Red で確認）。`repo.fail_exhausted_expired` → `pipeline.on_job_failed`（新規。Runner の `_on_failure` と共用）。基本設計 §9 の状態遷移図と Sweeper の行も更新。回帰 2 件。
@@ -186,6 +193,10 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## 次の作業
 
 依存関係と並行実行の可否を明記する。「並行可」のタスクは、別エージェントや別セッションに分けても衝突しない（触るファイルが重ならない）。
+
+### T-lease-merge. `handle_merge` の lease 検査（未着手・2026-11-13 起票）
+
+Phase 2 server §20 の `handle_merge` が lease を確かめずに `run_merge` と `on_merge_completed` を書く。lease が切れて Sweeper が回収した後に旧ワーカーが書くと、transcript の版が二重に進むか、回数切れで `failed` になった merge の後に会議が `transcribed` に進む。`handle_summary` と同じく、書き込みトランザクションの先頭で `lease_is_current` を確かめる。修正前に Red になる回帰テストを付ける。Phase 3 の `handle_merge` も確認する。
 
 ### T0. 2026-09-26 までの未コミット変更のコミット ✅ 完了（T10/T12 レビュー修正も 6a240d0 までコミット済み）
 
@@ -380,6 +391,11 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-11-13（Phase 2 server 設計書のレビュー指摘 3 件）
+
+- 有効 3 件：`handle_summary` の lease 検査、Sweeper のコミット後の配信、vad / merge 失敗時の状態表。Phase 3 server にも同じ変更を当てた。
+- 回帰 2 件（Red を確認）と保存確認 2 件。`verify-design-docs.sh server` 通過。未コミット。
 
 ### 2026-11-13（設計書の厳しめレビュー 3 回目）
 
