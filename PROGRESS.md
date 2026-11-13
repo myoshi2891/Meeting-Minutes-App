@@ -368,6 +368,12 @@ T3-c の内容（§31.4）:
 
 新しい順。1 セッション 3〜5 行まで。
 
+### 2026-11-13（レビュー指摘 3 件：補完の再生・エラー応答の本文・閉じていないブロック）
+
+- `MeetingEventsClient.backfill()` の保留分の再生を `replay()` にまとめ、コールバックの例外を 1 件ごとに記録して続ける（次の補完・取り直しを飛ばさない）。`Phase2Client` / `Phase3Client` の `request()` は、エラー応答の本文の読み取り失敗を TIMEOUT / NETWORK にせず status で返す。Phase 2 client を直し、Phase 3 client の載せ直しにも同じ変更を当てた。
+- `scripts/extract-design-code.py`：閉じていないコードブロックがあれば終了コード 1 で失敗させる（前フェーズのファイルのまま検証が通るのを防ぐ）。
+- 検証：追加した回帰テスト 2 件が修正前のコードで Red になることを確認。`scripts/verify-design-docs.sh` 通過（Phase 2 server 128・Phase 3 server 164・Phase 2 client 558・Phase 3 client 593）。製品コードは無変更のため `npm test` は未実行。未コミット。
+
 ### 2026-11-13（設計書の厳しめレビュー 2 回目）
 
 - 展開したコードのカバレッジを起点に、テストが通っていない経路をレビュー。SSE が最初の keepalive で落ちる、Apple Silicon で STT が cuda を選ぶ、モデルの選定が起動時のまま、プールが作り直されない、モデル取得が全滅、録音中の rerun が保存を止める、クライアントが応答を無検証で通す、を修正。詳細は「今回の変更と残課題」。
