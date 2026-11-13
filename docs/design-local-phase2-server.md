@@ -2552,6 +2552,7 @@ stateDiagram-v2
 | 旧ワーカーの VAD 書き込み | `handlers.handle_vad` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば Chunk も `on_vad_completed` も書かない（モデル未配置の分岐も同じ） | 回数切れで `failed` になった vad ジョブを残したまま Chunk が進む |
 | lease 切れ後の VAD 再試行 | `pipeline.on_vad_completed` は `pending` の Chunk にだけ適用する。`POST /jobs/{id}/retry` は `transcribe_chunk` のときだけ Chunk を `queued` にする | 結果をコミットした後に lease が切れて回数切れで回収された vad ジョブを再試行すると、完了済みの Chunk が `queued` に戻り、transcribe ジョブは既存なので作り直されず止まる |
 | lease 切れ後の transcribe 回収 | `pipeline.on_transcribe_failed` は `completed` の Chunk を変えない | ハンドラのコミットと `finish_job` の間で lease が切れ、Sweeper が回数切れで回収すると、書き込み済みの segments を持つ Chunk が `failed`（gap）になる |
+| 旧ワーカーの merge 書き込み | `handlers.handle_merge` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議の `transcribed`・要約ジョブのどれも書かない | 回数切れで `failed` になった merge ジョブを残したまま transcript の版が進み、要約ジョブが作られて会議が `completed` まで進む。lease を取り直した新しいワーカーと二重に merge すると版が 2 回進む |
 | 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、要約の結果を誰も確かめないまま会議が `completed` に戻る。`finish_job` の条件はジョブ行しか守らない |
 | lease 切れ後の要約回収 | `pipeline.on_summary_failed` は `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れて回数切れで回収されると、要約があるのに会議が `failed` になる。この場合はジョブ `failed`・会議 `completed` の組を意図して残す |
 | 回収の配信 | `sweeper._publish`（コミット後） | §14 |
@@ -4046,6 +4047,10 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
 
 async def handle_merge(ctx: AppContext, job: Job) -> str | None:
     async with ctx.db.write() as conn:
+        # lease が失効していれば transcript も会議の状態も書かず、要約ジョブも作らない（基本設計 §9.3）。
+        # 書くと failed の merge ジョブを残したまま transcript の版が進み、要約まで走る
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return None
         report = run_merge(conn, job.meeting_id, ctx.settings.thresholds)
         pipeline.on_merge_completed(conn, job.meeting_id)
     ctx.events.publish(job.meeting_id, {"type": "transcript_version", "transcriptVersion": report.transcript_version})
@@ -6538,6 +6543,24 @@ async def test_vad_from_expired_lease_does_not_advance_chunk(client: httpx.Async
         types = [j.job_type for j in repo.list_jobs(conn, "m-1")]
     assert chunk is not None and chunk.stt_status == "pending"
     assert "transcribe_chunk" not in types
+
+
+async def test_merge_from_expired_lease_does_not_write_transcript(client: httpx.AsyncClient, ctx: AppContext,
+                                                                  runner: JobRunner) -> None:
+    """lease を失った旧ワーカーの merge は書かない。書くと failed の merge ジョブを残したまま transcript が進み、要約ジョブまで作る（基本設計 §9.3）。"""
+    # Arrange: merge ジョブを抱えたワーカーが落ち、回数切れで回収される
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "merge_transcript")
+    stale = await _expire_exhausted(ctx, "merge_transcript")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Act: 旧ワーカーの merge が後から終わる
+    await handlers.handle_merge(ctx, stale)
+    # Assert: transcript の版は進まず、会議は transcribing のまま、要約ジョブも作らない
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        types = [j.job_type for j in repo.list_jobs(conn, "m-1")]
+    assert meeting is not None and (meeting.status, meeting.transcript_version) == ("transcribing", 0)
+    assert "synthesize_minutes" not in types
 
 
 async def test_sweeper_keeps_meeting_completed_by_summary_before_lease_expired(client: httpx.AsyncClient, ctx: AppContext,

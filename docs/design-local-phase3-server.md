@@ -3682,6 +3682,9 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
 
 async def handle_merge(ctx: AppContext, job: Job) -> str | None:
     async with ctx.db.write() as conn:
+        # lease が失効していれば何も書かない（Phase 2 §12 handle_merge）
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return None
         report = run_merge(conn, job.meeting_id, ctx.settings.thresholds)
         pipeline.on_merge_completed(conn, job.meeting_id)
         repo.record_metric(conn, "merge_echo", report.echo, meeting_id=job.meeting_id)
