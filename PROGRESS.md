@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-13（Phase 2 server 設計書のレビュー指摘 4 件・未コミット、ブランチ `dev`。PR #14 までマージ済み）
+最終更新: 2026-11-13（Phase 2 server 設計書のレビュー指摘 2 件・未コミット、ブランチ `dev`。PR #14 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,15 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 のレビュー指摘 3 件の後：`server` で Phase 2 server 135 件・Phase 3 server 197 件、pyflakes も通過。client は今回変更なし・未実行。設計書レビュー 3 回目の後：Phase 2 server 131 件・Phase 3 server 193 件・Phase 2 client 31 ファイル 559 件・Phase 3 client 35 ファイル 594 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 のレビュー指摘 2 件（要約・VAD の lease 切れ後の回収）の後：`server` で Phase 2 server 140 件・Phase 3 server 202 件、pyflakes も通過。レビュー指摘 3 件の後：`server` で Phase 2 server 135 件・Phase 3 server 197 件、pyflakes も通過。client は今回変更なし・未実行。設計書レビュー 3 回目の後：Phase 2 server 131 件・Phase 3 server 193 件・Phase 2 client 31 ファイル 559 件・Phase 3 client 35 ファイル 594 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-13（Phase 2 server 設計書のレビュー指摘 2 件・未コミット）：2 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md` と `docs/design-local-phase3-server.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **lease 切れ後の要約回収**：`handle_summary` が要約と会議の `completed` をコミットした後、`finish_job` の前に lease が切れて回数切れで回収されると、`on_summary_failed` が会議を `failed` にした。`completed` の会議は変えない（ジョブは `failed` のまま。transcribe と同じ方針）。Runner の失敗経路では `on_summary_started` が `summarizing` にしているので `completed` は来ない。ハンドラの結果とジョブ完了を 1 トランザクションにする案は Runner とハンドラの契約が変わるので採らなかった。§14 の表と本文、§15 の表を更新。Phase 3 の `on_summary_failed` にも同じ修正。Red（会議が `failed`）を確認。回帰 1 件。
+  - **lease 切れ後の VAD 再試行**：VAD の結果をコミット → transcribe 完了 → vad ジョブが回数切れで回収 → vad を再試行、の順で Chunk が `queued` のまま止まった。原因は 2 か所。(1) `POST /jobs/{id}/retry` が vad の再試行でも Chunk を `queued` にしていた、(2) `on_vad_completed` が適用済みの Chunk にも結果を書いた（transcribe ジョブは一意制約で作り直されない）。retry は `transcribe_chunk` のときだけ `queued` にし、`on_vad_completed` は `pending` の Chunk にだけ適用する（戻り値 `bool`。`handle_vad` は適用したときだけ VAD の値を書く）。merge は再試行した vad の完了後に Runner の `ensure_merge_job` が作る。`routes_jobs.py` は Phase 3 で載せ直していないので、Phase 3 の `compress_chunk` などの再試行で Chunk が `queued` に戻る問題も同時に直る。Phase 3 の `on_vad_completed` / `handle_vad` にも同じ修正。Red（Chunk が `queued`）を確認。回帰 1 件。
+  - 確認：`verify-design-docs.sh server` 通過（Phase 2 server 140・Phase 3 server 202、pyflakes 指摘なし）。`npm run typecheck` 通過、`npm test` 24 ファイル / 498 件通過。client は今回変更なし・未実行。
+  - **残り（未対応）**：vad の回収時（`on_job_failed` の vad の分岐）に、結果をコミット済みなら `ensure_merge_job` を呼ぶ照合は入れていない。現状は利用者の再試行まで会議が `transcribing` で待つ（再試行すれば進む）。
 
 - 2026-11-13（Phase 2 server 設計書のレビュー指摘 4 件・未コミット）：4 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md` と `docs/design-local-phase3-server.md` のみ。製品コード（`src/`・`test/`）は無変更。
   - **Sweeper のコミット後の読み直し**：`_publish` がコミット後に `db.read()` でジョブと会議を読み直していた。読み取りが失敗するとイベントが失われ、次の周は回収済みのジョブを選ばないので二度と流れない。流す内容（RETURNING の行と、`on_job_failed` の後に読んだ会議）を書き込みトランザクションの中で確定させ、配信だけをコミット後に行う。`_publish(events, jobs, meetings)` に変更（sweeper 内部のみ）。読み取りを失敗させて例外になることを Red で確認。回帰 1 件。
