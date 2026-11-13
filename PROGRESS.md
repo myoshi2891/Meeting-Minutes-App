@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-13（Phase 2 server 設計書のレビュー指摘 2 件・未コミット、ブランチ `dev`。PR #14 までマージ済み）
+最終更新: 2026-11-13（Phase 2 server / client 設計書のレビュー指摘 3 件・未コミット、ブランチ `dev`。PR #14 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,16 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 のレビュー指摘 2 件（要約・VAD の lease 切れ後の回収）の後：`server` で Phase 2 server 140 件・Phase 3 server 202 件、pyflakes も通過。レビュー指摘 3 件の後：`server` で Phase 2 server 135 件・Phase 3 server 197 件、pyflakes も通過。client は今回変更なし・未実行。設計書レビュー 3 回目の後：Phase 2 server 131 件・Phase 3 server 193 件・Phase 2 client 31 ファイル 559 件・Phase 3 client 35 ファイル 594 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 のレビュー指摘 3 件（merge の lease・下書きの書き込み順）の後：`all` で Phase 2 server 141 件・Phase 3 server 203 件・Phase 2 client 31 ファイル 560 件・Phase 3 client 35 ファイル 595 件、tsc・pyflakes も通過。レビュー指摘 2 件（要約・VAD の lease 切れ後の回収）の後：`server` で Phase 2 server 140 件・Phase 3 server 202 件、pyflakes も通過。レビュー指摘 3 件の後：`server` で Phase 2 server 135 件・Phase 3 server 197 件、pyflakes も通過。client は今回変更なし・未実行。設計書レビュー 3 回目の後：Phase 2 server 131 件・Phase 3 server 193 件・Phase 2 client 31 ファイル 559 件・Phase 3 client 35 ファイル 594 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-13（Phase 2 server / client 設計書のレビュー指摘 3 件・未コミット）：2 件を修正、1 件をスキップした。変更は `docs/design-local-phase2-server.md`・`docs/design-local-phase3-server.md`・`docs/design-local-phase2-client.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **スキップ：`on_merge_completed` で終端の要約ジョブを作り直す**：基本設計 §12.7 が「`transcript_version` が進んだ後の再生成は自動では起動せず、UI の操作でのみ起動する」と決めており、`test_manual_transcribe_of_skipped_chunk_reaches_the_transcript` もその挙動（`transcribed`・要約の版 1）を固定している。`transcribed` の会議に完了済みの要約ジョブが残っても、再生成（`reset_job_for_rerun`）で抜けられる。
+  - **`handle_merge` の lease 検査（T-lease-merge を解消）**：書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議・要約ジョブのどれも書かない。§15 の表に行を追加。Phase 3 の `handle_merge` にも同じ修正（`merge_echo` の記録も検査の後）。Red（版が 1 に進み会議が `transcribed`）を確認。回帰 1 件。
+  - **Phase 2 client `NotesStore` の下書きの書き込み順**：`setDraft`・`acceptServer`・`doSave` の IndexedDB 書き込みを `writeDraft()` の鎖で発行順に直列化し、`dispose()` は鎖の末尾まで待つ。失敗は鎖の中で `onError` に渡す（`onError` が投げても鎖は止めず `console.error`。`setDraft` の失敗も `onError` に届くようになった）。鎖が空なら呼び出しの中で同期的に書き始める（`then` で遅らせると、待たずに作り直したインスタンスの `load()` が書き込み前を読む。既存テスト 2 件がこれで Red になったので直した）。**実装の `SettingsStore` はトランザクションを同期的に作るので本番では起きない**。`DraftStore` のインターフェースが完了順を保証せず、設計書のテスト自身が順序の入れ替わる Store で検証しているための対策。§10 本文と §15.1 W8 を更新。Red（作り直したインスタンスが `["a"]` を `saved: true` で読み、編集が失われる）を Phase 2 / 3 client の両方で確認。回帰 1 件。
+  - 確認：`verify-design-docs.sh all` 通過（Phase 2 server 141・Phase 3 server 203・Phase 2 client 560・Phase 3 client 595、tsc・pyflakes 指摘なし）。`npm run typecheck` 通過、`npm test` 24 ファイル / 498 件通過。
+  - **残り（未対応）**：`MERGED_STATUSES` に `summarizing` が含まれるので、要約の実行中に手動 STT（無音 Chunk）を受けると merge が走って会議が `transcribed` に戻り、その後に古い版の要約が `completed` を書く。今回の指摘とは別件。Runner の `_publish_job` のコミット後の読み直しも残る。
 
 - 2026-11-13（Phase 2 server 設計書のレビュー指摘 2 件・未コミット）：2 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md` と `docs/design-local-phase3-server.md` のみ。製品コード（`src/`・`test/`）は無変更。
   - **lease 切れ後の要約回収**：`handle_summary` が要約と会議の `completed` をコミットした後、`finish_job` の前に lease が切れて回数切れで回収されると、`on_summary_failed` が会議を `failed` にした。`completed` の会議は変えない（ジョブは `failed` のまま。transcribe と同じ方針）。Runner の失敗経路では `on_summary_started` が `summarizing` にしているので `completed` は来ない。ハンドラの結果とジョブ完了を 1 トランザクションにする案は Runner とハンドラの契約が変わるので採らなかった。§14 の表と本文、§15 の表を更新。Phase 3 の `on_summary_failed` にも同じ修正。Red（会議が `failed`）を確認。回帰 1 件。
@@ -208,11 +215,12 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 依存関係と並行実行の可否を明記する。「並行可」のタスクは、別エージェントや別セッションに分けても衝突しない（触るファイルが重ならない）。
 
-### T-lease-merge. `handle_merge` の lease 検査（未着手・2026-11-13 起票）
+### T-lease-merge. `handle_merge` の lease 検査（lease 検査は 2026-11-13 に対応済み・未コミット。残りは下記）
 
-Phase 2 server §20 の `handle_merge` が lease を確かめずに `run_merge` と `on_merge_completed` を書く。lease が切れて Sweeper が回収した後に旧ワーカーが書くと、transcript の版が二重に進むか、回数切れで `failed` になった merge の後に会議が `transcribed` に進む。`handle_summary` と同じく、書き込みトランザクションの先頭で `lease_is_current` を確かめる。修正前に Red になる回帰テストを付ける。Phase 3 の `handle_merge` も確認する。
+`handle_merge` の lease 検査は Phase 2 / 3 とも入れた（回帰テスト `test_merge_from_expired_lease_does_not_write_transcript`）。残りは次の 2 点。
 
-あわせて、Runner の `_publish_job` もコミット後に `db.read()` で読み直している（Sweeper は 2026-11-13 にトランザクション内で確定する形へ直した）。読み取りが失敗するとそのジョブのイベントが流れないので、同じ形にするかを判断する。
+- 要約の実行中（`summarizing`）に手動 STT を受けると merge が走り、会議が `transcribed` に戻った後に古い版の要約が `completed` を書く。手動 STT の前提条件から `summarizing` を外すか、要約の書き込みで transcript の版を照合するかを決める。
+- Runner の `_publish_job` もコミット後に `db.read()` で読み直している（Sweeper は 2026-11-13 にトランザクション内で確定する形へ直した）。読み取りが失敗するとそのジョブのイベントが流れないので、同じ形にするかを判断する。
 
 ### T0. 2026-09-26 までの未コミット変更のコミット ✅ 完了（T10/T12 レビュー修正も 6a240d0 までコミット済み）
 
