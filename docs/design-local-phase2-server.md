@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── ブラウザ側（`docs/design-local-phase2-client.md`）。
 **配置:** `docs/design-local-phase2-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。
-**検証状態:** 本書のコードブロック（61 ファイル：`pyproject.toml`・実装 47・テスト 13）はパッケージとして抽出でき、Fake Provider による pytest 13 ファイル 128 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-13、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。Fake Provider のテストが通らない経路（実行デバイスの選定、faster-whisper の呼び出し、プロセスプールの作り直し、起動後のモデルの選び直し、モデルの取得、SSE の keepalive）は §23.8.2 がスタブと実プロセスで確かめる。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
+**検証状態:** 本書のコードブロック（61 ファイル：`pyproject.toml`・実装 47・テスト 13）はパッケージとして抽出でき、Fake Provider による pytest 13 ファイル 131 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-13、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。Fake Provider のテストが通らない経路（実行デバイスの選定、faster-whisper の呼び出し、プロセスプールの作り直し、起動後のモデルの選び直し、モデルの取得、SSE の keepalive）は §23.8.2 がスタブと実プロセスで確かめる。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
 
 ---
 
@@ -957,6 +957,25 @@ def finish_job(conn: sqlite3.Connection, job_id: str, owner: str, attempts: int,
     return cur.rowcount == 1
 
 
+def fail_exhausted_expired(conn: sqlite3.Connection, now: int) -> list[Job]:
+    """lease が切れたジョブのうち、試行回数を使い切ったものを failed にして返す。sweep_expired() より先に呼ぶ。
+
+    lease 切れは、ワーカーがジョブを抱えたまま落ちた・固まったことを意味し、Runner の失敗処理（回数の判定）を通らない。
+    回数を見ずに pending へ戻すと、実行するたびにプロセスを落とすジョブ（メモリ不足で OS に止められる等）が、
+    サーバーを起動し直すたびに永久に実行される。attempts は lease のたびに進む（lease_job）ので、ここで上限と比べる。
+    後続の処理（Chunk を failed にする等）は呼び出し側が pipeline.on_job_failed() で行う。
+    """
+    rows = conn.execute(
+        """UPDATE processing_jobs
+           SET status = 'failed', error_class = 'INTERNAL', last_error = 'lease expired; attempts exhausted',
+               lease_until = NULL, lease_owner = NULL, updated_at = ?
+           WHERE status IN ('leased','processing') AND lease_until IS NOT NULL AND lease_until < ? AND attempts >= max_attempts
+           RETURNING *""",
+        (now, now),
+    ).fetchall()
+    return [_row(Job, r) for r in rows]
+
+
 def sweep_expired(conn: sqlite3.Connection, now: int) -> int:
     cur = conn.execute(
         """UPDATE processing_jobs
@@ -1889,6 +1908,14 @@ def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
     repo.update_chunk(conn, chunk.id, stt_status="failed")
 
 
+def on_job_failed(conn: sqlite3.Connection, job: Job) -> None:
+    """ジョブが failed で確定した後の後続処理。Runner（ハンドラの失敗）と Sweeper（lease 切れで回数切れ）が同じ規則を使う。"""
+    if job.job_type == "transcribe_chunk":
+        on_transcribe_failed(conn, job_of_chunk(conn, job))
+    elif job.job_type == "synthesize_minutes":
+        on_summary_failed(conn, job.meeting_id)
+
+
 def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str) -> bool:
     """全 Chunk が終端（completed / skipped / 除外承認済み failed）かつ vad が残っていなければ merge を生成。"""
     counts = repo.count_chunks_by_stt(conn, meeting_id)
@@ -2136,6 +2163,7 @@ async def refresh_llm(ctx: AppContext) -> None:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -2146,6 +2174,8 @@ from ..db.models import Job
 from . import pipeline
 from .context import AppContext
 from .retry import JobError, decide, normalize_exception
+
+log = logging.getLogger(__name__)
 
 Handler = Callable[[AppContext, Job], Awaitable[str | None]]
 """ハンドラは成功時に None（または使用モデル名）を返し、失敗時に JobError を送出する。"""
@@ -2192,7 +2222,14 @@ class JobRunner:
 
     async def run_forever(self, idle_sleep_s: float = 1.0) -> None:
         while not self._stop.is_set():
-            ran = await self.run_once()
+            try:
+                ran = await self.run_once()
+            except Exception:  # noqa: BLE001
+                # ハンドラの例外は _execute が JobError にして記録する。ここへ来るのは lease や結果の記録そのものの失敗
+                # （DB のロック・ディスク満杯）。ループを終わらせると、サーバーは Chunk を受け取り続けるのに以後のジョブが
+                # 1 件も動かない。lease したままのジョブは Sweeper が期限切れで回収する
+                log.exception("job runner iteration failed; retrying")
+                ran = False
             if not ran:
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=idle_sleep_s)
@@ -2253,10 +2290,7 @@ class JobRunner:
             if err.error_class == "OOM" and job.job_type == "transcribe_chunk":
                 self._downgrade_stt(conn, job.meeting_id, job.model_name)
             if d.next_status == "failed":
-                if job.job_type == "transcribe_chunk":
-                    pipeline.on_transcribe_failed(conn, pipeline.job_of_chunk(conn, job))
-                elif job.job_type == "synthesize_minutes":
-                    pipeline.on_summary_failed(conn, job.meeting_id)
+                pipeline.on_job_failed(conn, job)
             elif job.job_type == "synthesize_minutes":
                 # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
                 pipeline.on_summary_deferred(conn, job.meeting_id)
@@ -2315,18 +2349,32 @@ class JobRunner:
 
 # 14. Sweeper `jobs/sweeper.py`
 
+lease が切れたジョブの扱いは 2 通りある（基本設計 §9.3）。
+
+| 条件 | 扱い | 理由 |
+| --- | --- | --- |
+| `attempts < max_attempts` | `pending` に戻す（`repo.sweep_expired`） | ワーカーが落ちた・固まった。別のワーカーがやり直す |
+| `attempts >= max_attempts` | `failed`（`error_class = INTERNAL`）にし、`pipeline.on_job_failed()` を呼ぶ（`repo.fail_exhausted_expired`） | lease 切れは Runner の失敗処理（`retry.decide` の回数判定）を通らない。回数を見ずに戻すと、実行するたびにプロセスごと落とすジョブが、サーバーを起動し直すたびに永久に実行される。`attempts` は lease のたびに進むので、上限と比べられる |
+
+`failed` になった `transcribe_chunk` は Chunk を `failed` にして merge を止め、利用者の再試行（`POST /jobs/{id}/retry`。`attempts` を 0 に戻す）か除外を待つ。ハンドラが失敗した場合と同じ扱いである。
+
+常駐ループ（`sweeper.run_forever`、`JobRunner.run_forever`）は、1 周の失敗（DB のロック、ディスク満杯）を記録して次の周へ進む。例外でループを抜けると、その `asyncio.Task` は誰も待っていないので黙って終わり、サーバーは Chunk を受け取り続けるのにジョブが 1 件も動かない状態になる。記録は標準の `logging`（`minutes_local.jobs.*`）に `ERROR` で出す。ハンドラを設定していなくても標準エラーに出る。
+
 ```python
 # minutes_local/jobs/sweeper.py
 """lease 期限切れジョブの回収。起動時と 30 秒ごと。基本設計 §9.3。起動時には確定済みで止まった会議も回収する。"""
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from ..db import repo
 from ..db.connection import Database, now_ms
 from ..db.models import AudioChunk
 from . import pipeline
+
+log = logging.getLogger(__name__)
 
 SWEEP_INTERVAL_S = 30.0
 
@@ -2368,16 +2416,28 @@ def _chunks_intact(data_dir: Path, chunks: list[AudioChunk]) -> bool:
 
 
 async def sweep_once(db: Database) -> int:
+    """lease が切れたジョブを回収する。戻り値は回収した件数（pending に戻した数 + 回数切れで failed にした数）。"""
     async with db.write() as conn:
-        n = repo.sweep_expired(conn, now_ms())
-        if n:
-            repo.record_metric(conn, "lease_expired", n)
-    return n
+        now = now_ms()
+        # 回数を使い切ったものは pending に戻さず failed にする（落ち続けるジョブを永久に実行しない。§8 fail_exhausted_expired）
+        exhausted = repo.fail_exhausted_expired(conn, now)
+        for job in exhausted:
+            pipeline.on_job_failed(conn, job)
+        n = repo.sweep_expired(conn, now)
+        if n or exhausted:
+            repo.record_metric(conn, "lease_expired", n + len(exhausted))
+        if exhausted:
+            repo.record_metric(conn, "lease_expired_exhausted", len(exhausted))
+    return n + len(exhausted)
 
 
 async def run_forever(db: Database, stop: asyncio.Event, interval_s: float = SWEEP_INTERVAL_S) -> None:
     while not stop.is_set():
-        await sweep_once(db)
+        try:
+            await sweep_once(db)
+        except Exception:  # noqa: BLE001
+            # 1 回の失敗（DB のロックなど）でループを終わらせない。終わると、落ちたワーカーの lease が回収されなくなる
+            log.exception("sweeper iteration failed; retrying")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_s)
         except asyncio.TimeoutError:
@@ -2399,8 +2459,10 @@ stateDiagram-v2
     processing --> retrying : retry.decide → retrying
     processing --> failed : retry.decide → failed
     retrying --> pending : lease_job の next_run_at <= now 条件で再取得（状態列は retrying のまま lease される）
-    leased --> pending : sweeper.sweep_once
-    processing --> pending : sweeper.sweep_once
+    leased --> pending : sweeper.sweep_once（attempts < max_attempts）
+    processing --> pending : sweeper.sweep_once（attempts < max_attempts）
+    leased --> failed : sweeper.sweep_once（attempts >= max_attempts）
+    processing --> failed : sweeper.sweep_once（attempts >= max_attempts）
     pending --> cancelled : pipeline.exclude_failed / request_rerun_stt
     retrying --> cancelled : 同上
     failed --> pending : repo.retry_job（API POST /jobs/{id}/retry）
@@ -2415,6 +2477,7 @@ stateDiagram-v2
 | `OOM` 時のダウングレード | `JobRunner._downgrade_stt` | `meetings.stt_model_used` と、未実行 `transcribe_chunk` の `model_name` を一括更新 |
 | `MODEL_MISSING` / `PROVIDER_UNREACHABLE` | `retry.decide` が `consume_attempt=False`。Runner が `attempts` を戻す | 無期限 retry。5 分間隔 |
 | 旧ワーカーの完了報告 | `repo.finish_job` の `lease_owner` + `attempts` 条件が 0 行 | Sweeper で回収後の二重完了を防ぐ |
+| lease 切れで回数切れ | `repo.fail_exhausted_expired` → `pipeline.on_job_failed` | `failed` の後続処理（Chunk を `failed` にする、会議を `failed` にする）は Runner の `_on_failure` と同じ関数を通る（§14） |
 | 旧ワーカーの結果書き込み | `repo.insert_segments` が `lease_is_current` で弾く | 失効した結果が UNIQUE 行を先取りし、正規の再試行の結果が捨てられるのを防ぐ |
 
 ---
@@ -5034,7 +5097,7 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
                 from .vad.silero_provider import SileroVADProvider
                 vad = SileroVADProvider(p, th.vad_threshold, th.vad_min_speech_ms, th.vad_min_voiced_ms)
             except ImportError:
-                # モデルは置いてあるが onnxruntime（extras の vad）が入っていない。起動を止めず、未配置と同じく
+                # モデルは置いてあるが onnxruntime（extras の stt / cuda）が入っていない。起動を止めず、未配置と同じく
                 # ブラウザ側の VAD で進める（doctor の vad 行に NOT INSTALLED と出る）
                 vad = None
 
@@ -6011,11 +6074,15 @@ async def test_web_dir_is_served_at_root_without_token_and_does_not_shadow_api(c
 # tests/test_jobs.py
 from __future__ import annotations
 
+import asyncio
+import sqlite3
+
 import httpx
 import pytest
 
 from minutes_local.db import repo
 from minutes_local.db.connection import now_ms
+from minutes_local.jobs import sweeper
 from minutes_local.jobs.context import AppContext
 from minutes_local.jobs.retry import OOMError, decide, InvalidAudioError, ModelMissingError, normalize_exception
 from minutes_local.jobs.runner import JobRunner
@@ -6152,6 +6219,72 @@ async def test_allowed_types_excludes_summary_while_stt_running(ctx: AppContext)
         conn.execute("INSERT INTO meetings (id,title,status,session_start_epoch_ms,native_sample_rate,consent_confirmed_at,created_at,updated_at) VALUES ('m','t','transcribing',0,16000,1,?,?)", (t, t))
         conn.execute("INSERT INTO processing_jobs (id,meeting_id,job_type,status,priority,created_at,updated_at) VALUES ('j','m','transcribe_chunk','processing',100,?,?)", (t, t))
     assert "synthesize_minutes" not in runner.allowed_types()
+
+
+async def test_runner_loop_survives_failed_iteration(ctx: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    """1 回の失敗（DB のロック・ディスク満杯）で常駐ループが終わらない。終わると、以後のジョブが 1 件も動かない。"""
+    # Arrange: 1 回目の run_once だけ失敗させる
+    runner = JobRunner(ctx, {})
+    calls = 0
+
+    async def flaky() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database or disk is full")
+        runner.stop()
+        return False
+
+    monkeypatch.setattr(runner, "run_once", flaky)
+    # Act
+    await asyncio.wait_for(runner.run_forever(idle_sleep_s=0.01), timeout=5)
+    # Assert: 失敗の後も次の周回が回った
+    assert calls == 2
+
+
+async def test_sweeper_loop_survives_failed_iteration(ctx: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    """回収ループも 1 回の失敗で終わらない。終わると、落ちたワーカーの lease が期限切れのまま回収されない。"""
+    # Arrange
+    stop = asyncio.Event()
+    calls = 0
+
+    async def flaky(_db: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        stop.set()
+        return 0
+
+    monkeypatch.setattr(sweeper, "sweep_once", flaky)
+    # Act
+    await asyncio.wait_for(sweeper.run_forever(ctx.db, stop, interval_s=0.01), timeout=5)
+    # Assert
+    assert calls == 2
+
+
+async def test_sweeper_fails_job_whose_lease_keeps_expiring(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
+    """実行するたびにワーカーごと落ちるジョブは、試行回数を使い切ったら failed にする（再起動のたびに永久に実行しない）。"""
+    # Arrange: VAD まで進め、transcribe ジョブを待機にする
+    await _seed(client, 1)
+    await finalize(client, "m-1", mic=1)
+    assert await runner.run_once() is True
+    # Act: lease しては結果を報告せずに落ちる、を max_attempts 回くり返す
+    job_id = ""
+    for attempt in range(1, 6):
+        async with ctx.db.write() as conn:
+            job = repo.lease_job(conn, "w-dead", ["transcribe_chunk"], now_ms())
+            assert job is not None and job.attempts == attempt and job.max_attempts == 5
+            conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
+            job_id = job.id
+        assert await sweep_once(ctx.db) == 1
+    # Assert: 6 回目は lease できず、Chunk は failed（利用者が再試行か除外を選ぶ。§12）
+    async with ctx.db.write() as conn:
+        assert repo.lease_job(conn, "w-new", ["transcribe_chunk"], now_ms()) is None
+        failed = repo.get_job(conn, job_id)
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    assert failed is not None and (failed.status, failed.error_class) == ("failed", "INTERNAL")
+    assert chunk is not None and chunk.stt_status == "failed"
 ```
 
 ### 23.4.1 既存 DB のアップグレードと fencing token
@@ -7233,6 +7366,8 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | faster-whisper 正常処理 | `test_full_pipeline_with_silent_chunk` |
 | GPU OOM retry + ダウングレード | `test_oom_downgrades_model_per_meeting`、`test_two_jobs_failing_with_oom_on_the_same_model_downgrade_once`、`test_downgrade_skips_models_that_are_not_installed`、`test_provider_loads_on_the_requested_device_and_keeps_one_model` |
 | ワーカークラッシュ → Sweeper → 再 lease | `test_sweeper_recovers_expired_lease_and_ignores_stale_owner`、`test_pool_is_rebuilt_after_a_worker_crash`、`test_pool_is_rebuilt_after_a_timeout` |
+| 落ち続けるジョブを永久に実行しない（lease 切れの回数上限） | `test_sweeper_fails_job_whose_lease_keeps_expiring` |
+| 常駐ループが 1 周の失敗で終わらない | `test_runner_loop_survives_failed_iteration`、`test_sweeper_loop_survives_failed_iteration` |
 | invalid audio no-retry | `test_failed_chunk_blocks_until_excluded`、`test_retry_decisions` |
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
 | DLQ = failed + 再試行 | `test_retry_failed_job_via_api`、`test_failed_chunk_blocks_until_excluded` |
@@ -7316,6 +7451,7 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | R4 | SSE の `job` イベントの形 | `JobRunner` は DB 行（snake_case）を流し、`GET /jobs` は camelCase（`job_view`）。ブラウザ側 §3 の `jobFromServerRow` が両方を受ける | 動作はするが契約が 2 つある。`job_view` を共有の場所へ移して SSE もそれを流せば 1 つにできる |
 | R5 | `PUT /notes` の `If-Match` なし | 無条件の上書きとして受ける（本書のクライアントは必ず付ける） | 他のクライアントが付け忘れると楽観ロックが効かない。必須（428）にするかを決める |
 | R6 | `transcribe_chunk` 実行中の排他は片方向 | STT 実行中は要約を lease しないが、要約の実行中に別の会議の STT は始まる（基本設計 §5.2 の規則どおり） | `gpu_small` で要約と STT が重なり OOM になりうる（どちらも retryable） |
+| R7 | サーバーの通常終了（Ctrl-C）が実行中のジョブの lease を返さない | `_cmd_serve` の `finally` は Task を cancel するだけで、ジョブは `processing` のまま残る。次の起動では lease の期限（最長 5 分）が切れるまで再実行されず、切れた時点で 1 回分の試行として数える（§14） | 同じジョブの実行中に 5 回終了すると `failed` になる（利用者の再試行で戻せる）。直すなら、cancel を受けた `_execute` が `attempts` を戻して `pending` にし、`_cmd_serve` が Task の終了を待ってから DB を閉じる |
 
 ---
 

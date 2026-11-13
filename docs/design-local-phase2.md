@@ -589,8 +589,10 @@ stateDiagram-v2
     processing --> retrying : retryable エラー かつ attempts < max_attempts
     processing --> failed : non-retryable エラー または attempts >= max_attempts
     retrying --> pending : next_run_at 到達（backoff）
-    leased --> pending : Sweeper が lease 期限切れを検出
-    processing --> pending : Sweeper が lease 期限切れを検出（ワーカークラッシュ）
+    leased --> pending : Sweeper が lease 期限切れを検出（attempts < max_attempts）
+    processing --> pending : Sweeper が lease 期限切れを検出（ワーカークラッシュ、attempts < max_attempts）
+    leased --> failed : Sweeper が lease 期限切れを検出（attempts >= max_attempts）
+    processing --> failed : Sweeper が lease 期限切れを検出（attempts >= max_attempts）
     pending --> cancelled : 会議削除 / 利用者キャンセル
     retrying --> cancelled : 同上
     failed --> pending : 利用者が「再試行」（attempts をリセット）
@@ -628,7 +630,7 @@ RETURNING id, meeting_id, chunk_id, job_type, attempts, model_name;
 | 仕組み | 内容 |
 | --- | --- |
 | heartbeat | `processing` 中のワーカーは 60 秒ごとに `UPDATE ... SET lease_until = now + 300000 WHERE id = ? AND lease_owner = ?` を発行する。STT 1 Chunk は通常 5 分未満だが、CPU-only の large モデルなど長時間の場合に備える |
-| Sweeper | 30 秒ごとに `status IN ('leased','processing') AND lease_until < now` を `pending` に戻し、`last_error = 'lease expired'` を記録する。起動時にも 1 回実行する（§5.3） |
+| Sweeper | 30 秒ごとに `status IN ('leased','processing') AND lease_until < now` を `pending` に戻し、`last_error = 'lease expired'` を記録する。起動時にも 1 回実行する（§5.3）。**`attempts >= max_attempts` のものは `pending` に戻さず `failed`（`error_class = INTERNAL`）にし、ハンドラの失敗と同じ後続処理を行う**。lease 切れはワーカーがジョブを抱えたまま落ちたことを意味し、Runner の回数判定を通らない。回数を見ずに戻すと、実行するたびにプロセスを落とすジョブ（メモリ不足で OS に止められる等）が再起動のたびに永久に実行される |
 | 二重実行 | Sweeper で戻された後に旧ワーカーが完了報告を送ってきた場合、`UPDATE ... WHERE id = :id AND lease_owner = :owner AND attempts = :attempts` が 0 行になるため無視される。§9.2 の `RETURNING` が返す `attempts` を fencing token としてワーカーが持ち回り、完了報告と結果の書き込みの両方に付ける |
 | 結果の書き込み | `transcript_segments` への INSERT は完了報告と同じトランザクションで行い、先に `SELECT 1 FROM processing_jobs WHERE id = :id AND lease_owner = :owner AND attempts = :attempts AND status = 'processing'` を検証して 0 行なら INSERT せずに結果を破棄する。lease 失効後の旧ワーカーが `INSERT OR IGNORE` で `UNIQUE (chunk_id, segment_index)` を先に埋め、正規の再試行（`attempts` が進んだ側）の結果が無視される事態を防ぐ。検証を通った同一 attempt の重複報告は `UNIQUE` + `INSERT OR IGNORE` で冪等のまま（Invariant 5） |
 
