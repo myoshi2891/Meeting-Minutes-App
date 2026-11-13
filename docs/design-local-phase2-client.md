@@ -2516,6 +2516,9 @@ export class NotesStore {
   private async save(): Promise<void> {
     if (this.inflight !== null) {
       await this.inflight;
+      // doSave の stillSame 判定の後（保存後の控えの書き込み中）に入った編集は doSave が予約しない。
+      // ここで予約し直さないと dirty のまま取り残される（dispose 後は schedule が予約しない）
+      if (this.state.sync === "dirty") this.schedule();
       return;
     }
     if (this.state.sync !== "dirty") return;
@@ -4041,6 +4044,31 @@ describe("NotesStore", () => {
     // Assert: 保存中の編集（stillSame=false）でも予約しない
     expect(b.timers).toHaveLength(0);
     expect(b.puts).toEqual([{ json: ["a"], revision: 0 }]);
+  });
+
+  it("保存後の控えの書き込み中に入った編集は、送信中の保存の完了を待った後に予約し直して送る", async () => {
+    // Arrange: PUT は成功（stillSame=true で予約しない）し、保存済みの控えの書き込みだけを止める
+    const b = build();
+    let releaseDrafts: () => void = () => undefined;
+    const draftGate = new Promise<void>((r) => (releaseDrafts = r));
+    const deps: NotesStoreDeps = {
+      ...b.deps,
+      drafts: { get: b.deps.drafts.get, set: async (k, v) => { if ((v as { saved?: unknown }).saved === true) await draftGate; await b.deps.drafts.set(k, v); } },
+    };
+    const store = new NotesStore(deps, "m");
+    await store.load();
+    store.setDraft(["a"]);
+    await b.fire();
+    store.setDraft(["ab"]);                              // 控えの書き込み中＝送信中の保存の完了前に編集する
+    await b.fire();                                      // debounce が切れても送信中の保存を待つだけで返る
+    // Act
+    releaseDrafts();
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+    // Assert: 編集が dirty のまま取り残されず、送り直しが予約されて送られる
+    expect(b.timers).toHaveLength(1);
+    await b.fire();
+    expect(b.puts).toEqual([{ json: ["a"], revision: 0 }, { json: ["ab"], revision: 1 }]);
+    expect(store.current.sync).toBe("saved");
   });
 
   it("debounce 後に 1 回だけ PUT し、revision が進む", async () => {
