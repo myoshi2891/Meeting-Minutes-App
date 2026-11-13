@@ -933,7 +933,14 @@ def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk, diarize
 
 
 def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
-    """failed は merge をブロックする。利用者が retry か exclude_failed を選ぶまで待つ（v4.0 §97〜§98）。"""
+    """failed は merge をブロックする。利用者が retry か exclude_failed を選ぶまで待つ（v4.0 §97〜§98）。
+
+    completed の Chunk は変えない。ハンドラが結果を書いた後、finish_job の前に lease が切れて Sweeper が回数切れで
+    回収すると、ここに来る。failed にすると書き込み済みの segments が gap になる（Phase 2 §14）。
+    """
+    current = repo.get_chunk(conn, chunk.id)
+    if current is not None and current.stt_status == "completed":
+        return
     repo.update_chunk(conn, chunk.id, stt_status="failed")
 
 
@@ -3478,6 +3485,9 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
         # transcribe_chunk 生成へ進む。skipped は audio_chunks.stt_status 専用の値であり、
         # processing_jobs.status には存在しない（Phase 2 基本設計 §13.1）。
         async with ctx.db.write() as conn:
+            # lease が失効していれば書かない（Phase 2 基本設計 §9.3）。検査と書き込みは同じトランザクションで行う
+            if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                return None
             pipeline.on_vad_completed(conn, chunk, chunk.has_voice, _stt_model_for(ctx, job.meeting_id, conn), ctx.diarization_active)
         return None
     try:
@@ -3488,6 +3498,9 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
         raise InvalidAudioError(str(e)) from e
     result = await asyncio.to_thread(ctx.vad.detect, pcm)
     async with ctx.db.write() as conn:
+        # 失効した旧ワーカーが書くと、failed の vad ジョブを残したまま Chunk が進む（Phase 2 §12 handle_vad）
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return None
         repo.update_chunk(conn, chunk.id, has_voice=result.has_voice, server_vad_score=result.voiced_ratio, vad_source="server_silero")
         pipeline.on_vad_completed(conn, chunk, result.has_voice, _stt_model_for(ctx, job.meeting_id, conn), ctx.diarization_active)
     return None
