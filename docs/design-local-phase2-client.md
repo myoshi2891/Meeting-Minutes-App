@@ -1926,7 +1926,7 @@ export class MeetingEventsClient {
     // 新しい補完の後に流すと古い status で巻き戻すが、前に流せば「前の保留 → 新しい補完 → 新しい保留」と時間の順に並ぶ
     const previous = this.held ?? [];
     this.held = null;
-    for (const data of previous) this.handle(data);
+    this.replay(previous);
     this.held = [];
     let failed = false;
     try {
@@ -1955,7 +1955,7 @@ export class MeetingEventsClient {
     // 補完に失敗しても保留分は流す（live を失わない）
     const held = this.held ?? [];
     this.held = null;
-    for (const data of held) this.handle(data);
+    this.replay(held);
     // 接続が開いたままだと次の open は来ず、切断中の変化（確定した status など）が戻らない。
     // 同じ接続のまま有限回だけ取り直す。取り直しも保留からやり直すので、先に流した live を古い値で巻き戻さない
     const delay = BACKFILL_RETRY_DELAYS_MS[attempt];
@@ -1964,6 +1964,20 @@ export class MeetingEventsClient {
       this.backfillRetry = null;
       if (generation === this.generation) void this.backfill(attempt + 1);
     }, delay);
+  }
+
+  /**
+   * 保留したイベントを順に流す。onEvent などのコールバックが 1 件で投げても、残りのイベントと、
+   * その後の補完の要求・取り直しの予約を飛ばさない（void で呼ばれた補完の未処理の reject になるだけなので、記録して続ける）
+   */
+  private replay(items: readonly string[]): void {
+    for (const data of items) {
+      try {
+        this.handle(data);
+      } catch (callbackError) {
+        console.error("[MeetingEventsClient] event callback threw:", callbackError);
+      }
+    }
   }
 
   private cancelBackfillRetry(): void {
@@ -2287,10 +2301,14 @@ export class Phase2Client {
         try {
           json = await res.json();
         } catch (error) {
-          // 本文の読み取り中の中断（タイムアウト）・通信断は外の catch で TIMEOUT / NETWORK にする（成功扱いにしない）
-          if (!(error instanceof SyntaxError)) throw error;
-          // 壊れた本文。成功応答なら null を値として返さず MALFORMED、エラー応答なら本文なしとして status で返す
-          if (res.ok) return { ok: false, status: res.status, code: "MALFORMED", message: `malformed body for ${method} ${path}` };
+          // エラー応答の本文は補足にすぎない。壊れていても読み取りが中断・通信断で失敗しても、本文なしとして status で返す
+          // （401 / 503 などの status を TIMEOUT / NETWORK に変えると、呼び出し側の判断が変わる）
+          if (res.ok) {
+            // 成功応答の本文の読み取り中の中断（タイムアウト）・通信断は外の catch で TIMEOUT / NETWORK にする（成功扱いにしない）
+            if (!(error instanceof SyntaxError)) throw error;
+            // 壊れた本文。null を値として返さず MALFORMED
+            return { ok: false, status: res.status, code: "MALFORMED", message: `malformed body for ${method} ${path}` };
+          }
         }
       }
       if (res.ok) {
@@ -3429,6 +3447,60 @@ describe("MeetingEventsClient", () => {
     }
   });
 
+  it("保留分を流す onEvent が例外を投げても、残りの保留分を流し、次の補完と取り直しの予約を続ける", async () => {
+    vi.useFakeTimers();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      // Arrange: 1 回目の補完は再接続まで返らず、2 回目は失敗する。onEvent は completed で投げる
+      let es: FakeEventSource | null = null;
+      let calls = 0;
+      const received: MeetingEvent[] = [];
+      const client = new MeetingEventsClient({
+        baseUrl: "http://127.0.0.1:43117",
+        token: "tok",
+        createEventSource: () => (es = new FakeEventSource()),
+        fetchJobs: async () => emptyJobs,
+        fetchMeeting: () => {
+          calls++;
+          if (calls === 1) return new Promise<MeetingDetailResponse>(() => undefined);
+          if (calls === 2) return Promise.reject(new Error("server down"));
+          return Promise.resolve(meetingDetail);
+        },
+        onEvent: (e) => {
+          if (e.type === "meeting_status" && e.status === "completed") throw new Error("callback bug");
+          received.push(e);
+        },
+        onError: () => undefined,
+      }, "m");
+      client.connect();
+      const source = es as unknown as FakeEventSource;
+      source.emit("open");
+      const failed = JSON.stringify({ type: "meeting_status", status: "completed" });
+      const transcribing = JSON.stringify({ type: "meeting_status", status: "transcribing" });
+      source.emit("meeting_status", failed);
+      source.emit("meeting_status", transcribing);
+      // Act 1: 1 回目の補完が終わらないうちに再接続する（前の接続の保留分を流す経路）
+      source.emit("open");
+      source.emit("meeting_status", failed);
+      source.emit("meeting_status", transcribing);
+      await vi.advanceTimersByTimeAsync(0);
+      // Assert 1: 2 回目の補完が走り、どちらの保留分も投げた 1 件の後ろが流れている
+      expect(calls).toBe(2);
+      expect(received).toEqual([
+        { type: "meeting_status", status: "transcribing" },
+        { type: "meeting_status", status: "transcribing" },
+      ]);
+      expect(consoleError).toHaveBeenCalledTimes(2);
+      // Act 2 / Assert 2: 補完の失敗後の取り直しも予約されている
+      await vi.advanceTimersByTimeAsync(BACKFILL_RETRY_DELAYS_MS[0]);
+      expect(calls).toBe(3);
+      client.close();
+    } finally {
+      consoleError.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("補完の取り直しは上限回数で止まり、close や再接続の後は古い接続の分を取り直さない", async () => {
     vi.useFakeTimers();
     try {
@@ -3677,12 +3749,20 @@ describe("Phase2Client の本文の読み取り", () => {
         c.error(new TypeError("network error"));
       },
     }), { status: 200 });
+    const brokenError: typeof fetch = async () => new Response(new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode("{"));
+        c.error(new TypeError("network error"));
+      },
+    }), { status: 503 });
     // Act
     const timeout = await new Phase2Client(config, stalled).getModels();
     const network = await new Phase2Client(config, broken).getModels();
-    // Assert
+    const errorStatus = await new Phase2Client(config, brokenError).getModels();
+    // Assert: エラー応答は本文を読めなくても status を保って返す
     expect(timeout).toMatchObject({ ok: false, status: 0, code: "TIMEOUT" });
     expect(network).toMatchObject({ ok: false, status: 0, code: "NETWORK" });
+    expect(errorStatus).toEqual({ ok: false, status: 503, code: "UNKNOWN", message: "HTTP 503" });
   });
 });
 ```
