@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-13（設計書の厳しめレビュー 2 回目・未コミット、ブランチ `dev`。PR #13 までマージ済み）
+最終更新: 2026-11-13（設計書の厳しめレビュー 3 回目・未コミット、ブランチ `dev`。PR #14 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,22 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 の設計書レビュー 2 回目の後：Phase 2 server 128 件・Phase 3 server 164 件・Phase 2 client 31 ファイル 557 件・Phase 3 client 35 ファイル 592 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 の設計書レビュー 3 回目の後：Phase 2 server 131 件・Phase 3 server 193 件・Phase 2 client 31 ファイル 559 件・Phase 3 client 35 ファイル 594 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-13（設計書の厳しめレビュー 3 回目・未コミット）：前回「読んでいない」と残した **Phase 3 server の固有部分**（pyannote・FLAC・scheduler・バックアップ・rebuild・CLI）を、カバレッジの低いファイルから読んだ。欠陥は実験かテストの Red で確かめてから直した。製品コード（`src/`・`test/`・`minutes_local/`）と Phase 1 設計書・クライアント設計書は無変更。
+  - **Phase 2 / 3 server（lease 切れの回数上限）**：Sweeper が lease 切れのジョブを回数を見ずに `pending` へ戻していた。実行するたびにプロセスを落とすジョブ（話者分離のメモリ不足など）が、**再起動のたびに永久に実行される**（6 回目も lease できることを Red で確認）。`repo.fail_exhausted_expired` → `pipeline.on_job_failed`（新規。Runner の `_on_failure` と共用）。基本設計 §9 の状態遷移図と Sweeper の行も更新。回帰 2 件。
+  - **Phase 2 / 3 server（常駐ループ）**：`JobRunner.run_forever` / `sweeper.run_forever` / Phase 3 の `scheduler.run_forever` が、1 周の例外（DB のロック・ディスク満杯）で Task ごと黙って終わった（以後ジョブが 1 件も動かない）。記録して続ける。回帰 3 件。
+  - **Phase 3 server（話者分離）**：実 Provider が Chunk の PCM を単純に連結していて、無音で STT を省いた Chunk 1 つにつき**後ろの話者区間が 30 秒ずつ前へずれた**（`FakeDiarizationProvider` は Chunk ごとの絶対時刻で作るので検出できなかった）。`assemble_timeline()` で絶対時刻に置く。`num_speakers`（人数の指定）に上限を渡していたのを `max_speakers` に。一時 WAV を OS の一時ディレクトリから `{dataDir}/tmp` へ。`HF_HUB_OFFLINE=1`、実行デバイスの指定、Pipeline の差し替え口（`pipeline=`。pyannote なしで本物のコードを通す）。回帰 3 件。
+  - **Phase 3 server（バックアップと復旧）**：書きかけのバックアップが正規の名前で残り復元元に選ばれた／バックアップが 1 つもないと壊れた DB のまま**起動できなかった**／復元後にバックアップより後の会議が DB に戻らなかった（`_restored` を捨てていた）／起動のたびにバックアップを作り、再起動 7 回で古い世代が全部消えた。`.part` → 付け替え、検査に通る最新から復元、なければ空で起動、復元後に `rebuild` を自動実行（`AppContext.recovery`、警告を表示）、バックアップは直近から 24 時間で判定。回帰 5 件。
+  - **Phase 3 server（rebuild）**：`meeting.json` の型が合わない項目（文字列の時刻、オブジェクトでない最上位など 7 通りを Red で確認）で rebuild 全体が例外で止まった。全項目を検証して既定値に置き換える。確定前の会議は `finalized` ではなく `recording` に戻す（ブラウザの残りの Chunk を 409 で断らない）。`doctor --rebuild` は serve の動作中は断る（ロック）。回帰 4 件。
+  - **Phase 3 server（圧縮）**：圧縮の切り替えに lease の検査がなく STT の再実行後も切り替えた／読み取りの直前に置き換わると正常な Chunk を `missing` にした／コミット後・WAV 削除前に落ちると WAV が残り続けた。`read_chunk_pcm()`（行の読み直し）ほか。回帰 3 件。**実コーデックを実行して確認**（soundfile 0.14.0 / libsndfile 1.2.2、往復がビット一致・破損入力は ValueError）。検証スクリプトが `soundfile` を入れて実コーデックのテストを走らせるようにした。
+  - **Phase 3 server（CLI・依存）**：`user add` の同名がトレースバック、利用者を失効させる手段がなかった（`user remove` を追加）。本文が参照する extras（`lan`・FLAC・話者分離）が **`pyproject.toml` に定義されていなかった**（§1.1 を新設。`dev` に `cryptography` もなく、テストが import で落ちる状態だった）。
+  - 本文：Phase 3 §2.2 / §2.4 / §2.5 / §3 / §11 / §12（実 Provider の契約の表）/ §17 / §18（控えの項目ごとの扱いの表）/ §22（場面ごとの動作の表）/ §23.8 / §24（3-h の実機項目と書き戻す場所）を更新。本文と食い違っていた記述（「`completed` 遷移ごとのバックアップ」「`.flac.part`」「所要時間を記録」）を実装に合わせた。
+  - 確認：`verify-design-docs.sh all` 通過（Phase 2 server 131・Phase 3 server 193・Phase 2 client 559・Phase 3 client 594、pyflakes 指摘なし）。Phase 1 埋め込み同期一致。対応表のテスト名は全件の実在を機械的に照合した。新規テストのうち、新しい API を import するもの（Phase 3 の `test_codec_recovery.py`・`test_diarization.py`）は、修正前の Red を 1 件ずつではなく、同じ内容の実験（10 件が失敗）と収集エラーで確認した。
+  - **残り（要判断）**：(1) 複数利用者に切り替えると既存の会議（所有者 `local`）が誰からも見えなくなる。引き継ぐ手段を設けるか（Phase 3 §2.5・§3）。(2) `completed` ごとのバックアップをやめ 24 時間ごとにした（最長 24 時間分の要約・ノートを失いうる）。この方針でよいか。(3) サーバーの通常終了が lease を返さない（Phase 2 server §26 R7）。R1〜R6 は前回のまま。
+  - **残り（未対応）**：pyannote 本体・faster-whisper の言語判定・実 TLS は未実行（Phase 3 server §24.3 の 3-h の表）。`__main__.py` の `serve` / `doctor` の本体はテストなし（カバレッジ 48%）。**Phase 2 / 3 のクライアント設計書と Phase 1 設計書は今回読んでいない**。Phase 3 の finalize は圧縮済み Chunk を存在だけで数える（前回からの残り）。
 
 - 2026-11-13（設計書の厳しめレビュー 2 回目・未コミット）：`docs/` の Phase 2 / 3 設計書を、展開したコードの**カバレッジ**（テストが一度も実行していない行）を起点にレビューした。前回までのレビューは「テストが通るか」で見ていたので、Fake Provider が通らない経路（実モデル・CLI・SSE・未テストのエンドポイント）が手つかずだった。見つけた欠陥は実験かテストの Red で確かめてから直した。製品コード（`src/`・`test/`・`minutes_local/`）は無変更。Phase 1 設計書も無変更（src と一致のまま）。
   - **Phase 2 server（SSE）**：`wait_for(gen.__anext__())` のタイムアウトで非同期ジェネレータごと終わり、**最初の keepalive（15 秒の無通信）の次の周回で接続が必ず落ちた**（実験で `RuntimeError: async generator raised StopAsyncIteration` を確認）。`EventBroker.attach()` / `detach()` を足し、SSE はキューを直接待つ。回帰 1 件。
@@ -367,6 +380,18 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-11-13（設計書の厳しめレビュー 3 回目）
+
+- Phase 3 server の固有部分（話者分離・バックアップ・rebuild・圧縮・CLI）を、カバレッジの低いファイルからレビュー。lease 切れの回数上限と常駐ループの保護は Phase 2 にも及ぶ（基本設計 §9 も更新）。詳細は「今回の変更と残課題」。
+- 検証：`verify-design-docs.sh all` 通過（Phase 2 server 131・Phase 3 server 193・client 559 / 594）。実 FLAC コーデックを実行して確認。検証スクリプトに `soundfile`・`numpy` を追加。
+- 未コミット。要判断 3 件（既存会議の引き継ぎ・バックアップの頻度・終了時の lease）。クライアント設計書は未レビュー。
+
+### 2026-11-13（レビュー指摘 2 件：ノートの保存中の編集・jobs の後着）
+
+- `NotesStore.save()`：送信中の保存を待って返る経路で、待った後も `dirty` なら `schedule()` で予約し直す。PUT 成功後の控えの書き込み中に入った編集は doSave の `stillSame` 判定をすり抜け、予約されずに `dirty` のまま残っていた（Phase 2 client §10。Phase 3 client は載せ直していない）。回帰 1 件（修正前に Red）。
+- `jobs_loaded` に会議 ID を持たせて表示中の会議と違えば捨てる指摘は、既に `meetingId` とガード・テストがあるためスキップ。
+- 検証：`scripts/verify-design-docs.sh client` 通過（Phase 2 client 559・Phase 3 client 594）。製品コードは無変更のため `npm test` は未実行。未コミット。
 
 ### 2026-11-13（レビュー指摘 3 件：補完の再生・エラー応答の本文・閉じていないブロック）
 
