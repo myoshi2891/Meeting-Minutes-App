@@ -2417,7 +2417,8 @@ export class NotesStore {
   /**
    * 最後に流した書き込みが失敗していれば、その下書き・控え（IndexedDB に入るはずだった内容）。成功すれば null に戻す。
    * 書き込みは発行順に流し、最後の書き込みは常にメモリ上の最新の状態を書くので、鎖が空になった時点で
-   * 「IndexedDB に無い最新の内容」を表す。dispose() が返し、作り直したインスタンスの load() が引き継ぐ
+   * 「IndexedDB に無い最新の内容」を表す。dispose() が返し、作り直したインスタンスの load() が引き継ぐ。
+   * load(carry) で引き継いだ内容も、このインスタンスの書き込みが成功するまでここに持つ（その前にもう一度作り直されても失わない）
    */
   private unwrittenDraft: Draft | null = null;
   private disposed = false;
@@ -2439,6 +2440,9 @@ export class NotesStore {
    * carry は作り直す前のインスタンスの dispose() の戻り値。IndexedDB に書けなかった最新の内容なので、IndexedDB の下書きより優先する
    */
   async load(carry: Draft | null = null): Promise<void> {
+    // 引き継いだ内容は IndexedDB に無い。下書き・控えの書き込みが成功するまで持ち、その前の dispose() が返せるようにする。
+    // 最初の await より前に入れる（load の途中で dispose() されても返す）。carry が null なら触らない
+    if (carry !== null) this.unwrittenDraft = carry;
     const draftRaw = carry ?? await this.deps.drafts.get(this.draftKey());
     const draft = isDraft(draftRaw) ? draftRaw : null;
     const res = await this.deps.getNotes(this.state.meetingId);
@@ -2515,6 +2519,7 @@ export class NotesStore {
    * setToken で作り直す前に呼ぶ。保留中の debounce を止め、古いトークンの PUT が新しいインスタンスと競合しないようにする。
    * 未送信の編集は IndexedDB の下書き（saved: false）に残っており、新しいインスタンスの load() が dirty として拾い直す。
    * 下書きの書き込みが失敗していれば IndexedDB には無いので、書けなかった最新の内容を返す（書けていれば null）。
+   * load(carry) で引き継いだ内容を、まだ一度も書けていなければ、それも返す。
    * 呼び出し側は戻り値を新しいインスタンスの load(carry) に渡す。渡さないと、debounce の保存は止めたので最新の編集を失う。
    * 送信中の PUT と、発行済みの下書き・控えの書き込みの完了を待って返る。新しいインスタンスの load() はこの完了を待ってから呼ぶ。
    * 待たずに load() すると、古い PUT が確定する前の revision と下書きを読み、確定後に送った編集が 409 で競合になる。
@@ -4113,6 +4118,32 @@ describe("NotesStore", () => {
     expect(errors.map((e) => e.message)).toEqual(["idb full"]);
   });
 
+  it("引き継いだ編集を一度も書かないうちにもう一度作り直しても、dispose が引き継いだ内容を返し、最新の編集を 1 回だけ送る", async () => {
+    // Arrange: 最新の編集の下書きだけが書けず、作り直したインスタンスに carry で引き継ぐ
+    const b = build();
+    const deps: NotesStoreDeps = {
+      ...b.deps,
+      drafts: { get: b.deps.drafts.get, set: async (k, v) => { if (JSON.stringify((v as { json?: unknown }).json) === JSON.stringify(["ab"])) throw new Error("idb full"); await b.deps.drafts.set(k, v); } },
+      onError: () => undefined,
+    };
+    const store = new NotesStore(deps, "m");
+    await store.load();
+    store.setDraft(["a"]);
+    store.setDraft(["ab"]);
+    const first = await store.dispose();
+    const middle = new NotesStore(b.deps, "m");
+    await middle.load(first);
+    // Act: 引き継いだインスタンスが保存（と控えの書き込み）をする前に、もう一度作り直す（§15.1 W8）
+    const second = await middle.dispose();
+    const last = new NotesStore(b.deps, "m");
+    await last.load(second);
+    while (b.timers.length > 0) await b.fire();
+    // Assert: IndexedDB には古い ["a"] しかないが、2 回目の dispose も引き継いだ内容を返し、最新の編集を 1 回だけ送る
+    expect(second?.json).toEqual(["ab"]);
+    expect(b.puts).toEqual([{ json: ["ab"], revision: 0 }]);
+    expect(last.current.sync).toBe("saved");
+  });
+
   it("送信中に編集して dispose したら、送信の完了後も古いインスタンスは送り直しを予約しない", async () => {
     // Arrange: 保存を始め、応答前に編集する
     const b = build();
@@ -4477,7 +4508,7 @@ describe("UI reducer", () => {
 | W5 | drain（サーバー復帰・`setToken`・確定再試行）と破棄・WAV 書き出しを Mic と System の両方の Controller に行う | `app.ts`・`main.ts` | §4 の 4、Phase 1 §31 | 確定中止後の書き出しに System の WAV も入る。破棄で両方が空になりロックが外れる |
 | W6 | 起動時復旧（Phase 1 §23）。`recovery.ts` が `listByMeeting(id, "mic")` で読むのは `audioFrameCount` を補うためで、Mic の時計の値なので **mic のままでよい**。未送信 Chunk の再投入は保存状態の索引で拾うので source を問わない | 変更なし（テストを追加） | Phase 1 §23 | System の未送信 Chunk も再送される。`audioFrameCount` は System の Chunk の `endFrame` では補われない |
 | W7 | 確定に成功した会議で `MeetingEvents`（§8）を開始し、`UiAction` に変換して `reduce`（§11）へ渡す。画面を離れたら `stop()` | `app.ts` | §8・§11 | `transcript_version` を受けて `GET /transcript` を取り直す。初回接続でも `GET /meetings/{id}` と `GET /jobs` で状態を補完し（確定から購読開始までのイベントを失わない）、再接続でも同じく補完する |
-| W8 | `Phase2Client`（§9）と `NotesStore`（§10）を、トークン・`baseUrl` を共有して生成する。`setToken` で作り直す。作り直す前に古い `NotesStore` の `dispose()` で保留中の debounce を `deps.clearTimer` で止め（古いトークンの PUT を新しいインスタンスと競合させない）、`dispose()` の完了（送信中の PUT と、発行済みの下書き・控えの書き込みの完了）を待ってから新しいインスタンスの `load()` を呼ぶ（待たないと古い PUT の確定前の revision を読み、保存中の編集が競合になる）。`dispose()` の戻り値（IndexedDB に書けなかった最新の下書き。書けていれば `null`）を `load(carry)` に渡す（渡さないと、下書きの書き込みが失敗した編集は止めた debounce の保存でも送られず失われる）。新しいインスタンスは `load()` を終えてから編集を受け付ける（未送信の編集は IndexedDB の下書き、または `carry` から引き継ぐ） | `app.ts` | §9・§10 | トークン変更後の要求が新しいトークンで出る。変更前の未送信の編集が 1 回だけ送られる |
+| W8 | `Phase2Client`（§9）と `NotesStore`（§10）を、トークン・`baseUrl` を共有して生成する。`setToken` で作り直す。作り直す前に古い `NotesStore` の `dispose()` で保留中の debounce を `deps.clearTimer` で止め（古いトークンの PUT を新しいインスタンスと競合させない）、`dispose()` の完了（送信中の PUT と、発行済みの下書き・控えの書き込みの完了）を待ってから新しいインスタンスの `load()` を呼ぶ（待たないと古い PUT の確定前の revision を読み、保存中の編集が競合になる）。`dispose()` の戻り値（IndexedDB に書けなかった最新の下書き。書けていれば `null`）を `load(carry)` に渡す（渡さないと、下書きの書き込みが失敗した編集は止めた debounce の保存でも送られず失われる）。新しいインスタンスは `load()` を終えてから編集を受け付ける（未送信の編集は IndexedDB の下書き、または `carry` から引き継ぐ）。`setToken` の作り直しは直列に行い、前の作り直し（`dispose()` → 生成 → `load()`）が終わってから次を始める。作り直しの間に届いたトークンは最新の 1 つだけを持ち（新しいものが勝つ）、前の作り直しが終わったら最新のトークンで作り直す。途中のトークンではインスタンスを作らない。要求を送れるのは最新の `NotesStore` だけで、古いインスタンスは `dispose()` 済みで送らない（重ねて作り直すと、2 つのインスタンスが同じ `carry` を `load()` して送る） | `app.ts` | §9・§10 | トークン変更後の要求が新しいトークンで出る。変更前の未送信の編集が 1 回だけ送られる。`setToken` が続けて呼ばれても、引き継いだ編集は最新のトークンで 1 回だけ送られる |
 | W9 | 同期誤差（`MultiSourceRecorder` の集計と `GET /meetings/{id}` の `syncDriftMs`）をヘッダに出す | `main.ts` | 基本設計 §16.3・§18 | 表示文言の純関数をテストする（Phase 1 の `recording-view.ts` と同じ方式） |
 | W10 | System Audio の取得ボタンと、取得できなかったとき（拒否・音声トラックなし）の Mic のみへの切り替え表示 | `main.ts`・`index.html` | §5、基本設計 §16.1 | `DegradedReason` の 2 値（§2）ごとの文言 |
 | W11 | 確定待ちの内訳（`main.ts` の `listByMeeting(id, "mic")` → `pendingCountsText`）に System の Chunk も含める | `main.ts`・`recording-view.ts` | Phase 1 §31.4 | System の未送信が残る会議で件数に出る。欠番・末尾の判定は source ごと |
