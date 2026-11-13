@@ -2401,7 +2401,7 @@ lease が切れたジョブの扱いは 2 通りある（基本設計 §9.3）�
 | `merge_transcript` | 変えない | 変えない（`transcribing`） | 要約ジョブを作らない | 失敗したジョブの再試行。除外の対象ではない |
 | `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2）。ただし既に `completed` なら変えない（下記） | なし | 再試行、または要約の再生成 |
 
-transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行は `INSERT OR IGNORE` なので結果が重複せず、除外しても Chunk が `completed` なので gap にならない。
+transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行は `INSERT OR IGNORE` なので結果が重複せず、除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
 
 要約・VAD も同じ隙間（ハンドラのコミットと `finish_job` の間）で回収されうる。どれもハンドラの結果とジョブの完了を 1 トランザクションにはせず（Runner とハンドラの契約が変わる）、後続処理の側で書き込み済みの結果を認める。
 
@@ -2551,7 +2551,7 @@ stateDiagram-v2
 | 旧ワーカーの結果書き込み | `repo.insert_segments` が `lease_is_current` で弾く | 失効した結果が UNIQUE 行を先取りし、正規の再試行の結果が捨てられるのを防ぐ |
 | 旧ワーカーの VAD 書き込み | `handlers.handle_vad` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば Chunk も `on_vad_completed` も書かない（モデル未配置の分岐も同じ） | 回数切れで `failed` になった vad ジョブを残したまま Chunk が進む |
 | lease 切れ後の VAD 再試行 | `pipeline.on_vad_completed` は `pending` の Chunk にだけ適用する。`POST /jobs/{id}/retry` は `transcribe_chunk` のときだけ Chunk を `queued` にする | 結果をコミットした後に lease が切れて回数切れで回収された vad ジョブを再試行すると、完了済みの Chunk が `queued` に戻り、transcribe ジョブは既存なので作り直されず止まる |
-| lease 切れ後の transcribe 回収 | `pipeline.on_transcribe_failed` は `completed` の Chunk を変えない | ハンドラのコミットと `finish_job` の間で lease が切れ、Sweeper が回数切れで回収すると、書き込み済みの segments を持つ Chunk が `failed`（gap）になる |
+| lease 切れ後の transcribe 回収 | `pipeline.on_transcribe_failed` は `completed` の Chunk を変えない。`POST /jobs/{id}/retry` も `completed` の Chunk を `queued` に戻さない | ハンドラのコミットと `finish_job` の間で lease が切れ、Sweeper が回数切れで回収すると、書き込み済みの segments を持つ Chunk が `failed`（gap）になる |
 | 旧ワーカーの merge 書き込み | `handlers.handle_merge` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議の `transcribed`・要約ジョブのどれも書かない | 回数切れで `failed` になった merge ジョブを残したまま transcript の版が進み、要約ジョブが作られて会議が `completed` まで進む。lease を取り直した新しいワーカーと二重に merge すると版が 2 回進む |
 | 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、要約の結果を誰も確かめないまま会議が `completed` に戻る。`finish_job` の条件はジョブ行しか守らない |
 | lease 切れ後の要約回収 | `pipeline.on_summary_failed` は `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れて回数切れで回収されると、要約があるのに会議が `failed` になる。この場合はジョブ `failed`・会議 `completed` の組を意図して残す |
@@ -4900,8 +4900,13 @@ async def retry(job_id: str, request: Request) -> Any:
         job = repo.get_job(conn, job_id)
         # queued に戻すのは transcribe だけ。vad の再試行で queued にすると、VAD の結果が適用済みの Chunk
         # （completed など）を戻してしまい、transcribe ジョブは既存なので作り直されず止まる（§14）
+        # transcribe でも completed の Chunk は戻さない。結果のコミット後に lease 切れで回収されたジョブの再試行で queued にすると、
+        # 再試行が失敗したとき on_transcribe_failed が completed を見られず failed（書き込み済みの segments が gap）にする。
+        # 再試行が成功すれば on_transcribe_completed が completed を書き直す
         if ok and job is not None and job.chunk_id is not None and job.job_type == "transcribe_chunk":
-            repo.update_chunk(conn, job.chunk_id, stt_status="queued")
+            chunk = repo.get_chunk(conn, job.chunk_id)
+            if chunk is not None and chunk.stt_status != "completed":
+                repo.update_chunk(conn, job.chunk_id, stt_status="queued")
     if not ok:
         return JSONResponse(error_body("VALIDATION", "job is not failed"), status_code=422)
     return {"jobId": job_id, "status": "pending"}
@@ -6526,6 +6531,34 @@ async def test_sweeper_keeps_chunk_completed_by_worker_before_lease_expired(clie
         chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
         swept = repo.get_job(conn, job.id)
     assert swept is not None and swept.status == "failed"
+    assert chunk is not None and chunk.stt_status == "completed"
+
+
+async def test_transcribe_retry_after_committed_result_keeps_chunk_completed(client: httpx.AsyncClient, ctx: AppContext,
+                                                                             runner: JobRunner) -> None:
+    """結果のコミット後に回収された transcribe ジョブを再試行しても Chunk を queued に戻さない。再試行が失敗しても completed のまま（§14）。"""
+    # Arrange: transcribe の結果は書けたが、完了報告の前に lease が切れて回数切れで回収された
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "transcribe_chunk")
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["transcribe_chunk"], now_ms())
+        assert job is not None
+    await handlers.handle_transcribe(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Act: 再試行し、その再試行もワーカーが落ちて回数切れで回収される（ハンドラの実装に依らず失敗させる）
+    assert (await client.post(f"/v1/jobs/{job.id}/retry")).status_code == 200
+    with ctx.db.read() as conn:
+        after_retry = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    await _expire_exhausted(ctx, "transcribe_chunk")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Assert: 再試行の受付でも失敗の後でも Chunk は completed。書き込み済みの segments は gap にならない
+    with ctx.db.read() as conn:
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+        retried = repo.get_job(conn, job.id)
+    assert after_retry is not None and after_retry.stt_status == "completed"
+    assert retried is not None and retried.status == "failed"
     assert chunk is not None and chunk.stt_status == "completed"
 
 
