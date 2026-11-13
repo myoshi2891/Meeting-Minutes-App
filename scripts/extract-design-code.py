@@ -18,12 +18,17 @@ OPEN = re.compile(r"^(?P<fence>(?P<ch>[`~])(?P=ch){2,})(?P<info>.*)$")
 HEAD = re.compile(r"^(?://|#) ((?:src|test|tests|minutes_local)/\S+|pyproject\.toml)\s*$")
 
 
+class UnclosedBlockError(Exception):
+    """閉じていないコードブロック。以降のブロック（後フェーズの差し替えなど）を取り出せないので、展開を失敗にする。"""
+
+
 def top_level_blocks(text: str) -> Iterator[tuple[int, str, str]]:
     """トップレベルのフェンスコードブロックを先頭から順に返す（開きの行番号, 言語, 本文）。
 
     言語のないブロックも追跡し、その中身は開きフェンスとして読まない（入れ子の ```python などを取り出さない）。
     閉じフェンスは開きと同じ文字（` か ~）で、長さが開き以上のもの（CommonMark）。短いもの・別の文字では閉じない。
-    閉じていないブロック（文書末まで続く）は返さない。
+    閉じていないブロック（文書末まで続く）があれば UnclosedBlockError を投げる。黙って打ち切ると、
+    差し替えるはずのファイルが前フェーズのまま残り、検証が成功してしまう。
     """
     lines = text.splitlines(keepends=True)
     i = 0
@@ -38,8 +43,7 @@ def top_level_blocks(text: str) -> Iterator[tuple[int, str, str]]:
         while j < len(lines) and close.match(lines[j].rstrip("\r\n")) is None:
             j += 1
         if j == len(lines):
-            print(f"L{i + 1}: 閉じていないコードブロックを無視した", file=sys.stderr)
-            return
+            raise UnclosedBlockError(f"L{i + 1}: 閉じていないコードブロックがある")
         yield i + 1, m.group("info").strip(), "".join(lines[i + 1:j])
         i = j + 1
 
@@ -55,6 +59,14 @@ def main() -> int:
     listing = args.list
     text = open(doc, encoding="utf-8").read()
     seen: dict[str, int] = {}
+    try:
+        return extract(doc, out, text, listing, seen)
+    except UnclosedBlockError as error:
+        print(f"{doc}: {error}", file=sys.stderr)
+        return 1
+
+
+def extract(doc: str, out: str, text: str, listing: bool, seen: dict[str, int]) -> int:
     for line_no, lang, body in top_level_blocks(text):
         # 言語のあるブロックだけを対象にする（従来どおり）。見出しは 1 行目だけを見る
         head = HEAD.match(body.split("\n", 1)[0]) if re.fullmatch(r"\w+", lang) else None
