@@ -4,6 +4,7 @@
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation
 **上位文書:** 議事録Webアプリケーション システム設計書 v4.0（設計レビュー版）。本書は v4.0 の「Recording is Source of Truth」原則と Invariant 1〜10 を変更せずに継承する。
 **位置づけ:** 本書だけを見て Phase 1 のコーディングと結合テストに着手できることを目的とする。
+**配置:** `docs/design-local-phase1.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 
 ---
 
@@ -3578,7 +3579,14 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   try {
     listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", redirect: "error", signal: listAbort.signal });
     // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
-    list = listRes.ok ? await listRes.json().catch(() => null) : null;
+    // null（壊れた応答）にするのは JSON の構文エラーだけ。本文の読み取り中の abort（タイムアウト）や
+    // 通信エラーは network として下の catch へ流す
+    list = listRes.ok
+      ? await listRes.json().catch((error: unknown) => {
+        if (error instanceof SyntaxError && !listAbort.signal.aborted) return null;
+        throw error;
+      })
+      : null;
   } catch (error) {
     return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}`, reason: "network" };
   } finally {
@@ -4862,7 +4870,7 @@ v4.0 §115 Step 1〜2 を本書の構成で細分化する。各ステップは�
 - `directSaver`（§15）には、送るたびに現在の `LocalSaver` を引く口を渡す。録音開始時点の `LocalSaver` を渡すと、トークン未設定や失効したトークンで始めた録音は、途中で `setToken` しても直接送信が通らない。トークン未設定の間は、送らずに `UNAUTHORIZED` の失敗を返す（Chunk はメモリ待機に残る）。
 - `setToken` は `LocalSaver` を作り直さず、同じインスタンスのトークンを更新する。Scheduler は送信前に saver を掴んでから IDB を読むため、作り直すとその間に差し替わった古いトークンで PUT し、401 で Monitor が unauthorized に戻ってしまう。
 - T10（2026-11-08）：Scheduler は PUT の成功状態（`DB_REGISTERED` / `SAVED`）を IDB に保存した後、`onChunkSaved(meetingId)` を通知する。App は `waiting_local_save` で保存待ちになった停止済み会議の Barrier を会議ロック付きで自動再試行する。Barrier 実行中の保存完了は再判定を予約し、保存待ちの結果を返す前にもう一度試す。照合不一致（`server mismatch`）で送り直した場合は、送り直した Chunk の保存通知で 1 回だけ確認し直す（`mismatchRechecked`。確定できるか確定中止で外す）。再び不一致なら保存通知では再試行せず、再送ループにしない。それ以外の `verify` / `finalize` の失敗でも保存通知から再試行しない。録音中の会議と別タブのロック保持中の会議は触らず、メモリ待機の Barrier も維持する。成功通知のない失敗をタイマーで無限再試行しない。UI の手動再試行と backend 復帰時の再試行も維持する。
-- Phase 2 のクライアント（`design-local-phase2-client.md`）は画面共有音声（system）の Controller を追加するため、この層を拡張して使う。
+- Phase 2 のクライアント（`docs/design-local-phase2-client.md`）は画面共有音声（system）の Controller を追加するため、この層を拡張して使う。
 
 ## 31.3 コード
 

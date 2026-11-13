@@ -2,6 +2,20 @@
 
 完全ローカル処理の議事録アプリ。現在は Phase 1 の実機検証中です。
 
+## ドキュメント
+
+基本設計書・詳細設計書（`design-local-phase*.md`）は、リポジトリ直下から [`docs/`](docs/) ディレクトリへ移行しました（2026-11-12）。
+
+- [docs/design-local-phase1.md](docs/design-local-phase1.md) — Phase 1 詳細設計書
+- [docs/design-local-phase2.md](docs/design-local-phase2.md) — Phase 2 / Phase 3 基本設計書
+- [docs/design-local-phase2-client.md](docs/design-local-phase2-client.md) — Phase 2 詳細設計書（ブラウザ側）
+- [docs/design-local-phase2-server.md](docs/design-local-phase2-server.md) — Phase 2 詳細設計書（サーバー側）
+- [docs/design-local-phase3-client.md](docs/design-local-phase3-client.md) — Phase 3 詳細設計書（ブラウザ側）
+- [docs/design-local-phase3-server.md](docs/design-local-phase3-server.md) — Phase 3 詳細設計書（サーバー側）
+- [PROGRESS.md](PROGRESS.md) — 進捗と次の作業
+- [CLAUDE.md](CLAUDE.md) — 開発ルール
+- `archive/` — 旧版（参照・編集対象外）
+
 ## 起動
 
 ```sh

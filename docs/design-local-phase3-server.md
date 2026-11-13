@@ -1,10 +1,11 @@
 # 議事録Webアプリケーション Phase 3 詳細設計書 ── サーバー側（Python）
 
-**対象:** Phase 2 詳細設計（`design-local-phase2-server.md`）の `minutes_local` パッケージに対する Phase 3 の追加・変更。Live STT（準リアルタイム）／話者分離／日英言語認識／FLAC 事後圧縮と高度な復旧／LAN 共有。
+**対象:** Phase 2 詳細設計（`docs/design-local-phase2-server.md`）の `minutes_local` パッケージに対する Phase 3 の追加・変更。Live STT（準リアルタイム）／話者分離／日英言語認識／FLAC 事後圧縮と高度な復旧／LAN 共有。
 **上位文書:** Phase 2 基本設計書 §20〜§24（Phase 3 概要）。Phase 3 には基本設計が存在しないため、本書 §2 で基本設計相当の判断を先に確定する。
-**対となる文書:** Phase 3 詳細設計書 ── ブラウザ側（`design-local-phase3-client.md`）。
+**対となる文書:** Phase 3 詳細設計書 ── ブラウザ側（`docs/design-local-phase3-client.md`）。
+**配置:** `docs/design-local-phase3-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。LAN 共有は「利用者自身が管理する LAN 内」に限定し、インターネット公開は対象外。
-**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 34 テストと本書の 20 テスト（計 12 ファイル 54 件）が Fake Provider による pytest で全件通過することを設計時点で確認している（§23）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
+**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 128 件と本書の 36 件（計 20 ファイル 164 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-13、§23）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
 
 ---
 
@@ -96,7 +97,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * TLS：`doctor --init-tls --host <hostname or IP>` で自己署名証明書（`cryptography`、extras `lan`）。ブラウザは初回に証明書の受け入れが必要（断定しない事項 §3）
 * 認証：`users` テーブル（`id`, `name`, `token_hash`, `created_at`）。`minutes-local user add <name>` がトークンを 1 回だけ表示する。`users` が空なら従来の `token` ファイルで `local` ユーザーとして動作（後方互換）
 * 認可：認証ミドルウェアが `/v1/meetings/{id}/...` と `/v1/jobs/{id}/...` の所有者を照合し、他人の会議は `404`（存在を漏らさない）。`GET /v1/meetings` は自分の会議のみ
-* ファイル階層：`recordings/{userId}/{meetingId}/{source}/{seq}.wav`。マイグレーション 011 が既存の `recordings/{meetingId}/` を `recordings/local/{meetingId}/` へ移動し `local_path` を更新する
+* ファイル階層：`recordings/{userId}/{meetingId}/{source}/{seq}.wav`。マイグレーション 012 が既存の `recordings/{meetingId}/` を `recordings/local/{meetingId}/` へ移動し `local_path` を更新する。旧ディレクトリは新しい階層を作る前に `{dataDir}/.migrate-012/` へ退避してから統合する（会議 ID が `local` だと旧ディレクトリと新しい階層の親が重なるため）
 * ジョブの公平性：`lease_job` を「利用者ごとの実行中ジョブ数が少ない利用者を優先」に変更（`ORDER BY running_per_user, priority, created_at`）。GPU は依然 1 台なので、同時実行数の上限は Phase 2 と同じ
 * CSP と origin：**API origin はページ origin と同一とする**（前提契約）。サーバーが `/` でアプリ自身を配信するので `connect-src 'self'` で吸収され変更不要、同一 origin なので CORS 設定も不要。LAN モードとは「ページ自体を LAN の https origin から開く」ことであり、loopback から開いたページが別ホストの API を叩く構成ではない。**別オリジン配信は対象外**で、ブラウザ側 `validateConnection()` がページ origin 以外を `NOT_PAGE_ORIGIN` で拒否して実装レベルでも強制する（クライアント側 §7.3）。将来対象化する場合は CSP `connect-src` への対象 origin 追加と、`Authorization` ヘッダを伴う preflight に対応した CORS 設定の両方が必要になる
 * インターネット公開・リバースプロキシ・OS ログイン連携は対象外
@@ -118,13 +119,13 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 
 ---
 
-# 4. SQLite マイグレーション 008〜011 `db/migrations_phase3.py`
+# 4. SQLite マイグレーション 009〜012 `db/migrations_phase3.py`
 
-Phase 2 の `db/migrate.py` は変更せず、Phase 3 のマイグレーションを別モジュールに置く。`bootstrap.build_context` が `migrate(db)` の直後に `apply_phase3(db, data_dir)` を呼ぶ。011 はファイル移動を伴うため Python で実装する。
+Phase 2 の `db/migrate.py` は変更せず、Phase 3 のマイグレーションを別モジュールに置く。`bootstrap.build_context` が `migrate(db)` の直後に `apply_phase3(db, data_dir)` を呼ぶ。012 はファイル移動を伴うため Python で実装する。
 
 ```python
 # minutes_local/db/migrations_phase3.py
-"""Phase 3 のマイグレーション（008〜011）。Phase 2 の migrate.py は変更しない。"""
+"""Phase 3 のマイグレーション（009〜012）。Phase 2 の migrate.py は変更しない。"""
 from __future__ import annotations
 
 import shutil
@@ -134,8 +135,8 @@ from pathlib import Path
 from .connection import Database, now_ms
 from .migrate import _exec_multi, current_version
 
-# 008: 会議・Chunk の列追加、話者テーブル
-M008 = """
+# 009: 会議・Chunk の列追加、話者テーブル
+M009 = """
 ALTER TABLE meetings ADD COLUMN language_ratio_json TEXT;
 ALTER TABLE meetings ADD COLUMN live_stt_enabled INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE meetings ADD COLUMN summary_language TEXT;
@@ -150,8 +151,8 @@ CREATE TABLE IF NOT EXISTS meeting_speakers (
 );
 """
 
-# 009: processing_jobs の job_type CHECK 拡張（SQLite は CHECK を ALTER できないため再作成）
-M009 = """
+# 010: processing_jobs の job_type CHECK 拡張（SQLite は CHECK を ALTER できないため再作成）
+M010 = """
 CREATE TABLE processing_jobs_new (
   id            TEXT PRIMARY KEY,
   meeting_id    TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
@@ -199,8 +200,8 @@ CREATE INDEX IF NOT EXISTS idx_jobs_runnable
 CREATE INDEX IF NOT EXISTS idx_jobs_lease ON processing_jobs(status, lease_until);
 """
 
-# 010: 利用者
-M010 = """
+# 011: 利用者
+M011 = """
 CREATE TABLE IF NOT EXISTS users (
   id         TEXT PRIMARY KEY,
   name       TEXT NOT NULL UNIQUE,
@@ -210,47 +211,64 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX IF NOT EXISTS idx_meetings_user ON meetings(local_user_id, created_at);
 """
 
-PHASE3_SQL: list[tuple[int, str]] = [(8, M008), (9, M009), (10, M010)]
+PHASE3_SQL: list[tuple[int, str]] = [(9, M009), (10, M010), (11, M011)]
 
 
-def _migrate_011_move_recordings(conn: sqlite3.Connection, data_dir: Path) -> int:
-    """recordings/{meetingId}/ → recordings/local/{meetingId}/。local_path を書き換える。戻り値は移動した Chunk 数。"""
-    rows = conn.execute("SELECT id, meeting_id, local_user_id_hint, local_path FROM (SELECT c.id, c.meeting_id, m.local_user_id AS local_user_id_hint, c.local_path FROM audio_chunks c JOIN meetings m ON m.id = c.meeting_id) WHERE local_path LIKE 'recordings/%'").fetchall()
+MIGRATE_012_STAGING = ".migrate-012"
+
+
+def _merge_tree(src: Path, dst: Path) -> None:
+    """src の中身を dst へ移し、src を消す。dst に同じパスのファイルがあれば dst を残す。src は作業場所の中だけを渡す。"""
+    for p in sorted(src.rglob("*")):
+        if p.is_file():
+            target = dst / p.relative_to(src)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.move(str(p), str(target))
+    shutil.rmtree(src)
+
+
+def _migrate_012_move_recordings(conn: sqlite3.Connection, data_dir: Path) -> int:
+    """recordings/{meetingId}/ → recordings/{userId}/{meetingId}/。local_path を書き換える。戻り値は書き換えた Chunk 数。
+
+    旧ディレクトリは、新しい階層を作る前にすべて recordings/ の外の作業場所（{dataDir}/.migrate-012/）へ退避する。
+    会議 ID は利用者 ID（既定 "local"）と同じ値を取りうる（SAFE_ID）。その場で移すと旧ディレクトリ recordings/local/ が
+    新しい階層の親と重なり、旧ディレクトリの片付けが他の会議の録音ごと消す。
+    途中で落ちたら apply_phase3 が 012 を記録しないので再実行される。退避を終えた印（.staged）があれば退避を飛ばし、
+    新しい階層を旧ディレクトリと取り違えない。local_path の書き換えは 012 の記録と同じトランザクションで行い、
+    作業場所（印を含む）は apply_phase3 が 012 の記録をコミットした後に片付ける。
+    """
+    staging = data_dir / MIGRATE_012_STAGING
+    staged = staging / ".staged"
+    recordings = data_dir / "recordings"
+    meetings = conn.execute("SELECT id, local_user_id FROM meetings").fetchall()
+    if not staged.exists():
+        staging.mkdir(parents=True, exist_ok=True)
+        for m in meetings:
+            old_dir = recordings / m["id"]
+            if old_dir.is_dir() and not (staging / m["id"]).exists():
+                shutil.move(str(old_dir), str(staging / m["id"]))
+        staged.touch()
+    for m in meetings:
+        src = staging / m["id"]
+        if src.is_dir():
+            _merge_tree(src, recordings / m["local_user_id"] / m["id"])
+    rows = conn.execute(
+        "SELECT c.id, c.local_path, m.local_user_id FROM audio_chunks c JOIN meetings m ON m.id = c.meeting_id "
+        "WHERE c.local_path LIKE 'recordings/%'").fetchall()
     moved = 0
     for r in rows:
-        old_rel = r["local_path"]
-        parts = old_rel.split("/")
-        if len(parts) == 4:  # recordings/{meetingId}/{source}/{file}
-            new_rel = f"recordings/{r['local_user_id_hint']}/{parts[1]}/{parts[2]}/{parts[3]}"
-        else:
+        parts = r["local_path"].split("/")
+        if len(parts) != 4:  # recordings/{meetingId}/{source}/{file} 以外は移行の対象外
             continue
-        src = data_dir / old_rel
-        dst = data_dir / new_rel
-        if src.exists():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
+        new_rel = f"recordings/{r['local_user_id']}/{parts[1]}/{parts[2]}/{parts[3]}"
         conn.execute("UPDATE audio_chunks SET local_path = ? WHERE id = ?", (new_rel, r["id"]))
         moved += 1
-    # meeting.json も移動（存在すれば）
-    for m in conn.execute("SELECT id, local_user_id FROM meetings").fetchall():
-        old_dir = data_dir / "recordings" / m["id"]
-        new_dir = data_dir / "recordings" / m["local_user_id"] / m["id"]
-        if old_dir.exists() and not new_dir.exists():
-            new_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(old_dir), str(new_dir))
-        elif old_dir.exists() and new_dir.exists():
-            for p in old_dir.rglob("*"):
-                if p.is_file():
-                    target = new_dir / p.relative_to(old_dir)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    if not target.exists():
-                        shutil.move(str(p), str(target))
-            shutil.rmtree(old_dir, ignore_errors=True)
     return moved
 
 
 def apply_phase3(db: Database, data_dir: Path) -> int:
-    """未適用の 008〜011 を順に適用する。戻り値は適用数。"""
+    """未適用の 009〜012 を順に適用する。戻り値は適用数。"""
     applied = 0
     for version, ddl in PHASE3_SQL:
         with db.write_sync() as conn:
@@ -260,14 +278,19 @@ def apply_phase3(db: Database, data_dir: Path) -> int:
             conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)", (version, now_ms()))
             applied += 1
     with db.write_sync() as conn:
-        if current_version(conn) < 11:
-            _migrate_011_move_recordings(conn, data_dir)
-            conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (11, ?)", (now_ms(),))
+        if current_version(conn) < 12:
+            _migrate_012_move_recordings(conn, data_dir)
+            conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (12, ?)", (now_ms(),))
             applied += 1
+    # 012 の記録がコミットされてから片付ける。先に印を消すと、記録前に落ちた再実行が新しい階層を旧ディレクトリと取り違える
+    staging = data_dir / MIGRATE_012_STAGING
+    if staging.exists():
+        (staging / ".staged").unlink(missing_ok=True)
+        staging.rmdir()      # 統合で空になっている。残っていれば想定外なので OSError で止める
     return applied
 ```
 
-009 で `foreign_keys = ON` のまま `DROP TABLE processing_jobs` を実行できるのは、`processing_jobs` が親テーブルではないためである。`INSERT ... SELECT *` は列順が Phase 2 §7 の DDL と同一であることに依存する（§3 の断定しない事項。§23.1 で検証）。
+010 で `foreign_keys = ON` のまま `DROP TABLE processing_jobs` を実行できるのは、`processing_jobs` が親テーブルではないためである。`INSERT ... SELECT *` は列順が Phase 2 §7 の DDL と同一であることに依存する（§3 の断定しない事項。§23.1 で検証）。
 
 ---
 
@@ -288,6 +311,7 @@ from typing import Any
 
 
 def default_data_dir() -> Path:
+    """OS 別の利用者データディレクトリ（Phase 1 §13）。クラウド同期対象になりやすい場所は避ける。"""
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "minutes-local"
     if sys.platform.startswith("win"):
@@ -299,6 +323,7 @@ def default_data_dir() -> Path:
 
 @dataclass(frozen=True)
 class Thresholds:
+    """基本設計 §11〜§13 のしきい値。固定仕様ではなく設定値。"""
     vad_threshold: float = 0.5
     vad_min_speech_ms: int = 250
     vad_min_voiced_ms: int = 500
@@ -330,11 +355,12 @@ class Settings:
     port: int = 43117
     ollama_base_url: str = "http://127.0.0.1:11434"
     language: str = "ja"              # "ja" | "en" | "auto"
-    stt_model: str | None = None
+    stt_model: str | None = None      # None = ハードウェア検出の推奨
     llm_model: str | None = None
     max_concurrent_stt: int | None = None
-    live_stt_enabled: bool = False
-    vad_sampling_ratio: float = 0.0
+    live_stt_enabled: bool = False    # Phase 3 §2.1（gpu_small / cpu_only は bootstrap が既定 False を保つ）
+    vad_sampling_ratio: float = 0.0   # §13.2 無音 Chunk のサンプリング STT（既定オフ）
+    web_dir: Path | None = None       # ブラウザアプリのビルド出力（index.html を含む）。None なら配信しない（Phase 2 §21.1）
     # Phase 3
     summary_language: str = "ja"      # 混在会議の要約言語
     diarization_enabled: bool = True  # Provider があれば有効
@@ -372,6 +398,7 @@ class Settings:
         return self.data_dir / "tls" / "key.pem"
 
     def with_overrides(self, values: dict[str, Any]) -> "Settings":
+        """settings テーブルの値で上書きする。未知キーは無視し、型が合わないものは捨てる。"""
         allowed = {
             "language": str, "stt_model": (str, type(None)), "llm_model": (str, type(None)),
             "max_concurrent_stt": (int, type(None)), "live_stt_enabled": bool,
@@ -394,6 +421,9 @@ def settings_from_env(base: Settings | None = None) -> Settings:
         kwargs["data_dir"] = Path(data_dir)
     if port and port.isdigit():
         kwargs["port"] = int(port)
+    web_dir = os.environ.get("MINUTES_WEB_DIR")
+    if web_dir:
+        kwargs["web_dir"] = Path(web_dir)
     return replace(s, **kwargs)
 ```
 
@@ -727,6 +757,7 @@ from ..llm.provider import SummaryProvider
 from ..storage.codec import AudioCodec
 from ..stt.executor import STTExecutor
 from ..stt.language import LanguageDetector
+from ..storage.models_dir import ModelDownloads
 from ..vad.provider import VADProvider
 from .events import EventBroker
 
@@ -753,6 +784,7 @@ class AppContext:
     vad: VADProvider | None
     llm: SummaryProvider
     events: EventBroker = field(default_factory=lambda: EventBroker())
+    downloads: ModelDownloads = field(default_factory=lambda: ModelDownloads())   # モデル取得の状態（§10.2）
     server_version: str = "0.3.0"
     # Phase 3
     diarization: DiarizationProvider | None = None
@@ -793,19 +825,37 @@ flowchart LR
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 from ..db import repo
 from ..db.models import AudioChunk, Job
+from ..storage.files import sha256_file
 
 BLOCKING_STT = ("pending", "queued", "processing")
 
 
-def on_finalized(conn: sqlite3.Connection, meeting_id: str) -> int:
+def chunk_file_intact(data_dir: Path, chunk: AudioChunk) -> bool:
+    """登録済み Chunk のファイルが存在し、WAV なら sha256 が登録時と一致するか（圧縮済みは存在だけを見る）。
+    finalize と起動時の回収（Phase 2 の sweeper.resume_finalized）が同じ規則で照合する。"""
+    path = data_dir / chunk.local_path
+    # ファイルシステムのエラーは「欠損」として False（起動時の回収で起動ごと止めず、finalize を 500 にしない。Phase 2 §12）
+    try:
+        return path.is_file() and (chunk.codec != "wav" or sha256_file(path) == chunk.sha256)
+    except OSError:
+        return False
+
+
+def on_finalized(conn: sqlite3.Connection, meeting_id: str, diarize: bool = False) -> int:
+    """全 Chunk に vad_chunk を生成し、meeting を transcribing にする。戻り値は新規ジョブ数。"""
     created = 0
     for chunk in repo.list_chunks(conn, meeting_id):
         if repo.insert_job(conn, meeting_id, "vad_chunk", chunk_id=chunk.id) is not None:
             created += 1
     repo.set_meeting_status(conn, meeting_id, "transcribing")
+    if created == 0:
+        # Chunk が 1 件もない会議（開始直後の停止など。Phase 1 のクライアントは 0 件でも確定する）は、
+        # 完了を契機に merge を起こす vad ジョブがない。ここで判定しないと transcribing のまま止まる
+        ensure_merge_job(conn, meeting_id, diarize)
     return created
 
 
@@ -824,6 +874,7 @@ def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk, diarize
 
 
 def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
+    """failed は merge をブロックする。利用者が retry か exclude_failed を選ぶまで待つ（v4.0 §97〜§98）。"""
     repo.update_chunk(conn, chunk.id, stt_status="failed")
 
 
@@ -833,6 +884,7 @@ def _all_chunks_terminal(conn: sqlite3.Connection, meeting_id: str) -> bool:
         return False
     if repo.count_jobs(conn, meeting_id, "vad_chunk", ["pending", "leased", "processing", "retrying"]) > 0:
         return False
+    # 未承認の failed transcribe ジョブがあれば待つ
     if repo.count_jobs(conn, meeting_id, "transcribe_chunk", ["failed"]) > 0:
         return False
     return True
@@ -867,6 +919,7 @@ def exclude_failed(conn: sqlite3.Connection, meeting_id: str, diarize: bool = Fa
 
 
 def on_merge_completed(conn: sqlite3.Connection, meeting_id: str) -> None:
+    """基本設計 §12.1：transcribed にし、summary ジョブを生成（INSERT OR IGNORE）。"""
     repo.set_meeting_status(conn, meeting_id, "transcribed")
     repo.insert_job(conn, meeting_id, "synthesize_minutes")
 
@@ -880,10 +933,12 @@ def on_summary_completed(conn: sqlite3.Connection, meeting_id: str) -> None:
 
 
 def on_summary_deferred(conn: sqlite3.Connection, meeting_id: str) -> None:
+    """要約が retrying に戻った：transcribed に戻し、transcript の閲覧を妨げない。"""
     repo.set_meeting_status(conn, meeting_id, "transcribed")
 
 
 def on_summary_failed(conn: sqlite3.Connection, meeting_id: str) -> None:
+    """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。"""
     repo.set_meeting_status(conn, meeting_id, "failed")
 
 
@@ -893,6 +948,8 @@ def request_regenerate_summary(conn: sqlite3.Connection, meeting_id: str) -> Non
 
 
 def request_rerun_stt(conn: sqlite3.Connection, meeting_id: str, stt_model: str | None) -> int:
+    """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。"""
+    # ジョブは行ごと消す。実行中のハンドラは lease の検査（行がない）で結果を書けなくなる（§8 lease_is_current）
     conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ?", (meeting_id,))
     for chunk in repo.list_chunks(conn, meeting_id):
         repo.delete_segments_of_chunk(conn, chunk.id)
@@ -935,6 +992,7 @@ from .context import AppContext
 from .retry import JobError, RetryDecision, decide, normalize_exception
 
 Handler = Callable[[AppContext, Job], Awaitable[str | None]]
+"""ハンドラは成功時に None（または使用モデル名）を返し、失敗時に JobError を送出する。"""
 
 HEARTBEAT_INTERVAL_S = 60.0
 LEASE_MS = 300_000
@@ -948,6 +1006,8 @@ class JobRunner:
         self.owner = f"{os.getpid()}:{worker_index}"
         self._stop = asyncio.Event()
 
+    # ---- 排他規則（基本設計 §5.2） ----
+
     def allowed_types(self) -> list[str]:
         types = ["vad_chunk", "live_transcribe_chunk", "transcribe_chunk", "merge_transcript", "compress_chunk"]
         with self.ctx.db.read() as conn:
@@ -960,7 +1020,10 @@ class JobRunner:
             types.append("synthesize_minutes")
         return types
 
+    # ---- 1 件実行 ----
+
     async def run_once(self) -> bool:
+        """1 件 lease して実行する。実行したら True、対象なしなら False。"""
         now = now_ms()
         async with self.ctx.db.write() as conn:
             job = repo_phase3.lease_job_fair(conn, self.owner, self.allowed_types(), now, LEASE_MS)
@@ -970,6 +1033,7 @@ class JobRunner:
         return True
 
     async def run_until_idle(self, max_jobs: int = 10_000) -> int:
+        """テストと finalize 直後の同期実行用。対象がなくなるまで回す。"""
         n = 0
         while n < max_jobs and await self.run_once():
             n += 1
@@ -987,16 +1051,19 @@ class JobRunner:
     def stop(self) -> None:
         self._stop.set()
 
+    # ---- 内部 ----
+
     async def _execute(self, job: Job) -> None:
         handler = self.handlers.get(job.job_type)
         if handler is None:
             async with self.ctx.db.write() as conn:
-                repo.finish_job(conn, job.id, self.owner, "failed", error_class="INTERNAL", last_error=f"no handler for {job.job_type}")
+                repo.finish_job(conn, job.id, self.owner, job.attempts, "failed", error_class="INTERNAL",
+                                last_error=f"no handler for {job.job_type}")
             return
 
         async with self.ctx.db.write() as conn:
             if not repo.mark_processing(conn, job.id, self.owner, job.model_name):
-                return
+                return  # Sweeper に回収済み
             if job.job_type == "synthesize_minutes":
                 pipeline.on_summary_started(conn, job.meeting_id)
         self._publish_job(job.id)
@@ -1014,10 +1081,11 @@ class JobRunner:
         hb.cancel()
         duration = int((time.monotonic() - started) * 1000)
         async with self.ctx.db.write() as conn:
-            ok = repo.finish_job(conn, job.id, self.owner, "completed", duration_ms=duration)
+            ok = repo.finish_job(conn, job.id, self.owner, job.attempts, "completed", duration_ms=duration)
             if ok and model_used is not None:
                 conn.execute("UPDATE processing_jobs SET model_name = ? WHERE id = ?", (model_used, job.id))
             if ok and job.job_type in ("vad_chunk", "transcribe_chunk"):
+                # 自分自身が processing のままではハンドラ内の ensure_merge_job が成立しないため、完了確定後に再判定する
                 pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
             if ok and job.job_type == "diarize_meeting":
                 pipeline.on_diarize_finished(conn, job.meeting_id)
@@ -1030,14 +1098,14 @@ class JobRunner:
             # モデル未配置等の無期限 retry では待たず failed にし、merge へ進める（§2.2）
             d = RetryDecision("failed", None, True)
         async with self.ctx.db.write() as conn:
-            ok = repo.finish_job(conn, job.id, self.owner, d.next_status, error_class=err.error_class,
+            ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
                                  last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
             if not ok:
-                return
+                return  # 旧ワーカーの報告は無視（基本設計 §9.3）
             if not d.consume_attempt:
                 conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
             if err.error_class == "OOM" and job.job_type in GPU_HEAVY and job.job_type != "diarize_meeting":
-                self._downgrade_stt(conn, job.meeting_id)
+                self._downgrade_stt(conn, job.meeting_id, job.model_name)
             if d.next_status == "failed":
                 if job.job_type == "transcribe_chunk":
                     pipeline.on_transcribe_failed(conn, pipeline.job_of_chunk(conn, job))
@@ -1048,17 +1116,28 @@ class JobRunner:
                     pipeline.on_diarize_finished(conn, job.meeting_id)
                 # live_transcribe_chunk / compress_chunk の失敗は後続に影響しない
             elif job.job_type == "synthesize_minutes":
+                # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
                 pipeline.on_summary_deferred(conn, job.meeting_id)
             repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
         self._publish_job(job.id)
 
-    def _downgrade_stt(self, conn, meeting_id: str) -> None:  # type: ignore[no-untyped-def]
+    def _downgrade_stt(self, conn, meeting_id: str, ran_with: str | None) -> None:  # type: ignore[no-untyped-def]
+        """会議単位でモデルを 1 段落とす（基本設計 §7.3）。ran_with は失敗したジョブが使ったモデル（lease 時点の model_name）。
+
+        落とすのは「モデル 1 つにつき 1 段」。同じモデルで並行して走っていた 2 件がどちらも OOM になっても、
+        2 件目は既に落とした後なので何もしない（失敗 1 件につき 1 段にすると small → tiny まで落ちる）。
+        落とす先は配置済みのモデルに限る（未配置の段を選ぶと MODEL_MISSING で待ち続ける）。
+        """
         from ..hw.tiers import downgrade_stt
         m = repo.get_meeting(conn, meeting_id)
         current = (m.stt_model_used if m and m.stt_model_used else (self.ctx.models.stt.name if self.ctx.models.stt else None))
         if current is None:
             return
+        if ran_with is not None and ran_with != current:
+            return
         nxt = downgrade_stt(current)
+        while nxt is not None and nxt not in self.ctx.models.installed_stt:
+            nxt = downgrade_stt(nxt)
         if nxt is None:
             return
         repo.update_meeting(conn, meeting_id, stt_model_used=nxt)
@@ -1389,18 +1468,18 @@ class FakeLanguageDetector(LanguageDetector):
 class FasterWhisperLanguageDetector(LanguageDetector):
     """faster-whisper の detect_language。先頭 30 秒の特徴量で判定するため短い Chunk では確信度が下がる（§3）。"""
 
-    def __init__(self, models_dir: Path, model_name: str, compute_type: str) -> None:
+    def __init__(self, models_dir: Path, model_name: str, compute_type: str, device: str = "cpu") -> None:
         self.models_dir = models_dir
         self.model_name = model_name
         self.compute_type = compute_type
+        self.device = device           # SttCandidate.device。compute_type から推測しない（Phase 2 §9）
         self._model: Any = None
 
     def _load(self) -> Any:
         if self._model is not None:
             return self._model
         from faster_whisper import WhisperModel  # type: ignore[import-not-found]
-        device = "cuda" if self.compute_type in ("float16", "int8_float16") else "cpu"
-        self._model = WhisperModel(str(self.models_dir / "whisper" / self.model_name), device=device, compute_type=self.compute_type)
+        self._model = WhisperModel(str(self.models_dir / "whisper" / self.model_name), device=self.device, compute_type=self.compute_type)
         return self._model
 
     def detect(self, pcm: bytes) -> LanguageGuess:
@@ -1487,10 +1566,14 @@ class MergeReport:
 
 
 def _candidates(segments: list[Segment]) -> list[Candidate]:
-    return [Candidate(s.id, s.chunk_id, s.start_ms, s.end_ms, s.normalized_text or normalize(s.text), s.confidence or 0.0) for s in segments]
+    return [
+        Candidate(s.id, s.chunk_id, s.start_ms, s.end_ms, s.normalized_text or normalize(s.text), s.confidence or 0.0)
+        for s in segments
+    ]
 
 
 def resolve_source(segments: list[Segment], th: Thresholds) -> dict[str, str]:
+    """1 source 分。戻り値は segment_id → merge_reason（'kept' または 'dup_of:<id>'）。"""
     cands = sorted(_candidates(segments), key=lambda c: (c.start_ms, c.end_ms, c.id))
     reason: dict[str, str] = {c.id: "kept" for c in cands}
     for i, a in enumerate(cands):
@@ -1563,6 +1646,7 @@ class Gap:
 
 
 def render_lines(conn: sqlite3.Connection, meeting_id: str, version: int) -> tuple[list[TranscriptLine], list[Gap]]:
+    """確定 transcript を時系列に並べ、stt_status='failed' の Chunk を gap として返す。"""
     segs = repo.list_segments(conn, meeting_id, merged_version=version)
     names = {sp.label: sp.name for sp in repo_phase3.list_speakers(conn, meeting_id)}
     lines = [TranscriptLine(s.id, s.source, s.start_ms, s.end_ms, s.text, s.speaker_id,
@@ -1666,6 +1750,7 @@ class AudioCodec(Protocol):
     @property
     def extension(self) -> str: ...
     def encode(self, pcm: bytes) -> bytes: ...
+    # 壊れた入力は ValueError で返す（read_pcm が InvalidWavError に包む）
     def decode(self, data: bytes) -> bytes: ...
 
 
@@ -1682,7 +1767,7 @@ class FakeCodec:
         return self.MAGIC + struct.pack("<I", len(pcm)) + pcm
 
     def decode(self, data: bytes) -> bytes:
-        if data[:4] != self.MAGIC:
+        if len(data) < 8 or data[:4] != self.MAGIC:
             raise ValueError("not a fake container")
         n, = struct.unpack_from("<I", data, 4)
         pcm = data[8:8 + n]
@@ -1705,7 +1790,12 @@ class FlacCodec:
     def decode(self, data: bytes) -> bytes:
         import numpy as np  # type: ignore[import-not-found]
         import soundfile as sf  # type: ignore[import-not-found]
-        audio, sr = sf.read(io.BytesIO(data), dtype="int16")
+        try:
+            audio, sr = sf.read(io.BytesIO(data), dtype="int16")
+        except RuntimeError as e:
+            # 壊れたファイルの libsndfile の例外（RuntimeError 系）を、AudioCodec.decode の約束どおり ValueError にそろえる。
+            # read_pcm はこれを InvalidWavError に変えるので、呼び出し側（修復判定・STT）は 1 種類の例外だけを扱えばよい
+            raise ValueError(f"flac decode failed: {e}") from e
         if sr != 16000:
             raise ValueError(f"unexpected sample rate {sr}")
         if audio.ndim > 1:
@@ -1764,6 +1854,7 @@ def sha256_file(path: Path) -> str:
 
 
 def parse_wav_header(data: bytes) -> WavHeader:
+    """PCM16 / mono / 16kHz 固定仕様に準拠していなければ InvalidWavError。"""
     if len(data) < WAV_HEADER_BYTES:
         raise InvalidWavError(f"too short: {len(data)} bytes")
     if data[0:4] != b"RIFF" or data[8:12] != b"WAVE" or data[12:16] != b"fmt " or data[36:40] != b"data":
@@ -1781,10 +1872,13 @@ def parse_wav_header(data: bytes) -> WavHeader:
         raise InvalidWavError("riff size mismatch")
     if WAV_HEADER_BYTES + data_bytes != len(data):
         raise InvalidWavError(f"data size {data_bytes} != actual {len(data) - WAV_HEADER_BYTES}")
+    if data_bytes == 0 or data_bytes % 2:
+        raise InvalidWavError(f"empty or odd-sized PCM16 data: {data_bytes} bytes")
     return WavHeader(data_bytes=data_bytes, sample_count=data_bytes // 2)
 
 
 def build_wav(pcm: bytes) -> bytes:
+    """テストと FLAC 復元用。PCM16 LE バイト列に 44 バイトヘッダを付ける。"""
     data_bytes = len(pcm)
     header = b"RIFF" + struct.pack("<I", 36 + data_bytes) + b"WAVE" + b"fmt " + struct.pack(
         "<IHHIIHH", 16, 1, WAV_CHANNELS, WAV_SAMPLE_RATE, 32000, 2, WAV_BITS
@@ -1802,6 +1896,7 @@ def meeting_dir(meeting_id: str, user_id: str = "local") -> str:
 
 
 def write_atomic(data_dir: Path, relative_path: str, data: bytes) -> Path:
+    """書き込みごとに一意な {path}.{ランダム}.part に書き、fsync 後に rename する（Phase 1 §12.1）。"""
     final = data_dir / relative_path
     final.parent.mkdir(parents=True, exist_ok=True)
     # 同時書き込みで一時ファイルを奪い合わないよう、書き込みごとに一意な .part を使う
@@ -1916,7 +2011,7 @@ def restore_latest(db_path: Path, backups_dir: Path) -> Path | None:
 
 # 18. 再構築 `storage/rebuild.py` と `meeting.json`
 
-finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` がそれと音声ファイルから欠損行を復元する。Phase 1/2 の確定 API は終了時刻を `endedAtEpochMs` で書き、移行 011 はそのファイルを `recordings/local/` へ移すだけなので、rebuild は `endedAt` がなければ `endedAtEpochMs` を読む（終了時刻を失わない）。`meeting.json` は手で編集・破損しうる外部入力なので、停止理由（`stopReason`）と検出時刻（`stopDetectedAtEpochMs`）は `Meeting` を組み立てる前に組で検証する（`_stop_metadata()`）。未知の停止理由で `Meeting` の検証が失敗したり、範囲外の時刻で SQLite への挿入が `OverflowError` になったりすると、rebuild 全体が止まって他の会議も復元できなくなるためである。停止理由が `manual` / `mic_ended` のどちらかで、検出時刻が確定 API と同じ範囲（0〜2⁶³−1、SQLite INTEGER の上限）の整数（`bool` を除く）のときだけ両方を残し、どちらかが不正なら両方を `None` にする。
+finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` がそれと音声ファイルから欠損行を復元する。終了時刻のキーは Phase 1/2 の確定 API と同じ `endedAtEpochMs` で書く（移行 012 が `recordings/local/` へ移すだけの Phase 1/2 の `meeting.json` と同じキーで読める）。会議の作成時に書く控え（Phase 2 §21.2）には終了時刻がなく、その場合 rebuild は `ended_at` を NULL にする（終了時刻を失わない）。`meeting.json` は手で編集・破損しうる外部入力なので、停止理由（`stopReason`）と検出時刻（`stopDetectedAtEpochMs`）は `Meeting` を組み立てる前に組で検証する（`_stop_metadata()`）。未知の停止理由で `Meeting` の検証が失敗したり、範囲外の時刻で SQLite への挿入が `OverflowError` になったりすると、rebuild 全体が止まって他の会議も復元できなくなるためである。停止理由が `manual` / `mic_ended` のどちらかで、検出時刻が確定 API と同じ範囲（0〜2⁶³−1、SQLite INTEGER の上限）の整数（`bool` を除く）のときだけ両方を残し、どちらかが不正なら両方を `None` にする。
 
 ```python
 # minutes_local/storage/rebuild.py
@@ -1927,13 +2022,14 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from ..db import repo
 from ..db.connection import now_ms
 from ..db.models import AudioChunk, Meeting
 from .codec import AudioCodec
-from .files import WAV_HEADER_BYTES, build_wav, parse_wav_header, sha256_hex
+from .files import WAV_HEADER_BYTES, build_wav, parse_wav_header, sha256_hex, write_atomic
+from .files import meeting_dir as meeting_rel_dir
 
 
 @dataclass
@@ -1945,24 +2041,22 @@ class RebuildReport:
 
 
 def write_meeting_json(data_dir: Path, meeting: Meeting, chunks: list[AudioChunk]) -> Path:
-    """finalize 時のスナップショット。Phase 1 §13 の規約。"""
-    d = data_dir / "recordings" / meeting.local_user_id / meeting.id
-    d.mkdir(parents=True, exist_ok=True)
+    """finalize 時のスナップショット。Phase 1 §13 の規約。キーは Phase 1/2 の meeting.json に Chunk 一覧と利用者を足したもの。
+
+    write_atomic で書く（書き込みごとに一意な一時ファイル + fsync、Phase 1 §12.1）。同時 finalize が同じ一時ファイルを奪い合わない。
+    """
     payload: dict[str, Any] = {
         "meetingId": meeting.id, "localUserId": meeting.local_user_id, "title": meeting.title,
         "sessionStartEpochMs": meeting.session_start_epoch_ms, "nativeSampleRate": meeting.native_sample_rate,
-        "consentConfirmedAt": meeting.consent_confirmed_at, "endedAt": meeting.ended_at,
+        "consentConfirmedAt": meeting.consent_confirmed_at, "endedAtEpochMs": meeting.ended_at,
         "totalAudioFrames": meeting.total_audio_frames,
         "stopReason": meeting.stop_reason, "stopDetectedAtEpochMs": meeting.stop_detected_at,
         "chunks": [{"source": c.source, "sequenceNo": c.sequence_no, "startOffsetMs": c.start_offset_ms,
                     "endOffsetMs": c.end_offset_ms, "sampleCount": c.sample_count, "sha256": c.sha256,
                     "vadScore": c.vad_score, "hasVoice": c.has_voice} for c in chunks],
     }
-    path = d / "meeting.json"
-    tmp = path.with_suffix(".json.part")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(path)
-    return path
+    rel = f"{meeting_rel_dir(meeting.id, meeting.local_user_id)}/meeting.json"
+    return write_atomic(data_dir, rel, json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8"))
 
 
 def _chunk_from_file(path: Path, codec: AudioCodec | None) -> tuple[int, str, bytes] | None:
@@ -1987,9 +2081,15 @@ def _stop_metadata(meta: dict[str, Any]) -> tuple[str | None, int | None]:
     """meeting.json の停止理由と検出時刻を組で検証する。片方でも不正なら両方 None（Meeting の検証で rebuild 全体を止めない）。"""
     reason, detected = meta.get("stopReason"), meta.get("stopDetectedAtEpochMs")
     # bool は int のサブクラスなので明示的に除く。範囲は確定 API と同じ SQLite INTEGER（範囲外は insert で OverflowError）
-    if reason in ("manual", "mic_ended") and isinstance(detected, int) and not isinstance(detected, bool) and 0 <= detected <= 2**63 - 1:
+    if reason in ("manual", "mic_ended") and _is_sqlite_epoch_ms(detected):
         return reason, detected
     return None, None
+
+
+def _is_sqlite_epoch_ms(value: object) -> TypeGuard[int]:
+    """確定 API と同じく 0 以上の整数で、SQLite INTEGER に収まるか（範囲外は insert で OverflowError）。"""
+    # bool は int のサブクラスなので明示的に除く
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2**63 - 1
 
 
 def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) -> RebuildReport:
@@ -2009,12 +2109,15 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
         t = now_ms()
         if repo.get_meeting(conn, meeting_id) is None:
             stop_reason, stop_detected_at = _stop_metadata(meta)
+            # 不正な終了時刻（範囲外・整数でない）は None にし、Meeting の検証や insert で rebuild 全体を止めない
+            ended_raw = meta.get("endedAtEpochMs")
+            ended_at = ended_raw if _is_sqlite_epoch_ms(ended_raw) else None
             repo.insert_meeting(conn, Meeting(
                 id=meeting_id, local_user_id=str(meta.get("localUserId", user_id)), title=str(meta.get("title", "復元された会議")),
                 status="finalized", session_start_epoch_ms=int(meta.get("sessionStartEpochMs", 0)),
                 native_sample_rate=int(meta.get("nativeSampleRate", 0)), consent_confirmed_at=int(meta.get("consentConfirmedAt", 0)),
-                # Phase 1/2 の finalize は endedAtEpochMs で書く（移行 011 で recordings/local/ へ移った meeting.json）。Phase 3 は endedAt
-                ended_at=meta.get("endedAt", meta.get("endedAtEpochMs")), total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
+                # 終了時刻のキーは全フェーズで endedAtEpochMs。会議の作成時に書いた控え（確定前）にはなく、その場合は None
+                ended_at=ended_at, total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
                 stop_reason=stop_reason, stop_detected_at=stop_detected_at,
             ))
             report.meetings_created += 1
@@ -2166,7 +2269,7 @@ def certificate_hostnames(cert_path: Path) -> list[str]:
 
 ```python
 # minutes_local/api/app.py
-"""FastAPI アプリ。Phase 3 で利用者認証と所有者照合を追加。"""
+"""FastAPI アプリ。Phase 2 の CORS・エラー応答の統一・アプリ配信に、Phase 3 で利用者認証と所有者照合を追加。"""
 from __future__ import annotations
 
 import hmac
@@ -2174,7 +2277,10 @@ import re
 from collections.abc import Awaitable, Callable
 
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from ..auth.users import LOCAL_USER_ID, find_user_by_token
 from ..db import repo_phase3
@@ -2187,6 +2293,12 @@ CSP = (
 )
 MEETING_PATH = re.compile(r"^/v1/meetings/([^/]+)(?:/|$)")
 JOB_PATH = re.compile(r"^/v1/jobs/([^/]+)(?:/|$)")
+
+# Vite の開発サーバー（Phase 1 §31.1）。Phase 1 §12 が CORS を許可する唯一の配信元
+DEV_ORIGIN = "http://127.0.0.1:5173"
+CORS_METHODS = ["GET", "POST", "PUT", "DELETE"]
+# Authorization を付ける要求はすべて preflight になる。If-Match はノートの楽観ロック（§21.3）
+CORS_HEADERS = ["Authorization", "Content-Type", "X-Chunk-SHA256", "X-Chunk-Meta", "If-Match"]
 
 
 def create_app(ctx: AppContext, token: str) -> FastAPI:
@@ -2202,17 +2314,31 @@ def create_app(ctx: AppContext, token: str) -> FastAPI:
         user_id = _resolve_user(request, ctx, token)
         request.state.authenticated = user_id is not None
         request.state.user_id = user_id or LOCAL_USER_ID
-        if path.startswith("/v1/") and path != "/v1/health":
+        # OPTIONS（preflight）はトークンを運べないので認証しない（Phase 1 §12）
+        if path.startswith("/v1/") and path != "/v1/health" and request.method != "OPTIONS":
             if user_id is None:
                 return JSONResponse(error_body("UNAUTHORIZED", "invalid or missing token"), status_code=401)
             denied = _ownership_denied(path, user_id, ctx)
             if denied:
                 return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            # ブラウザ側は応答本文を ApiErrorBody として読む（Phase 1 §12）。スタックトレースや既定の HTML を返さない
+            return JSONResponse(error_body("INTERNAL", "internal server error"), status_code=500)
         response.headers["Content-Security-Policy"] = CSP
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Cache-Control"] = "no-store"
         return response
+
+    # 後から足したミドルウェアが外側になる。CORS を最も外側に置き、401・422・500・507 にも CORS ヘッダを付ける。
+    # 付いていないと、ブラウザは応答を読めず原因を NETWORK と区別できない
+    app.add_middleware(CORSMiddleware, allow_origins=[DEV_ORIGIN], allow_methods=CORS_METHODS, allow_headers=CORS_HEADERS)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, _exc: RequestValidationError) -> JSONResponse:
+        # FastAPI 既定の {"detail": [...]} ではなく、他のエラーと同じ形で返す
+        return JSONResponse(error_body("VALIDATION", "invalid request"), status_code=422)
 
     app.include_router(routes_phase1.router)
     app.include_router(routes_meetings.router)
@@ -2220,6 +2346,11 @@ def create_app(ctx: AppContext, token: str) -> FastAPI:
     app.include_router(routes_models.router)
     app.include_router(routes_phase3.router)
     app.include_router(sse.router)
+    # ブラウザアプリ（`npm run build` の出力）の配信。ルータより後に置き、/v1/ を覆わない。
+    # 認証は /v1/ だけに掛かる（アプリ本体に秘密はなく、トークンは利用者が画面で入力する）
+    web = ctx.settings.web_dir
+    if web is not None and (web / "index.html").is_file():
+        app.mount("/", StaticFiles(directory=web, html=True), name="web")
     return app
 
 
@@ -2262,35 +2393,46 @@ def _ownership_denied(path: str, user_id: str, ctx: AppContext) -> bool:
 
 ```python
 # minutes_local/api/routes_phase1.py
-"""Phase 1 §12 の契約。形状は変更禁止。Phase 3 で利用者階層・Live フック・meeting.json・missing を追加。"""
+"""Phase 1 §12 の契約。形状は変更禁止、検証規則は Phase 2 §21.2 のまま。Phase 3 で利用者階層・Live フック・meeting.json・missing を追加。"""
 from __future__ import annotations
 
+import asyncio
 import base64
 import errno
 import json
+import math
+import re
 from typing import Any, Literal
 
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
-from pydantic import Field, model_validator, BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from ..db import repo
 from ..db.connection import now_ms
 from ..db.models import AudioChunk, Meeting
 from ..jobs import live, pipeline
-from ..storage.files import InvalidWavError, chunk_relative_path, parse_wav_header, sha256_file, sha256_hex, write_atomic
+from ..jobs.context import AppContext
+from ..storage.files import (InvalidWavError, chunk_relative_path, meeting_dir, parse_wav_header, read_pcm, sha256_hex,
+                             write_atomic)
 from ..storage.rebuild import write_meeting_json
 from .common import error_body, get_ctx
 
 router = APIRouter(prefix="/v1")
 
+# meetingId はファイルパス（recordings/{meetingId}/…）に使うので形式を固定する。".." や区切り文字を通さない
+SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+# finalize 前の状態。これ以外の会議には新しい Chunk を足さず、確定値も書き換えない
+OPEN_STATUSES = ("created", "recording", "finalizing")
+
 
 class CreateMeetingRequest(BaseModel):
     meetingId: str
     title: str
-    sessionStartEpochMs: int
-    nativeSampleRate: int
-    consentConfirmedAt: int
+    sessionStartEpochMs: int = Field(ge=0)
+    nativeSampleRate: int = Field(gt=0)
+    consentConfirmedAt: int = Field(ge=0)
 
 
 class FinalizeRequest(BaseModel):
@@ -2317,9 +2459,12 @@ def _capabilities(request: Request) -> dict[str, Any]:
         "cpuCores": hw.cpu_cores, "totalMemoryBytes": hw.total_memory_bytes,
         "sttModel": m.stt.name if m.stt else None, "llmModel": m.llm, "maxConcurrentStt": m.max_concurrent_stt,
         "tier": m.tier,
-        "availableSttModels": [{"name": n, "computeType": m.stt.compute_type if m.stt else "int8", "estimatedMemoryBytes": 0, "installed": True}
-                               for n in sorted(m.installed_stt)],
-        "availableLlmModels": [{"name": n, "parameterSizeB": None, "quantization": None, "estimatedMemoryBytes": None} for n in m.available_llm],
+        "availableSttModels": [
+            {"name": n, "computeType": m.stt.compute_type if m.stt else "int8", "estimatedMemoryBytes": 0, "installed": True}
+            for n in sorted(m.installed_stt)
+        ],
+        "availableLlmModels": [{"name": n, "parameterSizeB": None, "quantization": None, "estimatedMemoryBytes": None}
+                               for n in m.available_llm],
         "ollamaReachable": m.ollama_reachable, "allowConcurrentSttAndLlm": m.allow_concurrent_stt_and_llm,
         # Phase 3
         "diarizationAvailable": ctx.diarization is not None, "languageDetectionAvailable": ctx.language is not None,
@@ -2339,6 +2484,8 @@ async def health(request: Request) -> dict[str, Any]:
 @router.post("/meetings")
 async def create_meeting(req: CreateMeetingRequest, request: Request) -> JSONResponse:
     ctx = get_ctx(request)
+    if not SAFE_ID.fullmatch(req.meetingId):
+        return JSONResponse(error_body("VALIDATION", "invalid meetingId"), status_code=422)
     t = now_ms()
     m = Meeting(id=req.meetingId, local_user_id=request.state.user_id, title=req.title, status="recording",
                 session_start_epoch_ms=req.sessionStartEpochMs, native_sample_rate=req.nativeSampleRate,
@@ -2348,19 +2495,66 @@ async def create_meeting(req: CreateMeetingRequest, request: Request) -> JSONRes
         if created:
             repo.update_meeting(conn, m.id, live_stt_enabled=int(live.default_live_enabled(ctx)))
         current = repo.get_meeting(conn, req.meetingId)
+        chunks_now = repo.list_chunks(conn, req.meetingId)
     assert current is not None
-    body = {"meetingId": current.id, "status": current.status, "dataPath": f"recordings/{current.local_user_id}/{current.id}"}
+    # 録音メタデータの控え（Phase 1 §13）。作成時に書き、再送時はファイルが失われているときだけ書き直す
+    # （finalize 後の再送で、確定値を持つ meeting.json を作成時の内容へ戻さない）。
+    # 書くときは finalize と同じ write_meeting_json で DB の会議行と Chunk から書く。作成時の要求から書くと、
+    # 確定後に控えが失われて再送されたとき、確定値と Chunk 一覧のない控えに戻る
+    rel = f"{meeting_dir(current.id, current.local_user_id)}/meeting.json"
+    if created or not (ctx.settings.data_dir / rel).is_file():
+        try:
+            write_meeting_json(ctx.settings.data_dir, current, chunks_now)
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
+            raise
+    body = {"meetingId": current.id, "status": current.status, "dataPath": meeting_dir(current.id, current.local_user_id)}
     return JSONResponse(body, status_code=201 if created else 200)
 
 
-def _decode_meta(header: str | None) -> dict[str, Any]:
-    if not header:
-        return {}
-    padded = header + "=" * (-len(header) % 4)
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_meta(header: str, meeting_id: str, source: str, sequence_no: int, sample_count: int, sha: str, size: int) -> dict[str, Any]:
+    """X-Chunk-Meta（Base64URL の JSON）を復号し、URL・WAV と食い違えば ValueError（→ 422）。
+
+    メタデータは録音時刻の正なので、既定値で補わない。食い違ったまま登録すると transcript の時刻がずれる。
+    """
     try:
-        return json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return {}
+        meta = json.loads(base64.urlsafe_b64decode(header + "=" * (-len(header) % 4)))
+    except ValueError as e:      # binascii.Error / JSONDecodeError / UnicodeDecodeError はすべて ValueError の派生
+        raise ValueError("invalid X-Chunk-Meta") from e
+    if not isinstance(meta, dict):
+        raise ValueError("metadata must be an object")
+    if (meta.get("meetingId") != meeting_id or meta.get("source") != source
+            or meta.get("sequenceNo") != sequence_no or meta.get("sampleCount") != sample_count):
+        raise ValueError("metadata does not match URL or WAV")
+    start, end = meta.get("startOffsetMs"), meta.get("endOffsetMs")
+    if not _is_int(start) or not _is_int(end) or start < 0 or end < start:
+        raise ValueError("invalid timing")
+    # VAD の結果も既定値で補わない。hasVoice を True で補うと無音の Chunk まで文字起こしに回る（欠落は 422）
+    score = meta.get("vadScore")
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+        raise ValueError("invalid vadScore")
+    if not isinstance(meta.get("hasVoice"), bool):
+        raise ValueError("invalid hasVoice")
+    if (meta.get("sha256", sha) != sha or meta.get("sizeBytes", size) != size
+            or meta.get("sampleRate", 16000) != 16000 or meta.get("channels", 1) != 1):
+        raise ValueError("metadata does not match WAV")
+    return meta
+
+
+def _stored_chunk_intact(ctx: AppContext, chunk: AudioChunk) -> bool:
+    """保存済みファイルを read_pcm で読み、WAV の sha256 まで一致するか。"""
+    try:
+        read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec)
+    except InvalidWavError:        # 欠損・sha256 不一致・復号の失敗（コーデックは失敗を ValueError で返し、read_pcm が包む）
+        return False
+    except OSError:                # 権限・照合中の削除など読めないファイルも欠損として修復へ進める（500 にしない。chunk_file_intact と同じ規則）
+        return False
+    return True
 
 
 @router.put("/meetings/{meeting_id}/chunks/{source}/{sequence_no}")
@@ -2368,16 +2562,23 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
                     x_chunk_sha256: str | None = Header(default=None),
                     x_chunk_meta: str | None = Header(default=None)) -> JSONResponse:
     ctx = get_ctx(request)
-    if source not in ("mic", "system"):
-        return JSONResponse(error_body("VALIDATION", "source must be mic or system"), status_code=422)
+    if not SAFE_ID.fullmatch(meeting_id) or source not in ("mic", "system") or sequence_no < 0:
+        return JSONResponse(error_body("VALIDATION", "invalid chunk key"), status_code=422)
+    if (request.headers.get("content-type") != "audio/wav" or x_chunk_sha256 is None
+            or not SHA256_HEX.fullmatch(x_chunk_sha256) or x_chunk_meta is None):
+        return JSONResponse(error_body("VALIDATION", "invalid chunk headers"), status_code=422)
     data = await request.body()
     try:
         header = parse_wav_header(data)
     except InvalidWavError as e:
         return JSONResponse(error_body("VALIDATION", "invalid wav", str(e)), status_code=422)
     sha = sha256_hex(data)
-    if x_chunk_sha256 and x_chunk_sha256.lower() != sha:
+    if x_chunk_sha256 != sha:
         return JSONResponse(error_body("VALIDATION", "sha256 header mismatch"), status_code=422)
+    try:
+        meta = _validate_meta(x_chunk_meta, meeting_id, source, sequence_no, header.sample_count, sha, len(data))
+    except ValueError as e:
+        return JSONResponse(error_body("VALIDATION", str(e)), status_code=422)
 
     with ctx.db.read() as conn:
         meeting = repo.get_meeting(conn, meeting_id)
@@ -2387,14 +2588,35 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
     if existing is not None:
         if existing.sha256 != sha:
             return JSONResponse(error_body("CONFLICT_HASH_MISMATCH", "chunk exists with different content"), status_code=409)
-        if existing.save_status == "missing":
-            # 逆同期（§2.4）：ファイルを書き戻して verified に
-            write_atomic(ctx.settings.data_dir, existing.local_path, data)
+        path = ctx.settings.data_dir / existing.local_path
+        # 圧縮済み（codec != wav）も復号して WAV の sha256 と照合する（read_pcm と同じ検証）。存在だけを見ると壊れた控えを修復しない
+        intact = path.is_file() and _stored_chunk_intact(ctx, existing)
+        if not intact:
+            # 修復・逆同期（§2.4）：登録済みだがファイルが失われた・壊れた。内容は同じ（sha256 一致）なので WAV として書き戻す。
+            # 圧縮済みだった Chunk も WAV に戻る。確定後の会議でも受け付ける。
+            # 照合の間に会議・Chunk が削除されていれば書き戻さない。削除は DB のコミット後に rmtree するので、
+            # 書き込みロック下で確かめ直し、書き戻しもロックの中で行う（消えた録音を作り直さない。Phase 2 server §21.2 と同じ）
+            rel = chunk_relative_path(meeting_id, source, sequence_no, meeting.local_user_id)
+            repaired = {"local_path": rel, "codec": "wav", "sha256_flac": None, "size_bytes": len(data), "save_status": "registered"}
             async with ctx.db.write() as conn:
-                repo.update_chunk(conn, existing.id, save_status="verified", codec="wav")
-            existing = existing.model_copy(update={"save_status": "verified", "codec": "wav"})
-        return JSONResponse(_chunk_response(existing), status_code=200)
-    if meeting.status not in ("created", "recording", "finalizing"):
+                current = repo.get_chunk_by_key(conn, meeting_id, source, sequence_no)
+                if repo.get_meeting(conn, meeting_id) is None or current is None or current.id != existing.id:
+                    return JSONResponse(error_body("NOT_FOUND", "chunk not found"), status_code=404)
+                try:
+                    write_atomic(ctx.settings.data_dir, rel, data)
+                except OSError as e:
+                    if e.errno == errno.ENOSPC:
+                        return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
+                    raise
+                repo.update_chunk(conn, existing.id, **repaired)
+            existing = existing.model_copy(update=repaired)
+        elif existing.save_status == "missing":
+            # ファイルは無事（手動で戻された等）なのに missing のままなら、印だけ直す
+            async with ctx.db.write() as conn:
+                repo.update_chunk(conn, existing.id, save_status="registered")
+            existing = existing.model_copy(update={"save_status": "registered"})
+        return JSONResponse(_chunk_response(existing), status_code=200)   # 冪等再送（Phase 2 基本設計 §11）
+    if meeting.status not in OPEN_STATUSES:
         # 確定後の会議には新しい Chunk を足さない（登録済み Chunk の再送・修復は上で受け付け済み）
         return JSONResponse(error_body("CONFLICT_MEETING_FINALIZED", "meeting is already finalized"), status_code=409)
 
@@ -2405,22 +2627,30 @@ async def put_chunk(meeting_id: str, source: str, sequence_no: int, request: Req
         if e.errno == errno.ENOSPC:
             return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
         raise
-    meta = _decode_meta(x_chunk_meta)
-    duration_ms = int(header.sample_count / 16)
-    start = int(meta.get("startOffsetMs", sequence_no * 30000))
+    duration_ms = round(header.sample_count / 16)
     chunk = AudioChunk(
         id=repo.new_id(), meeting_id=meeting_id, source=source, sequence_no=sequence_no,  # type: ignore[arg-type]
-        start_offset_ms=start, end_offset_ms=int(meta.get("endOffsetMs", start + duration_ms)),
+        start_offset_ms=meta["startOffsetMs"], end_offset_ms=meta["endOffsetMs"],
         duration_ms=duration_ms, sample_count=header.sample_count, local_path=rel, size_bytes=len(data), sha256=sha,
-        vad_score=float(meta.get("vadScore", 0.0)), has_voice=bool(meta.get("hasVoice", True)), created_at=now_ms(),
+        vad_score=float(meta["vadScore"]), has_voice=meta["hasVoice"], created_at=now_ms(),
     )
+    # 同期誤差サンプル（基本設計 §16.3.1）。frameClockDriftMs は Phase 1 の ChunkTimingMetadata に
+    # 後から足した optional フィールドなので、欠落や非数値は 422 にせず無視する
+    # （Phase 1 クライアントがそのまま Phase 2 サーバーに繋がる、§2 の後方互換）。
+    drift = meta.get("frameClockDriftMs")
+    wall_start = meta.get("wallClockStartEpochMs")
+    sampled_at = (wall_start if _is_int(wall_start) else now_ms()) + duration_ms
+
     live_job: str | None = None
     async with ctx.db.write() as conn:
         # 読み取り後に finalize が確定させた場合に備え、書き込みロック下で状態を確かめ直す
         current = repo.get_meeting(conn, meeting_id)
-        if current is None or current.status not in ("created", "recording", "finalizing"):
+        if current is None or current.status not in OPEN_STATUSES:
             return JSONResponse(error_body("CONFLICT_MEETING_FINALIZED", "meeting is already finalized"), status_code=409)
         stored = repo.upsert_chunk(conn, chunk)
+        if isinstance(drift, (int, float)) and not isinstance(drift, bool) and math.isfinite(drift):
+            # 冪等再送で重複しないよう INSERT OR IGNORE（UNIQUE (meeting_id, source, sequence_no)）
+            repo.insert_sync_sample(conn, meeting_id, source, sequence_no, sampled_at, float(drift))
         if stored.id == chunk.id:
             live_job = live.on_chunk_registered(conn, ctx, meeting, stored)
     if live_job is not None:
@@ -2436,6 +2666,8 @@ def _chunk_response(c: AudioChunk) -> dict[str, Any]:
 @router.get("/meetings/{meeting_id}/chunks")
 async def list_chunks(meeting_id: str, request: Request) -> Any:
     ctx = get_ctx(request)
+    if not SAFE_ID.fullmatch(meeting_id):
+        return JSONResponse(error_body("VALIDATION", "invalid meetingId"), status_code=422)
     with ctx.db.read() as conn:
         if repo.get_meeting(conn, meeting_id) is None:
             return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
@@ -2448,7 +2680,11 @@ async def list_chunks(meeting_id: str, request: Request) -> Any:
 
 @router.post("/meetings/{meeting_id}/finalize")
 async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> Any:
+    """Finalization Barrier のサーバー側：件数一致 + 連番の連続 + ファイル存在 + sha256 照合 → finalized → ジョブ生成。"""
     ctx = get_ctx(request)
+    if (not SAFE_ID.fullmatch(meeting_id) or set(req.expectedChunkCounts) != {"mic", "system"}
+            or any(v < 0 for v in req.expectedChunkCounts.values())):
+        return JSONResponse(error_body("VALIDATION", "invalid finalize request"), status_code=422)
     with ctx.db.read() as conn:
         meeting = repo.get_meeting(conn, meeting_id)
         chunks = repo.list_chunks(conn, meeting_id)
@@ -2457,9 +2693,8 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
     counts = {"mic": 0, "system": 0}
     missing: list[str] = []
     for c in chunks:
-        path = ctx.settings.data_dir / c.local_path
-        ok = path.exists() and (c.codec != "wav" or sha256_file(path) == c.sha256)
-        if not ok:
+        # sha256 の計算はファイル全体を読むので、イベントループを塞がないようスレッドで行う（書き込みトランザクションの前）
+        if not await asyncio.to_thread(pipeline.chunk_file_intact, ctx.settings.data_dir, c):
             missing.append(f"{c.source}/{c.sequence_no}")
             continue
         counts[c.source] += 1
@@ -2471,20 +2706,43 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
         if counts.get(source, 0) != expected:
             return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", f"{source}: have {counts.get(source, 0)}, expected {expected}",
                                            ", ".join(missing) or None), status_code=409)
+        # 件数が合っていても連番に穴があれば確定しない（0,1,3 の 3 件を「3 件そろった」と扱わない）
+        seqs = sorted(c.sequence_no for c in chunks if c.source == source)
+        if seqs != list(range(len(seqs))):
+            return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", f"{source}: sequence gap"), status_code=409)
+    # 件数が期待と合っていても、登録済みで欠損・破損した Chunk があれば確定しない（期待より多く登録されていて、余りが壊れた場合）
+    if missing:
+        return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "missing or corrupted chunks", ", ".join(missing)), status_code=409)
+    transitioned = False
     async with ctx.db.write() as conn:
         # 先に確定した値を正とする。書き込みロック下で状態と件数を確かめ直し、2 回目以降は更新しない
         current = repo.get_meeting(conn, meeting_id)
-        if current is not None and current.status in ("created", "recording", "finalizing"):
+        # 照合の間に削除された会議を「確定した」と返さない（Phase 2 §21.2 と同じ）
+        if current is None:
+            return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
+        if current.status in OPEN_STATUSES:
             if len(repo.list_chunks(conn, meeting_id)) != len(chunks):
                 return JSONResponse(error_body("CONFLICT_CHUNKS_MISSING", "chunks changed during finalize"), status_code=409)
             repo.update_meeting(conn, meeting_id, status="finalized", ended_at=req.endedAtEpochMs, total_audio_frames=req.totalAudioFrames,
                                 stop_reason=req.stopReason, stop_detected_at=req.stopDetectedAtEpochMs)
-            pipeline.on_finalized(conn, meeting_id)
+            pipeline.on_finalized(conn, meeting_id, ctx.diarization_active)
+            transitioned = True
         snapshot = repo.get_meeting(conn, meeting_id)
         chunks_now = repo.list_chunks(conn, meeting_id)
+    # 状態の遷移はコミット済みなので、控えの書き出しより先に通知する。書き出しが 507 で終わると、
+    # 再送は transitioned が False になり、この遷移を通知する機会がなくなる（Phase 2 §21.2 と同じ）。
+    # 再送（確定済み会議への 2 回目以降の POST）では状態を進めていないので通知しない。
+    # 毎回 transcribing を流すと、completed の会議の画面が再送のたびに処理中へ戻る
+    if transitioned and snapshot is not None:
+        ctx.events.publish(meeting_id, {"type": "meeting_status", "status": snapshot.status})
+    # コミット後に確定値から書き、meeting.json が DB より先行しないようにする。再送でも毎回書き直す（Phase 1 §12）
     if snapshot is not None:
-        write_meeting_json(ctx.settings.data_dir, snapshot, chunks_now)
-    ctx.events.publish(meeting_id, {"type": "meeting_status", "status": "transcribing"})
+        try:
+            write_meeting_json(ctx.settings.data_dir, snapshot, chunks_now)
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                return JSONResponse(error_body("INSUFFICIENT_STORAGE", "disk full"), status_code=507)
+            raise
     return {"meetingId": meeting_id, "status": "finalized", "registeredChunkCounts": counts}
 ```
 
@@ -2508,8 +2766,9 @@ from pydantic import BaseModel
 from ..db import repo, repo_phase3
 from ..db.connection import now_ms
 from ..jobs import live, pipeline
+from ..jobs.selection import refresh_llm, refresh_stt
 from ..storage.files import meeting_dir
-from .common import error_body, get_ctx
+from .common import MERGED_STATUSES, POST_FINALIZE_STATUSES, clean_settings, error_body, get_ctx
 
 router = APIRouter(prefix="/v1")
 
@@ -2552,6 +2811,7 @@ async def meeting_detail(meeting_id: str, request: Request) -> Any:
         chunks = repo.list_chunks(conn, meeting_id)
         stt_counts = repo.count_chunks_by_stt(conn, meeting_id)
         latest = repo.latest_summary(conn, meeting_id)
+        drift = repo.sync_drift_percentiles(conn, meeting_id)      # 基本設計 §16.3.1
         live_state = live.compute_live_state(conn, ctx, m, now_ms())
         speakers = repo_phase3.list_speakers(conn, meeting_id)
         diarized = repo.count_jobs(conn, meeting_id, "diarize_meeting", ["completed"]) > 0
@@ -2560,7 +2820,7 @@ async def meeting_detail(meeting_id: str, request: Request) -> Any:
         "chunkCounts": {"mic": sum(1 for c in chunks if c.source == "mic"), "system": sum(1 for c in chunks if c.source == "system")},
         "sttStatusCounts": stt_counts, "transcriptVersion": m.transcript_version,
         "latestSummaryVersion": latest.version if latest else None,
-        "sttModelUsed": m.stt_model_used, "llmModelUsed": m.llm_model_used, "syncDriftMs": None,
+        "sttModelUsed": m.stt_model_used, "llmModelUsed": m.llm_model_used, "syncDriftMs": drift,
         # Phase 3
         "liveState": live_state, "liveSttEnabled": m.live_stt_enabled,
         "languageRatio": json.loads(m.language_ratio_json) if m.language_ratio_json else {},
@@ -2620,7 +2880,8 @@ async def summary(meeting_id: str, request: Request, version: int | None = None)
         s = repo.latest_summary(conn, meeting_id, version)
     if s is None:
         return JSONResponse(error_body("NOT_FOUND", "summary not found"), status_code=404)
-    return {"meetingId": meeting_id, "version": s.version, "summary": json.loads(s.result_json), "validation": json.loads(s.validation_json)}
+    return {"meetingId": meeting_id, "version": s.version, "summary": json.loads(s.result_json),
+            "validation": json.loads(s.validation_json)}
 
 
 @router.post("/meetings/{meeting_id}/summary/regenerate", status_code=202)
@@ -2639,8 +2900,15 @@ async def regenerate(meeting_id: str, request: Request) -> Any:
 async def rerun(meeting_id: str, req: RerunRequest, request: Request) -> Any:
     ctx = get_ctx(request)
     async with ctx.db.write() as conn:
-        if repo.get_meeting(conn, meeting_id) is None:
+        m = repo.get_meeting(conn, meeting_id)
+        if m is None:
             return JSONResponse(error_body("NOT_FOUND", "meeting not found"), status_code=404)
+        if m.status not in POST_FINALIZE_STATUSES:
+            # 確定前（録音中）に通すと会議が transcribing に進み、以後の Chunk の PUT が「確定済み」の 409 になる
+            return JSONResponse(error_body("VALIDATION", "meeting is not finalized"), status_code=422)
+        if req.sttModel is not None and req.sttModel not in ctx.models.installed_stt:
+            # 未配置のモデルで作り直すと、全 Chunk が MODEL_MISSING の待機に入る（既存の transcript は消した後）
+            return JSONResponse(error_body("VALIDATION", "stt model is not installed"), status_code=422)
         n = pipeline.request_rerun_stt(conn, meeting_id, req.sttModel)
     return {"jobsCreated": n}
 
@@ -2657,7 +2925,8 @@ async def get_notes(meeting_id: str, request: Request) -> Any:
 
 
 @router.put("/meetings/{meeting_id}/notes")
-async def put_notes(meeting_id: str, req: NotesPutRequest, request: Request, if_match: str | None = Header(default=None)) -> Any:
+async def put_notes(meeting_id: str, req: NotesPutRequest, request: Request,
+                    if_match: str | None = Header(default=None)) -> Any:
     ctx = get_ctx(request)
     expected = int(if_match) if if_match and if_match.isdigit() else None
     async with ctx.db.write() as conn:
@@ -2672,13 +2941,27 @@ async def put_notes(meeting_id: str, req: NotesPutRequest, request: Request, if_
 
 @router.post("/meetings/{meeting_id}/chunks/{source}/{sequence_no}/transcribe", status_code=202)
 async def transcribe_silent_chunk(meeting_id: str, source: str, sequence_no: int, request: Request) -> Any:
+    """has_voice=0 の Chunk を手動で STT（基本設計 §13.2）。"""
     ctx = get_ctx(request)
     async with ctx.db.write() as conn:
+        m = repo.get_meeting(conn, meeting_id)
         c = repo.get_chunk_by_key(conn, meeting_id, source, sequence_no)
-        if c is None:
+        if m is None or c is None:
             return JSONResponse(error_body("NOT_FOUND", "chunk not found"), status_code=404)
-        repo.update_chunk(conn, c.id, stt_status="queued", has_voice=True)
+        if m.status not in MERGED_STATUSES:
+            # merge の前（録音中・transcribing）は受けない。実行待ちの merge が、この Chunk の STT より先に走りうる
+            return JSONResponse(error_body("VALIDATION", "transcript is not ready"), status_code=422)
+        if c.stt_status != "skipped":
+            # 対象は VAD が無音と判定した Chunk だけ。それ以外は transcribe ジョブが既にあり（一意制約）、
+            # ジョブを作れないまま queued にすると、終端にならない Chunk が残って merge が永久に止まる
+            return JSONResponse(error_body("VALIDATION", "chunk is not a skipped chunk"), status_code=422)
         job_id = repo.insert_job(conn, meeting_id, "transcribe_chunk", chunk_id=c.id)
+        if job_id is None:
+            return JSONResponse(error_body("VALIDATION", "chunk already has a transcribe job"), status_code=422)
+        repo.update_chunk(conn, c.id, stt_status="queued", has_voice=True)
+        # 完了済みの merge ジョブを消す。この Chunk の STT が終わると ensure_merge_job が作り直し、transcript の版が上がる。
+        # 要約は自動では作り直さない（会議は transcribed に戻る。利用者が再生成を選ぶ）
+        repo.delete_finished_job(conn, meeting_id, "merge_transcript")
         repo.record_metric(conn, "vad_manual_transcribe", 1, meeting_id=meeting_id)
     return {"jobId": job_id}
 
@@ -2690,10 +2973,18 @@ async def put_settings(req: SettingsPutRequest, request: Request) -> Any:
         "language": req.language, "stt_model": req.sttModel, "llm_model": req.llmModel, "vad_sampling_ratio": req.vadSamplingRatio,
         "live_stt_enabled": req.liveSttEnabled, "summary_language": req.summaryLanguage, "diarization_enabled": req.diarizationEnabled,
     }.items() if v is not None}
+    error = clean_settings(values)      # 検査に通らなければ 1 つも保存しない
+    if error is not None:
+        return JSONResponse(error_body("VALIDATION", error), status_code=422)
     async with ctx.db.write() as conn:
         for k, v in values.items():
             repo.put_setting(conn, k, v)
     ctx.settings = ctx.settings.with_overrides(values)
+    # モデルの指定を変えたら選定をやり直す（やり直さないと再起動するまで前のモデルで走る）
+    if "stt_model" in values:
+        refresh_stt(ctx)
+    if "llm_model" in values:
+        await refresh_llm(ctx)
     warnings: list[str] = []
     if values.get("live_stt_enabled") and ctx.models.tier in ("gpu_small", "cpu_only"):
         warnings.append("この区分では Live STT が録音に影響する可能性があります（§2.1）")
@@ -2836,6 +3127,7 @@ from ..storage.files import InvalidWavError, build_wav, read_pcm, sha256_hex, wr
 from . import pipeline
 from .context import AppContext
 from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError
+from .selection import refresh_llm, refresh_stt
 
 DEFAULT_LLM_CTX_TOKENS = 8192
 
@@ -2853,6 +3145,10 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
     with ctx.db.read() as conn:
         chunk = pipeline.job_of_chunk(conn, job)
     if ctx.vad is None:
+        # モデル未配置：ブラウザ側の has_voice をそのまま採用し、vad_source は browser_rms のまま。
+        # 例外を投げずに戻るので runner は processing_jobs.status を completed にし、Phase 2 基本設計 §9.5 の
+        # transcribe_chunk 生成へ進む。skipped は audio_chunks.stt_status 専用の値であり、
+        # processing_jobs.status には存在しない（Phase 2 基本設計 §13.1）。
         async with ctx.db.write() as conn:
             pipeline.on_vad_completed(conn, chunk, chunk.has_voice, _stt_model_for(ctx, job.meeting_id, conn), ctx.diarization_active)
         return None
@@ -2878,10 +3174,13 @@ async def _run_stt(ctx: AppContext, job: Job, chunk: AudioChunk, *, with_overlap
         prev = repo.get_chunk_by_key(conn, chunk.meeting_id, chunk.source, chunk.sequence_no - 1) if with_overlap else None
     if meeting is None:
         raise InvalidAudioError("meeting missing")
+    if ctx.models.stt is None:
+        refresh_stt(ctx)   # 起動後に配置・取得したモデルを拾う。起動時の選定のままだと、再起動するまで待ち続ける
     model_name = job.model_name or meeting.stt_model_used or (ctx.models.stt.name if ctx.models.stt else None)
     if model_name is None:
         raise ModelMissingError("no STT model available")
     compute = ctx.models.stt.compute_type if ctx.models.stt else "int8"
+    device = ctx.models.stt.device if ctx.models.stt else "cpu"
     try:
         pcm = read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec)
         prev_pcm = read_pcm(ctx.settings.data_dir, prev.local_path, prev.sha256, ctx.codec) if prev is not None else None
@@ -2902,7 +3201,7 @@ async def _run_stt(ctx: AppContext, job: Job, chunk: AudioChunk, *, with_overlap
 
     factor = th.stt_timeout_factor_cpu if ctx.models.tier == "cpu_only" else th.stt_timeout_factor_gpu
     timeout_s = max(30.0, chunk.duration_ms / 1000 * factor)
-    req = STTRequest(pcm=stt_input, model_name=model_name, compute_type=compute, models_dir=str(ctx.settings.models_dir),
+    req = STTRequest(pcm=stt_input, model_name=model_name, compute_type=compute, device=device, models_dir=str(ctx.settings.models_dir),
                      language=language, beam_size=1 if ctx.models.tier == "cpu_only" else 5)
     try:
         result = await ctx.stt.transcribe(req, timeout_s)
@@ -2929,18 +3228,26 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         existing = repo_phase3.segments_of_chunk(conn, chunk.id)
         meeting = repo.get_meeting(conn, job.meeting_id)
     if existing:
-        # Live STT の結果を再利用（§2.1）
+        # Live STT の結果を再利用（§2.1）。完了にするのは lease の現行の所有者だけ（Phase 2 基本設計 §9.3）
         async with ctx.db.write() as conn:
+            if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                return None
             pipeline.on_transcribe_completed(conn, chunk, ctx.diarization_active)
             repo.record_metric(conn, "stt_reused_live", 1, meeting_id=chunk.meeting_id)
         return None
     result, prefix_ms, model_name, language, guess = await _run_stt(ctx, job, chunk, with_overlap=True)
     segments = _segments_from(result, chunk, prefix_ms, language)
     async with ctx.db.write() as conn:
-        repo.insert_segments(conn, segments)
+        # lease が失効していれば書かず、以降の集計と完了処理も行わない（Phase 2 基本設計 §9.3）。
+        # 書いた件数では判定しない。無音で segments が空だと失効していても 0 件になり、旧ワーカーが Chunk を完了にしてしまう
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return model_name
+        repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
         if meeting is not None and meeting.stt_model_used is None:
             repo.update_meeting(conn, chunk.meeting_id, stt_model_used=model_name)
         repo.record_metric(conn, "stt_seconds", chunk.duration_ms / 1000, model_name=model_name, meeting_id=chunk.meeting_id)
+        if result.model_load_ms:
+            repo.record_metric(conn, "stt_model_load_ms", result.model_load_ms, model_name=model_name)
         if guess is not None:
             repo.record_metric(conn, "language_prob", guess.probability, meeting_id=chunk.meeting_id)
         repo_phase3.save_language_ratio(conn, chunk.meeting_id, repo_phase3.language_ratio(conn, chunk.meeting_id))
@@ -2957,7 +3264,10 @@ async def handle_live_transcribe(ctx: AppContext, job: Job) -> str | None:
     result, prefix_ms, model_name, language, _ = await _run_stt(ctx, job, chunk, with_overlap=False)
     segments = _segments_from(result, chunk, prefix_ms, language)
     async with ctx.db.write() as conn:
-        repo.insert_segments(conn, segments)
+        # 確定 STT と同じ fencing（Phase 2 基本設計 §9.3）。失効したワーカーの結果は書かず、SSE にも流さない。
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return model_name
+        repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
         repo.record_metric(conn, "live_lag_ms", now_ms() - chunk.created_at, meeting_id=chunk.meeting_id)
     for s in segments:
         ctx.events.publish(chunk.meeting_id, {"type": "live_segment", "segment": {
@@ -3037,6 +3347,7 @@ def _summary_language(ctx: AppContext, ratio: dict[str, float]) -> tuple[str, bo
 
 
 async def handle_summary(ctx: AppContext, job: Job) -> str | None:
+    await refresh_llm(ctx)   # サーバーより後に起動した Ollama・後から pull したモデルを拾う（/api/tags を 1 回、期限 2 秒）
     llm_model = ctx.models.llm
     if llm_model is None:
         if not ctx.models.ollama_reachable:
@@ -3060,9 +3371,11 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
     accepted, rejected, unresolved = validate(synth.draft, index)
     total = len(synth.draft.topics) + len(synth.draft.decisions) + len(synth.draft.actionItems)
     t = now_ms()
-    summary = MeetingSummary(**accepted.model_dump(), rejected=rejected, modelName=llm_model, promptVersion=PROMPT_VERSION,
-                             transcriptVersion=meeting.transcript_version, generatedAt=t,
-                             modelCaveats=caveats_for(meeting.stt_model_used, llm_model))
+    summary = MeetingSummary(
+        **accepted.model_dump(), rejected=rejected, modelName=llm_model, promptVersion=PROMPT_VERSION,
+        transcriptVersion=meeting.transcript_version, generatedAt=t,
+        modelCaveats=caveats_for(meeting.stt_model_used, llm_model),
+    )
     report = SummaryValidationReport(schemaValid=True, schemaRetries=synth.schema_retries, mapWindows=synth.map_windows,
                                      totalItems=total, rejectedItems=len(rejected), unresolvedSegmentIds=unresolved)
     async with ctx.db.write() as conn:
@@ -3070,7 +3383,8 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
         repo.insert_summary(conn, SummaryVersion(
             id=repo.new_id(), meeting_id=job.meeting_id, version=version, transcript_version=meeting.transcript_version,
             model_name=llm_model, prompt_version=PROMPT_VERSION, result_json=summary.model_dump_json(),
-            raw_response_json=synth.raw, validation_json=report.model_dump_json(), generated_at=t))
+            raw_response_json=synth.raw, validation_json=report.model_dump_json(), generated_at=t,
+        ))
         repo.update_meeting(conn, job.meeting_id, llm_model_used=llm_model, summary_language=language)
         repo.record_metric(conn, "llm_schema_fail", synth.schema_retries, model_name=llm_model, meeting_id=job.meeting_id)
         pipeline.on_summary_completed(conn, job.meeting_id)
@@ -3134,7 +3448,13 @@ def exclude_failed(conn: sqlite3.Connection, meeting_id: str, diarize: bool = Fa
 """AppContext の組み立て。Phase 3 で integrity_check / Phase 3 マイグレーション / 新 Provider / 利用者モードを追加。"""
 from __future__ import annotations
 
+import csv
+import os
+import re
 import secrets
+import socket
+import subprocess
+import sys
 from pathlib import Path
 
 from .auth.users import user_count
@@ -3144,40 +3464,55 @@ from .db.connection import Database
 from .db.migrate import migrate
 from .db.migrations_phase3 import apply_phase3
 from .diarization.provider import DiarizationProvider
-from .hw import tiers
 from .hw.detect import Hardware, detect
-from .jobs.context import AppContext, ModelSelection
+from .jobs.context import AppContext
+from .jobs.selection import select_models
 from .llm.provider import SummaryProvider
 from .storage import backup
 from .storage.codec import AudioCodec
 from .stt.executor import InlineExecutor, PoolExecutor, STTExecutor
 from .stt.language import LanguageDetector
 from .stt.provider import STTProvider
-from .storage.models_dir import installed_whisper_models, silero_model_path
+from .storage.models_dir import silero_model_path
 from .vad.provider import VADProvider
 
 
-def load_or_create_token(path: Path) -> str:
-    if path.exists():
-        return path.read_text(encoding="utf-8").strip()
+def rotate_token(path: Path) -> str:
+    """32 バイトの乱数トークンを作り直して 0600 で書く。`serve` が起動のたびに呼ぶ（Phase 1 §4.3 の短命性）。
+
+    作成時点から 0600 にする（write_text の後で chmod すると、その間だけ他者が読める）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    token = secrets.token_urlsafe(32)
-    path.write_text(token, encoding="utf-8")
-    path.chmod(0o600)
+    token = secrets.token_hex(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        # 既存ファイルの権限が緩かった場合も締める。Windows の Python 3.12 以前には fchmod がないのでパスで行う
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:
+            os.chmod(path, 0o600)
+        os.write(fd, token.encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     return token
 
 
-def select_models(settings: Settings, hw: Hardware, available_llm: list[str], ollama_reachable: bool) -> ModelSelection:
-    tier = tiers.classify(hw)
-    installed = installed_whisper_models(settings.models_dir)
-    budget = hw.gpu.vram_bytes if hw.gpu.available else hw.total_memory_bytes // 2
-    stt = tiers.select_stt(tier, installed, budget, settings.stt_model)
-    llm = tiers.select_llm(tier, available_llm, settings.llm_model)
-    return ModelSelection(
-        tier=tier, stt=stt, llm=llm, installed_stt=installed, available_llm=available_llm, ollama_reachable=ollama_reachable,
-        max_concurrent_stt=settings.max_concurrent_stt or tiers.max_concurrent_stt(tier, hw.cpu_cores),
-        allow_concurrent_stt_and_llm=tiers.allow_concurrent_stt_and_llm(tier, hw, stt, None),
-    )
+def bind_listen_socket(host: str, port: int) -> socket.socket:
+    """待ち受けポートを確保する。`serve` はこれが成功してからトークンを作り直す（Phase 2 §22 と同じ）。
+
+    先にトークンを書くと、ポートが使用中で起動に失敗したとき、動いている既存のサーバーが受け付けるトークンと
+    ファイル（`minutes-local token` の表示）が食い違う。確保できなければ OSError（EADDRINUSE など）を送出する。
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    return socket.create_server((host, port), family=family)
+
+
+def read_token(path: Path) -> str | None:
+    """現在のトークン。`token` コマンド用。サーバーを一度も起動していなければ None。"""
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="ascii").strip() or None
 
 
 def open_database_with_recovery(settings: Settings) -> tuple[Database, Path | None]:
@@ -3197,11 +3532,70 @@ def _default_codec() -> AudioCodec | None:
     return FlacCodec()
 
 
+def restrict_to_current_user(path: Path) -> None:
+    """ディレクトリを現在の OS ユーザーだけが使えるようにする（録音・トークン・DB を置く）。
+
+    Unix は 0700。Windows の os.chmod は読み取り専用属性しか変えず ACL に効かないので、icacls で設定する。
+    1. 先にルートの継承を外し（/inheritance:r）、現在のユーザーの SID にだけフルコントロールを与える（(OI)(CI) で配下へ継承）。
+       ここから後の操作は権限を狭める方向だけになる。
+    2. 既存の配下を 1 件ずつ /reset で継承に戻す（ディレクトリは /T で再帰、ファイルは単体）。/inheritance:r は
+       継承した ACE しか外さず、他の主体へ明示的に与えた ACE が配下に残るため（Windows は既定で走査チェックを省くので、
+       配下のファイルは親を読めなくてもパス指定で開ける）。戻した配下はルートの SID の ACE だけを継承する。
+       ルートには /reset も再帰の操作もかけない。かけると親の継承が戻り、失敗・中断したときに前より緩い状態で残る。
+    /C（エラーを無視して続行）は付けない。1 つでも設定できなければ例外にする（1 が失敗すれば配下に触らない。2 の途中で
+    止まってもルートは締めたまま）。ルート自身に他の主体への明示 ACE が付いていれば残るが、サーバーが作ったディレクトリに
+    それを付けられるのは所有者か管理者だけで、その相手には ACL を掃除しても防げない。
+    付与先を名前や Administrators でなくトークンのユーザー SID にするのは、管理者として昇格して起動しても
+    付与先が変わらず、昇格せずに起動したときに本人が締め出されないため（昇格時の既定の所有者は Administrators になりうる）。
+    ACL を設定できなければ例外で起動を止める（緩い権限のまま録音を置かない）。
+    """
+    if not sys.platform.startswith("win"):
+        os.chmod(path, 0o700)
+        return
+    system32 = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "System32"
+    # PATH 上の同名の実行ファイルを拾わないよう、System32 の絶対パスで呼ぶ
+    out = subprocess.run([str(system32 / "whoami.exe"), "/user", "/fo", "csv", "/nh"],
+                         check=True, capture_output=True, text=True).stdout
+    row = next(csv.reader([out.strip()]), [])
+    sid = row[1] if len(row) == 2 else ""
+    if not re.fullmatch(r"S-1-\d+(-\d+)+", sid):
+        raise RuntimeError(f"cannot determine current user SID: {out.strip()!r}")
+    icacls = str(system32 / "icacls.exe")
+    subprocess.run([icacls, str(path), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
+                   check=True, capture_output=True, text=True)
+    for entry in sorted(os.scandir(path), key=lambda e: e.name):
+        recurse = ["/T"] if entry.is_dir(follow_symlinks=False) else []
+        subprocess.run([icacls, entry.path, "/reset", *recurse, "/Q"], check=True, capture_output=True, text=True)
+
+
+def acquire_data_dir_lock(data_dir: Path) -> int | None:
+    """データディレクトリを使う serve を 1 つに限る。取れたらロックを持つ fd、他の serve が持っていれば None。
+
+    ポートの確保だけでは、別のポートで起動した 2 つ目の serve が同じデータディレクトリのトークンを作り直し、
+    動いている 1 つ目のサーバーのトークンと `token` の表示が食い違う（DB のジョブも 2 つのプロセスが取り合う）。
+    fd はサーバーが動いている間閉じずに持つ。プロセスが終われば OS がロックを外す（ファイルは消さない）。
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(data_dir / "serve.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if sys.platform.startswith("win"):
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 async def build_context(settings: Settings, *, stt_provider: STTProvider | None = None, vad_provider: VADProvider | None = None,
                         llm_provider: SummaryProvider | None = None, hardware: Hardware | None = None,
                         diarization_provider: DiarizationProvider | None = None, language_detector: LanguageDetector | None = None,
                         codec: AudioCodec | None = None, tls_enabled: bool = False) -> AppContext:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    restrict_to_current_user(settings.data_dir)   # 録音・トークン・DB を置く。他の OS ユーザーに読ませない
     db, _restored = open_database_with_recovery(settings)
     migrate(db)
     apply_phase3(db, settings.data_dir)
@@ -3214,23 +3608,25 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
     if llm_provider is None:
         from .llm.ollama_provider import OllamaProvider
         th = settings.thresholds
-        ollama = OllamaProvider(settings.ollama_base_url, th.llm_connect_timeout_s, th.llm_read_timeout_s)
-        available_llm = await ollama.list_models()
-        llm_provider = ollama
-        ollama_reachable = bool(available_llm)
-    else:
-        available_llm, ollama_reachable = ["fake-llm"], True
+        llm_provider = OllamaProvider(settings.ollama_base_url, th.llm_connect_timeout_s, th.llm_read_timeout_s)
+    # None = 届かない（Ollama 未起動）、[] = 届くがモデルがない。起動は止めず、後で選び直す（jobs/selection.py）
+    listed = await llm_provider.list_models()
+    models = select_models(settings, hw, listed or [], listed is not None)
 
-    models = select_models(settings, hw, available_llm, ollama_reachable)
     stt: STTExecutor = InlineExecutor(stt_provider) if stt_provider is not None else PoolExecutor(models.max_concurrent_stt)
 
     vad: VADProvider | None = vad_provider
     if vad is None:
         p = silero_model_path(settings.models_dir)
         if p is not None:
-            from .vad.silero_provider import SileroVADProvider
             th = settings.thresholds
-            vad = SileroVADProvider(p, th.vad_threshold, th.vad_min_speech_ms, th.vad_min_voiced_ms)
+            try:
+                from .vad.silero_provider import SileroVADProvider
+                vad = SileroVADProvider(p, th.vad_threshold, th.vad_min_speech_ms, th.vad_min_voiced_ms)
+            except ImportError:
+                # モデルは置いてあるが onnxruntime（extras の vad）が入っていない。起動を止めず、未配置と同じく
+                # ブラウザ側の VAD で進める（doctor の vad 行に NOT INSTALLED と出る）
+                vad = None
 
     diarization = diarization_provider
     if diarization is None and (settings.models_dir / "diarization" / "config.yaml").exists():
@@ -3240,7 +3636,7 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
     language = language_detector
     if language is None and models.stt is not None and stt_provider is None:
         from .stt.language import FasterWhisperLanguageDetector
-        language = FasterWhisperLanguageDetector(settings.models_dir, models.stt.name, models.stt.compute_type)
+        language = FasterWhisperLanguageDetector(settings.models_dir, models.stt.name, models.stt.compute_type, models.stt.device)
 
     return AppContext(settings=settings, db=db, hardware=hw, models=models, stt=stt, vad=vad, llm=llm_provider,
                       diarization=diarization, language=language, codec=codec if codec is not None else _default_codec(),
@@ -3254,9 +3650,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
-from .bootstrap import build_context, load_or_create_token
+from .bootstrap import acquire_data_dir_lock, bind_listen_socket, build_context, read_token, rotate_token
 from .config import settings_from_env
 
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
@@ -3264,7 +3661,11 @@ LOOPBACK = ("127.0.0.1", "localhost", "::1")
 
 def _cmd_token(args: argparse.Namespace) -> int:
     s = settings_from_env()
-    print(load_or_create_token(s.token_path))
+    token = read_token(s.token_path)
+    if token is None:
+        print("token file not found. Start the server once with `minutes-local serve`.", file=sys.stderr)
+        return 1
+    print(token)
     return 0
 
 
@@ -3285,6 +3686,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"rebuild      : meetings+{report.meetings_created} chunks+{report.chunks_created} missing={report.chunks_marked_missing} skipped={report.skipped_files}")
     m, hw = ctx.models, ctx.hardware
     print(f"dataDir      : {s.data_dir}")
+    print(f"sqlite       : {ctx.db.path}")
     print(f"tier         : {m.tier} (gpu={hw.gpu.name or 'none'}, vram={hw.gpu.vram_bytes}, cores={hw.cpu_cores})")
     print(f"stt          : {m.stt.name + '/' + m.stt.compute_type if m.stt else 'NOT AVAILABLE'} installed={sorted(m.installed_stt)}")
     print(f"vad          : {'silero' if ctx.vad else 'NOT INSTALLED (browser VAD only)'}")
@@ -3292,6 +3694,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(f"language     : {'available' if ctx.language else 'fixed (' + s.language + ')'}")
     print(f"codec        : {ctx.codec.name if ctx.codec else 'NOT AVAILABLE (wav only)'}")
     print(f"ollama       : {'reachable' if m.ollama_reachable else 'unreachable'} llm={m.llm}")
+    print(f"concurrency  : stt={m.max_concurrent_stt} stt+llm={'yes' if m.allow_concurrent_stt_and_llm else 'no'}")
     print(f"users        : {'multi-user' if ctx.multi_user else 'single (token file)'}")
     ctx.stt.shutdown()
     ctx.db.close()
@@ -3335,14 +3738,36 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print(f"ERROR: TLS files not found under {s.tls_cert_path.parent}. Run `doctor --init-tls --host <hostname>`.", file=sys.stderr)
         return 2
 
-    async def main() -> None:
+    async def main() -> int:
+        # 同じデータディレクトリの serve は 1 つだけ。migrate より前に取り、取れなければ何も変えずに終わる
+        # （別のポートで動いている既存のサーバーのトークンを作り直さない）
+        lock = acquire_data_dir_lock(s.data_dir)
+        if lock is None:
+            print(f"ERROR: another server is using {s.data_dir}. The token was not changed.", file=sys.stderr)
+            return 1
+        try:
+            return await run()
+        finally:
+            os.close(lock)
+
+    async def run() -> int:
         ctx = await build_context(s, tls_enabled=bool(args.tls))
-        token = load_or_create_token(s.token_path)
+        try:
+            sock = bind_listen_socket(args.bind, s.port)
+        except OSError as e:
+            # ポートの確保に失敗したらトークンを書き換えない（既存のサーバーが動いていれば、そのトークンが有効なまま）
+            print(f"ERROR: cannot listen on {args.bind}:{s.port} ({e}). The token was not changed.", file=sys.stderr)
+            ctx.stt.shutdown()
+            ctx.db.close()
+            return 1
+        token = rotate_token(s.token_path)      # 起動のたびに作り直す（Phase 1 §4.3）。利用者別トークン（users テーブル）は作り直さない
         if not ctx.multi_user:
             print(f"token: {token}")
         app = create_app(ctx, token)
         stop = asyncio.Event()
         await sweeper.sweep_once(ctx.db)
+        # Phase 1 で確定した会議と doctor --rebuild が復元した会議のジョブを作る（Phase 2 §14）。diarize は既定の False
+        await sweeper.resume_finalized(ctx.db, s.data_dir)
         runners = [JobRunner(ctx, HANDLERS, i) for i in range(ctx.models.max_concurrent_stt)]
         tasks = [asyncio.create_task(r.run_forever()) for r in runners]
         tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, stop)))
@@ -3351,7 +3776,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         config = uvicorn.Config(app, host=args.bind, port=s.port, log_level="info", **kwargs)
         server = uvicorn.Server(config)
         try:
-            await server.serve()
+            await server.serve(sockets=[sock])
         finally:
             stop.set()
             for r in runners:
@@ -3360,9 +3785,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 t.cancel()
             ctx.stt.shutdown()
             ctx.db.close()
+        return 0
 
-    asyncio.run(main())
-    return 0
+    return asyncio.run(main())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3398,7 +3823,7 @@ if __name__ == "__main__":
 
 ## 23.1 ハーネス（変更）と Phase 2 テストの回帰
 
-Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 34 テストがそのまま通ることを回帰条件とする。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
+Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 128 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
 
 ```python
 # tests/conftest.py
@@ -3448,13 +3873,21 @@ def silence_pcm(seconds: float) -> bytes:
 
 
 def valid_summary_response(req: LLMRequest) -> str:
-    ids = re.findall(r"\[seg:([0-9a-f]{8,12})\]", req.user)
-    first = ids[:1]
+    """transcript 中の [seg:xxxxxxxx] を根拠として引用する、検証を通る応答。"""
+    # 段階2（v4.0 §66.2）を通すには、逐語引用とその位置まで揃える必要がある。
+    # 本文を伴わないダミー応答にすると検証が素通りし、回帰テストの意味がなくなる
+    hits = re.findall(r"\[seg:([0-9a-f]{8,12})\]\s*(.*)", req.user)
+    first = hits[:1]
+    ids = [h[0] for h in first]
+    quote = first[0][1] if first else ""
+    span = {"segmentId": ids[0], "start": 0, "end": len(quote)} if first else {"segmentId": "", "start": 0, "end": 0}
+    evidence = {"sourceSegmentIds": ids, "quote": quote, "evidenceSpan": span}
     return json.dumps({
         "summary": "テスト会議の要約",
-        "topics": [{"title": "話題A", "description": "説明", "sourceSegmentIds": first}],
-        "decisions": [{"text": "決定1", "sourceSegmentIds": first}],
-        "actionItems": [{"task": "タスク1", "assignee": None, "deadline": None, "sourceSegmentIds": first}],
+        "topics": [{"title": "話題A", "description": "説明", "sourceSegmentIds": ids}],
+        # claim は quote に裏付けられている必要があるので、引用本文から作る
+        "decisions": [{"text": quote, **evidence}],
+        "actionItems": [{"task": quote, "assignee": None, "deadline": None, **evidence}],
     }, ensure_ascii=False)
 
 
@@ -3560,19 +3993,29 @@ async def client3(ctx3: AppContext) -> AsyncIterator[httpx.AsyncClient]:
         await c.aclose()
 
 
+def recording_dir(ctx: AppContext, meeting_id: str, user_id: str = "local") -> Path:
+    """会議の録音ディレクトリ。Phase 3 は利用者階層を挟む（§2.5）。"""
+    return ctx.settings.data_dir / "recordings" / user_id / meeting_id
+
+
 async def create_meeting(client: httpx.AsyncClient, meeting_id: str = "m-1") -> None:
     r = await client.post("/v1/meetings", json={"meetingId": meeting_id, "title": "t", "sessionStartEpochMs": 0,
                                                 "nativeSampleRate": 48000, "consentConfirmedAt": 1})
     assert r.status_code in (200, 201)
 
 
-async def put_chunk(client: httpx.AsyncClient, meeting_id: str, seq: int, pcm: bytes, source: str = "mic") -> httpx.Response:
+async def put_chunk(client: httpx.AsyncClient, meeting_id: str, seq: int, pcm: bytes, source: str = "mic",
+                    meta: str | None = None) -> httpx.Response:
+    """meta は X-Chunk-Meta の中身（Base64URL 済み）。未指定なら既定のメタデータを組み立てる。"""
     wav = build_wav(pcm)
     duration = len(pcm) // 32
-    meta = {"startOffsetMs": seq * 30000, "endOffsetMs": seq * 30000 + duration, "vadScore": 0.5, "hasVoice": True}
-    meta_b64 = base64.urlsafe_b64encode(json.dumps(meta).encode()).decode().rstrip("=")
+    if meta is None:
+        # Phase 1 のクライアントが送る ChunkTimingMetadata のうち、サーバーが照合する項目（§21.2）
+        body = {"meetingId": meeting_id, "source": source, "sequenceNo": seq, "sampleCount": len(pcm) // 2,
+                "startOffsetMs": seq * 30000, "endOffsetMs": seq * 30000 + duration, "vadScore": 0.5, "hasVoice": True}
+        meta = base64.urlsafe_b64encode(json.dumps(body).encode()).decode().rstrip("=")
     return await client.put(f"/v1/meetings/{meeting_id}/chunks/{source}/{seq}", content=wav,
-                            headers={"Content-Type": "audio/wav", "X-Chunk-SHA256": sha256_hex(wav), "X-Chunk-Meta": meta_b64})
+                            headers={"Content-Type": "audio/wav", "X-Chunk-SHA256": sha256_hex(wav), "X-Chunk-Meta": meta})
 
 
 async def finalize(client: httpx.AsyncClient, meeting_id: str, mic: int, system: int = 0) -> httpx.Response:
@@ -3660,14 +4103,14 @@ async def test_list_and_finalize(client: httpx.AsyncClient, ctx: AppContext) -> 
     again = await finalize(client, "m-1", mic=3)
     assert again.status_code == 200
     with ctx.db.read() as conn:
-        assert repo.count_jobs(conn, "m-1", "vad_chunk", ["pending"]) == 3
+        assert repo.count_jobs(conn, "m-1", "vad_chunk", ["pending"]) == 3  # 冪等
 ```
 
 ## 23.2 マイグレーション
 
 ```python
 # tests/test_migration_phase3.py
-"""Phase 2 の DB とファイル配置から 008〜011 を適用する。"""
+"""Phase 2 の DB とファイル配置から 009〜012 を適用する。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -3695,12 +4138,12 @@ def test_apply_phase3_moves_files_and_extends_job_types(tmp_path: Path) -> None:
         repo.upsert_chunk(conn, AudioChunk(id="c", meeting_id="m", source="mic", sequence_no=0, start_offset_ms=0, end_offset_ms=1000,
                                            duration_ms=1000, sample_count=16000, local_path=old_rel, size_bytes=1, sha256="x", created_at=t))
         repo.insert_job(conn, "m", "transcribe_chunk", chunk_id="c")
-    assert current_version(db._read_conn) == 7
+    assert current_version(db._read_conn) == 8                                  # Phase 2 の最終版（008 sync_samples）
 
     applied = apply_phase3(db, data_dir)
     assert applied == 4
     with db.read() as conn:
-        assert current_version(conn) == 11
+        assert current_version(conn) == 12
         chunk = repo.get_chunk(conn, "c")
         assert chunk.local_path == "recordings/local/m/mic/000000.wav" and chunk.codec == "wav"
         assert (data_dir / chunk.local_path).exists() and not (data_dir / old_rel).exists()
@@ -3711,6 +4154,35 @@ def test_apply_phase3_moves_files_and_extends_job_types(tmp_path: Path) -> None:
         assert repo.insert_job(conn, "m", "diarize_meeting") is not None       # 新しい job_type が CHECK を通る
         assert repo.insert_job(conn, "m", "diarize_meeting") is None           # uq_diarize_job
     assert apply_phase3(db, data_dir) == 0                                      # 冪等
+    db.close()
+
+
+def test_apply_phase3_keeps_other_recordings_when_meeting_id_equals_user_id(tmp_path: Path) -> None:
+    """会議 ID "local" の旧ディレクトリ recordings/local/ は新しい階層の親と重なる。他の会議の録音を消さずに移す。"""
+    data_dir = tmp_path / "data"
+    db = Database(data_dir / "minutes.sqlite")
+    migrate(db)
+    t = now_ms()
+    with db.write_sync() as conn:
+        for mid in ("local", "m"):
+            repo.insert_meeting(conn, Meeting(id=mid, title="t", status="completed", session_start_epoch_ms=0, native_sample_rate=48000,
+                                              consent_confirmed_at=1, created_at=t, updated_at=t))
+            rel = f"recordings/{mid}/mic/000000.wav"
+            (data_dir / rel).parent.mkdir(parents=True)
+            (data_dir / rel).write_bytes(build_wav(sine_pcm(1)))
+            (data_dir / f"recordings/{mid}/meeting.json").write_text(mid)
+            repo.upsert_chunk(conn, AudioChunk(id=f"c-{mid}", meeting_id=mid, source="mic", sequence_no=0, start_offset_ms=0,
+                                               end_offset_ms=1000, duration_ms=1000, sample_count=16000, local_path=rel,
+                                               size_bytes=1, sha256="x", created_at=t))
+
+    apply_phase3(db, data_dir)
+    with db.read() as conn:
+        for mid in ("local", "m"):
+            chunk = repo.get_chunk(conn, f"c-{mid}")
+            assert chunk.local_path == f"recordings/local/{mid}/mic/000000.wav"
+            assert (data_dir / chunk.local_path).is_file()
+            assert (data_dir / f"recordings/local/{mid}/meeting.json").read_text() == mid
+    assert not (data_dir / ".migrate-012").exists()
     db.close()
 ```
 
@@ -3907,11 +4379,16 @@ async def test_echo_from_system_is_dropped_on_mic(ctx3: AppContext) -> None:
         for cid, src in (("c-mic", "mic"), ("c-sys", "system")):
             repo.upsert_chunk(conn, AudioChunk(id=cid, meeting_id="m", source=src, sequence_no=0, start_offset_ms=0, end_offset_ms=30000,
                                                duration_ms=30000, sample_count=480000, local_path="x", size_bytes=1, sha256="x", created_at=t))
-        repo.insert_segments(conn, [
+        # insert_segments は lease を検証する（Phase 2 §8 の fencing）。テストでも実際に lease したジョブの名義で書く
+        repo.insert_job(conn, "m", "transcribe_chunk", chunk_id="c-mic")
+        job = repo.lease_job(conn, "w-test", ["transcribe_chunk"], now_ms())
+        assert job is not None
+        written = repo.insert_segments(conn, [
             _seg("s1", "system", "c-sys", 1000, 4000, "来週までに対応します"),
             _seg("m1", "mic", "c-mic", 1200, 4100, "来週までに対応します。"),   # エコー
             _seg("m2", "mic", "c-mic", 5000, 8000, "了解しました", index=1),    # 本人の発話
-        ])
+        ], job_id=job.id, owner="w-test", attempts=job.attempts)
+        assert written == 3
         report = run_merge(conn, "m", Thresholds())
         rows = {r["id"]: (r["merged_version"], r["merge_reason"]) for r in conn.execute("SELECT id, merged_version, merge_reason FROM transcript_segments").fetchall()}
     assert report.echo == 1 and report.kept == 2
@@ -4003,7 +4480,7 @@ from minutes_local.jobs.context import AppContext
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.storage import backup
 from minutes_local.storage.codec import FakeCodec
-from minutes_local.storage.files import InvalidWavError, read_pcm
+from minutes_local.storage.files import read_pcm
 from minutes_local.storage.rebuild import RebuildReport, rebuild
 from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm
 
@@ -4034,6 +4511,29 @@ async def test_compress_replaces_wav_after_roundtrip(client3: httpx.AsyncClient,
     # 圧縮後も finalize の検証（codec != wav はファイル存在のみ）と transcript 取得が壊れない
     assert (await finalize(client3, "m-1", mic=2)).status_code == 200
     assert (await client3.get("/v1/meetings/m-1/transcript")).status_code == 200
+
+
+@pytest.mark.parametrize("corrupt", ["truncated", "garbage"])
+async def test_resend_repairs_corrupted_compressed_chunk(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                         corrupt: str) -> None:
+    """圧縮済みファイルが残っていても、復号した WAV の sha256 が合わなければ再 PUT で WAV に書き戻す（§2.4 修復）。"""
+    # Arrange: 圧縮した後、Chunk 0 の圧縮ファイルを壊す
+    await _completed_meeting(client3, runner3, ctx3)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    with ctx3.db.read() as conn:
+        c = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    path = ctx3.settings.data_dir / c.local_path
+    data = path.read_bytes()
+    path.write_bytes(data[:-100] if corrupt == "truncated" else b"xx")
+    # Act: ブラウザが同じ内容を再送する
+    r = await put_chunk(client3, "m-1", 0, sine_pcm(30))
+    # Assert
+    assert r.status_code == 200 and r.json()["registered"] is True
+    with ctx3.db.read() as conn:
+        repaired = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    assert repaired.codec == "wav" and repaired.save_status == "registered"
+    assert len(read_pcm(ctx3.settings.data_dir, repaired.local_path, repaired.sha256)) == 960000
 
 
 async def test_compress_keeps_wav_when_roundtrip_mismatches(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
@@ -4081,11 +4581,13 @@ async def test_rebuild_from_recordings(client3: httpx.AsyncClient, ctx3: AppCont
 
 
 async def test_rebuild_keeps_end_time_from_phase2_snapshot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
-    """Phase 1/2 の finalize が書いた meeting.json（endedAtEpochMs）を、移行 011 で移した後に rebuild しても終了時刻を失わない。"""
+    """meeting.json の終了時刻のキーは Phase 1/2 と同じ endedAtEpochMs。移行 012 で移した Phase 2 の控えからも、rebuild は終了時刻を失わない。"""
     await _completed_meeting(client3, runner3, ctx3)
     path = ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json"
     snapshot = json.loads(path.read_text(encoding="utf-8"))
-    snapshot["endedAtEpochMs"] = snapshot.pop("endedAt")                                 # Phase 2 §21.2 の確定 API と同じキー
+    assert "endedAt" not in snapshot and snapshot["endedAtEpochMs"] is not None          # Phase 2 §21.2 の確定 API と同じキー
+    for key in ("localUserId", "chunks"):                                                # Phase 2 の控えにはない項目を落とす
+        del snapshot[key]
     path.write_text(json.dumps(snapshot), encoding="utf-8")
     async with ctx3.db.write() as conn:
         conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
@@ -4132,6 +4634,17 @@ async def test_rebuild_drops_malformed_stop_pair(client3: httpx.AsyncClient, ctx
     assert m is not None and m.status == "finalized" and m.stop_reason is None and m.stop_detected_at is None
 
 
+@pytest.mark.parametrize("ended", [-1, 2**63, True, "1700000000000", 1.5])
+async def test_rebuild_drops_malformed_end_time(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner, ended: object) -> None:
+    """SQLite INTEGER に入らない・整数でない終了時刻は None にし、rebuild 全体を止めない（会議と Chunk は復元する）。"""
+    # Arrange / Act
+    await _completed_meeting(client3, runner3, ctx3)
+    report, m = _rewrite_snapshot_and_rebuild(ctx3, endedAtEpochMs=ended)
+    # Assert
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert m is not None and m.status == "finalized" and m.ended_at is None
+
+
 async def test_missing_chunk_is_reported_for_resync(client3: httpx.AsyncClient, ctx3: AppContext) -> None:
     await create_meeting(client3)
     pcm = sine_pcm(30)
@@ -4161,7 +4674,7 @@ import pytest
 
 from minutes_local.auth.tls import certificate_hostnames, generate_self_signed
 from minutes_local.auth.users import create_user
-from minutes_local.db import repo, repo_phase3
+from minutes_local.db import repo_phase3
 from minutes_local.db.connection import now_ms
 from minutes_local.jobs.context import AppContext
 from tests.conftest import BASE, _client_for, create_meeting, put_chunk, sine_pcm
@@ -4242,8 +4755,8 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | 圧縮の往復検証・不一致時の保持 | `test_compress_replaces_wav_after_roundtrip`、`test_compress_keeps_wav_when_roundtrip_mismatches` |
 | バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
-| マイグレーション 008〜011 | `test_apply_phase3_moves_files_and_extends_job_types` |
-| Phase 2 の回帰 | Phase 2 §23 の 34 テスト（`test_phase1_contract.py` は物理パスのみ更新） |
+| マイグレーション 009〜012 | `test_apply_phase3_moves_files_and_extends_job_types`、`test_apply_phase3_keeps_other_recordings_when_meeting_id_equals_user_id` |
+| Phase 2 の回帰 | Phase 2 §23 の 128 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
 
 ---
 
@@ -4256,7 +4769,7 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | 1 Live STT failure ≠ Recording failure | `live.on_chunk_registered` はジョブを生成するだけで PUT の成否に影響しない（例外は `insert_job` の冪等失敗のみ）。`handle_live_transcribe` は `stt_status` を触らない。Live ジョブの失敗は後続に影響しない（§9 `_on_failure`）。ブラウザ側は `NO_AUDIO_FRAMES` で Live を自動停止（client 文書 §8） |
 | 2 AI failure ≠ Transcript loss | Phase 2 と同じ。要約言語の判定（§21 `_summary_language`）は読み取りのみ |
 | 3 STT failure ≠ Recording loss | `handle_compress` は往復検証に成功したときだけ WAV を消す。`read_pcm` は FLAC でも WAV sha256 で照合。`rebuild` は既存行を上書きしない |
-| 4 Queue failure ≠ Job metadata loss | 009 のテーブル再作成は `INSERT ... SELECT *` で行を保つ（§23.2）。`processing_jobs` が唯一の Job Store である点は不変 |
+| 4 Queue failure ≠ Job metadata loss | 010 のテーブル再作成は `INSERT ... SELECT *` で行を保つ（§23.2）。`processing_jobs` が唯一の Job Store である点は不変 |
 | 5 Duplicate delivery ≠ Duplicate transcript | `uq_live_job` / `uq_diarize_job` / `uq_compress_job`。`handle_live_transcribe` と `handle_transcribe` は既存セグメントがあれば挿入しない |
 | 6 AI regeneration ≠ Manual note overwrite | 変更なし |
 | 7 VAD false negative ≠ Original audio loss | Live はブラウザ VAD の `has_voice=false` をスキップするだけで、確定 STT は Phase 2 の経路（サーバー VAD + 手動 STT）で救済できる |

@@ -3,9 +3,10 @@
 **対象フェーズ:** Phase 2 ── finalize 済み会議を、利用者のマシン上だけで「確定 transcript → AI 議事録 → 手動編集」まで処理する。System Audio の追加を含む。
 **Phase 3:** Live STT / 話者分離 / FLAC / 高度な復旧 / LAN 共有 ── 方針と接続点のみ（概要レベル）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation
-**上位文書:** システム設計書 v4.0、Phase 1 詳細設計書（`design-local-phase1.md`）。本書は両者の「Recording is Source of Truth」原則と Invariant 1〜10 を変更せずに継承する。
+**上位文書:** システム設計書 v4.0、Phase 1 詳細設計書（`docs/design-local-phase1.md`）。本書は両者の「Recording is Source of Truth」原則と Invariant 1〜10 を変更せずに継承する。
 **粒度:** 基本設計。アーキテクチャ・API 契約・SQLite スキーマ・状態遷移・アルゴリズム方針までを確定し、実装コードは TypeScript 型定義と SQL DDL に限る。Python 側はモジュール構成と責務の記述にとどめる。
 **技術選定（確定）:** 常駐サーバーは Python（FastAPI + SQLite + faster-whisper + Ollama HTTP API）。
+**配置:** `docs/design-local-phase2.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 
 ---
 
@@ -289,7 +290,7 @@ GPU OOM で STT ジョブが失敗した場合、次の候補に落として再�
 
 例外の設計上の扱い：
 
-* サーバーの外向き通信はこのエンドポイントの処理中に限り、接続先ホストを `huggingface.co` / `cdn-lfs.huggingface.co` の allowlist に固定する（Phase 1 §4.4 のサーバー側 allowlist を実装する初めての箇所）
+* サーバーの外向き通信はこのエンドポイントの処理中に限り、接続先ホストを allowlist（`huggingface.co` とそのリダイレクト先の CDN。ホスト名の一覧はサーバー側詳細設計 §10.2 の `DOWNLOAD_ALLOWLIST` が正）に固定する。リダイレクトは 1 段ずつたどり、要求を出す前に行き先を確かめる（Phase 1 §4.4 のサーバー側 allowlist を実装する初めての箇所）
 * ダウンロード中は `/v1/health.status = "degraded"` とし、理由を `downloading_model` として返す
 * 音声・transcript・要約のいかなるデータも、この通信に含まれない。送信するのはモデル名だけである
 * ブラウザ側の CSP `connect-src` は変更しない（ブラウザは Hugging Face と通信しない）
@@ -1505,7 +1506,7 @@ Phase 1 §27 で「Phase 1 対象外」だった 2, 4, 5, 6 が Phase 2 で実�
 
 | Step | 内容 | 完了判定 |
 | --- | --- | --- |
-| 2-a | §8 DDL + `db/migrate` + Phase 1 §12 のサーバー実装（最小スタブを本実装に） | Phase 1 の 11 テストがこのサーバーに対して通る |
+| 2-a | §8 DDL + `db/migrate` + Phase 1 §12 のサーバー実装（Phase 1 の `minutes_local/phase1.py` を本実装に置き換える。手順は詳細設計サーバー側 §1.2） | Phase 1 のサーバーテスト 10 件の内容を引き継いだテスト（詳細設計サーバー側 §23.3.1）と、Phase 1 のブラウザ側テストが通る。検証規則・CORS・トークン再生成を Phase 1 の実装から緩めない |
 | 2-b | §7 HW 検出 + `/v1/health` v2 + `/v1/models` | `doctor` が区分とモデル候補を表示 |
 | 2-c | §9 JobRunner + Sweeper + `vad_chunk`（§13） | finalize で全 Chunk に `has_voice` が付く。`kill -9` 後に再開 |
 | 2-d | §10 `transcribe_chunk` + §14 `GET /transcript` + SSE | 1 時間会議の transcript が UI に出る。OOM ダウングレードを疑似的に検証 |

@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-10（63 回目のレビュー修正・未コミット、ブランチ `dev`。62 回目までコミット済み）
+最終更新: 2026-11-13（設計書の厳しめレビュー 2 回目・未コミット、ブランチ `dev`。PR #13 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -8,7 +8,7 @@
 
 ## 現在地
 
-Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ PUT → finalize）のクライアント側を、[design-local-phase1.md](design-local-phase1.md) §30 の Step 順に実装している。
+Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ PUT → finalize）のクライアント側を、[docs/design-local-phase1.md](docs/design-local-phase1.md) §30 の Step 順に実装している（基本設計書・詳細設計書 `design-local-phase*.md` は 2026-11-12 にリポジトリ直下から `docs/` 配下へ移行済み）。
 
 | Step | 内容（設計書の節） | 状態 | 完了判定 |
 | --- | --- | --- | --- |
@@ -22,10 +22,98 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 の設計書レビュー 2 回目の後：Phase 2 server 128 件・Phase 3 server 164 件・Phase 2 client 31 ファイル 557 件・Phase 3 client 35 ファイル 592 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
 
+- 2026-11-13（設計書の厳しめレビュー 2 回目・未コミット）：`docs/` の Phase 2 / 3 設計書を、展開したコードの**カバレッジ**（テストが一度も実行していない行）を起点にレビューした。前回までのレビューは「テストが通るか」で見ていたので、Fake Provider が通らない経路（実モデル・CLI・SSE・未テストのエンドポイント）が手つかずだった。見つけた欠陥は実験かテストの Red で確かめてから直した。製品コード（`src/`・`test/`・`minutes_local/`）は無変更。Phase 1 設計書も無変更（src と一致のまま）。
+  - **Phase 2 server（SSE）**：`wait_for(gen.__anext__())` のタイムアウトで非同期ジェネレータごと終わり、**最初の keepalive（15 秒の無通信）の次の周回で接続が必ず落ちた**（実験で `RuntimeError: async generator raised StopAsyncIteration` を確認）。`EventBroker.attach()` / `detach()` を足し、SSE はキューを直接待つ。回帰 1 件。
+  - **Phase 2 / 3 server（実行デバイス）**：Apple Silicon は区分が `gpu_*` になり `float16` → `device="cuda"` を選んでいた（基本設計 §7.2 は「Apple Silicon は int8」。**開発機の Mac では STT が必ず失敗する**）。`SttCandidate.device` / `STTRequest.device` を足し、CUDA 以外は CPU の int8 にする（`tiers.for_backend`）。`compute_type` から device を推測する箇所をなくした（`gpu_small` の int8 が CPU で走っていた点も直る）。Phase 3 の `FasterWhisperLanguageDetector` も同じ。
+  - **Phase 2 / 3 server（モデルの選び直し）**：`ModelSelection` が起動時のままで、後から起動した Ollama・後から配置／取得したモデル・`PUT /settings` の変更が再起動まで反映されなかった。新規 `jobs/selection.py`（`select_models` を bootstrap から移動、`refresh_stt` / `refresh_llm`）。`list_models()` を `SummaryProvider` の Protocol に入れ、「届かない（None）」と「届くがモデルなし（[]）」を区別（後者は `MODEL_MISSING`）。Ollama の 404 は `ModelMissingError`。
+  - **Phase 2 server（プロセスプール）**：タイムアウトしたワーカーが止まらずプールを塞ぎ、ワーカーが落ちると `BrokenProcessPool` のまま以後の STT が全滅した（基本設計 §5.1 の「プールの再生成」が未設計）。`PoolExecutor` がプールを作り直す。巻き込まれたジョブは `INTERNAL`、原因のジョブは `OOM`。実プロセスのテスト 2 件。
+  - **Phase 2 / 3 server（ダウングレード）**：同じモデルで 2 件が OOM すると 2 段落ちた／未配置の段へ落とすと `MODEL_MISSING` で止まった／落としても前のモデルをワーカーが握ったままだった／`"cuda"` を含むだけで OOM 扱いにしていた。それぞれ修正（`is_oom_message`）。
+  - **Phase 2 server（モデル取得）**：`large-v3` のファイル名が違う（`vocabulary.json`・`preprocessor_config.json`。2026-11-13 に配布元の一覧で確認）、リダイレクト先 `us.aws.cdn.hf.co` が allowlist 外で**全モデルの取得が失敗**、しかも失敗がバックグラウンドのタスクの例外として消えていた。リダイレクトは要求の前に検査、`model.bin` を最後に取得、結果は新規 `ModelDownloads` → `GET /v1/models` の `downloads`。
+  - **Phase 2 / 3 server（操作系エンドポイント、すべて未テストだった）**：録音中の `transcript/rerun` が会議を `transcribing` に進め**以後の Chunk の PUT が 409**になった／無音 Chunk の手動 STT を `skipped` 以外に呼ぶと Chunk が `queued` で固まり、成功しても transcript に入らなかった／`PUT /settings` が無検証で、モデル指定を外す手段がなかった／存在しない会議の `exclude-failed` が 500。前提条件を §21.3 の表にし、回帰 7 件（すべて修正前に Red）。
+  - **Phase 2 client**：`Phase2Client` が成功応答を `json as T` で通していた（CLAUDE.md「サーバー応答は型ガードを通す」に反する。Phase 3 はデコーダ方式で対処済みだった）。デコーダ 11 個を `contracts-phase2.ts` に足し、`meetingId` の一致まで見る。フィクスチャはサーバー設計書を展開して取得した実応答。新規 `test/phase2-client.test.ts` 5 件（3 件は修正前に Red）。
+  - 確認：`verify-design-docs.sh all` 通過（Phase 2 server 128・Phase 3 server 164・Phase 2 client 557・Phase 3 client 592、pyflakes 指摘なし）。Phase 1 埋め込み同期 DIFF 0。`test_stt_runtime.py` の 17 件は新しい API を import するため、修正前の Red は収集エラーとして確認（1 件ずつの Red ではない）。
+  - **残り（未対応・要判断）**：Phase 2 server §26 に R1〜R6 として記載（取得中の health `degraded`、`vad_sampling_ratio` を読むコードがない、LLM の OOM 時の縮退、SSE の job が snake_case、`If-Match` なしの上書き、要約実行中の STT の排他）。**Phase 3 固有の部分（pyannote・FLAC・LAN / TLS・scheduler・rebuild）は今回読んでいない**（カバレッジは `pyannote_provider.py` 0%・`codec.py` 52%・`scheduler.py` 59%・`__main__.py` 28%）。`__main__.py`（`serve` / `doctor`）は両フェーズともテストなし。Phase 2 / 3 の画面層は未決事項 D1・D2（Phase 2 client §15.2）の判断待ちのまま。Apple Silicon の実機で `doctor` と実モデルの STT を確かめる（Step 2-b）。
+
+- 2026-11-12（PR #14 の 7 回目の指摘・未コミット）：CodeRabbit 6 件（nitpick 1 件を含む）を検証し、すべて有効として対応した（スキップなし）。新規テストは修正前の設計書で Red を確認（Phase 2 / 3 の両方）。製品コード（`src/`・`test/`）は無変更。
+  - **Phase 2 client §11 `jobs_loaded`**：アクションに `meetingId`（`JobListResponse.meetingId` を渡す）を足し、表示中の会議と違えば捨てる（`transcript_loaded` と同じ）。会議の切り替え前の一覧取得の後着が新しい会議の jobs に混ざっていた。会議切り替えのテストに 2 段の確認を追加。Phase 3 client は `state.ts` を載せ直していないので対象外。
+  - **Phase 2 / 3 client `backfill()`**：`failed` を `onError` より先に立て、`onError` の例外は `console.error` に記録して続ける。`onError` が投げると保留の解放と取り直しの予約が飛んでいた。回帰 1 件。
+  - **Phase 2 / 3 client `FetchEventSource.run()`/`pump()`**：listener の例外で抜けたとき、`pump` がストリームを `reader.cancel()` し、`run` の catch で `controller.abort()` する（`this.controller = null` の前）。接続が開いたまま残っていた。回帰 1 件。
+  - **Phase 2 server 修復（PUT 再送）**：照合を `pipeline.chunk_file_intact()`（`to_thread`）に替え、読めないファイルで 500 にせず書き戻す。未使用になった `sha256_file` の import を削除。Phase 3 は `_stored_chunk_intact` が `OSError` を受けていなかったので同じく欠損扱いにした。回帰 1 件（root では skip）。
+  - **Phase 2 / 3 server finalize**：書き込みトランザクションで読み直した会議が `None`（照合中に削除）なら 404。従来は「finalized」の成功応答を返していた。回帰 1 件。
+  - **nitpick `scripts/extract-design-code.py`**：argparse 化。不明なオプション・`--help` はファイルを開く前に終了コード 2 で止まる（従来は `--` で始まる未知の引数を黙って無視）。
+  - 追加の指摘 2 件（同日・有効）：**Phase 2 / 3 client `FetchEventSource`** の再接続で出す error を `emitError()` で listener ごとに例外を受けて配る（`run()` の try の外なので、投げると `waitBeforeRetry()` に進まず再接続が止まり、残りの listener も呼ばれなかった）。回帰 1 件。**Phase 2 server** の修復テストの skip 条件を `not hasattr(os, "geteuid") or os.geteuid() == 0` にした（Windows で収集時に AttributeError。chmod(0) で読めなくもできない）。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過。`verify-design-docs.sh all`：Phase 2 server 102 件・Phase 3 server 138 件・Phase 2 client 552 件・Phase 3 client 587 件、pyflakes 指摘なし。
+
+- 2026-11-12（PR #14 の 6 回目の指摘・244090c でコミット済み）：CodeRabbit 4 件を検証し、3 件を修正、1 件をスキップした。新規テストは修正前に Red を確認。製品コード（`src/`・`test/`）は無変更。
+  - **スキップ：Phase 2 client `NotesStore.save()`**（送信の完了後に dirty なら schedule）：送信中の編集は `setDraft` がタイマーを予約し、`doSave` も `stillSame` が false なら `schedule()` を呼ぶので、dirty のまま予約なしで残る経路がない。
+  - **Phase 2 / 3 server（`chunk_file_intact`）**：照合中のファイルシステムのエラー（権限・照合中の削除など）を `OSError` で受けて False（欠損）にする。存在確認も `is_file()` に変更。起動時の回収がサーバーの起動ごと止まらず、finalize も 500 ではなく 409 になる。回帰 1 件。
+  - **Phase 2 / 3 server（`X-Chunk-Meta`）**：`vadScore` / `hasVoice` を必須にし、欠落を既定値（0 / True）で補わない（`hasVoice` を True で補うと無音の Chunk まで文字起こしに回る）。§21 の照合表も「どちらも必須」に更新。テストの `_meta` 2 か所に両フィールドを追加し、欠落の 2 ケースを追加（回帰 2 件）。
+  - **Phase 2 / 3 server（finalize）**：`chunk_file_intact`（sha256 でファイル全体を読む）を `asyncio.to_thread` で実行し、イベントループを塞がない。書き込みトランザクションの前のまま。非ブロックを確かめるテストはなし（既存の finalize のテストで挙動が同じことを確認）。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過。`verify-design-docs.sh all`：Phase 2 server 100 件・Phase 3 server 136 件・Phase 2 client 549 件・Phase 3 client 584 件、pyflakes 指摘なし。
+  - 残り：リポジトリの Phase 1 サーバー（`minutes_local/phase1.py`）は `vadScore` / `hasVoice` を既定値で補ったまま（Phase 2 で置き換える対象。§25 Step 2-a）。
+
+- 2026-11-12（PR #14 の 5 回目の指摘・未コミット）：CodeRabbit 5 件（nitpick 1 件を含む）を検証し、すべて有効として対応した（スキップなし）。新規テストは修正前に Red を確認（nitpick のテスト強化は現行の挙動の確認）。製品コード（`src/`・`test/`）は無変更。
+  - **Phase 2 client §15.1 W2**：テストの期待値を §4 の 1 に合わせた。ロックが `heldLocks` に入るのは、Mic か System のメモリ待機が残るときと Mic の最終保存に失敗したときだけ。Mic が保存しきり両方空なら Mic の `stop()` が解放済みで、System の失敗で reject しても `heldLocks` には入らない。
+  - **Phase 2 client §10 NotesStore**：`doSave` は保存後の控え（新しい revision）の書き込みを `await` してから返す。`dispose()` はその完了まで待つ（`void` で投げていたので、作り直したインスタンスの `load()` が古い revision の控えを読んで conflict になった）。書き込みの失敗は新規の任意 dep `onError` に渡す（サーバーには保存済みなので状態は saved のまま。未処理の reject にしない）。回帰 2 件。
+  - **Phase 2 / 3 client（`request`）**：成功応答の本文を `res.json().catch(() => null)` で読んでいた。読み取り中の中断・通信断は外の catch で TIMEOUT / NETWORK に、壊れた JSON（`SyntaxError`）は成功応答なら `MALFORMED`、エラー応答なら従来どおり status で返す。204 は本文なし。回帰 3 件（Phase 2 の 2 件は Phase 3 でも走る）。
+  - **Phase 2 / 3 server（`resume_finalized`）**：始める前に finalize と同じ規則（source ごとの連番の連続、新規 `pipeline.chunk_file_intact()`）でファイルを照合し、欠損・破損があれば `finalized` のまま残す（直れば次の起動で拾う。件数は `resume_finalized_skipped` の metric）。`chunk_file_intact` は Phase 3 の pipeline（全文差し替え）で圧縮済みを存在だけで見る形にし、両 Phase の finalize もこれを使う。sha256 は書き込みロックの外で計算。引数に `data_dir` を追加（呼び出し元は両 Phase の `__main__`）。既存テストに破損と修復の場合を追加。
+  - **Phase 3 client（nitpick）**：STORAGE の再同期テストで、積んだ 1 件がサーバーに 1 回だけ届くこと（`putCount`・`arrivalOrder`）まで確かめる。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過・Phase 1 埋め込み同期一致。`verify-design-docs.sh all`：Phase 2 server 97 件・Phase 3 server 133 件・Phase 2 client 549 件・Phase 3 client 584 件、pyflakes 指摘なし。
+  - 残り：Phase 1 の `src/api/local-saver.ts`・`meeting-registrar.ts`・`backend-health-monitor.ts` も成功応答の本文を `json().catch(() => null)` で読む（読み取り中のタイムアウトが壊れた応答と区別されない）。今回の指摘範囲外。要否を判断する。`NotesStore.setDraft` / `acceptServer` の控えの書き込みも `void` のまま（失敗が未処理の reject になりうる）。
+
+- 2026-11-12（PR #14 の 4 回目の指摘・未コミット）：CodeRabbit 8 件を検証し、すべて有効として修正した（スキップなし）。新規・変更テストは修正前に Red を確認（ルートの ACL 失敗時に配下へ触らないテストと Windows の st_mode のガードは、旧コードでも通る／mac では実行されない保存確認）。製品コード（`src/`・`test/`）は無変更。
+  - **Phase 2 / 3 client（SSE の保留）**：補完の途中で再接続したら、前の接続の保留を捨てずに新しい補完を始める前に流す（「前の保留 → 新しい補完 → 新しい保留」の時間順）。捨てると補完に含まれない `progress` と、新しい補完も失敗したときの status を失った。既存テスト 1 件の期待値を更新、回帰 1 件。Phase 2 サーバーは `progress` を送らない（Phase 3 は Live の 1 種だけ）ので、切断中に落ちた `progress` を補完する経路はない。
+  - **Phase 2 / 3 client（バックオフ）**：`FetchEventSource` は 200 を受けただけではバックオフを戻さない。`SSE_STABLE_MS`（30 秒、keep-alive 2 回分）切れずに続き、その間にデータを 1 回以上受け取った接続の後で戻す（判定タイマーは finally で止める）。回帰 1 件。
+  - **Phase 2 client（reducer）**：`meeting_loaded` で別の会議を開いたら会議ごとの状態（transcript・summary・jobs・progress・stale の印）を捨て、表示設定（backend・showRejected・confidenceDimBelow）は残す。transcript / summary の応答は表示中の会議と違えば捨て、版の比較は同じ会議の中だけで行う。**前回入れた版の比較の退行**（会議 A の v3 を表示中に B を開くと B の v1 を捨てた）を直したもの。回帰 1 件。
+  - **Phase 2 / 3 server（icacls）**：ルートを先に `/inheritance:r /grant:r *SID:(OI)(CI)F` で締め、既存の配下を名前順に 1 件ずつ `/reset`（ディレクトリは `/T`）。ルートには `/reset` も再帰もかけない（前回の「`/reset /T` を先に」は、再起動のたびに締めたルートを親の継承へ戻し、2 回目が失敗すると緩いまま残った）。**前回分を一部戻した**：ルート自身に付いた他の主体への明示 ACE は消えない（付けられるのは所有者か管理者だけで、ACL では防げない。docstring に記載）。テストを順序検証に変更、ルート失敗時に配下へ触らないテストを追加。
+  - **Phase 2 / 3 server（トークン）**：新規 `acquire_data_dir_lock()`（`data_dir/serve.lock` を flock / msvcrt で排他）。`serve` は migrate より前に取り、取れなければトークンを作り直さずに終了（別ポートの 2 つ目の `serve` が動いているサーバーのトークンを壊さない）。回帰 1 件。
+  - **Phase 2 / 3 server（移行した会議）**：新規 `sweeper.resume_finalized()`。`serve` の起動時に `finalized` のまま止まった会議（Phase 1 で確定した会議、Phase 3 の `doctor --rebuild` が復元した会議）へ `on_finalized` を呼ぶ（`transcribing` に進むので 2 回目は拾わない。`insert_job` は冪等）。Phase 3 では diarize が既定の False になる。回帰 1 件。
+  - **Phase 2 server（テスト）**：トークンの st_mode の assert を Windows 以外に限定、Unix 用の restrict のテストは Windows で skip。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過・Phase 1 埋め込み同期一致。`verify-design-docs.sh all`：Phase 2 server 97 件・Phase 3 server 133 件・Phase 2 client 545 件・Phase 3 client 579 件、pyflakes 指摘なし。設計書冒頭の件数も実測値に更新。
+  - 残り：icacls・msvcrt のロックは Windows 実機で未確認。SonarCloud の S8707 3 件は前回の判断待ちのまま。
+
+- 2026-11-12（PR #14 の 3 回目の指摘・未コミット）：CodeRabbit 5 件を検証し、すべて有効として修正した（スキップなし）。新規・変更テスト 3 件はすべて修正前に Red を確認。製品コード（`src/`・`test/`）は無変更。
+  - **Phase 2 client §15.3**：Step 2-d2 の W8 が `NotesStore` を生成するのに、§10 NotesStore は後の 2-g1 にあった。§10 と `notes-store.test.ts` を 2-d2 へ移し、2-g1 はノートの編集 UI（D2 の決定後）だけにした（§15.2「W1〜W8 は D2 を待たずに進められる」と一致）。
+  - **Phase 2 client §11**：`transcript_loaded` / `summary_loaded` は、表示中より古い版の応答なら捨てる（後着した v2 が v3 を巻き戻し、stale の印は消えているので取り直されなかった）。同じ版は受け入れる。回帰 1 件。Phase 3 は `state.ts` 変更なしなので同期先なし。
+  - **Phase 2 / 3 server**：`restrict_to_current_user()` の Windows 分岐は、先に `icacls <dir> /reset /T /Q` でツリー全体の明示 ACE を消して継承に戻し、その後で `/inheritance:r /grant:r *SID:(OI)(CI)F`（`/inheritance:r` だけでは他の主体への明示 ACE がルート・既存の配下に残った）。既存テストを 2 回の呼び出しの順序検証に変更。
+  - **Phase 3 client**：`MeetingEventsClient.receive()` は補完中でも `live_segment` を保留せず即座に `onLiveSegment` へ渡す（ペイロードで判定。status などは従来どおり保留）。補完中の再接続で保留ごと捨てられ、次の poll まで出なかった。回帰 1 件。
+  - **scripts**：`verify-design-docs.sh` は `VERIFY_DIR` 未指定時の一時ディレクトリを EXIT の trap で消す（INT / TERM も EXIT を通す）。`VERIFY_DIR` 指定時は残す。成功・失敗の両方で消えることを確認。
+  - **SonarCloud（Quality Gate: Security Rating C）**：PR の脆弱性 5 件のうち `npx` の 2 件は既に CLOSED。残りは `scripts/extract-design-code.py` の S8707（コマンドライン引数による Path Traversal、27・44・45 行）の 3 件で、コードは変えていない。taint の経路を見ると、`commonpath` のガードは比較の基準 `out` 自体が `sys.argv` 由来なので、設計書の見出しのパスしか拘束しない（Sonar の判定は taint モデル上は正しい）。`open(doc)` は無検査。実害は、引数を操作されたエージェントが `<out>/{src,test,tests,minutes_local}/…`・`<out>/pyproject.toml` を書く、任意ファイルから見出し付きブロックを読む、の範囲。shell:S7679（`verify-design-docs.sh` の `init_packages` の `$1`）は `pkg_root` に代入して修正済み。**要判断**：SonarCloud で 3 件を Safe / Accept にする（推奨）か、信頼できる基準（`__file__` から求めたリポジトリの `docs/`、一時ディレクトリ）の内側に引数を限定する（`VERIFY_DIR` の置き場所が制限される。Sonar が認識するかは再解析まで不明）。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過。`verify-design-docs.sh all`：Phase 2 server 94 件・Phase 3 server 130 件・Phase 2 client 542 件・Phase 3 client 576 件、pyflakes 指摘なし。
+  - 残り：`/reset /T` と `/inheritance:r` の間は親の ACL を一時的に継承する（docstring に記載）。icacls の実挙動は Windows 実機で未確認（前回の残りと合わせて確認する）。
+
+- 2026-11-12（PR #14 の追加指摘・未コミット）：CodeRabbit 10 件を検証し、すべて有効として修正した（スキップなし）。新規テストはすべて修正前に Red を確認（JSON 破損の 1 件のみ、現行の挙動を固定する保存確認で修正前から Green）。
+  - **Phase 1 src**：`finalizer.ts` の `GET /chunks` の本文読み取りで `null`（壊れた応答）にするのは `SyntaxError` だけにし、abort 以外の通信エラー（`TypeError` など）も `network` として返す（回帰 1 件・保存確認 1 件）。Phase 1・Phase 2 client の設計書に同じ差分を反映。
+  - **Phase 2 / 3 client**：`MeetingEventsClient` の補完が失敗したら、同じ接続のまま 1・5・15 秒後に最大 3 回取り直す（新規 export `BACKFILL_RETRY_DELAYS_MS`。再接続・close で取り消し、取り直しも保留からやり直す）。`fetchJobs` / `fetchMeeting` のコメントに「期限までに必ず settle する」契約を明記（`Phase2Client` の `timeoutMs` が本文読み取りまで覆う）。`NotesStore.dispose()` を `Promise<void>` にし、送信中の PUT の完了を待つ（待たずに作り直すと、新しいインスタンスが確定前の revision を読み、保存中の編集が 409 の競合になった）。配線表 W8 に「`dispose()` の完了を待ってから `load()`」を追記。回帰 3 件。
+  - **Phase 2 / 3 server**：finalize は件数・連番が合っていても、欠損・破損した登録済み Chunk が 1 件でもあれば 409（期待より多く登録され、余りが壊れたまま確定した）。§21 の照合表も更新。データディレクトリの権限は新規 `restrict_to_current_user()`：Unix は 0700、Windows は `icacls` で継承を外し、`whoami /user` で得た現在のユーザー SID にだけ付与（昇格の有無で付与先が変わらない。SID が取れなければ起動を止める）。回帰 4 件（Windows 分岐は `sys.platform` と `subprocess.run` を差し替えて確認）。
+  - **Phase 3 server**：rebuild は `meeting.json` の `endedAtEpochMs` が 0 以上・SQLite INTEGER 内の整数でなければ `None` にして復元を続ける（`_stop_metadata` と同じ判定を `_is_sqlite_epoch_ms` に切り出し）。再 PUT の修復判定は圧縮済み Chunk も `read_pcm` で復号して WAV の sha256 と照合し、壊れていれば WAV に書き戻して `registered` にする。`FlacCodec.decode` は libsndfile の例外（RuntimeError 系）を `ValueError` に包み、`AudioCodec.decode` の約束（壊れた入力は ValueError）にそろえた（STT 側の `read_pcm` もクラッシュせず `InvalidWavError` になる。FLAC の分岐は soundfile 未導入の検証環境では未実行）。回帰 7 件。
+  - **scripts**：`verify-design-docs.sh` は `server` / `client` / `all` 以外の対象を exit 2 で拒否（何も検査せずに OK と出していた）。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 498 件通過・Phase 1 埋め込み同期一致。`verify-design-docs.sh all`：Phase 2 server 94 件・Phase 3 server 130 件・Phase 2 client 541 件・Phase 3 client 574 件、pyflakes 指摘なし。設計書冒頭の検証件数も実測値に更新。
+  - finalize の新しい 409 は、期待件数より多く登録され余りが壊れた場合だけに効く。Phase 1 の Finalizer は期待件数を「IDB とサーバー登録済みの連番の最大 + 1」で作るので余りも数に入り、壊れた余りは従来から件数不一致の 409 になる（既存クライアントに新しい再送ループは生じない）。
+  - 残り：`restrict_to_current_user()` の Windows 分岐は実機（昇格・非昇格の両方で起動）で未確認。Phase 3 の finalize は圧縮済み Chunk を存在だけで数える（修復判定と違い復号しない）。確定 API の `endedAtEpochMs` に上限がなく、2**63 以上で 500 になりうる（今回の指摘範囲外。要否を判断）。
+
+- 2026-11-12（PR #14 のレビュー指摘・SonarCloud・未コミット）：CodeRabbit 18 件と SonarCloud の Security 指摘 5 件を検証し、すべて有効として修正した（スキップなし）。
+  - **Phase 1 src**：`finalizer.ts` の `GET /chunks` で、本文の読み取り中のタイムアウト（abort）を壊れた応答（`malformed`）ではなく `network` として返す（回帰テスト 1 件、修正前に Red を確認）。Phase 1・Phase 2 client の設計書にも同じ差分を反映。
+  - **Phase 2 / 3 server**：finalize の `meeting_status` 通知を `meeting.json` の書き出し（507 になりうる）より先に行う。作成・再送の `meeting.json` を DB の会議行から書く（Phase 2 は `_meeting_json`、Phase 3 は `write_meeting_json`）。`serve` は待ち受けポートを確保（新規 `bind_listen_socket`）してからトークンを作り直す。確定・Live STT と Live 結果の再利用は lease を先に検査する（segments が空でも旧ワーカーが完了にしない）。`fchmod` がない環境（Windows の Python 3.12 以前）では `chmod`。Phase 3 の移行 012 は旧ディレクトリを `.migrate-012/` へ退避してから統合し、作業場所は 012 の記録のコミット後に片付ける（会議 ID `local` で他の会議の録音ごと消えた）。
+  - **Phase 2 / 3 client**：SSE は初回接続でも補完し、補完中の live イベントは保留して補完の後に流す（世代番号で古い接続の補完を捨てる）。`FetchEventSource` に接続期限 10 秒と無通信 45 秒の監視（新規 export `SSE_CONNECT_TIMEOUT_MS` / `SSE_IDLE_TIMEOUT_MS`）。補完中の保留は接続ごとにやり直す（前の接続の古い status を流さない）。stale の版の印は大きい方を残す。`NotesStore.dispose()` を追加（送信中の保存が終わっても送り直しを予約しない）。配線表 W2（ロックは Mic の `RecordingController`、`finally` で受け取る）・W7・W8・W11 と 2-h1 を更新。
+  - **scripts**：抽出の閉じフェンスを CommonMark どおり（同じ文字・開き以上の長さ）に、出力先の外へのパスを拒否（Sonar S8707）。verify は `VERIFY_DIR` を絶対パス化、抽出を関数化、pyflakes の指摘と失敗を NG に、`npx` をやめて `node_modules/.bin` を直接使う（Sonar S6505）。
+  - 確認：`npm run typecheck` 通過・TypeScript 24 ファイル / 496 件通過。`verify-design-docs.sh all`：Phase 2 server 90 件・Phase 3 server 119 件・Phase 2 client 30 ファイル 536 件・Phase 3 client 34 ファイル 569 件、pyflakes 指摘なし。新規テストは `bind_listen_socket` 以外、修正前のコードで Red を確認。
+  - 残り：SonarCloud の再解析で S8707（`open(doc)` の 26 行目）が残る場合は、CLI 引数の読み込みなので SonarCloud 上で「Safe」とするかを利用者が判断する。
+
+- 2026-11-12（設計書レビュー・未コミット）：`docs/` の設計書を、コードブロックを実ファイルに展開して tsc・Vitest・pytest を回す方法でレビューし、見つけた不整合を修正した（製品コード `src/`・`minutes_local/`・`test/`・`server_tests/` は無変更。Phase 1 設計書も無変更で src と一致のまま）。
+  - **Phase 3 server**：(1) マイグレーション番号が Phase 2 の 008（`sync_samples`）と衝突し、Phase 3 の列追加が丸ごと適用されなかった → 009〜012 に振り直し。(2) 全文差し替えの 14 ファイル＋テスト 2 ファイルが古い Phase 2 を元にしており、fencing token（`finish_job` / `insert_segments` の `attempts`）・`sync_samples`・要約の `quote` / `evidenceSpan`・docstring が巻き戻る状態だった → Phase 2 現行に Phase 3 の差分だけを載せ直した。(3) Live STT の書き込みにも fencing を適用。(4) `meeting.json` を `write_atomic`（一意な一時ファイル）で書き、終了時刻のキーを Phase 1/2 と同じ `endedAtEpochMs` に統一。(5) `on_finalized` に話者分離フラグを渡す。
+  - **Phase 2 server**：Phase 1 互換ルートが実装済みの `minutes_local/phase1.py` より緩かった → 会議 ID の形式検査（`..` を登録できると `DELETE` の `rmtree` がデータディレクトリの外へ届いた）、PUT のヘッダ・`X-Chunk-Meta` の検証、破損ファイルの再送による修復、確定の連番検査・キー検査、作成時の `meeting.json`、CORS（`http://127.0.0.1:5173`）と preflight、422 / 500 の `ApiErrorBody`、起動ごとのトークン再生成を追加。確定の再送で `meeting_status: transcribing` を流し直す不具合、Chunk 0 件の会議が `transcribing` で止まる不具合も修正。`web_dir` によるアプリ配信を追加（基本設計 §15・Phase 3 LAN モードの前提だったがコードがなかった）。`server_tests` 10 件の内容を `tests/test_phase1_server_compat.py`（43 件）へ移植し、変更前の設計では失敗することを確認。移行手順を §1.2 に追加。
+  - **Phase 2 client**：Finalizer が Phase 1 現行から離れた再実装で、Phase 1 のテスト 22 件を壊していた → 「Phase 1 現行 + 2 系統の差分」に作り直し、`FinalizeResult` は変えない（Phase 1 側の変更は `test/app.test.ts` の 1 か所）。SSE の復号を `TextDecoder` に変更（TS 7 の型エラー）。アプリへの組み込みが未記載だったので、配線表・未決事項・ブラウザ側の実装順序を §15 に追加。
+  - **Phase 3 client**：`events.ts` が「全文」と言いながら `FetchEventSource` を省いていた → 全文に。非 loopback の http の拒否文言を `disallowed host` 始まりに（Phase 1 のテストが通る）。逆同期テストが Scheduler の内部状態に依存していた点を修正。
+  - 追加：`scripts/extract-design-code.py`・`scripts/verify-design-docs.sh`。`CLAUDE.md` と `design-doc-sync` スキルに手順を追記。
+  - **未決事項（利用者の判断待ち、Phase 2 client §15.2）**：画面の描画方式（素の DOM か UI フレームワークか）とノートのエディタ（BlockNote は React が必要）。外部依存の追加を伴う。決まるまでサーバー側の全 Step と、ブラウザ側の録音・確定・SSE の部分は進められる。
+  - 残課題（設計書に未反映・次回のレビュー対象）：Phase 3 の `routes_jobs.exclude_failed` が話者分離フラグを渡さない（Phase 2 のファイルを変更禁止にしているため。除外後に話者分離を飛ばして merge へ進む）／Phase 3 の圧縮が `size_bytes` を圧縮後の値に書き換える（`GET /chunks` の `sizeBytes` が変わる）／Phase 2 `request_rerun_stt` の冗長な UPDATE と未使用変数／Phase 2・3 の画面層（DOM）のコードは設計書にない。
+
+- 2026-11-12（ドキュメント整理・未コミット）：リポジトリ直下に配置していた基本設計書・詳細設計書 6 ファイル（`design-local-phase1.md` / `design-local-phase2.md` / `design-local-phase2-client.md` / `design-local-phase2-server.md` / `design-local-phase3-client.md` / `design-local-phase3-server.md`）を `docs/` 配下へ移行した。あわせて関連ドキュメント（`README.md`・`CLAUDE.md`・`PROGRESS.md`・`.claude/skills/design-doc-sync/SKILL.md`・`.claude/skills/implement-design-step/SKILL.md` および各設計書ヘッダ）へ移行した旨と新パスを反映し、同期スクリプト（`scripts/sync-design-code.mjs`・`.claude/skills/design-doc-sync/scripts/check_design_sync.py`）の既定パスを更新した（製品コードの変更なし）。
 - 2026-11-10（63 回目・未コミット）：レビュー指摘 18 件を検証し 7 件を修正、11 件スキップ。(1) `pendingCountsText` の最大の連番・endFrame を Math.max への展開でなくループで求める（`hasSequenceGap` も。30 万件で RangeError になった）。(2) 直接送信の PUT が成功したら（DB 未登録でも）`health.lastSuccessfulLocalSaveAt` を `performance.now()` で更新（56 回目は読む箇所がないためスキップしたが、62 回目で Scheduler 側を performance 時計に揃えたので経路を揃えた）。(3) Controller は `createMediaStreamSource` が使うトラック（Web Audio の仕様どおり id 最小、新規 `selectSourceTrack()`）だけを切断監視する（53 回目のスキップを変更。1 本なら挙動は同じ）。(4) `BackendHealthMonitor.checkOnce()` の失敗応答・例外の経路にも、開始時と現在のトークンの比較を入れる（古いトークンの失敗が新しいトークンの HEALTHY・capabilities を消した）。(5) サーバーが受け付けない停止の検出時刻（NaN・小数・負数）は、Controller と App（`unsavedStops`）が記録せず未観測として停止を完了する。復旧は不正な観測（不明な理由も）を片方だけの行と同じく両方外して書き直し、Finalizer は不正な保存値を省いて確定する（新規 `isValidStopObservation()` / `isValidStopDetectedAt()`。55 回目の懸念どおり `put()` では拒否しない）。(6) ネットワーク失敗の再試行の予約が発火して会議ロックが使用中だったら、間隔を延ばして予約し直す（`MEETING_BUSY_IN_THIS_TAB` / `MEETING_LOCKED_BY_OTHER_TAB` を export。60 回目のスキップを変更：別タブの起動時復旧が一時的にロックを持つと、確定されないまま予約が消えた）。(7) `main.ts` の「書き出し」は `discardableMemoryBacklog()` の会議の分も同じ書き出しに入れ、破棄の確認は書き出しに含めた会議だけに出す（60 回目のスキップを変更。現状の経路では差が出ないが、保証をコードで閉じた）。スキップ：Stop ボタンの件（`releaseRecording` が解放時に有効化し、A の遅い完了は `recording` が B なので早期 return 済み）、手動再試行の通知（`manualRetryNeedsNotice()` が同じ理由の失敗も出す。57 回目に対応済み）、Phase 2 client の `stop()` の両方失敗（62 回目に `AggregateError` で対応済み）、`dispose()` 時のロック（src から呼ばれず、`heldLocks` も解放しない）、NETWORK 失敗後の中止済み Chunk の再投入（直後の pump の `markAllPendingUnavailable()` が中止を確かめて外すことをプローブで確認。pending は 0 に戻る）、`markAllPendingUnavailable()` の中止判定失敗（50 回目と同じ。再開可能な状態の間の書き換えだけで、次の pump で読み直す）、復旧の状態不一致時の `SAVING` 再送（44 回目と同じ。停止したタブのスケジューラが送り、確保の照合で二重送信に耐える。タブを閉じていれば次回起動で復旧）、読めなかった会議の同じ実行内での読み直し（56 回目と同じ）、`put()` の 401 とトークン確認の間の隙間（57 回目と同じ。間にタスク境界がない）、内訳の不完全表示をサーバー停止中に保つ件（50 回目と同じ）、drain で直接送った末尾のフレーム数の件（最終保存に成功していれば flush 後の値が IDB にあり、失敗時は `unsavedStops` が同じ `sessionClock` を持ち、離脱確認も続く。IDB に書けない状態でほかに残す先がない）。回帰テスト 14 件（内訳 1・Controller 5（時刻 1・トラック 1・検出時刻 3）・Monitor 2・Finalizer 4・復旧 1・App 1。修正前の Red を確認）。保存確認のテスト 2 件（トラックの「登録前に終了」・Monitor の「トークン不変なら従来どおり UNREACHABLE」。修正前から通る）。実機確認に追加：README「次の実機確認」6（確定中止後の書き出しに中止した会議の WAV が入り、破棄の確認がその会議だけに出る）。インターフェース変更：`selectSourceTrack()`・`isValidStopObservation()`・`isValidStopDetectedAt()`・`MEETING_BUSY_IN_THIS_TAB`・`MEETING_LOCKED_BY_OTHER_TAB` を export（既存の呼び出し元の変更なし）。`main.ts` は Vitest 対象外（typecheck のみ）。TypeScript 495 件・typecheck 通過。Phase 1 埋め込み同期（DIFF 0）・本文（§12 停止理由、§15 トラック監視・直接送信、§18 トークン差し替え、§31 ネットワーク再試行・書き出しと破棄）、Phase 2 client の RecordingController（トラック監視・検出時刻・直接送信）と Finalizer を更新。
 - 2026-11-10（62 回目・未コミット）：レビュー指摘 4 件を検証し全件修正。(1) Phase 2 client の `MultiSourceRecorder.stop()`（設計書のみ）は Mic の停止も失敗したとき、Mic の失敗を先頭・System の失敗を 2 番目にした `AggregateError` を投げる（従来は Mic の例外が System の失敗を消していた。片方だけの失敗は従来どおりその例外を投げる）。設計書のテストに 1 件追加。(2) PROGRESS の見出しとテスト件数を更新（61 回目の 478 件は HEAD で実行して確認）。(3) 確定中止の確認文言から「確定済みにはなりません」を外し、「このブラウザからの自動再送・確定は再開しません。サーバーで確定済みになっていた場合は取り消しません」にする（タイムアウトした確定 POST をサーバーが処理済みのことがある。指摘箇所は app.ts だが文言は `pending-actions.ts`）。(4) `LocalSaveScheduler` の `health.lastSuccessfulLocalSaveAt` を任意の `perfNow`（既定 `performance.now()`）で記録する（型の契約は performance.now() だが、App が渡す `now` は Date.now だった。再試行の `now` は変更なし）。回帰テスト 1 件（(4)、修正前の Red を確認）。インターフェース変更：`SchedulerDeps.perfNow?` を追加（任意、呼び出し元の変更なし）。Phase 1 埋め込み同期（DIFF 0）。
 - 2026-11-09（61 回目・コミット済み）：レビュー指摘 5 件を検証し全件修正。(1) Phase 2 client の RecordingController に `discardMemoryBacklog()` を戻す（`SessionController` が Phase 1 から引き継ぐ契約。drain と同じ `drainQueue` で直列化し、空にした後の処理を `onMemoryBacklogEmptied()` にまとめ、ロック解放は `otherSourceBacklogCount` も数える）。§4 の配線に「破棄は Mic と System の両方で呼び、App が合計 0 でロックを解放する」を追加。(2) README の報告項目に 5（ZIP）の結果を追加。(3) `measureMissingTailMs()` は Chunk が 1 件もない（`chunkCount === 0`）とき終わりを 0 とし、`audioFrameCount` 全体を欠けとして返す（従来は 0 を返し、最初の Chunk も届かずに確定した会議を警告しなかった）。(4) `RecordingController` は `start()` の準備中（`starting`。ロック取得後、Worklet ノード生成前で `node === null`）に drain・破棄が空で終わってもロックを解放しない（サーバー復帰の drain が準備中に走ると、録音を始める会議のロックが外れた）。(5) `finalizeResultText()` は `reason: "network"` に「サーバーが使えるようになれば自動で再試行します」と案内する（従来は「確定できませんでした」「再試行してください」で、App の自動再試行を伝えていなかった）。回帰テスト 3 件（(3) Finalizer 1・(4) Controller 1・(5) View 1。修正前の Red を確認）、新規テスト 1 件（(3) の欠けなし側）。既存テスト 1 件の fixture を修正（`recordAndSave(h, 0)` が Chunk 0 件で `audioFrameCount: 1600` を残しており、コメントの「最後の Chunk の終わりに揃える」と矛盾 → 0）。インターフェース変更なし（Phase 2 設計書の Controller に `discardMemoryBacklog()` を追加）。Phase 1 埋め込み同期（DIFF 0）・本文（§15 準備中のロック、§22 Chunk 0 件の欠けと network の文言）、Phase 2 client の RecordingController（破棄・準備中のロック）と Finalizer（Chunk 0 件の欠け）を更新。
@@ -118,7 +206,7 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 ### T3. アプリの配線と最小 UI ✅ 完了（2026-09-27）
 
-設計は [design-local-phase1.md](design-local-phase1.md) §31（アプリの組み立て）。利用者判断（2026-09-26）：Vite を追加し、配線は設計書に節を足してから実装する。
+設計は [docs/design-local-phase1.md](docs/design-local-phase1.md) §31（アプリの組み立て）。利用者判断（2026-09-26）：Vite を追加し、配線は設計書に節を足してから実装する。
 
 | ID | 内容 | 状態 |
 | --- | --- | --- |
@@ -140,7 +228,7 @@ T3-c の内容（§31.4）:
 - 利用者承認済みの順序：1-c の5分実録音を利用者が操作して結果報告 → Python / FastAPI / SQLite の最小サーバーを実装 → 1-d〜1-f を結合確認。1-g の60分実録音は次回。詳細な1-cの手順は [README.md](README.md)。
 - 最小サーバーは §12 の5 APIを実装済み。保存先は `private/phase1-data/`、127.0.0.1:43117。Pythonテストでトークン更新、CORS、原子的保存、冪等性、破損・容量不足・不完全な確定を検証済み。実ブラウザのPUTは未確認。
 - 会議作成APIの配線漏れは修正済み。通常送信・復旧・直接送信は共通の登録を通り、録音開始はサーバーを待たない。
-- 結果は [design-local-phase1.md](design-local-phase1.md) §28 の「状況」列に反映する。
+- 結果は [docs/design-local-phase1.md](docs/design-local-phase1.md) §28 の「状況」列に反映する。
 
 ### 次セッションの再開点：T4 実機再確認チェックリスト（2026-10-01 作成・A〜G 合格、H は一部確認）
 
@@ -196,7 +284,7 @@ T3-c の内容（§31.4）:
 3. **1-d/1-e：停止・復旧**：別の新規会議で録音を始め、サーバーをCtrl+Cで止めて5分間録音を続ける。録音中はタブを維持し、IDBの滞留Chunkと「サーバー未接続」表示を確認する。録音を続けたままサーバーを再起動して新しいトークンを入力し、連番順に再送され全件 `DB_REGISTERED` になることを確認してから録音停止し、`finalized` を確認する。強制終了の試験はさらに別の新規会議で、Chunkが1件以上IDBに入った後、Chromeのタスクマネージャーから録音タブのプロセスを終了して再度同じURLを開く（通常のタブ閉じはpagehideを通るため代用しない）。保存済みChunkが再送され、会議が確定待ちから復旧することを確認する。直近最大30秒が失われうることは仕様として記録する。
 4. **1-f：ブラウザの手動項目**：新規会議で一方のタブが録音中に同じURLを別タブで開き、前者が勝手に `stop_requested` / `finalized` へ移らないことを確認する。同意キャンセル、マイク権限拒否、録音中のマイク切断、タブ切替、最小化、画面ロックを個別に試し、画面の警告・録音状態・Chunk連番を記録する。画面ロック時のAudioContext動作はOS依存として観測結果のみ記す。Chrome単体での11 WAV再生と外部通信ゼロも、この機会に確認する。
 5. **1-f：IDB障害＋サーバー停止時のWAV書き出し**：既存会議に触らず短い新規会議を開始し、サーバーを停止する。DevTools Consoleで `const { ChunkStore } = await import('/src/storage/idb.ts'); window.__minutesOriginalPutChunk = ChunkStore.prototype.putChunk; ChunkStore.prototype.putChunk = async function () { throw new Error('T4 injected IDB write failure'); };` を実行する。30秒以上録音して1件以上のChunk生成を待ち、録音停止後、警告と「WAVを書き出す」ボタンからファイルを保存して再生確認する。最後に `ChunkStore.prototype.putChunk = window.__minutesOriginalPutChunk; delete window.__minutesOriginalPutChunk;` で注入を解除する（ページ再読み込みでも解除されるが、書き出し完了前は再読み込みしない）。この試験で書き出したWAVのサーバー取込経路は未設計なので、ファイルを手元に保持する。
-6. **記録と次段階**：各試験の会議ID、Chunk件数・連番、IDB状態、HTTPステータス、警告・エラー、外部通信の有無を [design-local-phase1.md](design-local-phase1.md) §28 と本ファイルへ反映する。失敗時は原因と再試験条件を記し、通過扱いにしない。必要な修正後は `.venv/bin/python -m pytest -q`、`npm run typecheck`、`npm test`、`npm run build`、`node scripts/sync-design-code.mjs --check`、`git diff --check` を実行する。1-g の60分実録音（120 Chunk、欠番なし、全件 `DB_REGISTERED`、外部通信なし）は別の試験として最後に実施する。コミットは利用者の指示・承認後のみ行う。
+6. **記録と次段階**：各試験の会議ID、Chunk件数・連番、IDB状態、HTTPステータス、警告・エラー、外部通信の有無を [docs/design-local-phase1.md](docs/design-local-phase1.md) §28 と本ファイルへ反映する。失敗時は原因と再試験条件を記し、通過扱いにしない。必要な修正後は `.venv/bin/python -m pytest -q`、`npm run typecheck`、`npm test`、`npm run build`、`node scripts/sync-design-code.mjs --check`、`git diff --check` を実行する。1-g の60分実録音（120 Chunk、欠番なし、全件 `DB_REGISTERED`、外部通信なし）は別の試験として最後に実施する。コミットは利用者の指示・承認後のみ行う。
 
 ### T11. ダイアログ表示中に Chunk の保存・送信が止まる疑い【2026-10-07 再現せず・保留】
 
@@ -279,6 +367,30 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-11-13（レビュー指摘 3 件：補完の再生・エラー応答の本文・閉じていないブロック）
+
+- `MeetingEventsClient.backfill()` の保留分の再生を `replay()` にまとめ、コールバックの例外を 1 件ごとに記録して続ける（次の補完・取り直しを飛ばさない）。`Phase2Client` / `Phase3Client` の `request()` は、エラー応答の本文の読み取り失敗を TIMEOUT / NETWORK にせず status で返す。Phase 2 client を直し、Phase 3 client の載せ直しにも同じ変更を当てた。
+- `scripts/extract-design-code.py`：閉じていないコードブロックがあれば終了コード 1 で失敗させる（前フェーズのファイルのまま検証が通るのを防ぐ）。フェンスの 3 文字までのインデントも受け付け、本文から開きのインデント分を取り除く（CommonMark。インデントした差し替えブロックを黙って取りこぼさない）。全設計書の展開結果は変更前と同一。
+- 検証：追加した回帰テスト 2 件が修正前のコードで Red になることを確認。`scripts/verify-design-docs.sh` 通過（Phase 2 server 128・Phase 3 server 164・Phase 2 client 558・Phase 3 client 593）。製品コードは無変更のため `npm test` は未実行。未コミット。
+
+### 2026-11-13（設計書の厳しめレビュー 2 回目）
+
+- 展開したコードのカバレッジを起点に、テストが通っていない経路をレビュー。SSE が最初の keepalive で落ちる、Apple Silicon で STT が cuda を選ぶ、モデルの選定が起動時のまま、プールが作り直されない、モデル取得が全滅、録音中の rerun が保存を止める、クライアントが応答を無検証で通す、を修正。詳細は「今回の変更と残課題」。
+- 検証：`scripts/verify-design-docs.sh all` 通過（Phase 2 server 128・Phase 3 server 164・Phase 2 client 557・Phase 3 client 592）。製品コードは無変更のため `npm test` は未実行。未コミット。
+- 次：Phase 3 固有部分のレビュー（未着手）と、Phase 2 server §26 の R1〜R6・未決事項 D1 / D2 の判断。
+
+### 2026-11-12（Phase 2 / 3 設計書のレビューと修正）
+
+- 設計書のコードブロックを展開して tsc・Vitest・pytest を回し、Phase 3 server の全面的な巻き戻り（古い Phase 2 が元）とマイグレーション番号の衝突、Phase 2 server の Phase 1 互換ルートの緩み（会議 ID 検査・CORS など）、Phase 2 client の Finalizer の乖離、Phase 3 client の欠落を修正した。詳細は「今回の変更と残課題」。
+- 検証：`scripts/verify-design-docs.sh all` が通過（Phase 2 server 87・Phase 3 server 115・Phase 2 client 527・Phase 3 client 560）。Phase 1 は `sync-design-code.mjs --check` で一致。製品コードは無変更のため `npm test` は未実行。
+- 次：Phase 2 client §15.2 の未決事項（描画方式・エディタ）を利用者に確認する。Phase 1 の残り（T4-H の聴取、T12-b、任意の C2、保留中の 1-g）は変わらず。
+
+### 2026-11-12（設計書の `docs/` 移行）
+
+- リポジトリ直下の `design-local-phase*.md`（6 ファイル）を新設した `docs/` 配下へ移動した。
+- `README.md`・`CLAUDE.md`・`PROGRESS.md`・`.claude/skills/`・各設計書の参照パスを更新し、`docs/` へ移行した旨を記載した。
+- `scripts/sync-design-code.mjs` と `check_design_sync.py` の参照先を `docs/design-local-phase1.md` に更新し、同期確認を通した。コミット未実施。
 
 ### 2026-11-08（49 回目・レビュー指摘 10 件）
 

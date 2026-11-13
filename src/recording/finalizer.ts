@@ -105,7 +105,14 @@ async function finalizeMeetingOnce(deps: FinalizerDeps, meetingId: string): Prom
   try {
     listRes = await fetchImpl(listUrl, { headers: { Authorization: `Bearer ${deps.token}` }, credentials: "omit", redirect: "error", signal: listAbort.signal });
     // サーバー応答は外部入力。型ガードを通してから使う（壊れた JSON も Result で返す）
-    list = listRes.ok ? await listRes.json().catch(() => null) : null;
+    // null（壊れた応答）にするのは JSON の構文エラーだけ。本文の読み取り中の abort（タイムアウト）や
+    // 通信エラーは network として下の catch へ流す
+    list = listRes.ok
+      ? await listRes.json().catch((error: unknown) => {
+        if (error instanceof SyntaxError && !listAbort.signal.aborted) return null;
+        throw error;
+      })
+      : null;
   } catch (error) {
     return { ok: false, stage: "verify", detail: `list request failed: ${errorMessage(error)}`, reason: "network" };
   } finally {

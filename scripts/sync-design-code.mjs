@@ -1,7 +1,7 @@
 // Keep Phase 1's complete embedded src blocks identical to the implementation.
 import { readFileSync, writeFileSync } from "node:fs";
 
-const docPath = "design-local-phase1.md";
+const docPath = "docs/design-local-phase1.md";
 const sources = [
   "src/types/recording.ts",
   "src/api/contracts.ts",
