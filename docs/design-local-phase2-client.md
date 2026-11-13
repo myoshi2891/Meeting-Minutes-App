@@ -2343,7 +2343,7 @@ function enc(s: string): string {
 
 # 10. ノートの Autosave `src/notes/notes-store.ts`
 
-基本設計 §19。debounce 1〜2 秒で `PUT /notes`、同時に IndexedDB `settings` ストアへ一時保存し、サーバー未起動時の編集を失わない。`409` は上書きせず差分 UI に委ねる。
+基本設計 §19。debounce 1〜2 秒で `PUT /notes`、同時に IndexedDB `settings` ストアへ一時保存し、サーバー未起動時の編集を失わない。`409` は上書きせず差分 UI に委ねる。IndexedDB への書き込み（編集の下書き・保存後の控え）は発行順に 1 本ずつ流す。`DraftStore` は完了順を保証しないので、並行に書くと、後から終わった保存後の控え（古い内容）がその間の編集の下書きを上書きし、作り直したインスタンスの `load()` が編集を黙って失う。
 
 ```typescript
 // src/notes/notes-store.ts
@@ -2376,7 +2376,10 @@ export interface NotesStoreDeps {
   readonly setTimer: (fn: () => void, ms: number) => unknown;
   readonly clearTimer: (handle: unknown) => void;
   readonly onChange: (state: NotesState) => void;
-  /** 保存後の控え（IndexedDB）の書き込みの失敗。サーバーには保存済みなので状態は変えない */
+  /**
+   * 下書き・保存後の控え（IndexedDB）の書き込みの失敗。状態は変えない（保存後の控えならサーバーには保存済み。
+   * 編集の下書きなら、メモリ上の編集は debounce の保存でサーバーへ送る）
+   */
   readonly onError?: (error: Error) => void;
 }
 
@@ -2401,6 +2404,14 @@ export class NotesStore {
   private state: NotesState;
   private timer: unknown = null;
   private inflight: Promise<void> | null = null;
+  /**
+   * 下書き・控えの書き込みを発行順に 1 本ずつ流す鎖。DraftStore は書き込みの完了順を保証しないので、
+   * 保存後の控え（古い json）が後から終わって、その間に入った編集の下書きを上書きしないようにする。
+   * 失敗は writeDraft の中で onError に渡すので、この鎖は reject しない
+   */
+  private draftWrites: Promise<void> = Promise.resolve();
+  /** 鎖に残っている書き込みの数。0 のときは同期的に書き始める */
+  private pendingDraftWrites = 0;
   private disposed = false;
 
   constructor(private readonly deps: NotesStoreDeps, meetingId: string) {
@@ -2453,7 +2464,7 @@ export class NotesStore {
   /** エディタの変更ごとに呼ぶ。debounce して保存する。 */
   setDraft(json: unknown, lastAppliedSummaryVersion: number | null = this.state.lastAppliedSummaryVersion): void {
     this.set({ json, lastAppliedSummaryVersion, sync: this.state.sync === "conflict" ? "conflict" : "dirty" });
-    void this.deps.drafts.set(this.draftKey(), { json, revision: this.state.revision, lastAppliedSummaryVersion, savedAt: Date.now(), saved: false } satisfies Draft);
+    void this.writeDraft({ json, revision: this.state.revision, lastAppliedSummaryVersion, savedAt: Date.now(), saved: false });
     if (this.state.sync !== "conflict") this.schedule();
   }
 
@@ -2462,7 +2473,7 @@ export class NotesStore {
     const s = this.state.serverNotes;
     if (s === null) return;
     this.set({ json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, sync: "saved", serverNotes: null });
-    void this.deps.drafts.set(this.draftKey(), { json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, savedAt: Date.now(), saved: true } satisfies Draft);
+    void this.writeDraft({ json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, savedAt: Date.now(), saved: true });
   }
 
   /** 差分 UI で「自分の版で上書き」を選んだとき：サーバーの revision を採用して再送。 */
@@ -2492,7 +2503,7 @@ export class NotesStore {
   /**
    * setToken で作り直す前に呼ぶ。保留中の debounce を止め、古いトークンの PUT が新しいインスタンスと競合しないようにする。
    * 未送信の編集は IndexedDB の下書き（saved: false）に残っており、新しいインスタンスの load() が dirty として拾い直す。
-   * 送信中の PUT があれば、その完了を待って返る。新しいインスタンスの load() はこの完了を待ってから呼ぶ。
+   * 送信中の PUT と、発行済みの下書き・控えの書き込みの完了を待って返る。新しいインスタンスの load() はこの完了を待ってから呼ぶ。
    * 待たずに load() すると、古い PUT が確定する前の revision と下書きを読み、確定後に送った編集が 409 で競合になる。
    */
   async dispose(): Promise<void> {
@@ -2501,6 +2512,39 @@ export class NotesStore {
     this.timer = null;
     // doSave は失敗を Result で扱い reject しない。控え（新しい revision）の書き込みの完了まで待つ
     if (this.inflight !== null) await this.inflight;
+    // 編集の下書きの書き込みは doSave の控えの後ろに並ぶことがあるので、鎖の末尾まで待つ（reject しない）
+    await this.draftWrites;
+  }
+
+  /**
+   * 下書き・控えを書く。内容は呼んだ時点で確定させ、書き込みは発行順に 1 本ずつ流す。
+   * 前の書き込みがなければ、この呼び出しの中で書き始める（IndexedDB のトランザクションを直後の load() より先に作る。
+   * then で 1 回遅らせると、待たずに作り直したインスタンスの load() が書き込み前の下書きを読む）
+   */
+  private writeDraft(draft: Draft): Promise<void> {
+    const key = this.draftKey();
+    const run = async (): Promise<void> => {
+      try {
+        await this.deps.drafts.set(key, draft);
+      } catch (error) {
+        this.reportError(error);
+      }
+    };
+    const next = this.pendingDraftWrites === 0 ? run() : this.draftWrites.then(run);
+    this.pendingDraftWrites++;
+    this.draftWrites = next.finally(() => {
+      this.pendingDraftWrites--;
+    });
+    return next;
+  }
+
+  private reportError(error: unknown): void {
+    try {
+      this.deps.onError?.(error instanceof Error ? error : new Error(String(error)));
+    } catch (callbackError) {
+      // onError が投げても鎖を止めない（後ろの書き込みと dispose が進まなくなる）
+      console.error("NotesStore onError threw", callbackError);
+    }
   }
 
   private schedule(): void {
@@ -2540,13 +2584,9 @@ export class NotesStore {
       if (!stillSame) this.schedule();
       // stillSame が false なら保存中に編集が入っている＝控えの内容はまだ未送信。
       // 書き込みの完了を待ってから返す。dispose() はこの完了を待つので、作り直したインスタンスの load() が
-      // 古い revision の控えを読んで競合にしない（§15.1 W8）。失敗は onError に渡す。サーバーには保存済みで、
+      // 古い revision の控えを読んで競合にしない（§15.1 W8）。失敗は writeDraft が onError に渡す。サーバーには保存済みで、
       // 控えが古いまま残っても次の load() は差分 UI（conflict）になるだけで編集は失われない
-      try {
-        await this.deps.drafts.set(this.draftKey(), { json: this.state.json, revision: res.value.revision, lastAppliedSummaryVersion: this.state.lastAppliedSummaryVersion, savedAt: Date.now(), saved: stillSame } satisfies Draft);
-      } catch (error) {
-        this.deps.onError?.(error instanceof Error ? error : new Error(String(error)));
-      }
+      await this.writeDraft({ json: this.state.json, revision: res.value.revision, lastAppliedSummaryVersion: this.state.lastAppliedSummaryVersion, savedAt: Date.now(), saved: stillSame });
       return;
     }
     if (res.status === 409) {
@@ -4071,6 +4111,32 @@ describe("NotesStore", () => {
     expect(store.current.sync).toBe("saved");
   });
 
+  it("保存後の控えの書き込みが編集の下書きより遅く終わっても、古い控えで上書きしない（作り直したインスタンスが編集を拾う）", async () => {
+    // Arrange: 保存済みの控えの書き込みだけを止め、その間に編集する（DraftStore は書き込みの順序を保証しない）
+    const b = build();
+    let releaseDrafts: () => void = () => undefined;
+    const draftGate = new Promise<void>((r) => (releaseDrafts = r));
+    const deps: NotesStoreDeps = {
+      ...b.deps,
+      drafts: { get: b.deps.drafts.get, set: async (k, v) => { if ((v as { saved?: unknown }).saved === true) await draftGate; await b.deps.drafts.set(k, v); } },
+    };
+    const store = new NotesStore(deps, "m");
+    await store.load();
+    store.setDraft(["a"]);
+    await b.fire();
+    store.setDraft(["ab"]);
+    // Act: 控えの書き込みが終わった直後に作り直す（setToken、§15.1 W8）
+    releaseDrafts();
+    await store.dispose();
+    const next = new NotesStore(b.deps, "m");
+    await next.load();
+    // Assert: 編集は未送信の下書きとして残り、送り直す
+    expect(next.current.json).toEqual(["ab"]);
+    expect(next.current.sync).toBe("dirty");
+    while (b.timers.length > 0) await b.fire();
+    expect(b.puts).toEqual([{ json: ["a"], revision: 0 }, { json: ["ab"], revision: 1 }]);
+  });
+
   it("debounce 後に 1 回だけ PUT し、revision が進む", async () => {
     const b = build();
     await b.store.load();
@@ -4369,7 +4435,7 @@ describe("UI reducer", () => {
 | W5 | drain（サーバー復帰・`setToken`・確定再試行）と破棄・WAV 書き出しを Mic と System の両方の Controller に行う | `app.ts`・`main.ts` | §4 の 4、Phase 1 §31 | 確定中止後の書き出しに System の WAV も入る。破棄で両方が空になりロックが外れる |
 | W6 | 起動時復旧（Phase 1 §23）。`recovery.ts` が `listByMeeting(id, "mic")` で読むのは `audioFrameCount` を補うためで、Mic の時計の値なので **mic のままでよい**。未送信 Chunk の再投入は保存状態の索引で拾うので source を問わない | 変更なし（テストを追加） | Phase 1 §23 | System の未送信 Chunk も再送される。`audioFrameCount` は System の Chunk の `endFrame` では補われない |
 | W7 | 確定に成功した会議で `MeetingEvents`（§8）を開始し、`UiAction` に変換して `reduce`（§11）へ渡す。画面を離れたら `stop()` | `app.ts` | §8・§11 | `transcript_version` を受けて `GET /transcript` を取り直す。初回接続でも `GET /meetings/{id}` と `GET /jobs` で状態を補完し（確定から購読開始までのイベントを失わない）、再接続でも同じく補完する |
-| W8 | `Phase2Client`（§9）と `NotesStore`（§10）を、トークン・`baseUrl` を共有して生成する。`setToken` で作り直す。作り直す前に古い `NotesStore` の `dispose()` で保留中の debounce を `deps.clearTimer` で止め（古いトークンの PUT を新しいインスタンスと競合させない）、`dispose()` の完了（送信中の PUT の完了）を待ってから新しいインスタンスの `load()` を呼ぶ（待たないと古い PUT の確定前の revision を読み、保存中の編集が競合になる）。新しいインスタンスは `load()` を終えてから編集を受け付ける（未送信の編集は IndexedDB の下書きから引き継ぐ） | `app.ts` | §9・§10 | トークン変更後の要求が新しいトークンで出る。変更前の未送信の編集が 1 回だけ送られる |
+| W8 | `Phase2Client`（§9）と `NotesStore`（§10）を、トークン・`baseUrl` を共有して生成する。`setToken` で作り直す。作り直す前に古い `NotesStore` の `dispose()` で保留中の debounce を `deps.clearTimer` で止め（古いトークンの PUT を新しいインスタンスと競合させない）、`dispose()` の完了（送信中の PUT と、発行済みの下書き・控えの書き込みの完了）を待ってから新しいインスタンスの `load()` を呼ぶ（待たないと古い PUT の確定前の revision を読み、保存中の編集が競合になる）。新しいインスタンスは `load()` を終えてから編集を受け付ける（未送信の編集は IndexedDB の下書きから引き継ぐ） | `app.ts` | §9・§10 | トークン変更後の要求が新しいトークンで出る。変更前の未送信の編集が 1 回だけ送られる |
 | W9 | 同期誤差（`MultiSourceRecorder` の集計と `GET /meetings/{id}` の `syncDriftMs`）をヘッダに出す | `main.ts` | 基本設計 §16.3・§18 | 表示文言の純関数をテストする（Phase 1 の `recording-view.ts` と同じ方式） |
 | W10 | System Audio の取得ボタンと、取得できなかったとき（拒否・音声トラックなし）の Mic のみへの切り替え表示 | `main.ts`・`index.html` | §5、基本設計 §16.1 | `DegradedReason` の 2 値（§2）ごとの文言 |
 | W11 | 確定待ちの内訳（`main.ts` の `listByMeeting(id, "mic")` → `pendingCountsText`）に System の Chunk も含める | `main.ts`・`recording-view.ts` | Phase 1 §31.4 | System の未送信が残る会議で件数に出る。欠番・末尾の判定は source ごと |
