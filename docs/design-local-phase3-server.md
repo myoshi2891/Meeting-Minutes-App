@@ -1327,7 +1327,7 @@ def set_live_enabled(conn: sqlite3.Connection, meeting_id: str, enabled: bool) -
     repo.update_meeting(conn, meeting_id, live_stt_enabled=int(enabled))
 ```
 
-Live で生成されたセグメントは `transcript_segments` に通常どおり挿入され（`merged_version=NULL`）、finalize 後の `transcribe_chunk` が同一 Chunk のセグメント有無を見て STT を省略する（§21 `handle_transcribe`）。Live は Overlap を付けないため、境界品質は確定 STT より僅かに劣る（§2.1）。
+Live で生成されたセグメントは `transcript_segments` に通常どおり挿入され（`merged_version=NULL`）、finalize 後の `transcribe_chunk` が同一 Chunk のセグメント有無を見て STT を省略する（§21 `handle_transcribe`）。Chunk が既に `completed` のとき（確定結果のコミット後に lease 切れで回収されたジョブの再試行）は省略せず、Phase 2 と同じく segments を置き換える（Phase 2 詳細設計 §14）。Live は Overlap を付けないため、境界品質は確定 STT より僅かに劣る（§2.1）。
 
 ---
 
@@ -3581,7 +3581,9 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         chunk = pipeline.job_of_chunk(conn, job)
         existing = repo_phase3.segments_of_chunk(conn, chunk.id)
         meeting = repo.get_meeting(conn, job.meeting_id)
-    if existing:
+    # 再利用するのは Live の結果だけ。Chunk が既に completed なら、既存の segments は前の attempt の確定結果
+    # （コミット後に lease 切れで回収されたジョブの再試行）なので、Phase 2 と同じく撮り直して置き換える（Phase 2 詳細設計 §14）
+    if existing and chunk.stt_status != "completed":
         # Live STT の結果を再利用（§2.1）。完了にするのは lease の現行の所有者だけ（Phase 2 基本設計 §9.3）
         async with ctx.db.write() as conn:
             if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
@@ -3596,7 +3598,13 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         # 書いた件数では判定しない。無音で segments が空だと失効していても 0 件になり、旧ワーカーが Chunk を完了にしてしまう
         if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return model_name
+        # この Chunk の結果を置き換える。前の結果で merge が終わっていれば作り直して版を上げる（Phase 2 詳細設計 §14・手動 STT と同じ）
+        current = repo.get_chunk(conn, chunk.id)
+        replaced = current is not None and current.stt_status == "completed"
+        repo.delete_segments_of_chunk(conn, chunk.id)
         repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
+        if replaced:
+            repo.delete_finished_job(conn, chunk.meeting_id, "merge_transcript")
         if meeting is not None and meeting.stt_model_used is None:
             repo.update_meeting(conn, chunk.meeting_id, stt_model_used=model_name)
         repo.record_metric(conn, "stt_seconds", chunk.duration_ms / 1000, model_name=model_name, meeting_id=chunk.meeting_id)
@@ -5615,7 +5623,7 @@ def test_doctor_rebuild_refuses_while_server_is_running(tmp_path: Path, monkeypa
 | 2 AI failure ≠ Transcript loss | Phase 2 と同じ。要約言語の判定（§21 `_summary_language`）は読み取りのみ |
 | 3 STT failure ≠ Recording loss | `handle_compress` は往復検証に成功し、lease が現行で、Chunk が読んだ時のままのときだけ WAV を消す。`read_pcm` は FLAC でも WAV sha256 で照合。読み取りは圧縮による置き換えを読み直して追う（`read_chunk_pcm`。正常な Chunk を `missing` にしない）。`rebuild` は既存行を上書きせず、確定前の会議を `recording` に戻して残りの Chunk を受け取れるようにする |
 | 4 Queue failure ≠ Job metadata loss | 010 のテーブル再作成は `INSERT ... SELECT *` で行を保つ（§23.2）。`processing_jobs` が唯一の Job Store である点は不変 |
-| 5 Duplicate delivery ≠ Duplicate transcript | `uq_live_job` / `uq_diarize_job` / `uq_compress_job`。`handle_live_transcribe` と `handle_transcribe` は既存セグメントがあれば挿入しない |
+| 5 Duplicate delivery ≠ Duplicate transcript | `uq_live_job` / `uq_diarize_job` / `uq_compress_job`。`handle_live_transcribe` と `handle_transcribe` は既存セグメントがあれば挿入しない（`handle_transcribe` は `completed` の Chunk の再試行だけ、segments を置き換える） |
 | 6 AI regeneration ≠ Manual note overwrite | 変更なし |
 | 7 VAD false negative ≠ Original audio loss | Live はブラウザ VAD の `has_voice=false` をスキップするだけで、確定 STT は Phase 2 の経路（サーバー VAD + 手動 STT）で救済できる |
 | 8 Browser tab hidden ≠ timer-based recording failure | サーバー側の日次スケジューラ・Sweeper は録音と無関係 |

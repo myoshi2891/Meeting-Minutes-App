@@ -2401,7 +2401,7 @@ lease が切れたジョブの扱いは 2 通りある（基本設計 §9.3）�
 | `merge_transcript` | 変えない | 変えない（`transcribing`） | 要約ジョブを作らない | 失敗したジョブの再試行。除外の対象ではない |
 | `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2）。ただし既に `completed` なら変えない（下記） | なし | 再試行、または要約の再生成 |
 
-transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行は `INSERT OR IGNORE` なので結果が重複せず、除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
+transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、同じ書き込みトランザクションでその Chunk の segments を消してから新しい結果を入れる（置き換え）。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにそのまま新しい segments を読む。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
 
 要約・VAD も同じ隙間（ハンドラのコミットと `finish_job` の間）で回収されうる。どれもハンドラの結果とジョブの完了を 1 トランザクションにはせず（Runner とハンドラの契約が変わる）、後続処理の側で書き込み済みの結果を認める。
 
@@ -2552,6 +2552,7 @@ stateDiagram-v2
 | 旧ワーカーの VAD 書き込み | `handlers.handle_vad` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば Chunk も `on_vad_completed` も書かない（モデル未配置の分岐も同じ） | 回数切れで `failed` になった vad ジョブを残したまま Chunk が進む |
 | lease 切れ後の VAD 再試行 | `pipeline.on_vad_completed` は `pending` の Chunk にだけ適用する。`POST /jobs/{id}/retry` は `transcribe_chunk` のときだけ Chunk を `queued` にする | 結果をコミットした後に lease が切れて回数切れで回収された vad ジョブを再試行すると、完了済みの Chunk が `queued` に戻り、transcribe ジョブは既存なので作り直されず止まる |
 | lease 切れ後の transcribe 回収 | `pipeline.on_transcribe_failed` は `completed` の Chunk を変えない。`POST /jobs/{id}/retry` も `completed` の Chunk を `queued` に戻さない | ハンドラのコミットと `finish_job` の間で lease が切れ、Sweeper が回数切れで回収すると、書き込み済みの segments を持つ Chunk が `failed`（gap）になる |
+| lease 切れ後の transcribe の再実行 | `handle_transcribe` は lease の検査の後、同じトランザクションで Chunk の segments を消してから入れる。Chunk が既に `completed` なら完了済みの merge ジョブも消す | 前の attempt の segments に新しい結果が混ざる。前の結果で merge が終わっていると、置き換えた区間がその版から消えたまま merge が作り直されない |
 | 旧ワーカーの merge 書き込み | `handlers.handle_merge` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議の `transcribed`・要約ジョブのどれも書かない | 回数切れで `failed` になった merge ジョブを残したまま transcript の版が進み、要約ジョブが作られて会議が `completed` まで進む。lease を取り直した新しいワーカーと二重に merge すると版が 2 回進む |
 | 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、要約の結果を誰も確かめないまま会議が `completed` に戻る。`finish_job` の条件はジョブ行しか守らない |
 | lease 切れ後の要約回収 | `pipeline.on_summary_failed` は `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れて回数切れで回収されると、要約があるのに会議が `failed` になる。この場合はジョブ `failed`・会議 `completed` の組を意図して残す |
@@ -4035,7 +4036,16 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         # 書いた件数では判定しない。無音で segments が空だと失効していても 0 件になり、旧ワーカーが Chunk を完了にしてしまう
         if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return model_name
+        # この Chunk の結果を置き換える。結果のコミット後に lease 切れで回収されたジョブの再試行・再実行では、前の attempt の
+        # segments が残っている。INSERT OR IGNORE だけでは、件数や区切りが変わった新しい結果と古い行が混ざる（§14）
+        current = repo.get_chunk(conn, chunk.id)
+        replaced = current is not None and current.stt_status == "completed"
+        repo.delete_segments_of_chunk(conn, chunk.id)
         repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
+        if replaced:
+            # 前の結果で merge が終わっていれば、その版から置き換えた区間が消えている。完了済みの merge ジョブを消し、
+            # 下の on_transcribe_completed → ensure_merge_job で作り直して版を上げる（手動 STT と同じ。要約は自動では作り直さない）
+            repo.delete_finished_job(conn, chunk.meeting_id, "merge_transcript")
         if meeting.stt_model_used is None:
             repo.update_meeting(conn, chunk.meeting_id, stt_model_used=model_name)
         repo.record_metric(conn, "stt_seconds", chunk.duration_ms / 1000, model_name=model_name, meeting_id=chunk.meeting_id)
@@ -6190,6 +6200,7 @@ from minutes_local.jobs.retry import OOMError, decide, InvalidAudioError, ModelM
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.jobs.sweeper import resume_finalized, sweep_once
 from minutes_local.stt.fake_provider import FakeSTTProvider
+from minutes_local.stt.provider import STTRequest, STTSegment
 from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm
 
 
@@ -6561,6 +6572,49 @@ async def test_transcribe_retry_after_committed_result_keeps_chunk_completed(cli
     assert retried is not None and retried.status == "failed"
     assert chunk is not None and chunk.stt_status == "completed"
 
+
+async def test_transcribe_retry_replaces_segments_and_remerges(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                                               stt_provider: FakeSTTProvider) -> None:
+    """結果のコミット後に回収された transcribe の再試行は、Chunk の segments を置き換え、終わっていた merge を作り直す（§14）。"""
+    # Arrange: 1 回目の結果（3 件）を書いた後、完了報告の前に lease が切れて回数切れで回収される。
+    # 1 回目のコミットで作られた merge と要約は、回収とは関係なく先に終わる
+    def first(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(0.0, 5.0, "旧い一", -0.2, 0.05), STTSegment(10.0, 15.0, "旧い二", -0.2, 0.05),
+                STTSegment(20.0, 25.0, "旧い三", -0.2, 0.05)]
+
+    def second(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(1.0, 8.0, "新しい一", -0.2, 0.05), STTSegment(12.0, 18.0, "新しい二", -0.2, 0.05)]
+
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "transcribe_chunk")
+    stt_provider.script = first
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["transcribe_chunk"], now_ms())
+        assert job is not None
+    await handlers.handle_transcribe(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    await runner.run_until_idle()
+    with ctx.db.read() as conn:
+        merged = repo.get_meeting(conn, "m-1")
+    assert merged is not None and merged.transcript_version == 1
+    # Act: 1 回目と件数・区切りの違う結果を返す再試行
+    stt_provider.script = second
+    assert (await client.post(f"/v1/jobs/{job.id}/retry")).status_code == 200
+    await runner.run_until_idle()
+    # Assert: Chunk には新しい結果だけが残り、merge が作り直されて版が上がり、transcript にも新しい結果だけが載る
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        all_texts = [s.text for s in repo.list_segments(conn, "m-1")]
+        latest = [s.text for s in repo.list_segments(conn, "m-1", merged_version=2)]
+        retried = repo.get_job(conn, job.id)
+    assert all_texts == ["新しい一", "新しい二"]
+    assert meeting is not None and meeting.transcript_version == 2
+    assert latest == ["新しい一", "新しい二"]
+    assert retried is not None and retried.status == "completed"
+    # 要約は自動では作り直さない（手動 STT と同じ。transcribed に戻る）
+    assert meeting.status == "transcribed"
 
 async def test_vad_from_expired_lease_does_not_advance_chunk(client: httpx.AsyncClient, ctx: AppContext) -> None:
     """lease を失った旧ワーカーの VAD 結果は書かない。書くと failed の vad ジョブを残したまま Chunk が進む（基本設計 §9.3）。"""
@@ -7770,7 +7824,7 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | 2 AI failure ≠ Transcript loss | `handlers.handle_summary` は `transcript_segments` に書かない。`runner._on_failure` → `pipeline.on_summary_deferred / on_summary_failed` は `meetings.status` のみ変更 |
 | 3 STT failure ≠ Recording loss | `handle_transcribe` は `read_pcm` のみ。`InvalidAudioError` 時は `save_status='missing'` を記録するだけ |
 | 4 Queue failure ≠ Job metadata loss | `processing_jobs` が唯一の Job Store。`sweeper.sweep_once` で再起動後に回収 |
-| 5 Duplicate delivery ≠ Duplicate transcript | `repo.finish_job` と `repo.insert_segments` の `lease_owner` + `attempts`（fencing token）検証、`INSERT OR IGNORE`、部分一意インデックス |
+| 5 Duplicate delivery ≠ Duplicate transcript | `repo.finish_job` と `repo.insert_segments` の `lease_owner` + `attempts`（fencing token）検証、`INSERT OR IGNORE`、部分一意インデックス。`handle_transcribe` は Chunk の segments を置き換える（再試行で前の attempt の行と混ざらない） |
 | 6 AI regeneration ≠ Manual note overwrite | `routes_meetings.put_notes` のみが `meeting_notes` を書く。`jobs/` に `put_notes` 呼び出しなし |
 | 7 VAD false negative ≠ Original audio loss | `pipeline.on_vad_completed` は `stt_status='skipped'` にするだけ。`transcribe_silent_chunk` で救済 |
 | 8 Browser tab hidden ≠ timer-based recording failure | サーバー側の該当なし。Sweeper / heartbeat のタイマーは処理進捗にのみ影響し、録音には関与しない |
