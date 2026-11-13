@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-13（Phase 2 server / client 設計書のレビュー指摘 3 件・未コミット、ブランチ `dev`。PR #14 までマージ済み）
+最終更新: 2026-11-13（Phase 2 server / client 設計書のレビュー指摘 2 件（transcribe 再試行・下書き失敗後の作り直し）・未コミット、ブランチ `dev`。PR #14 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,14 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 のレビュー指摘 3 件（merge の lease・下書きの書き込み順）の後：`all` で Phase 2 server 141 件・Phase 3 server 203 件・Phase 2 client 31 ファイル 560 件・Phase 3 client 35 ファイル 595 件、tsc・pyflakes も通過。レビュー指摘 2 件（要約・VAD の lease 切れ後の回収）の後：`server` で Phase 2 server 140 件・Phase 3 server 202 件、pyflakes も通過。レビュー指摘 3 件の後：`server` で Phase 2 server 135 件・Phase 3 server 197 件、pyflakes も通過。client は今回変更なし・未実行。設計書レビュー 3 回目の後：Phase 2 server 131 件・Phase 3 server 193 件・Phase 2 client 31 ファイル 559 件・Phase 3 client 35 ファイル 594 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 のレビュー指摘 2 件（transcribe 再試行・下書き失敗後の作り直し）の後：`all` で Phase 2 server 142 件・Phase 3 server 204 件・Phase 2 client 31 ファイル 561 件・Phase 3 client 35 ファイル 596 件。レビュー指摘 3 件（merge の lease・下書きの書き込み順）の後：`all` で Phase 2 server 141 件・Phase 3 server 203 件・Phase 2 client 31 ファイル 560 件・Phase 3 client 35 ファイル 595 件、tsc・pyflakes も通過。レビュー指摘 2 件（要約・VAD の lease 切れ後の回収）の後：`server` で Phase 2 server 140 件・Phase 3 server 202 件、pyflakes も通過。レビュー指摘 3 件の後：`server` で Phase 2 server 135 件・Phase 3 server 197 件、pyflakes も通過。client は今回変更なし・未実行。設計書レビュー 3 回目の後：Phase 2 server 131 件・Phase 3 server 193 件・Phase 2 client 31 ファイル 559 件・Phase 3 client 35 ファイル 594 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-13（Phase 2 server / client 設計書のレビュー指摘 2 件・未コミット）：2 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md`・`docs/design-local-phase2-client.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **lease 切れ後の transcribe 再試行**：結果をコミットした後に回数切れで回収された transcribe ジョブを再試行すると、`POST /jobs/{id}/retry` が `completed` の Chunk を `queued` に戻し、再試行がまた失敗すると `on_transcribe_failed` が `completed` を見られず `failed`（書き込み済みの segments が gap）にした。retry は `completed` の Chunk を戻さない（成功すれば `on_transcribe_completed` が `completed` を書き直す）。§14 本文・§15 の表を更新。`routes_jobs.py` は Phase 3 で変更禁止なので Phase 3 にも効く。テストは再試行の失敗を lease 切れの回収で作る（Phase 3 の `handle_transcribe` は既存の segments を再利用して STT を呼ばないので、STT の失敗では再試行が失敗しない）。Red（Chunk が `failed`）を確認。回帰 1 件。
+  - **下書きの書き込み失敗後の作り直し（`NotesStore`）**：編集の下書きの書き込みが失敗した後、debounce の保存の前に `setToken` で作り直すと、`dispose()` が保存を止め、IndexedDB に無い最新の編集を失った（`onError` の説明は「debounce の保存で送る」と約束していた）。最後の書き込みが失敗した下書きを `unwrittenDraft` に持ち、`dispose()` が返す（`Promise<Draft | null>`）。新しいインスタンスは `load(carry)` で IndexedDB の下書きより優先する。`Draft` を export。`onError`・`dispose()` の説明と §15.1 W8 を更新。Red（`["a"]` しか残らず最新の `["ab"]` が送られない）を Phase 2 client で確認。回帰 1 件。
+  - 確認：`verify-design-docs.sh all` 通過（Phase 2 server 142・Phase 3 server 204・Phase 2 client 561・Phase 3 client 596）。
 
 - 2026-11-13（Phase 2 server / client 設計書のレビュー指摘 3 件・未コミット）：2 件を修正、1 件をスキップした。変更は `docs/design-local-phase2-server.md`・`docs/design-local-phase3-server.md`・`docs/design-local-phase2-client.md` のみ。製品コード（`src/`・`test/`）は無変更。
   - **スキップ：`on_merge_completed` で終端の要約ジョブを作り直す**：基本設計 §12.7 が「`transcript_version` が進んだ後の再生成は自動では起動せず、UI の操作でのみ起動する」と決めており、`test_manual_transcribe_of_skipped_chunk_reaches_the_transcript` もその挙動（`transcribed`・要約の版 1）を固定している。`transcribed` の会議に完了済みの要約ジョブが残っても、再生成（`reset_job_for_rerun`）で抜けられる。
