@@ -14,7 +14,8 @@ import re
 import sys
 from collections.abc import Iterator
 
-OPEN = re.compile(r"^(?P<fence>(?P<ch>[`~])(?P=ch){2,})(?P<info>.*)$")
+# フェンスは行頭から 3 文字までのスペースでインデントしてよい（CommonMark）
+OPEN = re.compile(r"^(?P<indent> {0,3})(?P<fence>(?P<ch>[`~])(?P=ch){2,})(?P<info>.*)$")
 HEAD = re.compile(r"^(?://|#) ((?:src|test|tests|minutes_local)/\S+|pyproject\.toml)\s*$")
 
 
@@ -27,6 +28,7 @@ def top_level_blocks(text: str) -> Iterator[tuple[int, str, str]]:
 
     言語のないブロックも追跡し、その中身は開きフェンスとして読まない（入れ子の ```python などを取り出さない）。
     閉じフェンスは開きと同じ文字（` か ~）で、長さが開き以上のもの（CommonMark）。短いもの・別の文字では閉じない。
+    開きフェンスのインデント（n 文字）は、本文の各行の先頭から n 文字まで取り除く（CommonMark）。
     閉じていないブロック（文書末まで続く）があれば UnclosedBlockError を投げる。黙って打ち切ると、
     差し替えるはずのファイルが前フェーズのまま残り、検証が成功してしまう。
     """
@@ -38,13 +40,14 @@ def top_level_blocks(text: str) -> Iterator[tuple[int, str, str]]:
         if m is None or (m.group("ch") == "`" and "`" in m.group("info")):
             i += 1
             continue
-        close = re.compile(rf"^{re.escape(m.group('ch'))}{{{len(m.group('fence'))},}}[ \t]*$")
+        close = re.compile(rf"^ {{0,3}}{re.escape(m.group('ch'))}{{{len(m.group('fence'))},}}[ \t]*$")
+        strip = re.compile(rf"^ {{0,{len(m.group('indent'))}}}")
         j = i + 1
         while j < len(lines) and close.match(lines[j].rstrip("\r\n")) is None:
             j += 1
         if j == len(lines):
             raise UnclosedBlockError(f"L{i + 1}: 閉じていないコードブロックがある")
-        yield i + 1, m.group("info").strip(), "".join(lines[i + 1:j])
+        yield i + 1, m.group("info").strip(), "".join(strip.sub("", line, count=1) for line in lines[i + 1:j])
         i = j + 1
 
 
