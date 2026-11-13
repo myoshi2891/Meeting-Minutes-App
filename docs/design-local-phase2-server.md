@@ -1890,14 +1890,24 @@ def on_finalized(conn: sqlite3.Connection, meeting_id: str) -> int:
     return created
 
 
-def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: bool, model_name: str | None) -> None:
-    """has_voice なら transcribe_chunk を生成、そうでなければ skipped。"""
+def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: bool, model_name: str | None) -> bool:
+    """has_voice なら transcribe_chunk を生成、そうでなければ skipped。戻り値は結果を適用したか。
+
+    適用するのは Chunk が pending のときだけ。VAD の結果をコミットした後、finish_job の前に lease が切れて回数切れで
+    回収された vad ジョブを再試行すると、既に queued / completed の Chunk に来る。queued に戻すと、transcribe ジョブは
+    既存（一意制約）で作り直されず、Chunk が queued のまま merge を止める（§14）。
+    """
+    current = repo.get_chunk(conn, chunk.id)
+    if current is not None and current.stt_status != "pending":
+        ensure_merge_job(conn, chunk.meeting_id)
+        return False
     if has_voice:
         repo.update_chunk(conn, chunk.id, stt_status="queued")
         repo.insert_job(conn, chunk.meeting_id, "transcribe_chunk", chunk_id=chunk.id, model_name=model_name)
     else:
         repo.update_chunk(conn, chunk.id, stt_status="skipped")
     ensure_merge_job(conn, chunk.meeting_id)
+    return True
 
 
 def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
@@ -1979,7 +1989,15 @@ def on_summary_deferred(conn: sqlite3.Connection, meeting_id: str) -> None:
 
 
 def on_summary_failed(conn: sqlite3.Connection, meeting_id: str) -> None:
-    """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。"""
+    """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。
+
+    completed の会議は変えない。ハンドラが要約と completed をコミットした後、finish_job の前に lease が切れて Sweeper が
+    回数切れで回収すると、ここに来る。ハンドラの失敗（Runner）では、mark_processing の時点で on_summary_started が
+    summarizing にしているので completed は来ない（§14）。
+    """
+    current = repo.get_meeting(conn, meeting_id)
+    if current is not None and current.status == "completed":
+        return
     repo.set_meeting_status(conn, meeting_id, "failed")
 
 
@@ -2378,12 +2396,17 @@ lease が切れたジョブの扱いは 2 通りある（基本設計 §9.3）�
 
 | 失敗したジョブ | Chunk の `stt_status` | 会議の `status` | 後続 | 復旧 |
 | --- | --- | --- | --- | --- |
-| `vad_chunk` | 変えない（`pending` のまま） | 変えない（`transcribing`） | `pending` の Chunk が `ensure_merge_job` を止める | 失敗したジョブの再試行（`POST /jobs/{id}/retry`）。再試行で Chunk は `queued` になり、VAD の完了で `queued` / `skipped` に進む。除外（`exclude-failed`）の対象ではない |
+| `vad_chunk` | 変えない（`pending` のまま。ただし結果をコミット済みなら進んだまま。下記） | 変えない（`transcribing`） | `pending` の Chunk が `ensure_merge_job` を止める | 失敗したジョブの再試行（`POST /jobs/{id}/retry`）。再試行は Chunk を変えず（`queued` に戻すのは transcribe の再試行だけ）、VAD の完了で `pending` の Chunk を `queued` / `skipped` に進める。除外（`exclude-failed`）の対象ではない |
 | `transcribe_chunk` | `failed`（ただし既に `completed` なら変えない。下記） | 変えない（`transcribing`） | 未承認の `failed` ジョブが merge を止める | 再試行、または除外（`exclude-failed`。失敗区間は gap になる） |
 | `merge_transcript` | 変えない | 変えない（`transcribing`） | 要約ジョブを作らない | 失敗したジョブの再試行。除外の対象ではない |
-| `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2） | なし | 再試行、または要約の再生成 |
+| `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2）。ただし既に `completed` なら変えない（下記） | なし | 再試行、または要約の再生成 |
 
 transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行は `INSERT OR IGNORE` なので結果が重複せず、除外しても Chunk が `completed` なので gap にならない。
+
+要約・VAD も同じ隙間（ハンドラのコミットと `finish_job` の間）で回収されうる。どれもハンドラの結果とジョブの完了を 1 トランザクションにはせず（Runner とハンドラの契約が変わる）、後続処理の側で書き込み済みの結果を認める。
+
+* 要約：`on_summary_failed` は `completed` の会議を変えない。ジョブは `failed`、会議は `completed`（要約あり）のまま残る。ハンドラの失敗（Runner の `_on_failure`）では、`mark_processing` の時点で `on_summary_started` が会議を `summarizing` にしているので、ここに `completed` は来ない。
+* VAD：`on_vad_completed` は Chunk が `pending` のときだけ結果を適用し、それ以外（既に `queued` / `completed` / `skipped` / `failed`）では `ensure_merge_job` だけを呼ぶ（`handle_vad` は VAD の値も書き換えない）。合わせて `POST /jobs/{id}/retry` は、`queued` に戻す対象を `transcribe_chunk` に限る。どちらかが欠けると、`failed` の vad ジョブの再試行が完了済みの Chunk を `queued` に戻し、transcribe ジョブは既存（一意制約）で作り直されないので、Chunk が `queued` のまま merge を止める。再試行した vad の完了後は Runner が `ensure_merge_job` を呼ぶので merge へ進む。
 
 再試行（`retry_job`）は `attempts` を 0 に戻す。vad / merge の失敗で会議を `failed` にしないのは、会議の `failed` が「merge が 1 回は終わった」を意味するためである（§21.1 `MERGED_STATUSES`。無音 Chunk の手動 STT などがこれで判定する）。vad の失敗で Chunk を `failed` にしないのは、`failed` が `BLOCKING_STT` に含まれず、他の Chunk の完了を契機にその Chunk を欠いたまま merge が作られるためである。
 
@@ -2526,9 +2549,11 @@ stateDiagram-v2
 | 旧ワーカーの完了報告 | `repo.finish_job` の `lease_owner` + `attempts` 条件が 0 行 | Sweeper で回収後の二重完了を防ぐ |
 | lease 切れで回数切れ | `repo.fail_exhausted_expired` → `pipeline.on_job_failed` | `failed` の後続処理（Chunk を `failed` にする、会議を `failed` にする）は Runner の `_on_failure` と同じ関数を通る（§14） |
 | 旧ワーカーの結果書き込み | `repo.insert_segments` が `lease_is_current` で弾く | 失効した結果が UNIQUE 行を先取りし、正規の再試行の結果が捨てられるのを防ぐ |
-| 旧ワーカーの VAD 書き込み | `handlers.handle_vad` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば Chunk も `on_vad_completed` も書かない（モデル未配置の分岐も同じ） | 回数切れで `failed` になった vad ジョブを残したまま Chunk が進む。再試行の VAD が完了済みの Chunk を `queued` に戻し、transcribe ジョブは既存なので作り直されず止まる |
+| 旧ワーカーの VAD 書き込み | `handlers.handle_vad` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば Chunk も `on_vad_completed` も書かない（モデル未配置の分岐も同じ） | 回数切れで `failed` になった vad ジョブを残したまま Chunk が進む |
+| lease 切れ後の VAD 再試行 | `pipeline.on_vad_completed` は `pending` の Chunk にだけ適用する。`POST /jobs/{id}/retry` は `transcribe_chunk` のときだけ Chunk を `queued` にする | 結果をコミットした後に lease が切れて回数切れで回収された vad ジョブを再試行すると、完了済みの Chunk が `queued` に戻り、transcribe ジョブは既存なので作り直されず止まる |
 | lease 切れ後の transcribe 回収 | `pipeline.on_transcribe_failed` は `completed` の Chunk を変えない | ハンドラのコミットと `finish_job` の間で lease が切れ、Sweeper が回数切れで回収すると、書き込み済みの segments を持つ Chunk が `failed`（gap）になる |
-| 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、`failed` のジョブと `completed` の会議が組になる。`finish_job` の条件はジョブ行しか守らない |
+| 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、要約の結果を誰も確かめないまま会議が `completed` に戻る。`finish_job` の条件はジョブ行しか守らない |
+| lease 切れ後の要約回収 | `pipeline.on_summary_failed` は `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れて回数切れで回収されると、要約があるのに会議が `failed` になる。この場合はジョブ `failed`・会議 `completed` の組を意図して残す |
 | 回収の配信 | `sweeper._publish`（コミット後） | §14 |
 
 ---
@@ -3946,9 +3971,10 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
         # 完了済みの Chunk を queued に戻し、transcribe ジョブは既存なので作り直されず止まる
         if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return None
-        repo.update_chunk(conn, chunk.id, has_voice=result.has_voice, server_vad_score=result.voiced_ratio,
-                          vad_source="server_silero")
-        pipeline.on_vad_completed(conn, chunk, result.has_voice, _stt_model_for(ctx, job.meeting_id, conn))
+        # 既に適用済み（再試行で queued / completed の Chunk に来た）なら、VAD の値も書き換えない
+        if pipeline.on_vad_completed(conn, chunk, result.has_voice, _stt_model_for(ctx, job.meeting_id, conn)):
+            repo.update_chunk(conn, chunk.id, has_voice=result.has_voice, server_vad_score=result.voiced_ratio,
+                              vad_source="server_silero")
     return None
 
 
@@ -4867,7 +4893,9 @@ async def retry(job_id: str, request: Request) -> Any:
     async with ctx.db.write() as conn:
         ok = repo.retry_job(conn, job_id)
         job = repo.get_job(conn, job_id)
-        if ok and job is not None and job.chunk_id is not None:
+        # queued に戻すのは transcribe だけ。vad の再試行で queued にすると、VAD の結果が適用済みの Chunk
+        # （completed など）を戻してしまい、transcribe ジョブは既存なので作り直されず止まる（§14）
+        if ok and job is not None and job.chunk_id is not None and job.job_type == "transcribe_chunk":
             repo.update_chunk(conn, job.chunk_id, stt_status="queued")
     if not ok:
         return JSONResponse(error_body("VALIDATION", "job is not failed"), status_code=422)
@@ -6510,6 +6538,54 @@ async def test_vad_from_expired_lease_does_not_advance_chunk(client: httpx.Async
         types = [j.job_type for j in repo.list_jobs(conn, "m-1")]
     assert chunk is not None and chunk.stt_status == "pending"
     assert "transcribe_chunk" not in types
+
+
+async def test_sweeper_keeps_meeting_completed_by_summary_before_lease_expired(client: httpx.AsyncClient, ctx: AppContext,
+                                                                              runner: JobRunner) -> None:
+    """要約をコミットした後、finish_job の前に lease が切れて回数切れで回収されても、会議を failed に戻さない（§14）。"""
+    # Arrange: 要約と会議の completed は書けたが、完了報告の前に lease が切れて回数も使い切った
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["synthesize_minutes"], now_ms())
+        assert job is not None
+    await handlers.handle_summary(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    # Act
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Assert: ジョブは failed だが、書き込み済みの要約と会議の completed は残る
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        swept = repo.get_job(conn, job.id)
+        n = conn.execute("SELECT COUNT(*) AS n FROM meeting_summary_versions WHERE meeting_id = 'm-1'").fetchone()["n"]
+    assert swept is not None and swept.status == "failed"
+    assert meeting is not None and meeting.status == "completed"
+    assert n == 1
+
+
+async def test_vad_retry_after_committed_result_does_not_requeue_completed_chunk(client: httpx.AsyncClient, ctx: AppContext,
+                                                                                 runner: JobRunner) -> None:
+    """VAD の結果をコミットした後に lease が切れて回数切れで回収され、その vad ジョブを再試行しても、完了済みの Chunk を queued に戻さない（§14）。"""
+    # Arrange: VAD の結果は書けたが完了報告の前に止まり、その間に transcribe が完了した
+    await _seed(client, 1)
+    async with ctx.db.write() as conn:
+        vad = repo.lease_job(conn, "w-slow", ["vad_chunk"], now_ms())
+        assert vad is not None
+    await handlers.handle_vad(ctx, vad)
+    await runner.run_until_idle()
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (vad.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Act: 利用者が failed の vad ジョブを再試行する
+    assert (await client.post(f"/v1/jobs/{vad.id}/retry")).status_code == 200
+    await runner.run_until_idle()
+    # Assert: Chunk は completed のまま、会議は要約まで進む
+    with ctx.db.read() as conn:
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+        meeting = repo.get_meeting(conn, "m-1")
+    assert chunk is not None and chunk.stt_status == "completed"
+    assert meeting is not None and meeting.status == "completed"
 ```
 
 ### 23.4.1 既存 DB のアップグレードと fencing token

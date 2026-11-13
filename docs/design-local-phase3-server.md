@@ -918,13 +918,19 @@ def on_finalized(conn: sqlite3.Connection, meeting_id: str, diarize: bool = Fals
     return created
 
 
-def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: bool, model_name: str | None, diarize: bool) -> None:
+def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: bool, model_name: str | None, diarize: bool) -> bool:
+    """戻り値は結果を適用したか。適用するのは Chunk が pending のときだけ（再試行で適用済みの Chunk に来る。Phase 2 §12）。"""
+    current = repo.get_chunk(conn, chunk.id)
+    if current is not None and current.stt_status != "pending":
+        ensure_merge_job(conn, chunk.meeting_id, diarize)
+        return False
     if has_voice:
         repo.update_chunk(conn, chunk.id, stt_status="queued")
         repo.insert_job(conn, chunk.meeting_id, "transcribe_chunk", chunk_id=chunk.id, model_name=model_name)
     else:
         repo.update_chunk(conn, chunk.id, stt_status="skipped")
     ensure_merge_job(conn, chunk.meeting_id, diarize)
+    return True
 
 
 def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk, diarize: bool) -> None:
@@ -1019,7 +1025,13 @@ def on_summary_deferred(conn: sqlite3.Connection, meeting_id: str) -> None:
 
 
 def on_summary_failed(conn: sqlite3.Connection, meeting_id: str) -> None:
-    """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。"""
+    """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。
+
+    completed の会議は変えない。要約をコミットした後、finish_job の前に lease が切れて回数切れで回収されると来る（Phase 2 §14）。
+    """
+    current = repo.get_meeting(conn, meeting_id)
+    if current is not None and current.status == "completed":
+        return
     repo.set_meeting_status(conn, meeting_id, "failed")
 
 
@@ -3501,8 +3513,9 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
         # 失効した旧ワーカーが書くと、failed の vad ジョブを残したまま Chunk が進む（Phase 2 §12 handle_vad）
         if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return None
-        repo.update_chunk(conn, chunk.id, has_voice=result.has_voice, server_vad_score=result.voiced_ratio, vad_source="server_silero")
-        pipeline.on_vad_completed(conn, chunk, result.has_voice, _stt_model_for(ctx, job.meeting_id, conn), ctx.diarization_active)
+        # 既に適用済み（再試行で queued / completed の Chunk に来た）なら、VAD の値も書き換えない
+        if pipeline.on_vad_completed(conn, chunk, result.has_voice, _stt_model_for(ctx, job.meeting_id, conn), ctx.diarization_active):
+            repo.update_chunk(conn, chunk.id, has_voice=result.has_voice, server_vad_score=result.voiced_ratio, vad_source="server_silero")
     return None
 
 
