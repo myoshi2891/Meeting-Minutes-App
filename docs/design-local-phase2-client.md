@@ -2445,8 +2445,13 @@ export class NotesStore {
    */
   async load(carry: Draft | null = null): Promise<void> {
     // 引き継いだ内容は IndexedDB に無い。下書き・控えの書き込みが成功するまで持ち、その前の dispose() が返せるようにする。
-    // 最初の await より前に入れる（load の途中で dispose() されても返す）。carry が null なら触らない
-    if (carry !== null) this.unwrittenDraft = carry;
+    // 最初の await より前に入れる（load の途中で dispose() されても返す）。carry が null なら触らない。
+    // 同じく最初の await より前に IndexedDB へ書き始める。書かないと、編集もサーバーへの保存もないまま閉じたとき
+    // 引き継いだ内容がどこにも残らない。成功すれば writeDraft が unwrittenDraft を null に戻し、失敗すれば carry のまま onError に渡す
+    if (carry !== null) {
+      this.unwrittenDraft = carry;
+      void this.writeDraft(carry);
+    }
     const draftRaw = carry ?? await this.deps.drafts.get(this.draftKey());
     const draft = isDraft(draftRaw) ? draftRaw : null;
     const res = await this.deps.getNotes(this.state.meetingId);
@@ -2504,6 +2509,12 @@ export class NotesStore {
   acceptServer(): void {
     const s = this.state.serverNotes;
     if (s === null) return;
+    // dispose() が戻り値を返した後は、控えを書くと新しいインスタンスの下書きを後から上書きする。setDraft と同じく受け付けない。
+    // dispose() の待機中（handedOff の前）は受け付ける。dispose() は鎖が空になるまで待つので、この書き込みも待たれる
+    if (this.handedOff) {
+      this.reportError(new Error("NotesStore is disposed; the server version was not accepted"));
+      return;
+    }
     this.set({ json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, sync: "saved", serverNotes: null });
     void this.writeDraft({ json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, savedAt: Date.now(), saved: true });
   }
@@ -4154,7 +4165,8 @@ describe("NotesStore", () => {
     store.setDraft(["a"]);
     store.setDraft(["ab"]);
     const first = await store.dispose();
-    const middle = new NotesStore(b.deps, "m");
+    // 引き継いだインスタンスも ["ab"] を書けない（load(carry) は最初の await より前に書き始めるので、書ければ IndexedDB に残る）
+    const middle = new NotesStore(deps, "m");
     await middle.load(first);
     // Act: 引き継いだインスタンスが保存（と控えの書き込み）をする前に、もう一度作り直す（§15.1 W8）
     const second = await middle.dispose();
@@ -4339,6 +4351,38 @@ describe("NotesStore", () => {
     c.store.acceptServer();
     expect(c.store.current.json).toEqual(["server"]);
     expect(c.store.current.revision).toBe(3);
+  });
+
+  it("load(carry) は引き継いだ内容を最初の await より前に IndexedDB へ書き、書ければ dispose は null を返す", async () => {
+    // Arrange: 前のインスタンスが IndexedDB に書けなかった最新の編集
+    const b = build();
+    const carry = { json: ["carried"], revision: 0, lastAppliedSummaryVersion: null, savedAt: 1, saved: false };
+    const store = new NotesStore(b.deps, "m");
+    // Act: load の完了を待たずに IndexedDB を見る
+    const loading = store.load(carry);
+    const writtenBeforeAwait = b.drafts.get("notes:m");
+    await loading;
+    const handed = await store.dispose();
+    // Assert: 編集も保存もせずに閉じても、引き継いだ内容は IndexedDB に残る
+    expect(writtenBeforeAwait).toMatchObject({ json: ["carried"], saved: false });
+    expect(handed).toBeNull();
+  });
+
+  it("dispose が戻り値を返した後の acceptServer は控えを書かず、onError に知らせる", async () => {
+    // Arrange: conflict の状態で作り直しを終える
+    const errors: Error[] = [];
+    const c = build({ serverRevision: 3 });
+    await c.drafts.set("notes:m", { json: ["draft"], revision: 1, lastAppliedSummaryVersion: null, savedAt: 1 });
+    const store = new NotesStore({ ...c.deps, onError: (e) => errors.push(e) }, "m");
+    await store.load();
+    await store.dispose();
+    // Act
+    store.acceptServer();
+    await Promise.resolve();
+    // Assert: 新しいインスタンスが読む下書きを古いインスタンスが上書きしない
+    expect(c.drafts.get("notes:m")).toMatchObject({ json: ["draft"], revision: 1 });
+    expect(store.current.sync).toBe("conflict");
+    expect(errors.map((e) => e.message)).toEqual(["NotesStore is disposed; the server version was not accepted"]);
   });
 
   it("保存に成功した下書きは saved: true で控えられる", async () => {
