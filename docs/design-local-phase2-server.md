@@ -2000,17 +2000,20 @@ def on_job_failed(conn: sqlite3.Connection, job: Job) -> None:
         return
 
 
-def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str) -> bool:
-    """全 Chunk が終端（completed / skipped / 除外承認済み failed）かつ vad が残っていなければ merge を生成。"""
+def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str) -> str | None:
+    """全 Chunk が終端（completed / skipped / 除外承認済み failed）かつ vad が残っていなければ merge を生成。
+
+    戻り値は作ったジョブの id（作らなかった・既存なら None）。呼び出し側がコミット後にイベントを流すのに使う。
+    """
     counts = repo.count_chunks_by_stt(conn, meeting_id)
     if any(counts[s] > 0 for s in BLOCKING_STT):
-        return False
+        return None
     if repo.count_jobs(conn, meeting_id, "vad_chunk", ["pending", "leased", "processing", "retrying"]) > 0:
-        return False
+        return None
     # 未承認の failed transcribe ジョブがあれば待つ
     if repo.count_jobs(conn, meeting_id, "transcribe_chunk", ["failed"]) > 0:
-        return False
-    return repo.insert_job(conn, meeting_id, "merge_transcript") is not None
+        return None
+    return repo.insert_job(conn, meeting_id, "merge_transcript")
 
 
 def exclude_failed(conn: sqlite3.Connection, meeting_id: str) -> int:
@@ -2362,6 +2365,8 @@ class JobRunner:
             return
         hb.cancel()
         duration = int((time.monotonic() - started) * 1000)
+        removed: Job | None = None   # 下で消した完了済みの行の控え（消した後は読み直せない）
+        followup: str | None = None  # 作り直したジョブの id
         async with self.ctx.db.write() as conn:
             ok = repo.finish_job(conn, job.id, self.owner, job.attempts, "completed", duration_ms=duration)
             if ok and model_used is not None:
@@ -2372,10 +2377,15 @@ class JobRunner:
             if ok and job.job_type == "merge_transcript" and repo.has_replacements(conn, job.meeting_id):
                 # merge の書き込みのコミット後・この完了の記録の前（processing の間）にコミットした撮り直しは、この merge では
                 # 入れ替わっていない。handle_transcribe の delete_finished_job は processing の行を消さず、ensure_merge_job も
-                # 一意制約で作れないので、完了を記録した今、作り直す（作らないと撮り直しは次の merge まで公開されない）
+                # 一意制約で作れないので、完了を記録した今、作り直す（作らないと撮り直しは次の merge まで公開されない）。
+                # 消す前に完了を記録した行を控える。消した後の _publish_job は行を引けず、完了のイベントが流れない
+                removed = repo.get_job(conn, job.id)
                 repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
-                pipeline.ensure_merge_job(conn, job.meeting_id)
-        self._publish_job(job.id)
+                followup = pipeline.ensure_merge_job(conn, job.meeting_id)
+        # どちらもコミットの後に流す（コミット前に流すと、購読側が読み直したときに行がまだない・ロールバックで消える）
+        self._publish_job(job.id, removed=removed)
+        if followup is not None:
+            self._publish_job(followup)
 
     async def _on_failure(self, job: Job, err: JobError, duration_ms: int) -> None:
         now = now_ms()
@@ -2432,9 +2442,10 @@ class JobRunner:
         except asyncio.CancelledError:
             return
 
-    def _publish_job(self, job_id: str) -> None:
+    def _publish_job(self, job_id: str, *, removed: Job | None = None) -> None:
+        """removed はコミット済みのトランザクションで消した行の控え。消した行は読み直せないので控えを流す。"""
         with self.ctx.db.read() as conn:
-            job = repo.get_job(conn, job_id)
+            job = removed if removed is not None else repo.get_job(conn, job_id)
             meeting = repo.get_meeting(conn, job.meeting_id) if job else None
         if job is None:
             return
@@ -6765,7 +6776,8 @@ async def test_transcribe_retry_keeps_published_transcript_until_remerge_commits
 
 
 async def test_transcribe_retry_during_merge_schedules_followup_merge(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
-                                                                       stt_provider: FakeSTTProvider) -> None:
+                                                                       stt_provider: FakeSTTProvider,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
     """merge の書き込みの後・完了の記録の前にコミットした撮り直しは、その merge の完了後に作り直す merge が入れ替える（§14）。"""
     # Arrange: 1 回目の結果のコミット後に transcribe が回収され、その結果で merge が作られている
     def first(req: STTRequest) -> list[STTSegment]:
@@ -6804,8 +6816,15 @@ async def test_transcribe_retry_during_merge_schedules_followup_merge(client: ht
         return result
 
     runner.handlers["merge_transcript"] = merge_then_retry
+    published: list[dict] = []
+    monkeypatch.setattr(ctx.events, "publish", lambda _meeting_id, event: published.append(event))
     # Act
     await runner.run_until_idle()
+    # Assert: 消した最初の merge の完了と、作り直した merge（pending）のイベントが流れる
+    merges = [e["job"] for e in published if e.get("type") == "job" and e["job"]["job_type"] == "merge_transcript"]
+    completed = [j["id"] for j in merges if j["status"] == "completed"]
+    assert len(set(completed)) == 2
+    assert completed[-1] in {j["id"] for j in merges if j["status"] == "pending"}
     # Assert: 作り直した merge が撮り直しを入れ替え、版 2 は新しい結果だけになる
     with ctx.db.read() as conn:
         meeting = repo.get_meeting(conn, "m-1")
