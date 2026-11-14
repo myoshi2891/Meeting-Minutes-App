@@ -129,7 +129,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * 圧縮の原子性：メモリ上で符号化 → 復元して `build_wav(pcm)` の sha256 が `audio_chunks.sha256`（WAV 値、不変）と一致することを確かめる → `write_atomic` で `.flac` を書く → `local_path` / `codec='flac'` / `sha256_flac` 更新 → WAV 削除。不一致は `.flac` を書かずに `INVALID_AUDIO`（non-retryable）。WAV は残る
 * 圧縮と他の処理の競合：(a) 切り替えの更新は lease の現行の所有者だけが行い、Chunk の `local_path` / `sha256` が読んだ時のままであることも確かめる。STT の再実行（ジョブを行ごと消す）や再 PUT の修復（WAV に書き戻す）が先に起きていたら、WAV のまま残して作った `.flac` を消す。圧縮ファイルは試行ごとに別の一時ファイル（`*.staging`）に書き、lease の確認と同じ書き込みロックの下で最終パスへ置き換える。後始末で消すのはその試行の一時ファイルだけなので、lease を失った旧い試行が、別の試行の確定した圧縮ファイルを上書き・削除することはない。(b) 音声を読む側（VAD・STT・話者分離）は、読み取りに失敗したら Chunk の行を読み直し、パスが変わっていれば新しいパスから読む（`read_chunk_pcm()`）。読み直さないと、置き換わった直後の読み取りが「ファイルなし」になり、正常な Chunk を `missing` にしてしまう。(c) 更新のコミット後・WAV の削除前に落ちたら、やり直しのジョブが残った WAV を消す
 * `read_pcm` は拡張子で分岐し、FLAC の場合も WAV sha256 で照合する（`sha256` 列の意味を変えない）
-* バックアップ：`VACUUM INTO {dataDir}/backups/minutes-{epoch ms}.sqlite`。**直近のバックアップから 24 時間たっていたら作る**（起動時と 1 時間ごとに判定。基準はファイル名の時刻で、プロセスの起動からの経過ではない）。世代数 `backup_generations`（既定 7）。起動のたびに作ると、短時間に再起動を 7 回くり返しただけで古い世代がすべて押し出される。使うたびにサーバーを起動する使い方でも 1 日 1 世代になる。時計が戻ったときは、名前の時刻が現在より未来の世代を、期日の判定では直近として数えず、世代管理と復元元の選択では最も古い世代として扱う（戻った後に作った世代を作った直後に消さず、毎周作り直さない）。`completed` 遷移ごとのバックアップは行わない（DB 全体の複製なので会議 1 件ごとには重く、世代もその分早く回る。失われるのは最長 24 時間分の要約とノートで、録音と transcript は録音ファイルから作り直せる）
+* バックアップ：`VACUUM INTO {dataDir}/backups/minutes-{世代番号}-{epoch ms}.sqlite`。**直近のバックアップから 24 時間たっていたら作る**（起動時と 1 時間ごとに判定。基準はファイル名の時刻で、プロセスの起動からの経過ではない）。世代数 `backup_generations`（既定 7）。起動のたびに作ると、短時間に再起動を 7 回くり返しただけで古い世代がすべて押し出される。使うたびにサーバーを起動する使い方でも 1 日 1 世代になる。世代管理・復元元の選択・期日の判定の「新しい順」は名前の時刻ではなく世代番号（既存の最大 + 1、ファイル名に残る）で決める。時刻で並べると、時計が戻った後に作った世代が前の世代より古い扱いになり、時計が追いつくと元の順に戻って、どちらでも新しい世代を消す・古い世代から復元する。最新の世代の時刻が現在より未来なら（作った後に時計が戻った）期日として作る（戻った後に作った世代は番号が最大なので、作った直後に消さず、毎周作り直さない）。`completed` 遷移ごとのバックアップは行わない（DB 全体の複製なので会議 1 件ごとには重く、世代もその分早く回る。失われるのは最長 24 時間分の要約とノートで、録音と transcript は録音ファイルから作り直せる）
 * バックアップは `.part` に書いてから名前を付け替える。書きかけ・失敗したファイルは正規の名前では残らず、復元元にも世代管理の対象にもならない
 * 起動時 `PRAGMA integrity_check`。`ok` 以外なら、壊れたファイルを `minutes.sqlite.corrupt-{epoch}` に退避し、**検査に通る最も新しいバックアップ**を復元して開く（最新が壊れていれば 1 つ古いものへ下がる）。使えるバックアップが 1 つもなければ**空の DB で起動する**（起動を止めない。サーバーが動いていなければブラウザは Chunk を送れない）
 * 復元の直後に、録音ファイルから DB にない会議と Chunk を作り直す（下の rebuild と同じ処理を `build_context` が自動で行う）。バックアップより後に録音した会議は DB にないが、ファイルは残っているためである。作り直した会議は transcript から処理し直す。バックアップより後の要約とノートは失われる。起動時に、復元元と作り直した件数を標準エラーに警告として出す（黙って古い状態に戻さない）
@@ -143,7 +143,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 
 * 既定は Phase 1〜2 と同じ `127.0.0.1` 単一利用者。`serve --bind 0.0.0.0 --tls` を明示したときだけ LAN モード。`--tls` なしの非 loopback bind は拒否する（トークンが平文で LAN を流れるため）
 * TLS：`doctor --init-tls --host <hostname or IP>` で自己署名証明書（`cryptography`、extras `lan`）。ブラウザは初回に証明書の受け入れが必要（断定しない事項 §3）
-* 認証：`users` テーブル（`id`, `name`, `token_hash`, `created_at`）。`minutes-local user add <name>` がトークンを 1 回だけ表示する（同名は拒否）。`user remove <id>` で失効させる（トークンを漏らした・利用者が抜けた。会議と録音は消さない）。`user list` で一覧。`users` が空なら従来の `token` ファイルで `local` ユーザーとして動作（後方互換）
+* 認証：`users` テーブル（`id`, `name`, `token_hash`, `created_at`）。`minutes-local user add <name>` がトークンを 1 回だけ表示する（同名は拒否）。`user remove <id>` で失効させる（トークンを漏らした・利用者が抜けた。会議と録音は消さない）。`user list` で一覧。`users` が空なら従来の `token` ファイルで `local` ユーザーとして動作（後方互換）。DB をバックアップから復元すると（§2.4）`users` もその時点に戻り、バックアップの後に `user remove` で失効させた利用者のトークンがまた通る。運用者は復元の後に `user list` で確かめ、失効させたままにすべき利用者を `user remove` でもう一度消す（serve は復元の警告でこれを促す）
 * 単一利用者と複数利用者の切り替えは**起動時に決まる**（`AppContext.multi_user`）。最初の利用者を追加した後・最後の利用者を削除した後は、サーバーの再起動で反映する。複数利用者の間の追加・削除は再起動なしで効く（トークンは要求ごとに `users` を引く）。複数利用者に切り替えると `token` ファイルは使えなくなり、それまでに録音した会議（所有者 `local`）は誰からも見えなくなる（利用者を全員削除して単一利用者に戻すと見える）。既存の会議を特定の利用者へ引き継ぐ手段は本書の範囲外（§3）
 * 認可：認証ミドルウェアが `/v1/meetings/{id}/...` と `/v1/jobs/{id}/...` の所有者を照合し、他人の会議は `404`（存在を漏らさない）。`GET /v1/meetings` は自分の会議のみ
 * ファイル階層：`recordings/{userId}/{meetingId}/{source}/{seq}.wav`。マイグレーション 012 が既存の `recordings/{meetingId}/` を `recordings/local/{meetingId}/` へ移動し `local_path` を更新する。旧ディレクトリは新しい階層を作る前に `{dataDir}/.migrate-012/` へ退避してから統合する（会議 ID が `local` だと旧ディレクトリと新しい階層の親が重なるため）
@@ -1199,6 +1199,12 @@ class JobRunner:
             if ok and job.job_type in ("vad_chunk", "transcribe_chunk"):
                 # 自分自身が processing のままではハンドラ内の ensure_merge_job が成立しないため、完了確定後に再判定する
                 pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
+            if ok and job.job_type == "merge_transcript" and repo.has_replacements(conn, job.meeting_id):
+                # merge の書き込みのコミット後・この完了の記録の前（processing の間）にコミットした撮り直しは、この merge では
+                # 入れ替わっていない。handle_transcribe の delete_finished_job は processing の行を消さず、ensure_merge_job も
+                # 一意制約で作れないので、完了を記録した今、作り直す（作らないと撮り直しは次の merge まで公開されない）
+                repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
+                pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
             if ok and job.job_type == "diarize_meeting":
                 pipeline.on_diarize_finished(conn, job.meeting_id)
         self._publish_job(job.id)
@@ -1388,13 +1394,13 @@ def backup_due(ctx: AppContext, now: int) -> bool:
     """直近のバックアップから BACKUP_INTERVAL_MS 経っているか。1 つもなければ True。
 
     プロセスの起動からの経過ではなく、ファイル名の時刻で決める。使うたびにサーバーを起動しても 1 日 1 世代になり、
-    短時間に再起動を繰り返しても古い世代を押し出さない。時計が戻ったら、未来の時刻の世代は直近として数えない
-    （それしかなければ作る。作らないまま待ち続けると、戻った後のノートと要約にバックアップがない）。作った世代は
-    prune_backups が未来の世代より新しい扱いで残すので、次の周からはそれを直近として 1 日待つ（毎周作っては消すことはない）。
+    短時間に再起動を繰り返しても古い世代を押し出さない。直近は世代番号が最大の世代（list_backups の末尾）。
+    その時刻が未来なら（作った後に時計が戻った）作る。作らないまま待ち続けると、戻った後のノートと要約にバックアップがない。
+    作った世代は番号が最大なので、次の周からはそれを直近として 1 日待つ（毎周作っては消すことはない）。
     """
-    stamps = [backup.backup_time_ms(p) for p in backup.list_backups(ctx.settings.backups_dir)]
-    latest = max((t for t in stamps if t is not None and t <= now), default=None)
-    return latest is None or now - latest >= BACKUP_INTERVAL_MS
+    files = backup.list_backups(ctx.settings.backups_dir)
+    latest = backup.backup_time_ms(files[-1]) if files else None
+    return latest is None or latest > now or now - latest >= BACKUP_INTERVAL_MS
 
 
 async def run_once(ctx: AppContext, now: int | None = None) -> dict[str, int]:
@@ -1408,7 +1414,7 @@ async def run_once(ctx: AppContext, now: int | None = None) -> dict[str, int]:
         return {"compress_jobs": compressed, "backup": 0, "pruned": 0}
     started = time.monotonic()
     await asyncio.to_thread(backup.create_backup, ctx.db, ctx.settings.backups_dir, t)
-    pruned = backup.prune_backups(ctx.settings.backups_dir, ctx.settings.backup_generations, t)
+    pruned = backup.prune_backups(ctx.settings.backups_dir, ctx.settings.backup_generations)
     async with ctx.db.write() as conn:
         repo.record_metric(conn, "backup_created", 1)
         repo.record_metric(conn, "backup_duration_ms", int((time.monotonic() - started) * 1000))
@@ -2176,10 +2182,10 @@ def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = N
 
 | 関数 | 役割 | 落とし穴への対処 |
 | --- | --- | --- |
-| `create_backup` | `VACUUM INTO` で `minutes-{epoch ms}.sqlite` を作る | `.part` に書いてから名前を付け替える。書きかけを正規の名前で残さない。同じミリ秒の 2 回目は時刻を 1 進める（前の世代を上書きしない） |
-| `list_backups` | 完成したバックアップを古い順に返す | ファイル名の時刻（数値）で並べる。`.part` と規約外の名前は含めない |
+| `create_backup` | `VACUUM INTO` で `minutes-{世代番号}-{epoch ms}.sqlite` を作る | `.part` に書いてから名前を付け替える。書きかけを正規の名前で残さない。世代番号は既存の最大 + 1（同じミリ秒の 2 回目も前の世代を上書きしない） |
+| `list_backups` | 完成したバックアップを古い順に返す | ファイル名の世代番号で並べる（時刻で並べると時計の巻き戻りと追いつきで順が入れ替わる）。`.part` と規約外の名前は含めない |
 | `prune_backups` | 新しい方から `keep` 世代を残す | 中断で残った `.part` も消す |
-| `restore_latest` | 壊れた DB を退避し、復元元にできる最も新しいバックアップを置く | 候補ごとに `integrity_check` をかけ、壊れていれば 1 つ古いものへ下がる。空のファイルは検査に通るので、大きさも見る。使えるものがなければ DB を置かない（空で起動し、§18 が作り直す） |
+| `restore_latest` | 壊れた DB を退避し、復元元にできる最も新しいバックアップを置く | 候補ごとに `integrity_check` をかけ、壊れていれば 1 つ古いものへ下がる。空のファイルは検査に通るので、大きさも見る。使えるものがなければ DB を置かない（空で起動し、§18 が作り直す）。`users` もバックアップの時点に戻るので、その後に失効させた利用者のトークンがまた通る。運用者は復元の後に、失効させたままにすべき利用者をもう一度消す（§2.5） |
 | `Recovery` | 起動時に DB を作り直した記録（復元元・作り直した件数） | `AppContext.recovery` に載せ、`serve` / `doctor` が警告として出す（§22） |
 
 ```python
@@ -2210,16 +2216,20 @@ class Recovery:
 
 
 def create_backup(db: Database, backups_dir: Path, now: int | None = None) -> Path:
-    """`minutes-{epoch ms}.sqlite` を作る。now は名前に入れる時刻（省略時は現在。定期処理は期日の判定に使った時刻を渡す）。
+    """`minutes-{世代番号}-{epoch ms}.sqlite` を作る。now は名前に入れる時刻（省略時は現在。定期処理は期日の判定に使った時刻を渡す）。
 
+    世代番号は既存の最大 + 1。並び（世代管理・復元元の選択）は時刻ではなくこの番号で決める。時刻で並べると、時計が戻った後に
+    作った世代が前の世代より古い扱いになり、時計が追いつくと元の順に戻るので、どちらの時点でも新しい世代を消す・古い世代から復元する。
     書きかけを正規の名前で残さない。`.part` に書き、終わってから名前を付け替える。途中で失敗・強制終了しても、
     list_backups()（復元元と世代管理の対象）には完成したファイルしか現れない。
     """
     backups_dir.mkdir(parents=True, exist_ok=True)
     stamp = int(time.time() * 1000) if now is None else now
-    while (backups_dir / f"{PREFIX}{stamp}{SUFFIX}").exists():
-        stamp += 1                               # 同じミリ秒の 2 回目が前の世代を上書きしない
-    target = backups_dir / f"{PREFIX}{stamp}{SUFFIX}"
+    existing = list_backups(backups_dir)
+    gen = (backup_generation(existing[-1]) or 0) + 1 if existing else 1
+    while any(backups_dir.glob(f"{PREFIX}{gen}-*{SUFFIX}")):
+        gen += 1                                 # 規約外の名前と重なっても前の世代を上書きしない
+    target = backups_dir / f"{PREFIX}{gen}-{stamp}{SUFFIX}"
     part = target.with_name(target.name + PART_SUFFIX)
     part.unlink(missing_ok=True)                 # VACUUM INTO は既存のファイルへ書けない
     try:
@@ -2233,36 +2243,43 @@ def create_backup(db: Database, backups_dir: Path, now: int | None = None) -> Pa
     return target
 
 
+def _name_parts(path: Path) -> tuple[int, int] | None:
+    """(世代番号, epoch ms)。規約外の名前は None。"""
+    if not (path.name.startswith(PREFIX) and path.name.endswith(SUFFIX)):
+        return None
+    gen, sep, stamp = path.name[len(PREFIX):-len(SUFFIX)].partition("-")
+    if not (sep and gen.isdigit() and stamp.isdigit()):
+        return None
+    return int(gen), int(stamp)
+
+
+def backup_generation(path: Path) -> int | None:
+    """ファイル名に入っている世代番号。規約外の名前は None。"""
+    parts = _name_parts(path)
+    return parts[0] if parts is not None else None
+
+
 def backup_time_ms(path: Path) -> int | None:
-    """ファイル名に入っている作成時刻（epoch ms）。規約外の名前は None。"""
-    stamp = path.name[len(PREFIX):-len(SUFFIX)]
-    return int(stamp) if stamp.isdigit() else None
+    """ファイル名に入っている作成時刻（epoch ms）。規約外の名前は None。期日の判定だけに使い、並びには使わない。"""
+    parts = _name_parts(path)
+    return parts[1] if parts is not None else None
 
 
 def list_backups(backups_dir: Path) -> list[Path]:
-    """完成したバックアップを古い順に返す。書きかけ（.part）と規約外の名前は含めない。"""
+    """完成したバックアップを世代番号の順（古い順）に返す。書きかけ（.part）と規約外の名前は含めない。
+
+    世代管理・復元元の選択・期日の判定は、この順で揃える。番号はファイル名に残るので、時計が戻っても追いついても変わらない。
+    """
     if not backups_dir.exists():
         return []
-    stamped = [(backup_time_ms(p), p) for p in backups_dir.glob(f"{PREFIX}*{SUFFIX}") if p.is_file()]
-    return [p for _, p in sorted((t, p) for t, p in stamped if t is not None)]
+    numbered = [(_name_parts(p), p) for p in backups_dir.glob(f"{PREFIX}*{SUFFIX}") if p.is_file()]
+    return [p for _, p in sorted((parts, p) for parts, p in numbered if parts is not None)]
 
 
-def generations(backups_dir: Path, now: int | None = None) -> list[Path]:
-    """世代を古い順に返す。名前の時刻が now より未来のもの（時計が戻る前に作った世代）は、どれよりも古い世代として先頭に置く。
-
-    時刻の順だけで並べると、時計が戻った後に作った世代（名前の時刻は未来の世代より前）が最も古い扱いになり、
-    作った直後の世代管理で消える。期日の判定・世代管理・復元元の選択は、この順で揃える。
-    """
-    t = int(time.time() * 1000) if now is None else now
+def prune_backups(backups_dir: Path, keep: int) -> int:
+    """新しい方（世代番号の大きい方）から keep 世代を残して消す。前回の中断で残った書きかけ（.part）も消す。
+    戻り値は消した世代数。"""
     files = list_backups(backups_dir)
-    future = [p for p in files if (backup_time_ms(p) or 0) > t]
-    return future + [p for p in files if (backup_time_ms(p) or 0) <= t]
-
-
-def prune_backups(backups_dir: Path, keep: int, now: int | None = None) -> int:
-    """新しい方から keep 世代を残して消す（未来の時刻の世代から先に消す。generations()）。前回の中断で残った書きかけ（.part）も消す。
-    戻り値は消した世代数。now は世代の判定に使う時刻（省略時は現在。定期処理は期日の判定に使った時刻を渡す）。"""
-    files = generations(backups_dir, now)
     removed = 0
     for p in files[:-keep] if keep > 0 else files:
         p.unlink(missing_ok=True)
@@ -2301,8 +2318,11 @@ def restore_latest(db_path: Path, backups_dir: Path) -> Path | None:
     最新のものが壊れていれば 1 つ古いものへ下がる。使えるものが 1 つもなければ None を返し、DB のファイルは置かない
     （呼び出し側が空の DB として開き、録音ファイルから作り直す。§18）。壊れたファイルはどちらの場合も
     `minutes.sqlite.corrupt-{epoch}` に残す。
+
+    users テーブルもバックアップの時点に戻る。バックアップの後に `user remove` で失効させた利用者は行ごと戻り、
+    そのトークンがまた通る。運用者は復元の後、失効させたままにすべき利用者を `user remove` でもう一度消す（§2.5・serve の警告）。
     """
-    source = next((p for p in reversed(generations(backups_dir)) if usable_backup(p)), None)
+    source = next((p for p in reversed(list_backups(backups_dir)) if usable_backup(p)), None)
     if db_path.exists():
         shutil.move(str(db_path), str(db_path.with_name(f"{db_path.name}.corrupt-{int(time.time())}")))
     for extra in (db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm")):
@@ -2363,6 +2383,7 @@ class RebuildReport:
     meetings_created: int = 0
     meetings_finalized: int = 0     # 既存の確定前の行（確定前のバックアップから戻した）を控えに合わせて finalized にした数
     chunks_created: int = 0
+    chunks_relinked: int = 0        # 既存の行が指すファイルがなく、同じ音声の別のファイル（圧縮後の FLAC など）へ向け直した数
     chunks_marked_missing: int = 0
     skipped_files: list[str] | None = None
 
@@ -2492,8 +2513,34 @@ def _vad_score(value: object) -> float:
     return float(value) if ok else 0.0      # type: ignore[arg-type]
 
 
+def _codec_of(path: Path) -> str:
+    return "wav" if path.suffix == ".wav" else ("flac" if path.suffix == ".flac" else "fake")
+
+
+def _relink_chunk(conn: sqlite3.Connection, data_dir: Path, chunk: AudioChunk, f: Path, codec: AudioCodec | None) -> bool:
+    """既存の Chunk の行が指すファイルがなく、同じ連番のファイル f が同じ音声なら、行を f へ向け直す。向け直したら True。
+
+    古いバックアップから戻すと、その後に圧縮した Chunk の行は消した WAV を指したまま残る（handle_compress は WAV を消す）。
+    向け直さないと下の走査が missing にし、残っている圧縮ファイルを使わない。f を復元した WAV の sha256 が行と一致したときだけ
+    向け直す（検証していないファイルを指さない）。行そのもの（ID・時刻・STT の状態）は変えない。
+    """
+    rel = str(f.relative_to(data_dir))
+    if rel == chunk.local_path or (data_dir / chunk.local_path).exists():
+        return False
+    restored = _chunk_from_file(f, codec)
+    if restored is None or restored[1] != chunk.sha256:
+        return False
+    encoded = f.read_bytes()
+    repo.update_chunk(conn, chunk.id, local_path=rel, codec=_codec_of(f), size_bytes=len(encoded), save_status="verified",
+                      sha256_flac=None if f.suffix == ".wav" else sha256_hex(encoded))
+    return True
+
+
 def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) -> RebuildReport:
     """recordings/{userId}/{meetingId}/ を走査し、DB にない会議と Chunk の行を作る。既存の行は上書きしない。
+
+    既存の Chunk の行が指すファイルがないときは、同じ連番で内容（WAV の sha256）が一致するファイルへ向け直す（_relink_chunk）。
+    古いバックアップから戻した行が、その後の圧縮で消えた WAV を指しているためである。
 
     例外は確定の状態だけ。確定前に取ったバックアップから戻すと、会議の行は recording のまま残る。確定時の控えがあれば
     finalized に進め、欠けている終了時刻・総フレーム数・停止理由を控えから補う。ブラウザは確定を終えて再送しないので、
@@ -2551,7 +2598,10 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
                     # 連番が SQLite INTEGER に収まらない名前。照会・挿入の OverflowError で rebuild 全体を止めない
                     report.skipped_files.append(str(f.relative_to(data_dir)))
                     continue
-                if repo.get_chunk_by_key(conn, meeting_id, source, seq) is not None:
+                known = repo.get_chunk_by_key(conn, meeting_id, source, seq)
+                if known is not None:
+                    if _relink_chunk(conn, data_dir, known, f, codec):
+                        report.chunks_relinked += 1
                     continue
                 restored = _chunk_from_file(f, codec)
                 if restored is None:
@@ -2577,7 +2627,7 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
                     # 有音かどうかが分からなければ有音として扱う（無音と決めつけて STT を省かない。Invariant 7）
                     vad_score=_vad_score(mc.get("vadScore")), has_voice=has_voice if isinstance(has_voice, bool) else True,
                     save_status="verified", created_at=t,
-                    codec="wav" if f.suffix == ".wav" else ("flac" if f.suffix == ".flac" else "fake"),
+                    codec=_codec_of(f),
                 ))
                 report.chunks_created += 1
         # DB にあるがファイルがない Chunk を missing に
@@ -4219,7 +4269,9 @@ def _warn_recovery(recovery: Recovery | None) -> None:
     r = recovery.rebuilt
     print(f"WARNING: the database was corrupt and has been recovered. backup: {source}. "
           f"rebuilt from recordings: meetings+{r.meetings_created} chunks+{r.chunks_created} skipped={len(r.skipped_files or [])}. "
-          "Summaries and notes saved after the backup are lost; rebuilt meetings are transcribed again.", file=sys.stderr)
+          "Summaries and notes saved after the backup are lost; rebuilt meetings are transcribed again. "
+          "Users removed after the backup are restored and their tokens work again; run `minutes-local user list` "
+          "and remove them again with `minutes-local user remove <id>`.", file=sys.stderr)
 
 
 def _cmd_token(args: argparse.Namespace) -> int:
@@ -5348,6 +5400,24 @@ async def test_backup_prune_and_restore(ctx3: AppContext) -> None:
     ctx3.db = Database(s.db_path)                                                        # fixture の close 用
 
 
+async def test_backup_order_survives_clock_catching_up(ctx3: AppContext) -> None:
+    """時計が戻った後に作った世代は、時計が追いついた後も前の世代より新しい（並びは名前の時刻ではなく世代番号）。"""
+    # Arrange: 時計が進んでいた間に 1 世代、戻った後に 1 世代作る
+    day = 24 * 3600 * 1000
+    t0 = now_ms()
+    d = ctx3.settings.backups_dir
+    ahead = backup.create_backup(ctx3.db, d, t0 + day)
+    after_rollback = backup.create_backup(ctx3.db, d, t0)
+    # Act: 時計が両方の時刻を過ぎた後の並び・期日の判定・世代管理
+    order = backup.list_backups(d)
+    due = scheduler.backup_due(ctx3, t0 + day + 3600 * 1000)
+    pruned = backup.prune_backups(d, keep=1)
+    # Assert: 戻った後の世代が最新のまま（復元元は末尾から選ぶ）。期日はそれから 25 時間で来て、世代管理でも残る
+    assert order == [ahead, after_rollback]
+    assert due is True
+    assert pruned == 1 and backup.list_backups(d) == [after_rollback]
+
+
 async def test_rebuild_from_recordings(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
     await _completed_meeting(client3, runner3, ctx3)
     with ctx3.db.read() as conn:
@@ -5362,6 +5432,31 @@ async def test_rebuild_from_recordings(client3: httpx.AsyncClient, ctx3: AppCont
     assert report.meetings_created == 1 and report.chunks_created == 2 and report.skipped_files == []
     assert m is not None and m.local_user_id == "local" and m.status == "finalized" and m.title == "t"
     assert after == before
+
+
+async def test_rebuild_relinks_chunk_compressed_after_backup(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """古いバックアップから戻した行が圧縮で消えた WAV を指していても、同じ音声の圧縮ファイルへ向け直す。内容の合わないファイルは指さない。"""
+    # Arrange: 圧縮を終えた後、行だけを圧縮前（バックアップの時点）に戻す。2 つ目の Chunk の圧縮ファイルは壊す
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        old_rows = sorted(repo.list_chunks(conn, "m-1"), key=lambda c: c.sequence_no)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        for c in old_rows:
+            repo.update_chunk(conn, c.id, local_path=c.local_path, codec="wav", sha256_flac=None, size_bytes=c.size_bytes)
+    broken = (ctx3.settings.data_dir / old_rows[1].local_path).with_suffix(".fake")
+    broken.write_bytes(b"garbage")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        good = repo.get_chunk(conn, old_rows[0].id)
+        bad = repo.get_chunk(conn, old_rows[1].id)
+    # Assert: 行は作り直さずに向け直し、壊れた方は missing にする
+    assert (report.chunks_created, report.chunks_relinked, report.chunks_marked_missing) == (0, 1, 1)
+    assert good is not None and good.local_path.endswith(".fake") and good.codec == "fake" and good.save_status == "verified"
+    assert len(read_pcm(ctx3.settings.data_dir, good.local_path, good.sha256, FakeCodec())) == 960000
+    assert bad is not None and bad.local_path == old_rows[1].local_path and bad.save_status == "missing"
 
 
 async def test_rebuild_keeps_end_time_from_phase2_snapshot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
