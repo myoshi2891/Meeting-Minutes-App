@@ -2500,14 +2500,18 @@ export class NotesStore {
       this.reportError(new Error("NotesStore is disposed; the edit was not saved"));
       return;
     }
-    this.set({ json: content, lastAppliedSummaryVersion, sync: this.state.sync === "conflict" ? "conflict" : "dirty" });
+    // 状態の更新 → 書き込みを鎖に並べる → onChange の順にする。set() で先に知らせると、onChange の中で呼ばれた setDraft の
+    // 書き込み（後の編集）が先に並び、戻ってから並べるこの編集（前の編集）が下書きを上書きする
+    this.state = { ...this.state, json: content, lastAppliedSummaryVersion, sync: this.state.sync === "conflict" ? "conflict" : "dirty" };
     if (this.disposed) {
       // dispose() が鎖の末尾を待ち始めた後に書き込みを足すと、待たれないまま新しいインスタンスの load() と競合する。
       // 書かずに、dispose() が最新の状態を戻り値で引き継ぐ
       this.editedWhileDisposing = true;
+      this.deps.onChange(this.state);
       return;
     }
     void this.writeDraft({ json: content, revision: this.state.revision, lastAppliedSummaryVersion, savedAt: Date.now(), saved: false });
+    this.deps.onChange(this.state);
     if (this.state.sync !== "conflict") this.schedule();
   }
 
@@ -4067,6 +4071,32 @@ function build(opts: { serverRevision?: number; offline?: boolean } = {}) {
 }
 
 describe("NotesStore", () => {
+  it("onChange の中で setDraft が呼ばれても、下書きは後の編集になる（書き込みは編集の順に並ぶ）", async () => {
+    // Arrange: 最初の編集の通知の中で、エディタが続けて編集する
+    const b = build();
+    let reentered = false;
+    let store: NotesStore | null = null;
+    const deps: NotesStoreDeps = {
+      ...b.deps,
+      onChange: (s) => {
+        b.deps.onChange(s);
+        if (!reentered && Array.isArray(s.json) && s.json[0] === "a") {
+          reentered = true;
+          store?.setDraft(["ab"]);
+        }
+      },
+    };
+    store = new NotesStore(deps, "m");
+    await store.load();
+    // Act
+    store.setDraft(["a"]);
+    await store.dispose();                               // 鎖が空になるまで待つ
+    // Assert
+    expect(reentered).toBe(true);
+    expect(store.current.json).toEqual(["ab"]);
+    expect(b.drafts.get("notes:m")).toMatchObject({ json: ["ab"], saved: false });
+  });
+
   it("dispose で保留中の保存を止め、作り直したインスタンスが load で未送信の編集を引き継いで 1 回だけ送る", async () => {
     // Arrange: 編集して debounce 待ちのまま、トークン変更で作り直す（§15.1 W8）
     const b = build();
