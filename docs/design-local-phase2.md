@@ -505,6 +505,19 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_segments_meeting_time ON transcript_segments(meeting_id, start_ms);
 CREATE INDEX IF NOT EXISTS idx_segments_merged ON transcript_segments(meeting_id, merged_version);
+
+-- 完了済みの Chunk を撮り直した結果の置き場（§9.2 の表「結果の書き込み」）。次の merge_transcript が transcript_version を
+-- 上げるのと同じトランザクションで transcript_segments と入れ替える。0 件の結果も入れ替えるので、Chunk ごとの印と行を分ける
+CREATE TABLE IF NOT EXISTS segment_replacements (
+  chunk_id   TEXT PRIMARY KEY REFERENCES audio_chunks(id) ON DELETE CASCADE,
+  meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS staged_segments (
+  -- 列は transcript_segments と同じ。chunk_id だけ segment_replacements(chunk_id) を参照する（ON DELETE CASCADE）
+  ...,
+  UNIQUE (chunk_id, segment_index)
+);
 ```
 
 ## 8.7 meeting_summary_versions / meeting_notes
@@ -589,8 +602,10 @@ stateDiagram-v2
     processing --> retrying : retryable エラー かつ attempts < max_attempts
     processing --> failed : non-retryable エラー または attempts >= max_attempts
     retrying --> pending : next_run_at 到達（backoff）
-    leased --> pending : Sweeper が lease 期限切れを検出
-    processing --> pending : Sweeper が lease 期限切れを検出（ワーカークラッシュ）
+    leased --> pending : Sweeper が lease 期限切れを検出（attempts < max_attempts）
+    processing --> pending : Sweeper が lease 期限切れを検出（ワーカークラッシュ、attempts < max_attempts）
+    leased --> failed : Sweeper が lease 期限切れを検出（attempts >= max_attempts）
+    processing --> failed : Sweeper が lease 期限切れを検出（attempts >= max_attempts）
     pending --> cancelled : 会議削除 / 利用者キャンセル
     retrying --> cancelled : 同上
     failed --> pending : 利用者が「再試行」（attempts をリセット）
@@ -628,9 +643,9 @@ RETURNING id, meeting_id, chunk_id, job_type, attempts, model_name;
 | 仕組み | 内容 |
 | --- | --- |
 | heartbeat | `processing` 中のワーカーは 60 秒ごとに `UPDATE ... SET lease_until = now + 300000 WHERE id = ? AND lease_owner = ?` を発行する。STT 1 Chunk は通常 5 分未満だが、CPU-only の large モデルなど長時間の場合に備える |
-| Sweeper | 30 秒ごとに `status IN ('leased','processing') AND lease_until < now` を `pending` に戻し、`last_error = 'lease expired'` を記録する。起動時にも 1 回実行する（§5.3） |
+| Sweeper | 30 秒ごとに `status IN ('leased','processing') AND lease_until < now` を `pending` に戻し、`last_error = 'lease expired'` を記録する。起動時にも 1 回実行する（§5.3）。**`attempts >= max_attempts` のものは `pending` に戻さず `failed`（`error_class = INTERNAL`）にし、ハンドラの失敗と同じ後続処理を行う**。lease 切れはワーカーがジョブを抱えたまま落ちたことを意味し、Runner の回数判定を通らない。回数を見ずに戻すと、実行するたびにプロセスを落とすジョブ（メモリ不足で OS に止められる等）が再起動のたびに永久に実行される |
 | 二重実行 | Sweeper で戻された後に旧ワーカーが完了報告を送ってきた場合、`UPDATE ... WHERE id = :id AND lease_owner = :owner AND attempts = :attempts` が 0 行になるため無視される。§9.2 の `RETURNING` が返す `attempts` を fencing token としてワーカーが持ち回り、完了報告と結果の書き込みの両方に付ける |
-| 結果の書き込み | `transcript_segments` への INSERT は完了報告と同じトランザクションで行い、先に `SELECT 1 FROM processing_jobs WHERE id = :id AND lease_owner = :owner AND attempts = :attempts AND status = 'processing'` を検証して 0 行なら INSERT せずに結果を破棄する。lease 失効後の旧ワーカーが `INSERT OR IGNORE` で `UNIQUE (chunk_id, segment_index)` を先に埋め、正規の再試行（`attempts` が進んだ側）の結果が無視される事態を防ぐ。検証を通った同一 attempt の重複報告は `UNIQUE` + `INSERT OR IGNORE` で冪等のまま（Invariant 5） |
+| 結果の書き込み | 結果の書き込みと完了報告は別のトランザクションである。ハンドラは 1 つの書き込みトランザクションで、先に `SELECT 1 FROM processing_jobs WHERE id = :id AND lease_owner = :owner AND attempts = :attempts AND status = 'processing'` を検証し、0 行なら何も書かずに結果を破棄する。通れば、その Chunk の `transcript_segments` を新しい結果で置き換え、Chunk を `completed` にする。Chunk がまだ `completed` でなければ消してから入れる。既に `completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments` に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（§8.6。merge が失敗しても公開中の版は欠けない）。完了報告（ジョブの `completed`）はその後に Runner が上記の fencing 付き UPDATE で行う。検証によって、lease 失効後の旧ワーカーが `INSERT OR IGNORE` で `UNIQUE (chunk_id, segment_index)` を先に埋め、正規の再試行（`attempts` が進んだ側）の結果が無視される事態を防ぐ。同一 attempt の重複報告は `UNIQUE` + `INSERT OR IGNORE` で冪等のまま（Invariant 5）。2 つのトランザクションの間で lease が切れると、Sweeper が回数に応じてジョブを `pending` に戻すか `failed` にする（Chunk は `completed` のまま）。どちらでも、やり直した attempt が segments を置き換えるので前の結果と混ざらない。`failed` なら再試行か除外で収束し、除外しても Chunk は `completed` なので gap にならない。前の結果で merge が終わっていた場合は、置き場への書き込みと同じトランザクションで完了済みの merge ジョブを消して作り直し、その merge が入れ替えて transcript の版を上げる（詳細設計 §14） |
 
 ## 9.4 Retry 分類とバックオフ
 
@@ -666,7 +681,7 @@ flowchart LR
 | `vad_chunk` 完了 → `transcribe_chunk` | `has_voice=1` なら `pending`、`0` なら `audio_chunks.stt_status='skipped'` にしてジョブを作らない | §32 |
 | `transcribe_chunk` 完了 → `merge_transcript` | `SELECT COUNT(*) FROM audio_chunks WHERE meeting_id=? AND stt_status NOT IN ('completed','skipped')` が 0 | §57〜§60 |
 | `merge_transcript` 完了 → `synthesize_minutes` | 即時。ただし §5.2 の排他規則で lease は STT 完了後 | §61 |
-| いずれかが `failed` | 後続を生成しない。UI で「失敗 Chunk を再試行 / 除外して生成」を選ばせる | §97〜§98 |
+| いずれかが `failed` | 後続を生成しない。`transcribe_chunk` の失敗は UI で「失敗 Chunk を再試行 / 除外して生成」を選ばせる。`vad_chunk` と `merge_transcript` の失敗は再試行のみで、除外の対象ではない（`exclude-failed` が取り消すのは `transcribe_chunk` の `failed` ジョブだけ。詳細設計 §14） | §97〜§98 |
 
 「除外して生成」を選んだ場合、`failed` の `transcribe_chunk` を `cancelled` にし、`audio_chunks.stt_status='failed'` のまま `merge_transcript` を生成する。要約の入力には「この区間は文字起こしに失敗しました」を明示的に挿入する（v4.0 §98：AI に黙って欠落データを渡さない）。
 
@@ -682,14 +697,14 @@ stateDiagram-v2
     transcribing --> transcribed : merge_transcript completed
     transcribed --> summarizing : synthesize_minutes leased
     summarizing --> completed : summary version 保存
-    transcribing --> failed : transcribe failed かつ 利用者が除外を選ばない
     summarizing --> failed : summary failed（transcript は残る）
-    failed --> transcribing : 再試行
+    failed --> summarizing : 要約の再試行・再生成
+    failed --> transcribing : 利用者が STT 再実行
     completed --> summarizing : 利用者が再生成
     completed --> transcribing : 利用者が STT 再実行（モデル変更時）
 ```
 
-`failed` は「会議データの消失」ではない（v4.0 §105）。`transcribed` まで到達していれば transcript は閲覧・編集できる。
+会議の `failed` は要約の失敗だけで起きる。transcribe・VAD・merge のジョブが失敗しても会議は `transcribing` のまま残り、失敗したジョブの再試行（transcribe は除外も可）を待つ。会議の `failed` は「merge が 1 回は終わった」を意味するためである（詳細設計 §14）。`failed` は「会議データの消失」ではない（v4.0 §105）。`transcribed` まで到達していれば transcript は閲覧・編集できる。
 
 ---
 
@@ -757,9 +772,9 @@ Phase 1 §3.10 で先送りした重複排除アルゴリズムを確定する�
 
 | 項目 | 内容 |
 | --- | --- |
-| 入力 | 会議の全 `transcript_segments`（`merged_version IS NULL` または前回版）。`source` 別に `start_ms` 順 |
+| 入力 | 会議の全 `transcript_segments`（`merged_version IS NULL` または前回版）。`source` 別に `start_ms` 順。読む前に、同じトランザクションで撮り直した Chunk の行を `staged_segments` から入れ替える（§8.6） |
 | 出力 | 各行の `merged_version` と `merge_reason` を更新。`meetings.transcript_version` を +1。除外行は `merged_version = NULL`、`merge_reason = 'dup_of:<id>'` |
-| 冪等性 | 同じ入力集合に対して同じ結果を出す（決定的）。再実行は `transcript_version` を進めるだけで、行を削除しない |
+| 冪等性 | 同じ入力集合に対して同じ結果を出す（決定的）。再実行は `transcript_version` を進めるだけで、行を削除しない（撮り直した Chunk の古い行を入れ替えで消すのを除く） |
 
 ## 11.2 正規化
 
@@ -963,6 +978,12 @@ Phase 1 §3.8 で先送りした注記テーブルを、静的な設定ファイ
 ## 12.7 版管理と再生成
 
 v4.0 §67〜§68 を継承する。再生成は新しい `version` 行を追加し、旧版を削除しない。`transcript_version` が進んだ後の再生成は自動では起動せず、UI の「再生成」操作でのみ起動する（利用者が transcript を修正した直後に AI が勝手に上書きする体験を避ける）。
+
+**transcript が進んだ後の引用。** 要約の `sourceSegmentIds`（と、そのどれかを指す `evidenceSpan.segmentId`）は、生成時の transcript 版（`MeetingSummary.transcriptVersion`）の segment を指す。その後に segments の行を消して作り直す処理がある：撮り直しの入れ替え（詳細設計 §8 `repo.promote_replacements`）、手動 STT（`request_rerun_stt`）、未完了の Chunk の再試行（`handle_transcribe`）。無音区間の STT（`transcribe_silent_chunk`）は行を足すだけで消さない。消えた行を指す引用は次のように扱う（Phase 3 も同じ）。
+
+* 要約は書き換えない・消さない（`result_json` は生成時のまま。上の「旧版を削除しない」と同じ）。サーバーは引用を付け替えない。
+* クライアントは、表示中の transcript が要約より新しい版のときだけ、引用先が transcript にあるかを照合する（詳細設計 client §11 `unresolvedCitations`）。同じ版なら §12.5 の検証で全件が実在する。
+* 見つからない引用は transcript へ飛ばさない。決定事項・アクションは生成時に保存した逐語引用（`quote`）を「生成時の引用」として出し、話題（引用を持たない）は「根拠の行は作り直されました」と出す。あわせて「transcript が更新されました。必要なら再生成してください」と案内する（再生成は上のとおり利用者の操作でのみ）。
 
 ---
 

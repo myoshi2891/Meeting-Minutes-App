@@ -1,6 +1,6 @@
 # 進捗と次の作業
 
-最終更新: 2026-11-13（設計書の厳しめレビュー 2 回目・未コミット、ブランチ `dev`。PR #13 までマージ済み）
+最終更新: 2026-11-14（レビュー指摘 5 件・6 件・3 件・6 件・4 件に続き、Phase 2 client / server・Phase 3 server のレビュー指摘 4 件（採用時の同期的な失敗・置き換わった引用・分離の読み込み前の上限・VAD 失敗時の lease）・未コミット。その前は Phase 2 client / server・Phase 3 server のレビュー指摘 4 件（保存完了・採用の通知中の編集・撮り直し後の merge のイベント・バックアップ復元テストの名前）・未コミット。その前は Phase 2 client / server・Phase 3 server のレビュー指摘 6 件（待機中の acceptServer・writeDraft の入れ子・撮り直しの staging・タイムラインの上限・pyannote のテレメトリ・分離の lease）・未コミット、ブランチ `dev`。PR #14 までマージ済み）
 
 新しいセッションはこのファイルから始める。作業を終えたら「現在地」「次の作業」「セッションログ」を更新する（ルールは [CLAUDE.md](CLAUDE.md)）。
 
@@ -22,9 +22,102 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 
 - 自動テスト（最新・62 回目の変更後）: TypeScript 24 ファイル / 479 件がすべて通過、`npm run typecheck` も通過（2026-11-10。Python は今回変更なし・未実行）。61 回目の変更後（回帰 3 件・新規 1 件を追加）は TypeScript 24 ファイル / 478 件・typecheck 通過（2026-11-10 にコミット 3a79126 の状態で実行して確認）。60 回目の変更後は TypeScript 24 ファイル / 474 件・typecheck 通過。59 回目の変更後は TypeScript 24 ファイル / 471 件・typecheck 通過。58 回目の変更後は TypeScript 24 ファイル / 466 件・typecheck 通過。57 回目の変更後は TypeScript 24 ファイル / 456 件・typecheck 通過。56 回目の変更後は TypeScript 23 ファイル / 446 件・Python 10 件・typecheck 通過。55 回目の変更後は TypeScript 444 件・typecheck 通過。53 回目の変更後は TypeScript 433 件・Python 10 件がすべて通過、`npm run typecheck` も通過（2026-11-09、build は未実行。Python は `PYTHONPATH=. uv run pytest server_tests`）。52 回目の変更後は TypeScript 427 件・typecheck 通過。51 回目の変更後は TypeScript 415 件・typecheck 通過。50 回目の変更後は TypeScript 410 件・typecheck 通過。49 回目の変更後は Python 10 件、TypeScript 403 件・typecheck 通過。48 回目の変更後は TypeScript 397 件・Python 10 件・typecheck 通過。45 回目の変更後は TypeScript 372 件・Python 10 件、typecheck・`npm run build` 通過。44 回目の変更後の記録は TypeScript 365 件・Python 10 件・typecheck 通過。それより前（停止理由の永続化以前）の記録は Python 7 件・TypeScript 352 件。`npm audit` は前回確認で 0 件（2026-11-06、vite 7.3.7・vitest 5.1.0・certifi 2026.10.23）。
 - 設計書と src の同期: 変更した Phase 1 の埋め込みコードは `scripts/sync-design-code.mjs` で同期。後続 Phase 2 client の会議情報保持とバナー文言も反映。
-- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-13 の設計書レビュー 2 回目の後：Phase 2 server 128 件・Phase 3 server 164 件・Phase 2 client 31 ファイル 557 件・Phase 3 client 35 ファイル 592 件、tsc・pyflakes も通過）。
+- Phase 2 / 3 は設計書のみ（クライアント・サーバーとも未実装）。設計書のコードは `scripts/verify-design-docs.sh` で検証済み（2026-11-14 のレビュー指摘 4 件（置き換わった引用・分離の上限ほか）の後：`all` で Phase 2 server 146 件・Phase 3 server 219 件・Phase 2 client 31 ファイル 575 件・Phase 3 client 35 ファイル 610 件、tsc・pyflakes も通過。レビュー指摘 4 件（通知中の編集・merge のイベントほか）の後：`all` で Phase 2 server 145 件・Phase 3 server 217 件・Phase 2 client 31 ファイル 573 件・Phase 3 client 35 ファイル 608 件、tsc・pyflakes も通過。レビュー指摘 6 件（staging・テレメトリほか）の後：`all` で Phase 2 server 144 件・Phase 3 server 214 件・Phase 2 client 31 ファイル 569 件・Phase 3 client 35 ファイル 604 件、tsc・pyflakes も通過。レビュー指摘 3 件（acceptServer・carry・話者の引き継ぎ）の後：`all` で Phase 2 server 143 件・Phase 3 server 211 件・Phase 2 client 31 ファイル 566 件・Phase 3 client 35 ファイル 601 件、tsc・pyflakes も通過。レビュー指摘 6 件の後：`server` と `client` で Phase 2 server 143 件・Phase 3 server 210 件・Phase 2 client 31 ファイル 564 件・Phase 3 client 35 ファイル 599 件、tsc・pyflakes も通過。レビュー指摘 5 件の後：`server` と `client` で Phase 2 server 143 件・Phase 3 server 205 件・Phase 2 client 31 ファイル 562 件・Phase 3 client 35 ファイル 597 件、tsc・pyflakes も通過。2026-11-13 のレビュー指摘 2 件（transcribe 再試行・下書き失敗後の作り直し）の後：`all` で Phase 2 server 142 件・Phase 3 server 204 件・Phase 2 client 31 ファイル 561 件・Phase 3 client 35 ファイル 596 件。レビュー指摘 3 件（merge の lease・下書きの書き込み順）の後：`all` で Phase 2 server 141 件・Phase 3 server 203 件・Phase 2 client 31 ファイル 560 件・Phase 3 client 35 ファイル 595 件、tsc・pyflakes も通過。レビュー指摘 2 件（要約・VAD の lease 切れ後の回収）の後：`server` で Phase 2 server 140 件・Phase 3 server 202 件、pyflakes も通過。レビュー指摘 3 件の後：`server` で Phase 2 server 135 件・Phase 3 server 197 件、pyflakes も通過。client は今回変更なし・未実行。設計書レビュー 3 回目の後：Phase 2 server 131 件・Phase 3 server 193 件・Phase 2 client 31 ファイル 559 件・Phase 3 client 35 ファイル 594 件、tsc・pyflakes も通過）。
 
 ### 今回の変更と残課題
+
+- 2026-11-14（Phase 2 client / server・Phase 3 server 設計書のレビュー指摘 4 件・未コミット）：4 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2.md`・`docs/design-local-phase2-client.md`・`docs/design-local-phase2-server.md`・`docs/design-local-phase3-server.md`。
+  - **採用時の同期的な失敗（`NotesStore.acceptServer`）**：書き込みの鎖が空だと採用した版の控えは同期的に書き始め、`drafts.set` が同期的に投げると `catch → onError → setDraft` がその中で走る。その後の `set()` が状態を採用した版で上書きし、`dispose()` の待機中なら編集の代わりに採用した版を未保存として引き継いだ。状態の更新 → フラグの戻し → 書き込み → `onChange(this.state)` の順にする。回帰 1 件（PUT の 409 で `dispose()` が送信中の保存を待つ間に、conflict の通知から採用する）。
+  - **置き換わった引用（基本設計 §12.7）**：撮り直しの入れ替え（`promote_replacements`）・手動 STT・未完了の Chunk の再試行は segments の行を消して作り直し、生成済みの要約の `sourceSegmentIds` が消えた行を指す。方針を基本設計 §12.7 に書いた：要約は書き換えない、クライアントが表示中の transcript が要約より新しい版のときだけ照合し、見つからない引用は transcript へ飛ばさず保存済みの `quote`（話題は「作り直されました」）を出して再生成を案内する。`evidenceSpan.segmentId` は検証で `sourceSegmentIds` のどれかに限られるので後者だけ見る。client §11 に selector `unresolvedCitations` を追加（新規 1 件）。API は変えていない。Phase 2 / 3 server の `promote_replacements`・`request_rerun_stt`・Phase 3 `run_merge` から §12.7 を参照。
+  - **分離の読み込み前の上限（Phase 3 `handle_diarize`）**：全 Chunk の PCM を読んでから `assemble_timeline`（pyannote の経路だけ）で上限を見ていた。読む前に行の時刻で 1 source の長さを確かめ（`check_timeline_span`、`MAX_TIMELINE_MS` を流用）、読み込み中も読んだ量が上限を超えた時点でやめる。ファイルの大きさは使わない（圧縮済みの Chunk は小さい）。`assemble_timeline` の検査は残す。回帰 1 件。
+  - **VAD 失敗時の lease（Phase 2 / 3 `handle_vad`）**：`InvalidWavError` の分岐が lease を見ずに Chunk を `missing` にしていた。成功時と同じ `lease_is_current` で守り、例外は従来どおり投げる。回帰 1 件（p3s でも Phase 3 のコードに対して走る）。
+  - 確認：`verify-design-docs.sh all` が通過（Phase 2 server 146・Phase 3 server 219・Phase 2 client 575・Phase 3 client 610）。Red：作業ツリーの複製でコード修正だけを戻すと、回帰 3 件がすべて失敗した（client 1 件は Phase 2 / 3 の両方、VAD は p2s / p3s の両方、分離は p3s）。`unresolvedCitations` は新しい関数なので Red はない。
+  - **残り（未対応）**：`handle_transcribe` の `InvalidWavError` の分岐（Phase 2 / 3）も lease を見ずに `missing` にする（同じ形。指摘の範囲外なので未修正）。引用の表示（quote と案内の文言）は client の UI 実装で `unresolvedCitations` を使って出す。
+
+- 2026-11-14（Phase 2 client / server・Phase 3 server 設計書のレビュー指摘 4 件・未コミット）：4 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-client.md`・`docs/design-local-phase2-server.md`・`docs/design-local-phase3-server.md` のみ。
+  - **保存完了の通知中の編集（`NotesStore.doSave`）**：`set({ sync: "saved" })` の `onChange` の中で `setDraft` が呼ばれると、未送信の内容を `stillSame`（true）のまま `saved: true` で控えた。控えの `saved` は書く時点の `this.state.json` と送った `snapshot.json` で比べ直す。後続フェーズに同じ保存処理の写しはない（`docs/*.md` を `stillSame` で検索して確認）。回帰 1 件。
+  - **採用の通知中の編集（`NotesStore.acceptServer`）**：`set()` を先に呼んでいたため、`onChange` の中の `setDraft` の書き込みが採用した版（`saved: true`）の書き込みより先に並んで上書きされ、`dispose()` の待機中なら立て直した `editedWhileDisposing` を後から下ろしていた。`setDraft` と同じく、控えの書き込みとフラグの戻しを `set()` より前にする。回帰 2 件（通常時・待機中）。
+  - **撮り直し後に作り直す merge のイベント（Phase 2 / 3 Runner `_execute`）**：`delete_finished_job` で完了済みの merge の行を消した後に `_publish_job(job.id)` が行を引けず、完了のイベントも作り直した merge のイベントも流れなかった。消す前に行を控え（`_publish_job(..., removed=)`）、`ensure_merge_job` が返す新しいジョブの id と合わせてコミット後に流す。インターフェース変更：`ensure_merge_job` の戻り値を `bool` から作ったジョブの id（`str | None`）にした（呼び出し側は戻り値を使っていない）。既存の `test_transcribe_retry_during_merge_schedules_followup_merge` にイベントの検証を足した。
+  - **バックアップ復元のテスト（Phase 3 `test_restore_skips_broken_backup`）**：壊れた候補の名前（`minutes-9999999999999.sqlite`）が `_name_parts` の規約（`minutes-{世代}-{epoch ms}.sqlite`）に合わず、`list_backups` が除いていたため、空・破損のファイルを退ける経路を通っていなかった。`good` より新しい世代の規約どおりの名前にし、復元の前に `list_backups` の順を確かめる。
+  - 確認：`verify-design-docs.sh all` が通過（Phase 2 server 145・Phase 3 server 217・Phase 2 client 573・Phase 3 client 608）。Red：作業ツリーの複製でコード修正だけを戻すと、追加・拡張したテスト 4 件がすべて失敗した（p2s / p3s の各 1 件、Phase 2 / 3 client の各 3 件）。バックアップのテストはテストだけの修正なので Red はない。
+
+- 2026-11-14（Phase 2 client / server・Phase 3 server 設計書のレビュー指摘 6 件・未コミット）：6 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2.md`・`docs/design-local-phase2-client.md`・`docs/design-local-phase2-server.md`・`docs/design-local-phase3-server.md` のみ。
+  - **待機中の `acceptServer()`**：`dispose()` の待機中に編集してからサーバー版を採用すると、`editedWhileDisposing` が残り、`dispose()` がサーバー版を `saved: false` で引き継いで新しいインスタンスが送り直した。採用時に下ろす（後から入った編集は `setDraft` が立て直す）。回帰 2 件（採用前の編集は引き継がない・採用後の編集は引き継ぐ）。
+  - **`writeDraft()` の入れ子**：`drafts.set` が同期的に投げると、`catch → reportError → onError → setDraft` の入れ子の `writeDraft` が件数 0 と見て並行に書き始め、その末尾を外側が上書きした。`dispose()` は件数が残るのに決着済みの末尾を待ち続ける（マイクロタスクで回り続け、IndexedDB の完了が来ない）。件数と末尾（gate）を `run()` の前に確定させ、同期的な書き始めは保つ。回帰 1 件。
+  - **撮り直しの置き換え（Phase 2 / 3 `handle_transcribe`）**：完了済みの Chunk の再試行が segments をその場で消し、作り直す merge のコミットまで（失敗すればその後も）公開中の版からその区間が抜けた。新しい結果を `staged_segments`（印は `segment_replacements`。0 件の結果も入れ替えるため分けた）に置き、`run_merge` が版を上げるのと同じトランザクションで `repo.promote_replacements` が入れ替える。表は Phase 2 のマイグレーション 5 に足した（未実装なので番号は増やさない）。`UNIQUE (chunk_id, segment_index)`（Invariant 5）は変えない。手動 STT は置き場も消す。Phase 3 は `set_segment_speaker` が置き場にも書き（話者の引き継ぎと分離の再試行で話者を失わない）、`handle_merge` が入れ替え後に言語比率を取り直す。回帰 1 件（merge の失敗で巻き戻り、やり直しで版 2 になる）。完了前の Chunk はその場で置き換える（どの版にも載っていない）。基本設計 §8.6（表）・§9.2「結果の書き込み」・§11 の merge の入力と冪等性も合わせた。
+  - **タイムラインの上限（Phase 3 `assemble_timeline`）**：開始時刻が離れた Chunk があると、間の無音を埋めるために際限なく確保した。`MAX_TIMELINE_MS`（4 時間、1 source 約 461 MB）を超えたら確保の前に `InvalidAudioError`（話者分離なしで続行）。既存の設計に会議の長さの上限は無かったので新しく決めた（§3 のリスク表にも記載）。回帰 1 件。
+  - **pyannote のテレメトリ**：pyannote.audio 4.x は既定で OpenTelemetry により `otel.pyannote.ai` へ利用状況を送り、`HF_HUB_OFFLINE` では止まらない。`PYANNOTE_METRICS_ENABLED=false` で止める。許す版を `>=3.1,<4.1` に狭め、その全リリースの wheel を確認した（3.1.0〜3.4.0 は送信のコードなし、4.0.0〜4.0.7 は送信の 3 関数すべてがこの変数で止まる。4.0.6 は未公開）。opentelemetry-sdk 1.34.0 で、記録が無ければ送信 0 回を実測。言語判定が同じプロセスで faster_whisper（huggingface_hub）を先に import するので、`_load` での `HF_HUB_OFFLINE` 設定は間に合わなかった。両方の変数を `build_context` の最初で設定する（`_load` にも単体利用のために残す）。`config.yaml` が pyannoteAI の製品パイプライン（`pipelines.pyannoteai.*`。`sdk` は音声を Web API へ送る）を指したら `MODEL_MISSING`。構築後に判定するが、pyannoteai-sdk 0.4.0 の `Client.__init__` は通信しないことを確認した。単体テストは pyannote 本体が要るので無し（3-h の実機確認に 60 秒以上の待ちと 3.x / 4.x の両方を足した）。
+  - **分離の lease（Phase 3 `handle_diarize`）**：書き込みの前に `lease_is_current` を見ていなかった。失効していれば何も書かない。回帰 1 件。
+  - 確認：`verify-design-docs.sh all` が通過（Phase 2 server 144・Phase 3 server 214・Phase 2 client 569・Phase 3 client 604。p3s は Phase 2 のテストも含む）。追加したテストの Red は実行していない（`writeDraft` の入れ子のテストは、旧コードでは失敗ではなくマイクロタスクの無限ループで止まる）。
+
+- 2026-11-14（Phase 2 client / Phase 3 server 設計書のレビュー指摘 3 件・コミット済み）：3 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-client.md`・`docs/design-local-phase3-server.md` のみ。
+  - **返した後の `acceptServer()`**：`dispose()` が戻り値を返した後でも控えを書き、新しいインスタンスの下書きを後から上書きできた。`setDraft()` と同じく `handedOff` で受け付けず `onError` に知らせる。`dispose()` の待機中（返す前）は従来どおり受け付ける（鎖が空になるまで待たれる）。回帰 1 件。
+  - **`load(carry)` の即時書き込み**：引き継いだ内容はメモリ（`unwrittenDraft`）にしかなく、編集も保存もないまま閉じると失われた。最初の await より前に `writeDraft(carry)` で書き始める（成功で `unwrittenDraft` が null、失敗で carry のまま `onError`）。回帰 1 件。既存の「一度も書けないまま再度作り直す」テストは、中間のインスタンスも書けない `deps` に変えて意図を保った。
+  - **transcribe 再試行での話者（Phase 3 `handle_transcribe`）**：話者分離の完了後に Chunk の segments を置き換えると、新しい segments は話者なしで、`ensure_merge_job` は分離を作り直さず merge へ進んでいた。置き換える前の segments の話者を、同じ source で時間の重なりが最大のものから移す（`_assign_speakers` を流用）。分離を再実行しないのは、ラベルが振り直されて利用者が付けた名前と食い違うため。回帰 1 件（`test_transcribe_retry_after_diarize_keeps_speakers`）。残課題：分離の実行中に置き換えが起きると、分離は古い segments に割り当てるので新しい segments は話者なしになる（未対応）。
+  - 確認：`verify-design-docs.sh all` が通過（Phase 2 server 143・Phase 3 server 211・Phase 2 client 566・Phase 3 client 601）。追加したテストの Red は実行していない。
+
+- 2026-11-14（Phase 2 client / Phase 3 server 設計書のレビュー指摘 6 件・コミット済み）：6 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-client.md`・`docs/design-local-phase3-server.md` のみ。
+  - **`NotesStore.dispose()` 中の編集**：`dispose()` が鎖の末尾を 1 回 await した後の `setDraft()` は書き込みを足し、待たれないまま新しいインスタンスの `load()` と競合していた。`dispose()` の開始後の `setDraft()` は書き込みを足さず、最新の状態を戻り値（carry）で引き継ぐ。戻り値を返した後の `setDraft()` は受け付けず `onError` に知らせる。`dispose()` は鎖が空になるまで待つ（`acceptServer` などが待機中に足した書き込みも待つ）。回帰 1 件。
+  - **`setDraft()` の写し取り**：`json` を参照のまま持ち、エディタが同じオブジェクトを書き換えると、並んだ書き込みと `doSave` の snapshot が変わった。入口で `structuredClone` する（呼び出しごとに別のオブジェクトなので `stillSame` の参照比較も保たれる）。回帰 1 件。
+  - **確定前のバックアップからの復元（Phase 3 `rebuild`）**：DB にない会議だけを作り、既存の行は見なかったので、確定前に取ったバックアップから戻した会議は `recording` のまま `resume_finalized` に拾われなかった。確定前の状態の既存の行は、確定時の控え（`endedAtEpochMs` あり）があれば `finalized` にし、欠けた終了時刻・総フレーム数・停止理由を補う（`RebuildReport.meetings_finalized`）。回帰 1 件（起動時の復旧から `resume_finalized` でジョブができるまで）。
+  - **圧縮の一時ファイル（`handle_compress`）**：最終パスへ直接書いてから lease を確かめ、失敗時に最終パスを消していたので、lease を失った旧い試行が別の試行の確定ファイルを上書き・削除できた。試行ごとの `*.staging` に書き、lease の確認と同じ書き込みロックの下で `os.replace`、後始末はその試行の一時ファイルだけ。テストの途中で、旧い試行がエンコード後に WAV の大きさを測って `FileNotFoundError`（一時ファイルが残る）になることが分かったので、大きさはエンコード前に測る。回帰 1 件。
+  - **時計の巻き戻り（バックアップ）**：直近が未来なら毎周作り、作った世代（名前の時刻が未来の世代より前）を世代管理が直後に消していた。`backup.generations()` で未来の世代を最も古い扱いにし、`prune_backups`（`now` を追加）・`restore_latest` で使う。`backup_due` は未来の世代を直近として数えない。回帰 1 件。
+  - **Chunk の時刻の組（`rebuild`）**：開始だけを検証し、既定の終了（開始 + 長さ）が SQLite INTEGER を超えたり、終了が開始より前だったりした。`_chunk_offsets()` で組として検証し、使えなければ連番から仮定した値にする（それも収まらない連番、2⁶³ 以上の連番のファイルは飛ばす）。既存の parametrize に 2 件追加。
+  - 確認：`verify-design-docs.sh server` と `client` が通過（Phase 2 server 143・Phase 3 server 210・Phase 2 client 564・Phase 3 client 599）。追加したテストの Red（修正前のコードで失敗すること）は実行していない。
+
+- 2026-11-14（Phase 2 server / client / 基本設計のレビュー指摘 5 件・未コミット）：5 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2.md`・`docs/design-local-phase2-server.md`・`docs/design-local-phase3-server.md`・`docs/design-local-phase2-client.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **transcribe の segments 置き換え**：結果のコミット後に lease 切れで回収されたジョブの再試行は `INSERT OR IGNORE` で足すだけで、件数・区切りが変わった新しい結果と前の attempt の行が混ざった。`handle_transcribe` は lease の検査の後、同じ書き込みトランザクションで Chunk の segments を消してから入れる。前の結果のコミット時に作られた merge が回収までに終わっていると、置き換えた区間がその版から消え、一意制約で merge を作り直せない。そのため Chunk が既に `completed` なら完了済みの merge ジョブも消す（手動 STT と同じ。版が上がり、会議は `transcribed`、要約は自動では作り直さない）。§14 本文・§15 の表・Invariant 5 を更新。Phase 3 の `handle_transcribe` は既存 segments があると Live の結果として再利用していたので、再利用を `completed` でない Chunk に限り、`completed` の Chunk は同じく置き換える（§10・Invariant 5 も更新）。Red（Phase 3 の旧コードで旧い segments が残る）を確認。回帰 1 件。
+  - **基本設計 §9.3「結果の書き込み」**：segments の書き込みと完了報告を「同じトランザクション」としていたが、詳細設計どおり別のトランザクションと書き直した。その間の lease 切れ（`pending` に戻す・回数切れで `failed`）での収束と、置き換え・merge の作り直しを書く。
+  - **基本設計 §9.5 の失敗行と §9.6 の状態遷移**：vad・merge の失敗は再試行のみで除外の対象外と明記。`transcribing --> failed`（transcribe の失敗）を削除し、会議の `failed` は要約の失敗だけで起きると追記。`failed --> transcribing : 再試行` は詳細設計（要約の再試行は `on_summary_started` で `summarizing`）に合わせ、`failed --> summarizing`（要約の再試行・再生成）と `failed --> transcribing`（STT 再実行）に分けた。
+  - **`NotesStore.load(carry)` の carry 保持**：引き継いだ内容を書き込みが成功するまで `unwrittenDraft` に持ち、その前にもう一度作り直されても `dispose()` が返す（`carry` が null なら従来どおり）。説明コメントを更新。回帰 1 件（Red は未実行。修正前は 2 回目の `dispose()` が null を返し、IndexedDB の古い `["a"]` を送る）。
+  - **§15.1 W8 `setToken` の直列化**：作り直しは直列で、途中に届いたトークンは最新の 1 つだけを持ち、前の作り直しの後に最新のトークンで作り直す。要求を送れるのは最新の `NotesStore` だけ。確認の列に「続けて呼ばれても 1 回だけ送る」を追加。
+  - 確認：`verify-design-docs.sh server` と `client` が通過（Phase 2 server 143・Phase 3 server 205・Phase 2 client 562・Phase 3 client 597）。
+
+- 2026-11-13（Phase 2 server / client 設計書のレビュー指摘 2 件・未コミット）：2 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md`・`docs/design-local-phase2-client.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **lease 切れ後の transcribe 再試行**：結果をコミットした後に回数切れで回収された transcribe ジョブを再試行すると、`POST /jobs/{id}/retry` が `completed` の Chunk を `queued` に戻し、再試行がまた失敗すると `on_transcribe_failed` が `completed` を見られず `failed`（書き込み済みの segments が gap）にした。retry は `completed` の Chunk を戻さない（成功すれば `on_transcribe_completed` が `completed` を書き直す）。§14 本文・§15 の表を更新。`routes_jobs.py` は Phase 3 で変更禁止なので Phase 3 にも効く。テストは再試行の失敗を lease 切れの回収で作る（Phase 3 の `handle_transcribe` は既存の segments を再利用して STT を呼ばないので、STT の失敗では再試行が失敗しない）。Red（Chunk が `failed`）を確認。回帰 1 件。
+  - **下書きの書き込み失敗後の作り直し（`NotesStore`）**：編集の下書きの書き込みが失敗した後、debounce の保存の前に `setToken` で作り直すと、`dispose()` が保存を止め、IndexedDB に無い最新の編集を失った（`onError` の説明は「debounce の保存で送る」と約束していた）。最後の書き込みが失敗した下書きを `unwrittenDraft` に持ち、`dispose()` が返す（`Promise<Draft | null>`）。新しいインスタンスは `load(carry)` で IndexedDB の下書きより優先する。`Draft` を export。`onError`・`dispose()` の説明と §15.1 W8 を更新。Red（`["a"]` しか残らず最新の `["ab"]` が送られない）を Phase 2 client で確認。回帰 1 件。
+  - 確認：`verify-design-docs.sh all` 通過（Phase 2 server 142・Phase 3 server 204・Phase 2 client 561・Phase 3 client 596）。
+
+- 2026-11-13（Phase 2 server / client 設計書のレビュー指摘 3 件・未コミット）：2 件を修正、1 件をスキップした。変更は `docs/design-local-phase2-server.md`・`docs/design-local-phase3-server.md`・`docs/design-local-phase2-client.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **スキップ：`on_merge_completed` で終端の要約ジョブを作り直す**：基本設計 §12.7 が「`transcript_version` が進んだ後の再生成は自動では起動せず、UI の操作でのみ起動する」と決めており、`test_manual_transcribe_of_skipped_chunk_reaches_the_transcript` もその挙動（`transcribed`・要約の版 1）を固定している。`transcribed` の会議に完了済みの要約ジョブが残っても、再生成（`reset_job_for_rerun`）で抜けられる。
+  - **`handle_merge` の lease 検査（T-lease-merge を解消）**：書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議・要約ジョブのどれも書かない。§15 の表に行を追加。Phase 3 の `handle_merge` にも同じ修正（`merge_echo` の記録も検査の後）。Red（版が 1 に進み会議が `transcribed`）を確認。回帰 1 件。
+  - **Phase 2 client `NotesStore` の下書きの書き込み順**：`setDraft`・`acceptServer`・`doSave` の IndexedDB 書き込みを `writeDraft()` の鎖で発行順に直列化し、`dispose()` は鎖の末尾まで待つ。失敗は鎖の中で `onError` に渡す（`onError` が投げても鎖は止めず `console.error`。`setDraft` の失敗も `onError` に届くようになった）。鎖が空なら呼び出しの中で同期的に書き始める（`then` で遅らせると、待たずに作り直したインスタンスの `load()` が書き込み前を読む。既存テスト 2 件がこれで Red になったので直した）。**実装の `SettingsStore` はトランザクションを同期的に作るので本番では起きない**。`DraftStore` のインターフェースが完了順を保証せず、設計書のテスト自身が順序の入れ替わる Store で検証しているための対策。§10 本文と §15.1 W8 を更新。Red（作り直したインスタンスが `["a"]` を `saved: true` で読み、編集が失われる）を Phase 2 / 3 client の両方で確認。回帰 1 件。
+  - 確認：`verify-design-docs.sh all` 通過（Phase 2 server 141・Phase 3 server 203・Phase 2 client 560・Phase 3 client 595、tsc・pyflakes 指摘なし）。`npm run typecheck` 通過、`npm test` 24 ファイル / 498 件通過。
+  - **残り（未対応）**：`MERGED_STATUSES` に `summarizing` が含まれるので、要約の実行中に手動 STT（無音 Chunk）を受けると merge が走って会議が `transcribed` に戻り、その後に古い版の要約が `completed` を書く。今回の指摘とは別件。Runner の `_publish_job` のコミット後の読み直しも残る。
+
+- 2026-11-13（Phase 2 server 設計書のレビュー指摘 2 件・未コミット）：2 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md` と `docs/design-local-phase3-server.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **lease 切れ後の要約回収**：`handle_summary` が要約と会議の `completed` をコミットした後、`finish_job` の前に lease が切れて回数切れで回収されると、`on_summary_failed` が会議を `failed` にした。`completed` の会議は変えない（ジョブは `failed` のまま。transcribe と同じ方針）。Runner の失敗経路では `on_summary_started` が `summarizing` にしているので `completed` は来ない。ハンドラの結果とジョブ完了を 1 トランザクションにする案は Runner とハンドラの契約が変わるので採らなかった。§14 の表と本文、§15 の表を更新。Phase 3 の `on_summary_failed` にも同じ修正。Red（会議が `failed`）を確認。回帰 1 件。
+  - **lease 切れ後の VAD 再試行**：VAD の結果をコミット → transcribe 完了 → vad ジョブが回数切れで回収 → vad を再試行、の順で Chunk が `queued` のまま止まった。原因は 2 か所。(1) `POST /jobs/{id}/retry` が vad の再試行でも Chunk を `queued` にしていた、(2) `on_vad_completed` が適用済みの Chunk にも結果を書いた（transcribe ジョブは一意制約で作り直されない）。retry は `transcribe_chunk` のときだけ `queued` にし、`on_vad_completed` は `pending` の Chunk にだけ適用する（戻り値 `bool`。`handle_vad` は適用したときだけ VAD の値を書く）。merge は再試行した vad の完了後に Runner の `ensure_merge_job` が作る。`routes_jobs.py` は Phase 3 で載せ直していないので、Phase 3 の `compress_chunk` などの再試行で Chunk が `queued` に戻る問題も同時に直る。Phase 3 の `on_vad_completed` / `handle_vad` にも同じ修正。Red（Chunk が `queued`）を確認。回帰 1 件。
+  - 確認：`verify-design-docs.sh server` 通過（Phase 2 server 140・Phase 3 server 202、pyflakes 指摘なし）。`npm run typecheck` 通過、`npm test` 24 ファイル / 498 件通過。client は今回変更なし・未実行。
+  - **残り（未対応）**：vad の回収時（`on_job_failed` の vad の分岐）に、結果をコミット済みなら `ensure_merge_job` を呼ぶ照合は入れていない。現状は利用者の再試行まで会議が `transcribing` で待つ（再試行すれば進む）。
+
+- 2026-11-13（Phase 2 server 設計書のレビュー指摘 4 件・未コミット）：4 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md` と `docs/design-local-phase3-server.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **Sweeper のコミット後の読み直し**：`_publish` がコミット後に `db.read()` でジョブと会議を読み直していた。読み取りが失敗するとイベントが失われ、次の周は回収済みのジョブを選ばないので二度と流れない。流す内容（RETURNING の行と、`on_job_failed` の後に読んだ会議）を書き込みトランザクションの中で確定させ、配信だけをコミット後に行う。`_publish(events, jobs, meetings)` に変更（sweeper 内部のみ）。読み取りを失敗させて例外になることを Red で確認。回帰 1 件。
+  - **lease 切れ後の transcribe 回収**：ハンドラが Chunk を `completed` にコミットした後、`finish_job` の前に lease が切れて回数切れで回収されると、`on_transcribe_failed` が Chunk を `failed`（gap）に上書きした。`completed` の Chunk は変えない（ジョブは `failed` のまま。再試行・除外のどちらでも gap にならない）。§14 の表と本文、§15 の表を更新。Phase 3 の `on_transcribe_failed` にも同じ修正。Red を確認。回帰 1 件。ハンドラの結果とジョブ完了を 1 トランザクションにする案は Runner とハンドラの契約が変わるので採らなかった。
+  - **`handle_vad` の lease 検査**：失効した旧ワーカーの VAD が Chunk を進め、transcribe ジョブを作っていた。2 つの書き込み（モデル未配置の分岐と通常の分岐）の先頭で `lease_is_current` を確かめる。§15 の表に行を追加。Phase 3 の `handle_vad` にも同じ修正。Chunk が `queued` に進むことを Red で確認。回帰 1 件。
+  - **テストヘルパー `_expire_exhausted`**：lease 時点の Job（attempts=1）を返していたので、要約のテストが attempts の不一致だけで弾かれていた。`repo.get_job` で読み直して返す（attempts の不一致に頼らない。回収後は `lease_owner` も NULL なので、status の検査だけを切り分けるわけではない）。
+  - 確認：`verify-design-docs.sh` 全体通過（Phase 2 server 138・Phase 3 server 200・client 559 / 594）。`npm run typecheck` 通過、`npm test` 24 ファイル / 498 件通過。
+  - **残り（未対応）**：Runner の `_publish_job` も同じくコミット後に読み直す（指摘の範囲外）。T-lease-merge と合わせて見直す。
+
+- 2026-11-13（Phase 2 server 設計書のレビュー指摘 3 件・コミット済み e891bad）：3 件とも有効として対応した（スキップなし）。変更は `docs/design-local-phase2-server.md` と `docs/design-local-phase3-server.md` のみ。製品コード（`src/`・`test/`）は無変更。
+  - **lease を失った要約の書き込み**：`handle_summary` が lease を確かめずに要約を書き、会議を `completed` にしていた。Sweeper が回数切れで `failed`（会議も `failed`）にした後でも書けてしまう（修正前は会議が `completed` になることを Red で確認）。書き込みトランザクションの先頭で `lease_is_current` を確かめる。Phase 3 の `handle_summary` にも同じ修正。回帰 1 件。
+  - **Sweeper の配信**：回収したジョブと会議の状態を SSE に流していなかった（画面が `processing` のまま止まる）。`sweep_once(db, events)` / `run_forever(db, events, stop, …)` に変え、コミット後に `job` / `meeting_status` を流す。`repo.sweep_expired` は件数ではなく戻したジョブ（`list[Job]`）を返す。起動処理（Phase 2 / 3）とテストの呼び出しも更新。配信 0 件の Red を確認。回帰 1 件。
+  - **vad / merge の失敗**：`on_job_failed` に分岐を明記し、§14 にジョブ種別ごとの失敗時の状態表を追加。どちらの失敗でも Chunk と会議は変えず（会議の `failed` は merge 済みを意味する）、失敗したジョブの再試行で進む。挙動は従来と同じなので、テストは保存確認 2 件（修正前から Green）。Phase 3 の `on_job_failed` にも同じ分岐。
+  - 確認：`verify-design-docs.sh server` 通過（Phase 2 server 135・Phase 3 server 197）。`npm run typecheck` 通過、`npm test` 24 ファイル / 498 件通過。
+  - **残り（未対応）**：`handle_merge` も lease を確かめずに書く（今回の指摘の範囲外）。次の作業の T-lease-merge に積んだ。
+
+- 2026-11-13（設計書の厳しめレビュー 3 回目・未コミット）：前回「読んでいない」と残した **Phase 3 server の固有部分**（pyannote・FLAC・scheduler・バックアップ・rebuild・CLI）を、カバレッジの低いファイルから読んだ。欠陥は実験かテストの Red で確かめてから直した。製品コード（`src/`・`test/`・`minutes_local/`）と Phase 1 設計書・クライアント設計書は無変更。
+  - **Phase 2 / 3 server（lease 切れの回数上限）**：Sweeper が lease 切れのジョブを回数を見ずに `pending` へ戻していた。実行するたびにプロセスを落とすジョブ（話者分離のメモリ不足など）が、**再起動のたびに永久に実行される**（6 回目も lease できることを Red で確認）。`repo.fail_exhausted_expired` → `pipeline.on_job_failed`（新規。Runner の `_on_failure` と共用）。基本設計 §9 の状態遷移図と Sweeper の行も更新。回帰 2 件。
+  - **Phase 2 / 3 server（常駐ループ）**：`JobRunner.run_forever` / `sweeper.run_forever` / Phase 3 の `scheduler.run_forever` が、1 周の例外（DB のロック・ディスク満杯）で Task ごと黙って終わった（以後ジョブが 1 件も動かない）。記録して続ける。回帰 3 件。
+  - **Phase 3 server（話者分離）**：実 Provider が Chunk の PCM を単純に連結していて、無音で STT を省いた Chunk 1 つにつき**後ろの話者区間が 30 秒ずつ前へずれた**（`FakeDiarizationProvider` は Chunk ごとの絶対時刻で作るので検出できなかった）。`assemble_timeline()` で絶対時刻に置く。`num_speakers`（人数の指定）に上限を渡していたのを `max_speakers` に。一時 WAV を OS の一時ディレクトリから `{dataDir}/tmp` へ。`HF_HUB_OFFLINE=1`、実行デバイスの指定、Pipeline の差し替え口（`pipeline=`。pyannote なしで本物のコードを通す）。回帰 3 件。
+  - **Phase 3 server（バックアップと復旧）**：書きかけのバックアップが正規の名前で残り復元元に選ばれた／バックアップが 1 つもないと壊れた DB のまま**起動できなかった**／復元後にバックアップより後の会議が DB に戻らなかった（`_restored` を捨てていた）／起動のたびにバックアップを作り、再起動 7 回で古い世代が全部消えた。`.part` → 付け替え、検査に通る最新から復元、なければ空で起動、復元後に `rebuild` を自動実行（`AppContext.recovery`、警告を表示）、バックアップは直近から 24 時間で判定。回帰 5 件。
+  - **Phase 3 server（rebuild）**：`meeting.json` の型が合わない項目（文字列の時刻、オブジェクトでない最上位など 7 通りを Red で確認）で rebuild 全体が例外で止まった。全項目を検証して既定値に置き換える。確定前の会議は `finalized` ではなく `recording` に戻す（ブラウザの残りの Chunk を 409 で断らない）。`doctor --rebuild` は serve の動作中は断る（ロック）。回帰 4 件。
+  - **Phase 3 server（圧縮）**：圧縮の切り替えに lease の検査がなく STT の再実行後も切り替えた／読み取りの直前に置き換わると正常な Chunk を `missing` にした／コミット後・WAV 削除前に落ちると WAV が残り続けた。`read_chunk_pcm()`（行の読み直し）ほか。回帰 3 件。**実コーデックを実行して確認**（soundfile 0.14.0 / libsndfile 1.2.2、往復がビット一致・破損入力は ValueError）。検証スクリプトが `soundfile` を入れて実コーデックのテストを走らせるようにした。
+  - **Phase 3 server（CLI・依存）**：`user add` の同名がトレースバック、利用者を失効させる手段がなかった（`user remove` を追加）。本文が参照する extras（`lan`・FLAC・話者分離）が **`pyproject.toml` に定義されていなかった**（§1.1 を新設。`dev` に `cryptography` もなく、テストが import で落ちる状態だった）。
+  - 本文：Phase 3 §2.2 / §2.4 / §2.5 / §3 / §11 / §12（実 Provider の契約の表）/ §17 / §18（控えの項目ごとの扱いの表）/ §22（場面ごとの動作の表）/ §23.8 / §24（3-h の実機項目と書き戻す場所）を更新。本文と食い違っていた記述（「`completed` 遷移ごとのバックアップ」「`.flac.part`」「所要時間を記録」）を実装に合わせた。
+  - 確認：`verify-design-docs.sh all` 通過（Phase 2 server 131・Phase 3 server 193・Phase 2 client 559・Phase 3 client 594、pyflakes 指摘なし）。Phase 1 埋め込み同期一致。対応表のテスト名は全件の実在を機械的に照合した。新規テストのうち、新しい API を import するもの（Phase 3 の `test_codec_recovery.py`・`test_diarization.py`）は、修正前の Red を 1 件ずつではなく、同じ内容の実験（10 件が失敗）と収集エラーで確認した。
+  - **残り（要判断）**：(1) 複数利用者に切り替えると既存の会議（所有者 `local`）が誰からも見えなくなる。引き継ぐ手段を設けるか（Phase 3 §2.5・§3）。(2) `completed` ごとのバックアップをやめ 24 時間ごとにした（最長 24 時間分の要約・ノートを失いうる）。この方針でよいか。(3) サーバーの通常終了が lease を返さない（Phase 2 server §26 R7）。R1〜R6 は前回のまま。
+  - **残り（未対応）**：pyannote 本体・faster-whisper の言語判定・実 TLS は未実行（Phase 3 server §24.3 の 3-h の表）。`__main__.py` の `serve` / `doctor` の本体はテストなし（カバレッジ 48%）。**Phase 2 / 3 のクライアント設計書と Phase 1 設計書は今回読んでいない**。Phase 3 の finalize は圧縮済み Chunk を存在だけで数える（前回からの残り）。
 
 - 2026-11-13（設計書の厳しめレビュー 2 回目・未コミット）：`docs/` の Phase 2 / 3 設計書を、展開したコードの**カバレッジ**（テストが一度も実行していない行）を起点にレビューした。前回までのレビューは「テストが通るか」で見ていたので、Fake Provider が通らない経路（実モデル・CLI・SSE・未テストのエンドポイント）が手つかずだった。見つけた欠陥は実験かテストの Red で確かめてから直した。製品コード（`src/`・`test/`・`minutes_local/`）は無変更。Phase 1 設計書も無変更（src と一致のまま）。
   - **Phase 2 server（SSE）**：`wait_for(gen.__anext__())` のタイムアウトで非同期ジェネレータごと終わり、**最初の keepalive（15 秒の無通信）の次の周回で接続が必ず落ちた**（実験で `RuntimeError: async generator raised StopAsyncIteration` を確認）。`EventBroker.attach()` / `detach()` を足し、SSE はキューを直接待つ。回帰 1 件。
@@ -173,6 +266,13 @@ Phase 1（ブラウザ録音 → IndexedDB → ローカル常駐サーバーへ
 ## 次の作業
 
 依存関係と並行実行の可否を明記する。「並行可」のタスクは、別エージェントや別セッションに分けても衝突しない（触るファイルが重ならない）。
+
+### T-lease-merge. `handle_merge` の lease 検査（lease 検査は 2026-11-13 に対応済み・未コミット。残りは下記）
+
+`handle_merge` の lease 検査は Phase 2 / 3 とも入れた（回帰テスト `test_merge_from_expired_lease_does_not_write_transcript`）。残りは次の 2 点。
+
+- 要約の実行中（`summarizing`）に手動 STT を受けると merge が走り、会議が `transcribed` に戻った後に古い版の要約が `completed` を書く。手動 STT の前提条件から `summarizing` を外すか、要約の書き込みで transcript の版を照合するかを決める。
+- Runner の `_publish_job` もコミット後に `db.read()` で読み直している（Sweeper は 2026-11-13 にトランザクション内で確定する形へ直した）。読み取りが失敗するとそのジョブのイベントが流れないので、同じ形にするかを判断する。
 
 ### T0. 2026-09-26 までの未コミット変更のコミット ✅ 完了（T10/T12 レビュー修正も 6a240d0 までコミット済み）
 
@@ -367,6 +467,28 @@ T3-c の内容（§31.4）:
 ## セッションログ
 
 新しい順。1 セッション 3〜5 行まで。
+
+### 2026-11-13（Phase 2 server 設計書のレビュー指摘 4 件）
+
+- 有効 4 件：Sweeper の配信内容をトランザクション内で確定、`on_transcribe_failed` は completed の Chunk を変えない、`handle_vad` の lease 検査、`_expire_exhausted` の読み直し。Phase 3 server にも同じ変更を当てた。
+- 回帰 3 件（Red を確認）。`verify-design-docs.sh` 全体通過。未コミット。
+
+### 2026-11-13（Phase 2 server 設計書のレビュー指摘 3 件）
+
+- 有効 3 件：`handle_summary` の lease 検査、Sweeper のコミット後の配信、vad / merge 失敗時の状態表。Phase 3 server にも同じ変更を当てた。
+- 回帰 2 件（Red を確認）と保存確認 2 件。`verify-design-docs.sh server` 通過。コミット済み（e891bad）。
+
+### 2026-11-13（設計書の厳しめレビュー 3 回目）
+
+- Phase 3 server の固有部分（話者分離・バックアップ・rebuild・圧縮・CLI）を、カバレッジの低いファイルからレビュー。lease 切れの回数上限と常駐ループの保護は Phase 2 にも及ぶ（基本設計 §9 も更新）。詳細は「今回の変更と残課題」。
+- 検証：`verify-design-docs.sh all` 通過（Phase 2 server 131・Phase 3 server 193・client 559 / 594）。実 FLAC コーデックを実行して確認。検証スクリプトに `soundfile`・`numpy` を追加。
+- 未コミット。要判断 3 件（既存会議の引き継ぎ・バックアップの頻度・終了時の lease）。クライアント設計書は未レビュー。
+
+### 2026-11-13（レビュー指摘 2 件：ノートの保存中の編集・jobs の後着）
+
+- `NotesStore.save()`：送信中の保存を待って返る経路で、待った後も `dirty` なら `schedule()` で予約し直す。PUT 成功後の控えの書き込み中に入った編集は doSave の `stillSame` 判定をすり抜け、予約されずに `dirty` のまま残っていた（Phase 2 client §10。Phase 3 client は載せ直していない）。回帰 1 件（修正前に Red）。
+- `jobs_loaded` に会議 ID を持たせて表示中の会議と違えば捨てる指摘は、既に `meetingId` とガード・テストがあるためスキップ。
+- 検証：`scripts/verify-design-docs.sh client` 通過（Phase 2 client 559・Phase 3 client 594）。製品コードは無変更のため `npm test` は未実行。未コミット。
 
 ### 2026-11-13（レビュー指摘 3 件：補完の再生・エラー応答の本文・閉じていないブロック）
 
