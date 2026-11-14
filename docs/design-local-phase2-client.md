@@ -2422,6 +2422,10 @@ export class NotesStore {
    */
   private unwrittenDraft: Draft | null = null;
   private disposed = false;
+  /** dispose() の開始後に入った編集がある。鎖に書き込みを足さず、dispose() の戻り値で引き継ぐ */
+  private editedWhileDisposing = false;
+  /** dispose() が戻り値を返した。以後の編集は誰にも引き継がれないので、受け付けずに onError へ知らせる */
+  private handedOff = false;
 
   constructor(private readonly deps: NotesStoreDeps, meetingId: string) {
     this.state = { meetingId, json: null, revision: 0, lastAppliedSummaryVersion: null, sync: "idle", serverNotes: null };
@@ -2478,8 +2482,21 @@ export class NotesStore {
 
   /** エディタの変更ごとに呼ぶ。debounce して保存する。 */
   setDraft(json: unknown, lastAppliedSummaryVersion: number | null = this.state.lastAppliedSummaryVersion): void {
-    this.set({ json, lastAppliedSummaryVersion, sync: this.state.sync === "conflict" ? "conflict" : "dirty" });
-    void this.writeDraft({ json, revision: this.state.revision, lastAppliedSummaryVersion, savedAt: Date.now(), saved: false });
+    // 呼んだ時点の内容に固定する。エディタが同じオブジェクトを後から書き換えても、並んだ書き込みと doSave の snapshot は変わらない。
+    // 呼び出しごとに別のオブジェクトになるので、doSave の stillSame（参照の比較）も編集の有無を見分けられる
+    const content = structuredClone(json);
+    if (this.handedOff) {
+      this.reportError(new Error("NotesStore is disposed; the edit was not saved"));
+      return;
+    }
+    this.set({ json: content, lastAppliedSummaryVersion, sync: this.state.sync === "conflict" ? "conflict" : "dirty" });
+    if (this.disposed) {
+      // dispose() が鎖の末尾を待ち始めた後に書き込みを足すと、待たれないまま新しいインスタンスの load() と競合する。
+      // 書かずに、dispose() が最新の状態を戻り値で引き継ぐ
+      this.editedWhileDisposing = true;
+      return;
+    }
+    void this.writeDraft({ json: content, revision: this.state.revision, lastAppliedSummaryVersion, savedAt: Date.now(), saved: false });
     if (this.state.sync !== "conflict") this.schedule();
   }
 
@@ -2520,6 +2537,7 @@ export class NotesStore {
    * 未送信の編集は IndexedDB の下書き（saved: false）に残っており、新しいインスタンスの load() が dirty として拾い直す。
    * 下書きの書き込みが失敗していれば IndexedDB には無いので、書けなかった最新の内容を返す（書けていれば null）。
    * load(carry) で引き継いだ内容を、まだ一度も書けていなければ、それも返す。
+   * 呼んだ後の setDraft は書き込みを鎖に足さず、返すまでに入った編集は最新の状態として戻り値で引き継ぐ。返した後の setDraft は受け付けない。
    * 呼び出し側は戻り値を新しいインスタンスの load(carry) に渡す。渡さないと、debounce の保存は止めたので最新の編集を失う。
    * 送信中の PUT と、発行済みの下書き・控えの書き込みの完了を待って返る。新しいインスタンスの load() はこの完了を待ってから呼ぶ。
    * 待たずに load() すると、古い PUT が確定する前の revision と下書きを読み、確定後に送った編集が 409 で競合になる。
@@ -2530,9 +2548,14 @@ export class NotesStore {
     this.timer = null;
     // doSave は失敗を Result で扱い reject しない。控え（新しい revision）の書き込みの完了まで待つ
     if (this.inflight !== null) await this.inflight;
-    // 編集の下書きの書き込みは doSave の控えの後ろに並ぶことがあるので、鎖の末尾まで待つ（reject しない）
-    await this.draftWrites;
-    return this.unwrittenDraft;
+    // 編集の下書きの書き込みは doSave の控えの後ろに並ぶことがあるので、鎖が空になるまで待つ（reject しない）。
+    // 待っている間に足された書き込み（acceptServer など）も待つ。1 回の await だと、その時点の末尾までしか待たない
+    while (this.pendingDraftWrites > 0) await this.draftWrites;
+    const carry: Draft | null = this.editedWhileDisposing
+      ? { json: this.state.json, revision: this.state.revision, lastAppliedSummaryVersion: this.state.lastAppliedSummaryVersion, savedAt: Date.now(), saved: false }
+      : this.unwrittenDraft;
+    this.handedOff = true;
+    return carry;
   }
 
   /**
@@ -4142,6 +4165,53 @@ describe("NotesStore", () => {
     expect(second?.json).toEqual(["ab"]);
     expect(b.puts).toEqual([{ json: ["ab"], revision: 0 }]);
     expect(last.current.sync).toBe("saved");
+  });
+
+  it("dispose の待機中に入った編集は書き込みを足さず、dispose の戻り値で引き継いで 1 回だけ送る。返した後の編集は受け付けない", async () => {
+    // Arrange: 保存を始め、応答を止めたまま作り直しを始める
+    const b = build();
+    let releasePut: () => void = () => undefined;
+    const putGate = new Promise<void>((r) => (releasePut = r));
+    const writes: unknown[] = [];
+    const errors: Error[] = [];
+    const deps: NotesStoreDeps = {
+      ...b.deps,
+      putNotes: async (...args) => { await putGate; return b.deps.putNotes(...args); },
+      drafts: { get: b.deps.drafts.get, set: async (k, v) => { writes.push((v as { json?: unknown }).json); await b.deps.drafts.set(k, v); } },
+      onError: (e) => errors.push(e),
+    };
+    const store = new NotesStore(deps, "m");
+    await store.load();
+    store.setDraft(["a"]);
+    b.timers.shift()?.fn();
+    const disposing = store.dispose();
+    // Act: dispose が送信の完了を待っている間に編集し、送信を終わらせる
+    store.setDraft(["ab"]);
+    releasePut();
+    const carry = await disposing;
+    store.setDraft(["abc"]);
+    const next = new NotesStore(b.deps, "m");
+    await next.load(carry);
+    while (b.timers.length > 0) await b.fire();
+    // Assert: 待機中の編集は鎖に足さず（控えの書き込みは doSave の 1 回だけ）、最新の版で引き継いで送る
+    expect(writes).toEqual([["a"], ["ab"]]);
+    expect(carry).toMatchObject({ json: ["ab"], revision: 1, saved: false });
+    expect(b.puts).toEqual([{ json: ["a"], revision: 0 }, { json: ["ab"], revision: 1 }]);
+    expect(errors.map((e) => e.message)).toEqual(["NotesStore is disposed; the edit was not saved"]);
+  });
+
+  it("setDraft は呼んだ時点の内容を写し取り、後からエディタが同じオブジェクトを書き換えても下書きと送信は変わらない", async () => {
+    // Arrange
+    const b = build();
+    await b.store.load();
+    const doc: string[] = ["a"];
+    // Act: 渡した配列を、保存の前にその場で書き換える
+    b.store.setDraft(doc);
+    doc.push("mutated");
+    while (b.timers.length > 0) await b.fire();
+    // Assert
+    expect(b.puts).toEqual([{ json: ["a"], revision: 0 }]);
+    expect((b.drafts.get("notes:m") as { json?: unknown }).json).toEqual(["a"]);
   });
 
   it("送信中に編集して dispose したら、送信の完了後も古いインスタンスは送り直しを予約しない", async () => {
