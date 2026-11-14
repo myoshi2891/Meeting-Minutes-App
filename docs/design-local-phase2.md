@@ -979,6 +979,12 @@ Phase 1 §3.8 で先送りした注記テーブルを、静的な設定ファイ
 
 v4.0 §67〜§68 を継承する。再生成は新しい `version` 行を追加し、旧版を削除しない。`transcript_version` が進んだ後の再生成は自動では起動せず、UI の「再生成」操作でのみ起動する（利用者が transcript を修正した直後に AI が勝手に上書きする体験を避ける）。
 
+**transcript が進んだ後の引用。** 要約の `sourceSegmentIds`（と、そのどれかを指す `evidenceSpan.segmentId`）は、生成時の transcript 版（`MeetingSummary.transcriptVersion`）の segment を指す。その後に segments の行を消して作り直す処理がある：撮り直しの入れ替え（詳細設計 §8 `repo.promote_replacements`）、手動 STT（`request_rerun_stt`）、未完了の Chunk の再試行（`handle_transcribe`）。無音区間の STT（`transcribe_silent_chunk`）は行を足すだけで消さない。消えた行を指す引用は次のように扱う（Phase 3 も同じ）。
+
+* 要約は書き換えない・消さない（`result_json` は生成時のまま。上の「旧版を削除しない」と同じ）。サーバーは引用を付け替えない。
+* クライアントは、表示中の transcript が要約より新しい版のときだけ、引用先が transcript にあるかを照合する（詳細設計 client §11 `unresolvedCitations`）。同じ版なら §12.5 の検証で全件が実在する。
+* 見つからない引用は transcript へ飛ばさない。決定事項・アクションは生成時に保存した逐語引用（`quote`）を「生成時の引用」として出し、話題（引用を持たない）は「根拠の行は作り直されました」と出す。あわせて「transcript が更新されました。必要なら再生成してください」と案内する（再生成は上のとおり利用者の操作でのみ）。
+
 ---
 
 # 13. サーバー側 VAD（`vad_chunk`）
