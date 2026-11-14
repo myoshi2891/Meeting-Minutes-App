@@ -891,16 +891,29 @@ export interface SummaryTopic {
   readonly sourceSegmentIds: ReadonlyArray<string>;
 }
 
+/** quote が引用元セグメント本文のどこにあるかを示す半開区間 [start, end)（v4.0 §66.1）。 */
+export interface EvidenceSpan {
+  readonly segmentId: string;
+  readonly start: number;
+  readonly end: number;
+}
+
 export interface SummaryActionItem {
   readonly task: string;
   readonly assignee: string | null;
   readonly deadline: string | null;
   readonly sourceSegmentIds: ReadonlyArray<string>;
+  /** 引用元セグメント本文からの逐語引用。サーバー側で位置と逐語一致を検証済み（v4.0 §66.2）。§12.7 の「生成時の引用」に使う */
+  readonly quote: string;
+  /** segmentId は sourceSegmentIds のどれか */
+  readonly evidenceSpan: EvidenceSpan;
 }
 
 export interface SummaryDecision {
   readonly text: string;
   readonly sourceSegmentIds: ReadonlyArray<string>;
+  readonly quote: string;
+  readonly evidenceSpan: EvidenceSpan;
 }
 
 /** LLM が生成する形（format に渡す JSON Schema はこの型から生成する） */
@@ -916,7 +929,10 @@ export type RejectionReason =
   | "SEGMENT_ID_EMPTY"          // sourceSegmentIds が空
   | "ASSIGNEE_NOT_IN_TRANSCRIPT" // 担当者名が transcript に出現しない
   | "DEADLINE_NOT_IN_TRANSCRIPT" // 期限表現が transcript に出現しない
-  | "DUPLICATE";
+  | "DUPLICATE"
+  | "QUOTE_NOT_VERBATIM"        // quote が引用元セグメント本文に逐語で存在しない
+  | "EVIDENCE_SPAN_MISMATCH"    // evidenceSpan が quote の位置と一致しない／引用元 ID を指していない
+  | "CLAIM_NOT_SUPPORTED";      // 決定内容・タスクが quote に裏付けられていない
 
 export interface RejectedItem {
   readonly kind: "topic" | "decision" | "actionItem";
