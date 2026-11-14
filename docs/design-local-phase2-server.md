@@ -461,6 +461,34 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_segments_meeting_time ON transcript_segments(meeting_id, start_ms);
 CREATE INDEX IF NOT EXISTS idx_segments_merged ON transcript_segments(meeting_id, merged_version);
+-- 完了済みの Chunk を撮り直した結果の置き場（§12 handle_transcribe）。次の merge が版を上げるのと同じトランザクションで
+-- transcript_segments と入れ替える（repo.promote_replacements）。それまで公開中の版の行には触れない。
+-- 撮り直しの結果が 0 件（無音）でも入れ替えるので、Chunk ごとの印（segment_replacements）と行（staged_segments）を分ける
+CREATE TABLE IF NOT EXISTS segment_replacements (
+  chunk_id   TEXT PRIMARY KEY REFERENCES audio_chunks(id) ON DELETE CASCADE,
+  meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS staged_segments (
+  id              TEXT PRIMARY KEY,
+  meeting_id      TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  chunk_id        TEXT NOT NULL REFERENCES segment_replacements(chunk_id) ON DELETE CASCADE,
+  source          TEXT NOT NULL CHECK (source IN ('mic','system')),
+  segment_index   INTEGER NOT NULL,
+  start_ms        INTEGER NOT NULL,
+  end_ms          INTEGER NOT NULL,
+  text            TEXT NOT NULL,
+  normalized_text TEXT,
+  language        TEXT,
+  confidence      REAL,
+  no_speech_prob  REAL,
+  merged_version  INTEGER,
+  merge_reason    TEXT,
+  speaker_id         TEXT,
+  speaker_confidence REAL,
+  created_at      INTEGER NOT NULL,
+  UNIQUE (chunk_id, segment_index)
+);
 """),
     (6, """
 CREATE TABLE IF NOT EXISTS meeting_summary_versions (
@@ -1032,23 +1060,26 @@ def reset_job_for_rerun(conn: sqlite3.Connection, meeting_id: str, job_type: Job
 
 # ---- transcript_segments ----
 
+_SEGMENT_COLUMNS = ("id, meeting_id, chunk_id, source, segment_index, start_ms, end_ms, text, normalized_text, "
+                    "language, confidence, no_speech_prob, merged_version, merge_reason, speaker_id, speaker_confidence, created_at")
+
+
 def insert_segments(conn: sqlite3.Connection, segments: list[Segment], *,
-                    job_id: str, owner: str, attempts: int) -> int:
+                    job_id: str, owner: str, attempts: int, staged: bool = False) -> int:
     """UNIQUE (chunk_id, segment_index) + INSERT OR IGNORE（Invariant 5）。
 
     書き込み前に lease を検証する。完了報告を弾くだけでは不十分で、リースが切れた旧ワーカーの
     結果が先に UNIQUE 行を埋めると、正規の再試行の結果が INSERT OR IGNORE で黙って捨てられる。
     検証と INSERT は同じトランザクションで行う（呼び出し側が write() で開いている）。
+    staged=True は撮り直しの結果を staged_segments に書く（先に stage_replacement を呼ぶ）。
     """
     if not lease_is_current(conn, job_id, owner, attempts):
         return 0        # 失効したワーカーの結果は破棄する
+    table = "staged_segments" if staged else "transcript_segments"
     n = 0
     for s in segments:
         cur = conn.execute(
-            """INSERT OR IGNORE INTO transcript_segments
-               (id, meeting_id, chunk_id, source, segment_index, start_ms, end_ms, text, normalized_text,
-                language, confidence, no_speech_prob, merged_version, merge_reason, speaker_id, speaker_confidence, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            f"INSERT OR IGNORE INTO {table} ({_SEGMENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (s.id, s.meeting_id, s.chunk_id, s.source, s.segment_index, s.start_ms, s.end_ms, s.text,
              s.normalized_text, s.language, s.confidence, s.no_speech_prob, s.merged_version, s.merge_reason,
              s.speaker_id, s.speaker_confidence, s.created_at),
@@ -1119,6 +1150,26 @@ def list_segments(conn: sqlite3.Connection, meeting_id: str, merged_version: int
 
 def delete_segments_of_chunk(conn: sqlite3.Connection, chunk_id: str) -> None:
     conn.execute("DELETE FROM transcript_segments WHERE chunk_id = ?", (chunk_id,))
+
+
+def stage_replacement(conn: sqlite3.Connection, meeting_id: str, chunk_id: str) -> None:
+    """完了済みの Chunk の撮り直しを始める。前の撮り直しでまだ merge されていない結果は捨てる（staged_segments は CASCADE）。"""
+    conn.execute("DELETE FROM segment_replacements WHERE chunk_id = ?", (chunk_id,))
+    conn.execute("INSERT INTO segment_replacements (chunk_id, meeting_id, created_at) VALUES (?,?,?)", (chunk_id, meeting_id, now_ms()))
+
+
+def promote_replacements(conn: sqlite3.Connection, meeting_id: str) -> int:
+    """撮り直した Chunk の segments を staged_segments から transcript_segments へ入れ替える。戻り値は Chunk 数。
+
+    run_merge が版を上げるのと同じトランザクションで呼ぶ。merge が失敗すれば入れ替えごと巻き戻り、公開中の版が残る。
+    """
+    rows = conn.execute("SELECT chunk_id FROM segment_replacements WHERE meeting_id = ? ORDER BY chunk_id", (meeting_id,)).fetchall()
+    for r in rows:
+        conn.execute("DELETE FROM transcript_segments WHERE chunk_id = ?", (r["chunk_id"],))
+        conn.execute(f"INSERT INTO transcript_segments ({_SEGMENT_COLUMNS}) SELECT {_SEGMENT_COLUMNS} FROM staged_segments WHERE chunk_id = ?",
+                     (r["chunk_id"],))
+    conn.execute("DELETE FROM segment_replacements WHERE meeting_id = ?", (meeting_id,))
+    return len(rows)
 
 
 def set_merge_result(conn: sqlite3.Connection, segment_id: str, merged_version: int | None, reason: str) -> None:
@@ -2010,6 +2061,8 @@ def request_rerun_stt(conn: sqlite3.Connection, meeting_id: str, stt_model: str 
     """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。"""
     # ジョブは行ごと消す。実行中のハンドラは lease の検査（行がない）で結果を書けなくなる（§8 lease_is_current）
     conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ?", (meeting_id,))
+    # まだ merge されていない撮り直しの結果も捨てる（残すと、やり直した結果を次の merge が古い結果で上書きする）
+    conn.execute("DELETE FROM segment_replacements WHERE meeting_id = ?", (meeting_id,))
     for chunk in repo.list_chunks(conn, meeting_id):
         repo.delete_segments_of_chunk(conn, chunk.id)
         repo.update_chunk(conn, chunk.id, stt_status="pending")
@@ -2401,7 +2454,7 @@ lease が切れたジョブの扱いは 2 通りある（基本設計 §9.3）�
 | `merge_transcript` | 変えない | 変えない（`transcribing`） | 要約ジョブを作らない | 失敗したジョブの再試行。除外の対象ではない |
 | `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2）。ただし既に `completed` なら変えない（下記） | なし | 再試行、または要約の再生成 |
 
-transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、同じ書き込みトランザクションでその Chunk の segments を消してから新しい結果を入れる（置き換え）。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにそのまま新しい segments を読む。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
+transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、その Chunk の segments を新しい結果で置き換える。Chunk がまだ `completed` でなければ、同じ書き込みトランザクションで segments を消してから入れる。`completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments`（Chunk ごとの印は `segment_replacements`）に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（`repo.promote_replacements`）。その場で消すと、作り直す merge がコミットするまで transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにその merge が入れ替えてから新しい segments を読む。手動 STT（§12 `request_rerun_stt`）は、まだ入れ替えていない撮り直しの結果も捨てる。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
 
 要約・VAD も同じ隙間（ハンドラのコミットと `finish_job` の間）で回収されうる。どれもハンドラの結果とジョブの完了を 1 トランザクションにはせず（Runner とハンドラの契約が変わる）、後続処理の側で書き込み済みの結果を認める。
 
@@ -2552,7 +2605,7 @@ stateDiagram-v2
 | 旧ワーカーの VAD 書き込み | `handlers.handle_vad` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば Chunk も `on_vad_completed` も書かない（モデル未配置の分岐も同じ） | 回数切れで `failed` になった vad ジョブを残したまま Chunk が進む |
 | lease 切れ後の VAD 再試行 | `pipeline.on_vad_completed` は `pending` の Chunk にだけ適用する。`POST /jobs/{id}/retry` は `transcribe_chunk` のときだけ Chunk を `queued` にする | 結果をコミットした後に lease が切れて回数切れで回収された vad ジョブを再試行すると、完了済みの Chunk が `queued` に戻り、transcribe ジョブは既存なので作り直されず止まる |
 | lease 切れ後の transcribe 回収 | `pipeline.on_transcribe_failed` は `completed` の Chunk を変えない。`POST /jobs/{id}/retry` も `completed` の Chunk を `queued` に戻さない | ハンドラのコミットと `finish_job` の間で lease が切れ、Sweeper が回数切れで回収すると、書き込み済みの segments を持つ Chunk が `failed`（gap）になる |
-| lease 切れ後の transcribe の再実行 | `handle_transcribe` は lease の検査の後、同じトランザクションで Chunk の segments を消してから入れる。Chunk が既に `completed` なら完了済みの merge ジョブも消す | 前の attempt の segments に新しい結果が混ざる。前の結果で merge が終わっていると、置き換えた区間がその版から消えたまま merge が作り直されない |
+| lease 切れ後の transcribe の再実行 | `handle_transcribe` は lease の検査の後、Chunk の segments を置き換える。Chunk が既に `completed` なら、新しい結果を `staged_segments` に置いて完了済みの merge ジョブを消し、作り直す merge が版を上げるのと同じトランザクションで入れ替える。`completed` でなければ同じトランザクションで消してから入れる | 前の attempt の segments に新しい結果が混ざる。前の結果で merge が終わっていると、置き換えた区間がその版から消えたまま merge が作り直されない。その場で消すと、merge のコミットまで（失敗すればその後も）公開中の版から区間が抜ける |
 | 旧ワーカーの merge 書き込み | `handlers.handle_merge` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議の `transcribed`・要約ジョブのどれも書かない | 回数切れで `failed` になった merge ジョブを残したまま transcript の版が進み、要約ジョブが作られて会議が `completed` まで進む。lease を取り直した新しいワーカーと二重に merge すると版が 2 回進む |
 | 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、要約の結果を誰も確かめないまま会議が `completed` に戻る。`finish_job` の条件はジョブ行しか守らない |
 | lease 切れ後の要約回収 | `pipeline.on_summary_failed` は `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れて回数切れで回収されると、要約があるのに会議が `failed` になる。この場合はジョブ `failed`・会議 `completed` の組を意図して残す |
@@ -3249,6 +3302,8 @@ def run_merge(conn: sqlite3.Connection, meeting_id: str, th: Thresholds) -> Merg
     if meeting is None:
         raise ValueError(f"meeting not found: {meeting_id}")
     new_version = meeting.transcript_version + 1
+    # 撮り直した Chunk の結果を入れ替える。版を上げるのと同じトランザクションなので、失敗すれば公開中の版が残る（§12 handle_transcribe）
+    repo.promote_replacements(conn, meeting_id)
     all_segments = repo.list_segments(conn, meeting_id)
     kept = dropped = 0
     for source in ("mic", "system"):
@@ -4040,10 +4095,18 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         # segments が残っている。INSERT OR IGNORE だけでは、件数や区切りが変わった新しい結果と古い行が混ざる（§14）
         current = repo.get_chunk(conn, chunk.id)
         replaced = current is not None and current.stt_status == "completed"
-        repo.delete_segments_of_chunk(conn, chunk.id)
-        repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
         if replaced:
-            # 前の結果で merge が終わっていれば、その版から置き換えた区間が消えている。完了済みの merge ジョブを消し、
+            # 前の結果は公開中の版（merged_version）に載っていることがある。ここで消すと、作り直す merge がコミットするまで
+            # transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。新しい結果は staged_segments に置き、
+            # 次の merge が版を上げるのと同じトランザクションで入れ替える（repo.promote_replacements）
+            repo.stage_replacement(conn, chunk.meeting_id, chunk.id)
+            repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts, staged=True)
+        else:
+            # 完了前の attempt の行はどの版にも載っていない（merge は全 Chunk の完了後）ので、その場で置き換える
+            repo.delete_segments_of_chunk(conn, chunk.id)
+            repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
+        if replaced:
+            # 前の結果で merge が終わっていれば、新しい結果は作り直す merge まで入れ替わらない。完了済みの merge ジョブを消し、
             # 下の on_transcribe_completed → ensure_merge_job で作り直して版を上げる（手動 STT と同じ。要約は自動では作り直さない）
             repo.delete_finished_job(conn, chunk.meeting_id, "merge_transcript")
         if meeting.stt_model_used is None:
@@ -6615,6 +6678,80 @@ async def test_transcribe_retry_replaces_segments_and_remerges(client: httpx.Asy
     assert retried is not None and retried.status == "completed"
     # 要約は自動では作り直さない（手動 STT と同じ。transcribed に戻る）
     assert meeting.status == "transcribed"
+
+
+async def test_transcribe_retry_keeps_published_transcript_until_remerge_commits(client: httpx.AsyncClient, ctx: AppContext,
+                                                                                runner: JobRunner, stt_provider: FakeSTTProvider,
+                                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    """撮り直した結果は、作り直す merge のコミットまで公開中の版を変えない。merge が失敗しても公開中の版は残る（§12 handle_transcribe）。"""
+    # Arrange: 1 回目の結果で merge まで終え（版 1）、結果のコミット後に回収された transcribe を撮り直す
+    def first(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(0.0, 5.0, "旧い一", -0.2, 0.05), STTSegment(10.0, 15.0, "旧い二", -0.2, 0.05)]
+
+    def second(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(1.0, 8.0, "新しい一", -0.2, 0.05)]
+
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "transcribe_chunk")
+    stt_provider.script = first
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["transcribe_chunk"], now_ms())
+        assert job is not None
+    await handlers.handle_transcribe(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    await runner.run_until_idle()
+    stt_provider.script = second
+    assert (await client.post(f"/v1/jobs/{job.id}/retry")).status_code == 200
+    while True:
+        with ctx.db.read() as conn:
+            retried = repo.get_job(conn, job.id)
+        if retried is not None and retried.status == "completed":
+            break
+        assert await runner.run_once() is True
+    # Assert 1: 撮り直しをコミットしても、merge の前は版 1 がそのまま読める
+    with ctx.db.read() as conn:
+        before = [s.text for s in repo.list_segments(conn, "m-1", merged_version=1)]
+    assert before == ["旧い一", "旧い二"]
+
+    # Act 2: 作り直す merge が、入れ替えと版の更新を書いた後で失敗する
+    real_run_merge = handlers.run_merge
+
+    def crashing_merge(conn: sqlite3.Connection, meeting_id: str, th: Any) -> Any:
+        real_run_merge(conn, meeting_id, th)
+        raise RuntimeError("merge crashed")
+
+    monkeypatch.setattr(handlers, "run_merge", crashing_merge)
+    async with ctx.db.write() as conn:
+        merge_job = repo.lease_job(conn, "w-merge", ["merge_transcript"], now_ms())
+        assert merge_job is not None
+    with pytest.raises(RuntimeError):
+        await handlers.handle_merge(ctx, merge_job)
+    # Assert 2: 入れ替えごと巻き戻り、版 1 が残る
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        after_crash = [s.text for s in repo.list_segments(conn, "m-1", merged_version=1)]
+    assert meeting is not None and meeting.transcript_version == 1
+    assert after_crash == ["旧い一", "旧い二"]
+
+    # Act 3: merge をやり直す
+    monkeypatch.undo()
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (merge_job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    await runner.run_until_idle()
+    # Assert 3: 版 2 は新しい結果だけになり、置き場は空になる
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        latest = [s.text for s in repo.list_segments(conn, "m-1", merged_version=2)]
+        all_texts = [s.text for s in repo.list_segments(conn, "m-1")]
+        staged = conn.execute("SELECT COUNT(*) AS n FROM staged_segments").fetchone()["n"]
+        marks = conn.execute("SELECT COUNT(*) AS n FROM segment_replacements").fetchone()["n"]
+    assert meeting is not None and meeting.transcript_version == 2
+    assert latest == ["新しい一"] and all_texts == ["新しい一"]
+    assert staged == 0 and marks == 0
+
 
 async def test_vad_from_expired_lease_does_not_advance_chunk(client: httpx.AsyncClient, ctx: AppContext) -> None:
     """lease を失った旧ワーカーの VAD 結果は書かない。書くと failed の vad ジョブを残したまま Chunk が進む（基本設計 §9.3）。"""

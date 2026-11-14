@@ -43,7 +43,7 @@ stt = ["faster-whisper>=1.0", "onnxruntime>=1.17"]
 cuda = ["faster-whisper>=1.0", "onnxruntime-gpu>=1.17"]
 flac = ["soundfile>=0.12", "numpy>=1.26"]
 lan = ["cryptography>=42"]
-diarization = ["pyannote.audio>=3.1"]
+diarization = ["pyannote.audio>=3.1,<4.1"]   # 4.1 以降はテレメトリ（§12 の表「通信」）の止め方を確かめていない
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "anyio>=4", "cryptography>=42", "soundfile>=0.12", "numpy>=1.26"]
 
 [project.scripts]
@@ -159,7 +159,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 | --- | --- | --- |
 | pyannote の話者数推定と精度、必要 VRAM | 会議の話者数・音質・重なり発話で大きく変わる。VRAM は 2〜4 GiB 程度が報告されるが環境依存 | `usage_metrics(diarize_duration_ms, diarize_speakers)` を記録。VRAM 予算は STT と同じ排他規則（Phase 2 §5.2）で `diarize_meeting` を STT 完了後にのみ lease |
 | pyannote のモデルの配置と API（版による違い） | 配布形態・`config.yaml` の書式・Pipeline の戻り値は pyannote.audio の版で変わる。本書は pyannote 本体を実行していない | 本書が固定するのは Provider の外側の契約だけ（§12：`config.yaml` の場所、通信させない、連続した WAV を渡す、区間を絶対時刻で返す）。実物の配置手順と戻り値の形は Step 3-h で確かめ、§12 の表を実測で更新する |
-| 話者分離の所要時間とメモリ（CPU） | 会議の長さに比例し、CPU では実時間に近い時間がかかりうる。全 Chunk の PCM をメモリに載せる（60 分で 1 source あたり約 115 MB、WAV 化でその倍） | 実行中は heartbeat が lease を延ばす（Phase 2 §13）。タイムアウトは設けない。プロセスごと落ちた場合は lease 切れの回数上限で `failed` → 話者分離なしで続行（§2.2） |
+| 話者分離の所要時間とメモリ（CPU） | 会議の長さに比例し、CPU では実時間に近い時間がかかりうる。全 Chunk の PCM をメモリに載せる（60 分で 1 source あたり約 115 MB、WAV 化でその倍） | 実行中は heartbeat が lease を延ばす（Phase 2 §13）。タイムアウトは設けない。1 source のタイムラインが 4 時間（`MAX_TIMELINE_MS`、約 461 MB）を超える会議は、確保の前に `INVALID_AUDIO` で話者分離なしにする（§12 `assemble_timeline`。開始時刻の壊れた Chunk で際限なく確保しない）。プロセスごと落ちた場合は lease 切れの回数上限で `failed` → 話者分離なしで続行（§2.2） |
 | 複数利用者への切り替え時の既存会議 | 所有者 `local` の会議をどの利用者に引き継ぐかは運用の判断 | 引き継ぎの手段は設けない。`user add` が切り替えの影響を表示する（§22） |
 | Whisper の言語判定精度（短い Chunk・混在） | `detect_language` は先頭 30 秒の特徴量で判定し、確信度が低いことがある | 確信度をセグメントごとに `usage_metrics(language_prob)` に記録。< 0.6 のフォールバック率を監視 |
 | Live STT が録音に影響しない | 同一マシンで STT が走ると CPU/GPU が競合する | ブラウザ側 `NO_AUDIO_FRAMES` 発生時に Live を自動停止（client 文書 §8）。`usage_metrics(live_lag_ms)` を記録 |
@@ -719,7 +719,14 @@ def upsert_speaker(conn: sqlite3.Connection, meeting_id: str, label: str, name: 
 
 
 def set_segment_speaker(conn: sqlite3.Connection, segment_id: str, label: str | None, confidence: float | None) -> None:
+    """撮り直して入れ替え待ちの segments（Phase 2 staged_segments）にも付ける。入れ替えで話者を失わない。"""
     conn.execute("UPDATE transcript_segments SET speaker_id = ?, speaker_confidence = ? WHERE id = ?", (label, confidence, segment_id))
+    conn.execute("UPDATE staged_segments SET speaker_id = ?, speaker_confidence = ? WHERE id = ?", (label, confidence, segment_id))
+
+
+def staged_segments_of_meeting(conn: sqlite3.Connection, meeting_id: str) -> list[Segment]:
+    rows = conn.execute("SELECT * FROM staged_segments WHERE meeting_id = ? ORDER BY source, start_ms, segment_index", (meeting_id,)).fetchall()
+    return [_row(Segment, r) for r in rows]
 
 
 # ---- 言語 ----
@@ -1044,6 +1051,8 @@ def request_rerun_stt(conn: sqlite3.Connection, meeting_id: str, stt_model: str 
     """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。"""
     # ジョブは行ごと消す。実行中のハンドラは lease の検査（行がない）で結果を書けなくなる（§8 lease_is_current）
     conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ?", (meeting_id,))
+    # まだ merge されていない撮り直しの結果も捨てる（Phase 2 §12 request_rerun_stt）
+    conn.execute("DELETE FROM segment_replacements WHERE meeting_id = ?", (meeting_id,))
     for chunk in repo.list_chunks(conn, meeting_id):
         repo.delete_segments_of_chunk(conn, chunk.id)
         repo.update_chunk(conn, chunk.id, stt_status="pending")
@@ -1429,7 +1438,7 @@ async def run_forever(ctx: AppContext, stop: asyncio.Event, interval_s: float = 
 | --- | --- | --- |
 | モデルの場所 | `{dataDir}/models/diarization/config.yaml`（Pipeline の設定）。このファイルがあれば `build_context` が実 Provider を作る。設定が参照するモデル（セグメンテーション・話者埋め込み）のファイルも同じディレクトリの下に置き、設定からは**絶対パス**で指す（相対パスの基準は pyannote の版に依存する） | 3-h |
 | 取得 | サーバーは取得しない。利用者が配布元から取得して配置する（設計時点の理解では、配布元が利用条件への同意を求める配布形態で、サーバーが代わりに取得できない） | 3-h |
-| 通信 | ロードの前に `HF_HUB_OFFLINE=1` を設定する。設定が Hub 上のモデル名を指していても取りに行かず、ロードの失敗として現れる（Zero External Data Egress） | 3-h（ネットワークを切らずにロードし、外向きの接続がないことを見る） |
+| 通信 | import の前に `HF_HUB_OFFLINE=1` と `PYANNOTE_METRICS_ENABLED=false` を設定する。前者で、設定が Hub 上のモデル名を指していても取りに行かず、ロードの失敗として現れる。後者で、4.x が既定で送る利用状況のテレメトリ（OpenTelemetry、送信先 `otel.pyannote.ai`）を止める。どちらも `build_context`（§22）がプロセスの最初に設定する（言語判定が同じプロセスで faster_whisper を先に import するので、分離のロード時では `HF_HUB_OFFLINE` が効かない）。許す版は `>=3.1,<4.1` で、その全リリースの wheel を確かめた（3.1.0〜3.4.0 は送信のコードなし、4.0.0〜4.0.7 は送信の 3 関数がすべてこの変数で止まる）。版の上限を上げるときは同じ確認をやり直す。読み込んだパイプラインが pyannoteAI の製品パイプライン（`pyannote.audio.pipelines.pyannoteai.*`。`sdk` は音声を Web API へ送る）なら `MODEL_MISSING` にする（Zero External Data Egress） | 3-h（ネットワークを切らずにロードと分離を行い、4.0.0 の送信間隔（60 秒）より長く待って外向きの接続がないことを見る。3.x と 4.x の両方） |
 | 入力 | source ごとに `assemble_timeline()` で連続させた 16 kHz・mono・PCM16 の WAV を `{dataDir}/tmp/` に書き、そのパスを渡す。終わったら消す。OS の一時ディレクトリは使わない（録音がデータディレクトリの外に出る） | `test_pyannote_provider_keeps_absolute_time_across_skipped_chunk` |
 | 引数 | 話者数の上限があれば `max_speakers`。`num_speakers`（人数の指定）には渡さない。`handle_diarize` は上限を渡さない（推定に任せる） | 同上 |
 | 戻り値 | `itertracks(yield_label=True)` で `(区間, _, 話者)` を列挙できるもの。区間の `start` / `end` は渡した WAV の先頭からの秒。結果のオブジェクトが `speaker_diarization` 属性を持つ版では、その属性を使う | 3-h |
@@ -1447,6 +1456,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol
+
+from ..jobs.retry import InvalidAudioError
+
+# 1 source あたりのタイムラインの上限（先頭の Chunk の開始から最後の Chunk の終わりまで）。16 kHz・PCM16 で 1 ms = 32 バイトなので
+# 4 時間で約 461 MB、bytes への変換と WAV 化の一時的な複製を足しても上限が決まる。開始時刻が壊れた Chunk が 1 つあるだけで、
+# 間の無音を埋めるために際限なく確保しないようにする
+MAX_TIMELINE_MS = 4 * 60 * 60 * 1000
 
 
 @dataclass(frozen=True)
@@ -1480,11 +1496,12 @@ class DiarizationProvider(Protocol):
     def diarize(self, req: DiarizationRequest) -> DiarizationResult: ...
 
 
-def assemble_timeline(chunks: list[tuple[int, bytes]]) -> tuple[int, bytes]:
+def assemble_timeline(chunks: list[tuple[int, bytes]], max_ms: int = MAX_TIMELINE_MS) -> tuple[int, bytes]:
     """(先頭の絶対開始 ms, 連続した PCM)。各 Chunk を絶対時刻の位置に置き、渡されなかった区間を無音で埋める。
 
     単純に連結すると、間の Chunk が 1 つ抜けるたびに後ろの音声が Chunk 長（30 秒）ずつ前へ詰まり、Provider が返す区間が
     会議の時刻とずれて、別の人の発言に話者ラベルが付く。16 kHz では 1 ms = 16 サンプルなので、位置は誤差なく決まる。
+    長さが max_ms を超えるときは、確保する前に InvalidAudioError（再試行しない）にする。話者分離なしで続行する（§2.2）。
     """
     if not chunks:
         return 0, b""
@@ -1492,6 +1509,8 @@ def assemble_timeline(chunks: list[tuple[int, bytes]]) -> tuple[int, bytes]:
     base_ms = ordered[0][0]
     even = [(start_ms, pcm[: len(pcm) - len(pcm) % 2]) for start_ms, pcm in ordered]     # PCM16 の半端な 1 バイトは捨てる
     total = max((start_ms - base_ms) * 32 + len(pcm) for start_ms, pcm in even)
+    if total > max_ms * 32:
+        raise InvalidAudioError(f"diarization timeline too long: {total // 32} ms > {max_ms} ms")
     buf = bytearray(total)
     for start_ms, pcm in even:
         offset = (start_ms - base_ms) * 32
@@ -1561,14 +1580,26 @@ class PyannoteDiarizationProvider(DiarizationProvider):
         if not config.exists():
             raise ModelMissingError("diarization model not installed (models/diarization/config.yaml)")
         # config.yaml が Hugging Face Hub 上のモデル名を指していても、取りに行かせない（Zero External Data Egress）。
-        # 配置が足りなければ通信せず、ロードの失敗として現れる。import より前に設定する（huggingface_hub は import 時に読む）
+        # 配置が足りなければ通信せず、ロードの失敗として現れる。huggingface_hub は import 時に読むので、本番は build_context（§22）が
+        # プロセスの最初に設定する。ここでも設定するのは、Provider を単体で使う場合（build_context を通らない）のため
         os.environ["HF_HUB_OFFLINE"] = "1"
+        # pyannote.audio 4.x は既定で利用状況（モデル・パイプラインの初期化、処理した音声の長さ）を OpenTelemetry で
+        # otel.pyannote.ai へ送る。HF_HUB_OFFLINE では止まらない。許す版（>=3.1,<4.1）の全リリースの wheel で確かめた：
+        # 3.1.0〜3.4.0 には送信のコードが無い。4.0.0〜4.0.7 は送信の 3 関数がどれもこの環境変数を呼ぶたびに見て、"false" なら何も記録しない
+        # （import 時は未設定のときだけ既定値 true を入れる）。記録が無ければ送信処理は何も送らない（opentelemetry-sdk 1.34.0 で実測）。
+        # set_telemetry_metrics(..., save_choice_as_default=True) はパッケージ内の設定を書き換えるので使わない
+        os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
         try:
             from pyannote.audio import Pipeline  # type: ignore[import-not-found]
         except ImportError as e:
             raise ModelMissingError(f"pyannote.audio not installed: {e}") from e
         try:
             pipeline = Pipeline.from_pretrained(str(config))
+            # config.yaml は利用者が置く。4.x の pipelines.pyannoteai.* を指していると、sdk は実行時に音声を pyannoteAI の Web API へ
+            # アップロードし、local は別パッケージ（pyannoteai）に処理を委ねる（通信しないことを確かめていない）。
+            # どちらも受け付けず、オープンソースのローカルのパイプラインだけを使う（Zero External Data Egress）
+            if type(pipeline).__module__.startswith("pyannote.audio.pipelines.pyannoteai"):
+                raise ModelMissingError("diarization config points to a pyannoteAI hosted pipeline; only local models are allowed")
             if self.device != "cpu":
                 import torch  # type: ignore[import-not-found]
                 pipeline.to(torch.device(self.device))      # 既定は CPU。移さないと GPU があっても CPU で走る
@@ -1801,6 +1832,8 @@ def run_merge(conn: sqlite3.Connection, meeting_id: str, th: Thresholds) -> Merg
     if meeting is None:
         raise ValueError(f"meeting not found: {meeting_id}")
     new_version = meeting.transcript_version + 1
+    # 撮り直した Chunk の結果を入れ替える。版を上げるのと同じトランザクションなので、失敗すれば公開中の版が残る（Phase 2 §18）
+    repo.promote_replacements(conn, meeting_id)
     all_segments = repo.list_segments(conn, meeting_id)
     for s in all_segments:
         if s.normalized_text is None:
@@ -3668,11 +3701,17 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         current = repo.get_chunk(conn, chunk.id)
         replaced = current is not None and current.stt_status == "completed"
         # 話者分離が終わっていると、ensure_merge_job は diarize_meeting を作り直さず merge へ進む。
-        # 消す前の segments の話者を、同じ source で時間の重なりが最大のものから新しい segments へ移す（§21 の割当と同じ規則）。
+        # 置き換える前の segments の話者を、同じ source で時間の重なりが最大のものから新しい segments へ移す（§21 の割当と同じ規則）。
         # 分離を再実行しないのは、ラベル（S1, S2…）が振り直されて利用者が付けた名前と食い違うため。話者の無い segments は移さない
         previous = repo_phase3.segments_of_chunk(conn, chunk.id) if replaced else []
-        repo.delete_segments_of_chunk(conn, chunk.id)
-        repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
+        if replaced:
+            # 前の結果は公開中の版に載っていることがあるので消さず、次の merge が版を上げるのと同じトランザクションで入れ替える
+            # （Phase 2 §12 handle_transcribe・repo.promote_replacements）。下の話者の付け直しは staged_segments にも届く
+            repo.stage_replacement(conn, chunk.meeting_id, chunk.id)
+            repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts, staged=True)
+        else:
+            repo.delete_segments_of_chunk(conn, chunk.id)
+            repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
         carried = tuple(SpeakerTurn(p.source, p.start_ms, p.end_ms, p.speaker_id,
                                     p.speaker_confidence if p.speaker_confidence is not None else 0.0)
                         for p in previous if p.speaker_id is not None)
@@ -3737,7 +3776,8 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
         raise ModelMissingError("diarization provider not available")
     with ctx.db.read() as conn:
         chunks = repo.list_chunks(conn, job.meeting_id)
-        segments = repo.list_segments(conn, job.meeting_id)
+        # 撮り直して入れ替え待ちの segments にも付ける（失敗した分離の再試行は merge の後に走りうる。入れ替えで話者を失わない）
+        segments = repo.list_segments(conn, job.meeting_id) + repo_phase3.staged_segments_of_meeting(conn, job.meeting_id)
     pcm_by_source: dict[str, list[tuple[int, bytes]]] = {}
     for c in chunks:
         if c.stt_status != "completed":
@@ -3752,6 +3792,10 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
     result = await asyncio.to_thread(ctx.diarization.diarize, req)
     assignments = _assign_speakers(segments, result.turns)
     async with ctx.db.write() as conn:
+        # lease が失効していれば何も書かない（Phase 2 基本設計 §9.3）。分離は長く走るので、失効した旧ワーカーが
+        # merge の後でラベルを上書きしたり、新しい attempt の結果を古い結果で置き換えたりする
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return None
         for sid, label, conf in assignments:
             repo_phase3.set_segment_speaker(conn, sid, label, conf)
         for label in sorted({lb for _, lb, _ in assignments if lb}):
@@ -3770,6 +3814,8 @@ async def handle_merge(ctx: AppContext, job: Job) -> str | None:
         if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return None
         report = run_merge(conn, job.meeting_id, ctx.settings.thresholds)
+        # 撮り直しの結果は handle_transcribe の時点では transcript_segments に無い。入れ替えた後の segments で言語比率を取り直す
+        repo_phase3.save_language_ratio(conn, job.meeting_id, repo_phase3.language_ratio(conn, job.meeting_id))
         pipeline.on_merge_completed(conn, job.meeting_id)
         repo.record_metric(conn, "merge_echo", report.echo, meeting_id=job.meeting_id)
     ctx.events.publish(job.meeting_id, {"type": "transcript_version", "transcriptVersion": report.transcript_version})
@@ -4081,6 +4127,12 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
                         diarization_provider: DiarizationProvider | None = None, language_detector: LanguageDetector | None = None,
                         codec: AudioCodec | None = None, tls_enabled: bool = False, recover: bool = True) -> AppContext:
     """recover=False は、動いている serve の横で呼ぶ `doctor` 用。壊れた DB の退避・復元をしない（使用中の DB を動かさない）。"""
+    # モデルの取得とテレメトリを止める（Zero External Data Egress。§12 の表「通信」）。どのモデルを読むよりも前に、プロセスの最初で設定する。
+    # huggingface_hub は import 時に HF_HUB_OFFLINE を読む。言語判定（FasterWhisperLanguageDetector）は同じプロセスで faster_whisper を
+    # import し、transcribe は話者分離より先に走るので、PyannoteDiarizationProvider._load での設定だけでは間に合わない。
+    # STT の ProcessPool（spawn）のワーカーも、起動時の環境を受け継ぐ
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     restrict_to_current_user(settings.data_dir)   # 録音・トークン・DB を置く。他の OS ユーザーに読ませない
     db, recovery = open_database_with_recovery(settings) if recover else (Database(settings.db_path), None)
@@ -4840,6 +4892,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from minutes_local.config import Thresholds
 from minutes_local.db import repo, repo_phase3
@@ -4850,6 +4903,7 @@ from minutes_local.diarization.provider import DiarizationRequest, assemble_time
 from minutes_local.diarization.pyannote_provider import PyannoteDiarizationProvider
 from minutes_local.storage.files import parse_wav_header
 from minutes_local.jobs.context import AppContext
+from minutes_local.jobs.handlers import handle_diarize
 from minutes_local.jobs.retry import InvalidAudioError, ModelMissingError
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.jobs.sweeper import sweep_once
@@ -5015,6 +5069,17 @@ def test_assemble_timeline_pads_gaps_with_silence() -> None:
     assert assemble_timeline([]) == (0, b"")
 
 
+def test_assemble_timeline_rejects_too_long_timeline_before_allocating() -> None:
+    """開始時刻が離れた Chunk があっても、間を埋めるための確保をせず、再試行しない失敗にする。"""
+    # Arrange: 1 秒の Chunk が 0 秒目と、上限を 1 ms 超える位置にある。上限ちょうどまでは組み立てる
+    one = b"\x01\x00" * 16000
+    # Act / Assert
+    with pytest.raises(InvalidAudioError):
+        assemble_timeline([(0, one), (10_000, one)], max_ms=10_999)
+    base_ms, pcm = assemble_timeline([(0, one), (10_000, one)], max_ms=11_000)
+    assert base_ms == 0 and len(pcm) == 11_000 * 32
+
+
 def test_pyannote_provider_keeps_absolute_time_across_skipped_chunk(tmp_path: Path) -> None:
     """無音で STT を省いた Chunk があっても、後ろの Chunk の話者区間が会議の時刻からずれない。"""
     # Arrange: 0〜30 秒と 60〜90 秒の Chunk（30〜60 秒は渡されない）。Pipeline は 60〜90 秒に 2 人目を返す
@@ -5075,6 +5140,32 @@ async def test_diarize_that_keeps_crashing_does_not_block_merge(client3: httpx.A
         segs = repo.list_segments(conn, "m-1", merged_version=1)
     assert meeting is not None and meeting.status == "completed"
     assert segs and all(s.speaker_id is None for s in segs)
+
+
+async def test_expired_diarize_worker_does_not_write_speakers(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                              diarization_provider: FakeDiarizationProvider) -> None:
+    """lease が切れた旧ワーカーは、話者分離を終えても結果を書かない（Phase 2 基本設計 §9.3）。"""
+    # Arrange: 話者分離のジョブを lease し、結果を書く前に lease を失効させて回収する
+    await _two_source_meeting(client3)
+    while True:
+        with ctx3.db.read() as conn:
+            if any(j.job_type == "diarize_meeting" for j in repo.list_jobs(conn, "m-1")):
+                break
+        assert await runner3.run_once() is True
+    async with ctx3.db.write() as conn:
+        old = repo_phase3.lease_job_fair(conn, "w-old", ["diarize_meeting"], now_ms())
+        assert old is not None
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (old.id,))
+    await sweep_once(ctx3.db, ctx3.events)
+    # Act: 旧ワーカーが分離を終えて書こうとする
+    assert await handle_diarize(ctx3, old) is None
+    # Assert: 分離は走ったが、話者ラベルも話者の一覧も書かれない
+    with ctx3.db.read() as conn:
+        segs = repo.list_segments(conn, "m-1")
+        speakers = conn.execute("SELECT COUNT(*) AS n FROM meeting_speakers WHERE meeting_id = 'm-1'").fetchone()["n"]
+    assert len(diarization_provider.calls) == 1
+    assert segs and all(s.speaker_id is None for s in segs)
+    assert speakers == 0
 ```
 
 ## 23.5 言語認識
@@ -5869,7 +5960,7 @@ Step の順序で気を付ける点：
 | 項目 | 手順 | 書き戻す場所 |
 | --- | --- | --- |
 | pyannote のモデルの配置 | 配布元から取得し `{dataDir}/models/diarization/` に置く。`config.yaml` の参照をローカルの絶対パスにする。`doctor` の `diarization` 行が `available` になる | §12 の表「モデルの場所」「取得」 |
-| 通信しないこと | ネットワークをつないだまま話者分離を 1 回実行し、外向きの接続が出ないことを確かめる（`HF_HUB_OFFLINE`） | §12 の表「通信」 |
+| 通信しないこと | ネットワークをつないだまま話者分離を 1 回実行し、終わってから 60 秒以上待っても外向きの接続が出ないことを確かめる（`HF_HUB_OFFLINE`・`PYANNOTE_METRICS_ENABLED`）。pyannote.audio 3.x と 4.x の両方で行う | §12 の表「通信」 |
 | Pipeline の戻り値 | 入れた版で `itertracks(yield_label=True)` が使えるか、`speaker_diarization` 属性を経由するか | §12 の表「戻り値」、`_run()` の末尾 |
 | 所要時間とメモリ | 60 分・2 source の会議で `diarize_duration_ms` とプロセスの最大メモリを記録する（Apple Silicon は CPU） | §3 の表 |
 | 言語判定 | 日英混在の録音で `language_prob` と判定結果を確かめる | §3 の表 |

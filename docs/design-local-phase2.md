@@ -505,6 +505,19 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_segments_meeting_time ON transcript_segments(meeting_id, start_ms);
 CREATE INDEX IF NOT EXISTS idx_segments_merged ON transcript_segments(meeting_id, merged_version);
+
+-- 完了済みの Chunk を撮り直した結果の置き場（§9.2 の表「結果の書き込み」）。次の merge_transcript が transcript_version を
+-- 上げるのと同じトランザクションで transcript_segments と入れ替える。0 件の結果も入れ替えるので、Chunk ごとの印と行を分ける
+CREATE TABLE IF NOT EXISTS segment_replacements (
+  chunk_id   TEXT PRIMARY KEY REFERENCES audio_chunks(id) ON DELETE CASCADE,
+  meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS staged_segments (
+  -- 列は transcript_segments と同じ。chunk_id だけ segment_replacements(chunk_id) を参照する（ON DELETE CASCADE）
+  ...,
+  UNIQUE (chunk_id, segment_index)
+);
 ```
 
 ## 8.7 meeting_summary_versions / meeting_notes
@@ -632,7 +645,7 @@ RETURNING id, meeting_id, chunk_id, job_type, attempts, model_name;
 | heartbeat | `processing` 中のワーカーは 60 秒ごとに `UPDATE ... SET lease_until = now + 300000 WHERE id = ? AND lease_owner = ?` を発行する。STT 1 Chunk は通常 5 分未満だが、CPU-only の large モデルなど長時間の場合に備える |
 | Sweeper | 30 秒ごとに `status IN ('leased','processing') AND lease_until < now` を `pending` に戻し、`last_error = 'lease expired'` を記録する。起動時にも 1 回実行する（§5.3）。**`attempts >= max_attempts` のものは `pending` に戻さず `failed`（`error_class = INTERNAL`）にし、ハンドラの失敗と同じ後続処理を行う**。lease 切れはワーカーがジョブを抱えたまま落ちたことを意味し、Runner の回数判定を通らない。回数を見ずに戻すと、実行するたびにプロセスを落とすジョブ（メモリ不足で OS に止められる等）が再起動のたびに永久に実行される |
 | 二重実行 | Sweeper で戻された後に旧ワーカーが完了報告を送ってきた場合、`UPDATE ... WHERE id = :id AND lease_owner = :owner AND attempts = :attempts` が 0 行になるため無視される。§9.2 の `RETURNING` が返す `attempts` を fencing token としてワーカーが持ち回り、完了報告と結果の書き込みの両方に付ける |
-| 結果の書き込み | 結果の書き込みと完了報告は別のトランザクションである。ハンドラは 1 つの書き込みトランザクションで、先に `SELECT 1 FROM processing_jobs WHERE id = :id AND lease_owner = :owner AND attempts = :attempts AND status = 'processing'` を検証し、0 行なら何も書かずに結果を破棄する。通れば、その Chunk の `transcript_segments` を消してから新しい結果を入れ（置き換え）、Chunk を `completed` にする。完了報告（ジョブの `completed`）はその後に Runner が上記の fencing 付き UPDATE で行う。検証によって、lease 失効後の旧ワーカーが `INSERT OR IGNORE` で `UNIQUE (chunk_id, segment_index)` を先に埋め、正規の再試行（`attempts` が進んだ側）の結果が無視される事態を防ぐ。同一 attempt の重複報告は `UNIQUE` + `INSERT OR IGNORE` で冪等のまま（Invariant 5）。2 つのトランザクションの間で lease が切れると、Sweeper が回数に応じてジョブを `pending` に戻すか `failed` にする（Chunk は `completed` のまま）。どちらでも、やり直した attempt が segments を置き換えるので前の結果と混ざらない。`failed` なら再試行か除外で収束し、除外しても Chunk は `completed` なので gap にならない。前の結果で merge が終わっていた場合は、置き換えと同じトランザクションで完了済みの merge ジョブを消して作り直し、transcript の版を上げる（詳細設計 §14） |
+| 結果の書き込み | 結果の書き込みと完了報告は別のトランザクションである。ハンドラは 1 つの書き込みトランザクションで、先に `SELECT 1 FROM processing_jobs WHERE id = :id AND lease_owner = :owner AND attempts = :attempts AND status = 'processing'` を検証し、0 行なら何も書かずに結果を破棄する。通れば、その Chunk の `transcript_segments` を新しい結果で置き換え、Chunk を `completed` にする。Chunk がまだ `completed` でなければ消してから入れる。既に `completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments` に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（§8.6。merge が失敗しても公開中の版は欠けない）。完了報告（ジョブの `completed`）はその後に Runner が上記の fencing 付き UPDATE で行う。検証によって、lease 失効後の旧ワーカーが `INSERT OR IGNORE` で `UNIQUE (chunk_id, segment_index)` を先に埋め、正規の再試行（`attempts` が進んだ側）の結果が無視される事態を防ぐ。同一 attempt の重複報告は `UNIQUE` + `INSERT OR IGNORE` で冪等のまま（Invariant 5）。2 つのトランザクションの間で lease が切れると、Sweeper が回数に応じてジョブを `pending` に戻すか `failed` にする（Chunk は `completed` のまま）。どちらでも、やり直した attempt が segments を置き換えるので前の結果と混ざらない。`failed` なら再試行か除外で収束し、除外しても Chunk は `completed` なので gap にならない。前の結果で merge が終わっていた場合は、置き場への書き込みと同じトランザクションで完了済みの merge ジョブを消して作り直し、その merge が入れ替えて transcript の版を上げる（詳細設計 §14） |
 
 ## 9.4 Retry 分類とバックオフ
 
@@ -759,9 +772,9 @@ Phase 1 §3.10 で先送りした重複排除アルゴリズムを確定する�
 
 | 項目 | 内容 |
 | --- | --- |
-| 入力 | 会議の全 `transcript_segments`（`merged_version IS NULL` または前回版）。`source` 別に `start_ms` 順 |
+| 入力 | 会議の全 `transcript_segments`（`merged_version IS NULL` または前回版）。`source` 別に `start_ms` 順。読む前に、同じトランザクションで撮り直した Chunk の行を `staged_segments` から入れ替える（§8.6） |
 | 出力 | 各行の `merged_version` と `merge_reason` を更新。`meetings.transcript_version` を +1。除外行は `merged_version = NULL`、`merge_reason = 'dup_of:<id>'` |
-| 冪等性 | 同じ入力集合に対して同じ結果を出す（決定的）。再実行は `transcript_version` を進めるだけで、行を削除しない |
+| 冪等性 | 同じ入力集合に対して同じ結果を出す（決定的）。再実行は `transcript_version` を進めるだけで、行を削除しない（撮り直した Chunk の古い行を入れ替えで消すのを除く） |
 
 ## 11.2 正規化
 
