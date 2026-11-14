@@ -159,7 +159,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 | --- | --- | --- |
 | pyannote の話者数推定と精度、必要 VRAM | 会議の話者数・音質・重なり発話で大きく変わる。VRAM は 2〜4 GiB 程度が報告されるが環境依存 | `usage_metrics(diarize_duration_ms, diarize_speakers)` を記録。VRAM 予算は STT と同じ排他規則（Phase 2 §5.2）で `diarize_meeting` を STT 完了後にのみ lease |
 | pyannote のモデルの配置と API（版による違い） | 配布形態・`config.yaml` の書式・Pipeline の戻り値は pyannote.audio の版で変わる。本書は pyannote 本体を実行していない | 本書が固定するのは Provider の外側の契約だけ（§12：`config.yaml` の場所、通信させない、連続した WAV を渡す、区間を絶対時刻で返す）。実物の配置手順と戻り値の形は Step 3-h で確かめ、§12 の表を実測で更新する |
-| 話者分離の所要時間とメモリ（CPU） | 会議の長さに比例し、CPU では実時間に近い時間がかかりうる。全 Chunk の PCM をメモリに載せる（60 分で 1 source あたり約 115 MB、WAV 化でその倍） | 実行中は heartbeat が lease を延ばす（Phase 2 §13）。タイムアウトは設けない。1 source のタイムラインが 4 時間（`MAX_TIMELINE_MS`、約 461 MB）を超える会議は、確保の前に `INVALID_AUDIO` で話者分離なしにする（§12 `assemble_timeline`。開始時刻の壊れた Chunk で際限なく確保しない）。プロセスごと落ちた場合は lease 切れの回数上限で `failed` → 話者分離なしで続行（§2.2） |
+| 話者分離の所要時間とメモリ（CPU） | 会議の長さに比例し、CPU では実時間に近い時間がかかりうる。全 Chunk の PCM をメモリに載せる（60 分で 1 source あたり約 115 MB、WAV 化でその倍） | 実行中は heartbeat が lease を延ばす（Phase 2 §13）。タイムアウトは設けない。1 source のタイムラインが 4 時間（`MAX_TIMELINE_MS`、約 461 MB）を超える会議は、PCM を読む前に `INVALID_AUDIO` で話者分離なしにする（§12 `handle_diarize` が Chunk の行の時刻で確かめ（`check_timeline_span`）、読み込み中の量と `assemble_timeline` の確保前にも確かめる。開始時刻の壊れた Chunk で際限なく読み込み・確保しない）。プロセスごと落ちた場合は lease 切れの回数上限で `failed` → 話者分離なしで続行（§2.2） |
 | 複数利用者への切り替え時の既存会議 | 所有者 `local` の会議をどの利用者に引き継ぐかは運用の判断 | 引き継ぎの手段は設けない。`user add` が切り替えの影響を表示する（§22） |
 | Whisper の言語判定精度（短い Chunk・混在） | `detect_language` は先頭 30 秒の特徴量で判定し、確信度が低いことがある | 確信度をセグメントごとに `usage_metrics(language_prob)` に記録。< 0.6 のフォールバック率を監視 |
 | Live STT が録音に影響しない | 同一マシンで STT が走ると CPU/GPU が競合する | ブラウザ側 `NO_AUDIO_FRAMES` 発生時に Live を自動停止（client 文書 §8）。`usage_metrics(live_lag_ms)` を記録 |
@@ -1051,7 +1051,10 @@ def request_regenerate_summary(conn: sqlite3.Connection, meeting_id: str) -> Non
 
 
 def request_rerun_stt(conn: sqlite3.Connection, meeting_id: str, stt_model: str | None) -> int:
-    """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。"""
+    """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。
+
+    消した segments を引用している要約は書き換えない（Phase 2 基本設計 §12.7「transcript が進んだ後の引用」）。
+    """
     # ジョブは行ごと消す。実行中のハンドラは lease の検査（行がない）で結果を書けなくなる（§8 lease_is_current）
     conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ?", (meeting_id,))
     # まだ merge されていない撮り直しの結果も捨てる（Phase 2 §12 request_rerun_stt）
@@ -1533,6 +1536,22 @@ def assemble_timeline(chunks: list[tuple[int, bytes]], max_ms: int = MAX_TIMELIN
         offset = (start_ms - base_ms) * 32
         buf[offset:offset + len(pcm)] = pcm
     return base_ms, bytes(buf)
+
+
+def check_timeline_span(spans: list[tuple[str, int, int]], max_ms: int = MAX_TIMELINE_MS) -> None:
+    """(source, 開始 ms, 終了 ms) の並びから、assemble_timeline が組み立てる長さを PCM を読む前に確かめる。超えれば InvalidAudioError。
+
+    全 Chunk の PCM を読んでから assemble_timeline で弾くと、上限を超える会議でもその前に全部をメモリに載せる。
+    長さは Chunk の行の時刻で決め、ファイルの大きさは使わない（圧縮済みの Chunk はファイルが小さい）。
+    行の時刻より長く復号される Chunk は、handle_diarize の読み込み中の上限と assemble_timeline が弾く。
+    """
+    bounds: dict[str, tuple[int, int]] = {}
+    for source, start_ms, end_ms in spans:
+        lo, hi = bounds.get(source, (start_ms, end_ms))
+        bounds[source] = (min(lo, start_ms), max(hi, end_ms))
+    for source, (lo, hi) in sorted(bounds.items()):
+        if hi - lo > max_ms:
+            raise InvalidAudioError(f"diarization timeline too long: {source} {hi - lo} ms > {max_ms} ms")
 ```
 
 ```python
@@ -1849,7 +1868,8 @@ def run_merge(conn: sqlite3.Connection, meeting_id: str, th: Thresholds) -> Merg
     if meeting is None:
         raise ValueError(f"meeting not found: {meeting_id}")
     new_version = meeting.transcript_version + 1
-    # 撮り直した Chunk の結果を入れ替える。版を上げるのと同じトランザクションなので、失敗すれば公開中の版が残る（Phase 2 §18）
+    # 撮り直した Chunk の結果を入れ替える。版を上げるのと同じトランザクションなので、失敗すれば公開中の版が残る（Phase 2 §18）。
+    # 消した行を引用している要約は書き換えない（Phase 2 基本設計 §12.7。クライアントが生成時の引用として出す）
     repo.promote_replacements(conn, meeting_id)
     all_segments = repo.list_segments(conn, meeting_id)
     for s in all_segments:
@@ -3602,7 +3622,7 @@ from pathlib import Path
 from ..db import repo, repo_phase3
 from ..db.connection import now_ms
 from ..db.models import AudioChunk, Job, Segment, SummaryVersion
-from ..diarization.provider import DiarizationRequest, SpeakerTurn
+from ..diarization.provider import MAX_TIMELINE_MS, DiarizationRequest, SpeakerTurn, check_timeline_span
 from ..llm.caveats import caveats_for
 from ..llm.map_reduce import synthesize
 from ..llm.prompts import MIXED_NOTE_EN, MIXED_NOTE_JA, PROMPT_VERSION
@@ -3666,7 +3686,10 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
         pcm = read_chunk_pcm(ctx, chunk)
     except InvalidWavError as e:
         async with ctx.db.write() as conn:
-            repo.update_chunk(conn, chunk.id, save_status="missing")
+            # 成功時と同じく、失効した旧ワーカーは Chunk を書かない（Phase 2 §12 handle_vad）。例外はそのまま投げる。
+            # 失敗の記録は Runner が行い、旧ワーカーの報告は finish_job の fencing が無視する
+            if repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                repo.update_chunk(conn, chunk.id, save_status="missing")
         raise InvalidAudioError(str(e)) from e
     result = await asyncio.to_thread(ctx.vad.detect, pcm)
     async with ctx.db.write() as conn:
@@ -3837,14 +3860,21 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
         raise ModelMissingError("diarization provider not available")
     with ctx.db.read() as conn:
         chunks = repo.list_chunks(conn, job.meeting_id)
+    targets = [c for c in chunks if c.stt_status == "completed"]
+    # PCM を読む前に、行の時刻で 1 source のタイムラインの長さを確かめる（assemble_timeline と同じ上限。§9 の表）。
+    # 超えれば InvalidAudioError（再試行しない）で、話者分離なしで merge へ進む（§2.2）
+    check_timeline_span([(c.source, c.start_offset_ms, c.end_offset_ms) for c in targets])
     pcm_by_source: dict[str, list[tuple[int, bytes]]] = {}
-    for c in chunks:
-        if c.stt_status != "completed":
-            continue
+    loaded: dict[str, int] = {}
+    for c in targets:
         try:
             pcm = read_chunk_pcm(ctx, c)
         except InvalidWavError:
             continue
+        # 行の時刻より長く復号される Chunk があっても、読んだ量が上限（16 kHz・PCM16 で 1 ms = 32 バイト）を超えた時点でやめる
+        loaded[c.source] = loaded.get(c.source, 0) + len(pcm)
+        if loaded[c.source] > MAX_TIMELINE_MS * 32:
+            raise InvalidAudioError(f"diarization input too large: {c.source} {loaded[c.source]} bytes")
         pcm_by_source.setdefault(c.source, []).append((c.start_offset_ms, pcm))
     req = DiarizationRequest(meeting_id=job.meeting_id, pcm_by_source=pcm_by_source, models_dir=str(ctx.settings.models_dir),
                              work_dir=str(ctx.settings.tmp_dir))
@@ -4965,10 +4995,11 @@ from minutes_local.db import repo, repo_phase3
 from minutes_local.db.connection import now_ms
 from minutes_local.db.models import Segment
 from minutes_local.diarization.fake_provider import FakeDiarizationProvider
-from minutes_local.diarization.provider import DiarizationRequest, assemble_timeline
+from minutes_local.diarization.provider import MAX_TIMELINE_MS, DiarizationRequest, assemble_timeline
 from minutes_local.diarization.pyannote_provider import PyannoteDiarizationProvider
 from minutes_local.storage.files import parse_wav_header
 from minutes_local.jobs.context import AppContext
+from minutes_local.jobs import handlers as handlers_module
 from minutes_local.jobs.handlers import handle_diarize
 from minutes_local.jobs.retry import InvalidAudioError, ModelMissingError
 from minutes_local.jobs.runner import JobRunner
@@ -5054,6 +5085,46 @@ async def test_diarize_failure_does_not_block_merge(client3: httpx.AsyncClient, 
         jobs = {j.job_type: j.status for j in repo.list_jobs(conn, "m-1") if j.job_type in ("diarize_meeting", "merge_transcript")}
     assert m.status == "completed" and all(s.speaker_id is None for s in segs)
     assert jobs == {"diarize_meeting": "failed", "merge_transcript": "completed"}
+
+
+async def test_diarize_rejects_too_long_timeline_before_reading_pcm(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                                    diarization_provider: FakeDiarizationProvider,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """1 source のタイムラインが上限を超える会議は、Chunk の PCM を読む前に話者分離なしにする（§9 の表）。"""
+    # Arrange: mic の 2 つ目の Chunk の時刻を上限の先へずらす（開始時刻の壊れた Chunk）
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        conn.execute("UPDATE audio_chunks SET start_offset_ms = start_offset_ms + ?, end_offset_ms = end_offset_ms + ? "
+                     "WHERE meeting_id = 'm-1' AND source = 'mic' AND sequence_no = 1", (MAX_TIMELINE_MS, MAX_TIMELINE_MS))
+    reads_in_diarize: list[str] = []
+    in_diarize = False
+    real_read = handlers_module.read_chunk_pcm
+
+    def spy(c: AppContext, chunk: Any) -> bytes:
+        if in_diarize:
+            reads_in_diarize.append(chunk.id)
+        return real_read(c, chunk)
+
+    real_diarize = runner3.handlers["diarize_meeting"]
+
+    async def diarize_flagged(c: AppContext, job: Any) -> str | None:
+        nonlocal in_diarize
+        in_diarize = True
+        try:
+            return await real_diarize(c, job)
+        finally:
+            in_diarize = False
+
+    monkeypatch.setattr(handlers_module, "read_chunk_pcm", spy)
+    runner3.handlers["diarize_meeting"] = diarize_flagged
+    # Act
+    await runner3.run_until_idle()
+    # Assert: PCM を 1 件も読まず、Provider も呼ばずに失敗し、merge は進む
+    with ctx3.db.read() as conn:
+        jobs = {j.job_type: j for j in repo.list_jobs(conn, "m-1") if j.job_type in ("diarize_meeting", "merge_transcript")}
+    assert reads_in_diarize == [] and diarization_provider.calls == []
+    assert jobs["diarize_meeting"].status == "failed" and jobs["diarize_meeting"].error_class == "INVALID_AUDIO"
+    assert jobs["merge_transcript"].status == "completed"
 
 
 async def test_diarize_model_missing_does_not_wait(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
