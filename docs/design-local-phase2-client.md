@@ -2527,11 +2527,15 @@ export class NotesStore {
     }
     // dispose() の待機中に入った編集は、サーバー版の採用で捨てた。残すと dispose() がサーバー版を saved: false で引き継ぎ、
     // 新しいインスタンスが未保存として送り直す。
-    // 控えの書き込みとフラグの戻しは set() より前に行う（setDraft と同じ順）。set() の onChange の中で setDraft が呼ばれると、
-    // その書き込みはこの後ろに並んで採用した版を上書きし、待機中なら editedWhileDisposing を立て直す
+    // 状態の更新 → フラグの戻し → 控えの書き込み → onChange の順にする（setDraft と同じ）。
+    // - 状態は書き込みより前に変える：drafts.set が同期的に投げると、writeDraft の中で catch → onError → setDraft が走る。
+    //   後から状態を採用した版で上書きすると、その編集が消え、dispose() は採用した版を未保存として引き継ぐ
+    // - onChange は最後に呼ぶ：その中の setDraft の書き込みを採用した版の後ろに並べ、待機中なら editedWhileDisposing を立て直させる。
+    //   知らせるのはその時点の this.state（入れ子の setDraft が進めていれば、その編集を含む）
+    this.state = { ...this.state, json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, sync: "saved", serverNotes: null };
     this.editedWhileDisposing = false;
     void this.writeDraft({ json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, savedAt: Date.now(), saved: true });
-    this.set({ json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, sync: "saved", serverNotes: null });
+    this.deps.onChange(this.state);
   }
 
   /** 差分 UI で「自分の版で上書き」を選んだとき：サーバーの revision を採用して再送。 */
@@ -2849,6 +2853,38 @@ export function dimmedSegmentIds(state: UiState): ReadonlySet<string> {
     if (s.confidence !== null && s.confidence < state.confidenceDimBelow) ids.add(s.id);
   }
   return ids;
+}
+
+/** 引用先の segment が表示中の transcript にない要約の項目（基本設計 §12.7「transcript が進んだ後の引用」）。 */
+export interface UnresolvedCitation {
+  readonly kind: "topic" | "decision" | "actionItem";
+  /** summary.topics / decisions / actionItems の添字 */
+  readonly index: number;
+  readonly missingSegmentIds: ReadonlyArray<string>;
+  /** 決定事項・アクションは生成時に保存した逐語引用を出す（transcript へは飛ばない）。話題は引用を持たないので null */
+  readonly quote: string | null;
+}
+
+/**
+ * 要約の生成後に transcript の版が進むと（撮り直しの入れ替え・手動 STT など）、引用先の segment が消えていることがある。
+ * 要約は書き換えないので（§12.7）、表示中の transcript と照合して、飛べない引用を項目ごとに返す。
+ * evidenceSpan.segmentId はサーバーの検証で sourceSegmentIds のどれかに限られるので、sourceSegmentIds だけを見ればよい。
+ * 同じ版なら生成時の検証（§12.5）で全件が実在する。transcript が要約より古い（取得待ち）ときも照合しない（取り直すと解消する）。
+ */
+export function unresolvedCitations(state: UiState): ReadonlyArray<UnresolvedCitation> {
+  if (state.summary === null || state.transcript === null) return [];
+  const summary = state.summary.summary;
+  if (summary.transcriptVersion >= state.transcript.transcriptVersion) return [];
+  const present = new Set(state.transcript.segments.map((seg) => seg.id));
+  const out: UnresolvedCitation[] = [];
+  const check = (kind: UnresolvedCitation["kind"], index: number, ids: ReadonlyArray<string>, quote: string | null): void => {
+    const missing = ids.filter((id) => !present.has(id));
+    if (missing.length > 0) out.push({ kind, index, missingSegmentIds: missing, quote });
+  };
+  summary.topics.forEach((t, i) => check("topic", i, t.sourceSegmentIds, null));
+  summary.decisions.forEach((d, i) => check("decision", i, d.sourceSegmentIds, d.quote));
+  summary.actionItems.forEach((a, i) => check("actionItem", i, a.sourceSegmentIds, a.quote));
+  return out;
 }
 
 /** 折りたたみが開いているときだけ rejected を返す。 */
@@ -4030,7 +4066,7 @@ describe("Phase2Client の応答の検証", () => {
 ```typescript
 // test/notes-store.test.ts
 import { describe, expect, it } from "vitest";
-import { NotesStore, type NotesState, type NotesStoreDeps } from "../src/notes/notes-store";
+import { NotesStore, type Draft, type NotesState, type NotesStoreDeps } from "../src/notes/notes-store";
 import type { ApiResult } from "../src/api/phase2-client";
 import type { NotesResponse } from "../src/api/contracts-phase2";
 
@@ -4520,6 +4556,44 @@ describe("NotesStore", () => {
     expect(c.drafts.get("notes:m")).toMatchObject({ json: ["mine"], revision: 3, saved: false });
   });
 
+  it("dispose の待機中、採用した版の控えの書き込みが同期的に投げ、onError の中で入った編集は未保存として引き継ぐ", async () => {
+    // Arrange: 保存の PUT が 409 になり、dispose() はその保存（inflight）を待っている。書き込みの鎖は空なので、
+    // 採用した版の控えは acceptServer の中で同期的に書き始め、drafts.set がその場で投げる
+    const b = build();
+    let throwNext = false;
+    let acceptOnConflict = false;
+    let disposing: Promise<Draft | null> | null = null;
+    const store: NotesStore = new NotesStore({
+      ...b.deps,
+      drafts: {
+        get: b.deps.drafts.get,
+        set: (k, v) => {
+          if (!throwNext) return b.deps.drafts.set(k, v);
+          throwNext = false;
+          throw new Error("quota exceeded");
+        },
+      },
+      onError: () => store.setDraft(["mine"]),
+      onChange: (s) => {
+        if (!acceptOnConflict || s.sync !== "conflict" || disposing === null) return;
+        acceptOnConflict = false;                       // 1 回だけ（入れ子の setDraft も conflict を知らせる）
+        throwNext = true;
+        store.acceptServer();
+      },
+    }, "m");
+    await store.load();
+    store.setDraft(["a"]);
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));   // 編集の下書きの書き込みを終える
+    b.bumpServer();                                     // 別タブが先に保存した（revision 1）
+    acceptOnConflict = true;
+    b.timers.shift()?.fn();                             // PUT → 409 → getNotes の途中
+    // Act
+    disposing = store.dispose();
+    const carry = await disposing;
+    // Assert: onError の中の編集は、採用したサーバーの版（revision 1）の上の未保存として引き継ぐ
+    expect(carry).toMatchObject({ json: ["mine"], revision: 1, saved: false });
+  });
+
   it("dispose の待機中、サーバー版の採用の通知の中で入った編集は、未保存として引き継ぐ", async () => {
     // Arrange: 下書きの書き込みを止めたまま作り直しを始める
     const c = build({ serverRevision: 3 });
@@ -4616,7 +4690,7 @@ describe("NotesStore", () => {
 ```typescript
 // test/ui-state.test.ts
 import { describe, expect, it } from "vitest";
-import { INITIAL_UI_STATE, backendBanner, dimmedSegmentIds, failedJobs, jobCounts, reduce, visibleRejected } from "../src/ui/state";
+import { INITIAL_UI_STATE, backendBanner, dimmedSegmentIds, failedJobs, jobCounts, reduce, unresolvedCitations, visibleRejected } from "../src/ui/state";
 import type { JobSummary, MeetingDetailResponse, SummaryResponse, TranscriptResponse } from "../src/api/contracts-phase2";
 
 const job = (id: string, status: JobSummary["status"], updatedAt = 1): JobSummary =>
@@ -4741,6 +4815,33 @@ describe("UI reducer", () => {
     expect(visibleRejected(s)).toEqual([]);
     s = reduce(s, { type: "toggle_rejected" });
     expect(visibleRejected(s)).toHaveLength(1);
+  });
+
+  it("transcript の版が進んで引用先が消えた項目だけを、保存済みの quote と合わせて返す（同じ版なら照合しない）", () => {
+    // Arrange: 版 1 の要約が seg-a（残る）と seg-b（撮り直しで置き換わる）を引用している
+    const span = { segmentId: "seg-b", start: 0, end: 1 };
+    const summary: SummaryResponse = {
+      meetingId: "m", version: 1,
+      summary: {
+        summary: "s", rejected: [], modelName: "llm", promptVersion: "v1", transcriptVersion: 1, generatedAt: 0, modelCaveats: [],
+        topics: [{ title: "話題", description: "", sourceSegmentIds: ["seg-a", "seg-b"] }],
+        decisions: [{ text: "決定", sourceSegmentIds: ["seg-b"], quote: "旧い引用", evidenceSpan: span }],
+        actionItems: [{ task: "作業", assignee: null, deadline: null, sourceSegmentIds: ["seg-a"], quote: "残る引用", evidenceSpan: { ...span, segmentId: "seg-a" } }],
+      },
+      validation: { schemaValid: true, schemaRetries: 0, mapWindows: 1, totalItems: 3, rejectedItems: 0, unresolvedSegmentIds: [] },
+    };
+    const seg = (id: string) => ({ id, source: "mic" as const, startMs: 0, endMs: 1, text: id, confidence: 0.9, language: "ja", chunkSequenceNo: 0, speakerId: null });
+    const tr = (v: number, ids: string[]): TranscriptResponse => ({ meetingId: "m", transcriptVersion: v, gaps: [], segments: ids.map(seg) });
+    const base = reduce(INITIAL_UI_STATE, { type: "summary_loaded", summary });
+    // Act
+    const sameVersion = unresolvedCitations(reduce(base, { type: "transcript_loaded", transcript: tr(1, ["seg-a"]) }));
+    const advanced = unresolvedCitations(reduce(base, { type: "transcript_loaded", transcript: tr(2, ["seg-a", "seg-new"]) }));
+    // Assert
+    expect(sameVersion).toEqual([]);
+    expect(advanced).toEqual([
+      { kind: "topic", index: 0, missingSegmentIds: ["seg-b"], quote: null },
+      { kind: "decision", index: 0, missingSegmentIds: ["seg-b"], quote: "旧い引用" },
+    ]);
   });
 
   it("失敗ジョブとバナー", () => {
