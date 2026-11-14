@@ -2548,15 +2548,32 @@ def _codec_of(path: Path) -> str:
     return "wav" if path.suffix == ".wav" else ("flac" if path.suffix == ".flac" else "fake")
 
 
+def _file_matches_chunk(path: Path, chunk: AudioChunk, codec: AudioCodec | None) -> bool | None:
+    """path が chunk の音声として読めるか。True：読めて内容が行と一致。False：ない・読めない・形式が壊れている・内容が違う。
+    None：この環境では確かめられない（圧縮ファイルで、行に sha256_flac がなく codec も合わない）。健全かもしれないので壊れた扱いにしない。
+    """
+    if path.suffix != ".wav" and chunk.sha256_flac is not None:
+        # 圧縮ファイルは行に控えたファイルの sha256 と比べる（codec がなくても確かめられる）
+        try:
+            return sha256_hex(path.read_bytes()) == chunk.sha256_flac
+        except OSError:
+            return False
+    if path.suffix != ".wav" and (codec is None or codec.extension != path.suffix):
+        return None if path.exists() else False
+    restored = _chunk_from_file(path, codec)
+    return restored is not None and restored[1] == chunk.sha256
+
+
 def _relink_chunk(conn: sqlite3.Connection, data_dir: Path, chunk: AudioChunk, f: Path, codec: AudioCodec | None) -> bool:
-    """既存の Chunk の行が指すファイルがなく、同じ連番のファイル f が同じ音声なら、行を f へ向け直す。向け直したら True。
+    """既存の Chunk の行が指すファイルがない（または壊れている）とき、同じ連番のファイル f が同じ音声なら、行を f へ向け直す。向け直したら True。
 
     古いバックアップから戻すと、その後に圧縮した Chunk の行は消した WAV を指したまま残る（handle_compress は WAV を消す）。
     向け直さないと下の走査が missing にし、残っている圧縮ファイルを使わない。f を復元した WAV の sha256 が行と一致したときだけ
     向け直す（検証していないファイルを指さない）。行そのもの（ID・時刻・STT の状態）は変えない。
+    行が指すファイルが残っていても、壊れていれば（_file_matches_chunk が False）向け直す。健全なとき・確かめられないときは向け直さない。
     """
     rel = str(f.relative_to(data_dir))
-    if rel == chunk.local_path or (data_dir / chunk.local_path).exists():
+    if rel == chunk.local_path or _file_matches_chunk(data_dir / chunk.local_path, chunk, codec) is not False:
         return False
     restored = _chunk_from_file(f, codec)
     if restored is None or restored[1] != chunk.sha256:
@@ -2570,7 +2587,7 @@ def _relink_chunk(conn: sqlite3.Connection, data_dir: Path, chunk: AudioChunk, f
 def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) -> RebuildReport:
     """recordings/{userId}/{meetingId}/ を走査し、DB にない会議と Chunk の行を作る。既存の行は上書きしない。
 
-    既存の Chunk の行が指すファイルがないときは、同じ連番で内容（WAV の sha256）が一致するファイルへ向け直す（_relink_chunk）。
+    既存の Chunk の行が指すファイルがない・壊れているときは、同じ連番で内容（WAV の sha256）が一致するファイルへ向け直す（_relink_chunk）。
     古いバックアップから戻した行が、その後の圧縮で消えた WAV を指しているためである。
 
     例外は確定の状態だけ。確定前に取ったバックアップから戻すと、会議の行は recording のまま残る。確定時の控えがあれば
@@ -2661,9 +2678,15 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
                     codec=_codec_of(f),
                 ))
                 report.chunks_created += 1
-        # DB にあるがファイルがない Chunk を missing に
+        # DB にあるがファイルがない Chunk を missing に。verified の Chunk はファイルがあっても読めなければ（壊れている・内容が違う）
+        # missing にする（存在するだけで読める Chunk として扱わない）。確かめられない圧縮ファイル（None）はそのまま。
+        # verified でない行（registered）は存在だけを見る（従来どおり）
         for c in repo.list_chunks(conn, meeting_id):
-            if not (data_dir / c.local_path).exists() and c.save_status != "missing":
+            if c.save_status == "missing":
+                continue
+            path = data_dir / c.local_path
+            broken = _file_matches_chunk(path, c, codec) is False if c.save_status == "verified" else not path.exists()
+            if broken:
                 repo.update_chunk(conn, c.id, save_status="missing")
                 report.chunks_marked_missing += 1
     return report
@@ -3472,6 +3495,10 @@ async def transcribe_silent_chunk(meeting_id: str, source: str, sequence_no: int
         # 完了済みの merge ジョブを消す。この Chunk の STT が終わると ensure_merge_job が作り直し、transcript の版が上がる。
         # 要約は自動では作り直さない（会議は transcribed に戻る。利用者が再生成を選ぶ）
         repo.delete_finished_job(conn, meeting_id, "merge_transcript")
+        # 完了済みの話者分離も消す。分離は completed の Chunk だけを入力にしたので、この Chunk の音声の区間には話者区間がない。
+        # 残すと ensure_merge_job が分離を作り直さずに merge へ進み、拾い直した segments は話者の無いまま公開される。
+        # 作り直した分離は、話者の付いた segments を変えず、話者の無い segments だけに付ける（handle_diarize の _align_labels）
+        repo.delete_finished_job(conn, meeting_id, "diarize_meeting")
         repo.record_metric(conn, "vad_manual_transcribe", 1, meeting_id=meeting_id)
     return {"jobId": job_id}
 
@@ -3855,6 +3882,36 @@ def _assign_speakers(segments: list[Segment], turns: tuple[SpeakerTurn, ...]) ->
     return out
 
 
+def _align_labels(segments: list[Segment], turns: tuple[SpeakerTurn, ...], taken: set[str]) -> tuple[SpeakerTurn, ...]:
+    """作り直した分離のラベルを、前の分離で segments に付いたラベルへ付け替える（利用者が付けた名前と食い違わせない）。
+
+    分離をやり直すとラベル（S1, S2…）は振り直される。同じ source で時間が重なる長さの合計が大きい組から 1 対 1 で対応付ける。
+    対応の無いラベルは taken（segments と meeting_speakers のラベル）と重ならない新しいラベルにする。
+    """
+    overlap: dict[tuple[str, str], int] = {}
+    for s in segments:
+        if s.speaker_id is None:
+            continue
+        for t in turns:
+            ov = min(s.end_ms, t.end_ms) - max(s.start_ms, t.start_ms)
+            if t.source == s.source and ov > 0:
+                overlap[(t.label, s.speaker_id)] = overlap.get((t.label, s.speaker_id), 0) + ov
+    mapping: dict[str, str] = {}
+    used: set[str] = set()
+    for (new, old), _ in sorted(overlap.items(), key=lambda kv: (-kv[1], kv[0])):
+        if new not in mapping and old not in used:
+            mapping[new] = old
+            used.add(old)
+    reserved = set(taken) | used
+    n = 1
+    for new in sorted({t.label for t in turns} - set(mapping)):
+        while f"S{n}" in reserved:
+            n += 1
+        mapping[new] = f"S{n}"
+        reserved.add(mapping[new])
+    return tuple(SpeakerTurn(t.source, t.start_ms, t.end_ms, mapping[t.label], t.confidence) for t in turns)
+
+
 async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
     if ctx.diarization is None:
         raise ModelMissingError("diarization provider not available")
@@ -3889,7 +3946,14 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
         # 開始時に読んだ ID だけに書くと、その行は話者の無いまま次の merge で昇格する。読み直せば staged 行にも付く。
         # 撮り直して入れ替え待ちの segments にも付ける（失敗した分離の再試行は merge の後に走りうる。入れ替えで話者を失わない）
         segments = repo.list_segments(conn, job.meeting_id) + repo_phase3.staged_segments_of_meeting(conn, job.meeting_id)
-        assignments = _assign_speakers(segments, result.turns)
+        turns = result.turns
+        if any(s.speaker_id is not None for s in segments):
+            # 作り直した分離（無音と判定した Chunk を手動 STT した後。transcribe_silent_chunk）。話者の付いた segments は変えず、
+            # 話者の無い segments（拾い直した音声）だけに、前のラベルへ付け替えた区間で付ける。失敗すれば何も変えずに merge へ進む
+            taken = {s.speaker_id for s in segments if s.speaker_id is not None} | {sp.label for sp in repo_phase3.list_speakers(conn, job.meeting_id)}
+            turns = _align_labels(segments, turns, taken)
+            segments = [s for s in segments if s.speaker_id is None]
+        assignments = _assign_speakers(segments, turns)
         for sid, label, conf in assignments:
             repo_phase3.set_segment_speaker(conn, sid, label, conf)
         for label in sorted({lb for _, lb, _ in assignments if lb}):
@@ -5008,6 +5072,7 @@ from minutes_local.merge.merger import format_for_llm, render_lines, run_merge
 from minutes_local.merge.normalize import normalize
 from minutes_local.stt.fake_provider import FakeSTTProvider
 from minutes_local.stt.provider import STTRequest, STTSegment
+from minutes_local.vad.fake_provider import FakeVADProvider
 from tests.conftest import create_meeting, finalize, put_chunk, silence_pcm, sine_pcm
 
 
@@ -5252,6 +5317,45 @@ async def test_speaker_after_silent_chunk_is_not_shifted(client3: httpx.AsyncCli
     assert {s.speaker_id for s in segs if s.start_ms < 30000} == {"S1"}
     assert {s.speaker_id for s in segs if s.start_ms >= 60000} == {"S2"}
     assert pipeline.calls[0][0].parent == ctx3.settings.data_dir / "tmp"
+
+
+async def test_manual_transcribe_of_skipped_chunk_gets_speakers_without_relabeling(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                                   runner3: JobRunner) -> None:
+    """無音と判定した Chunk を手動 STT すると、分離を作り直して拾い直した segments に話者を付ける。前の話者・ラベルの名前は変えない。"""
+    # Arrange: 0〜30 秒が A、60〜90 秒が B。中央の Chunk は小さな声で、サーバー VAD が無音と判定する（false negative）
+    pipeline = _FakePipeline([(0.0, 30.0, "A"), (60.0, 90.0, "B")])
+    ctx3.diarization = PyannoteDiarizationProvider(pipeline=pipeline)
+    ctx3.vad = FakeVADProvider(rms_threshold=0.1)
+    await create_meeting(client3)
+    for seq, pcm in enumerate([sine_pcm(30), sine_pcm(30, amplitude=0.02), sine_pcm(30)]):
+        await put_chunk(client3, "m-1", seq, pcm)
+    await finalize(client3, "m-1", mic=3)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        skipped = repo.get_chunk_by_key(conn, "m-1", "mic", 1)
+        assert skipped is not None and skipped.stt_status == "skipped"
+        repo_phase3.upsert_speaker(conn, "m-1", "S2", "佐藤")
+        before = {(s.start_ms, s.speaker_id) for s in repo.list_segments(conn, "m-1", merged_version=1)}
+    # 作り直した分離はラベルを振り直す：中央（拾い直した声）が 2 番目に現れるので、付け替えなければ S2（佐藤）になる
+    pipeline.tracks = [(0.0, 30.0, "A"), (30.0, 60.0, "C"), (60.0, 90.0, "B")]
+    # Act
+    assert (await client3.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+    await runner3.run_until_idle()
+    # Assert
+    with ctx3.db.read() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        assert m is not None and m.transcript_version == 2
+        segs = repo.list_segments(conn, "m-1", merged_version=2)
+        speakers = {sp.label: sp.name for sp in repo_phase3.list_speakers(conn, "m-1")}
+    # 拾い直した Chunk の segments。隣の Chunk の前置き（重なり）の segment は前の話者のまま
+    recovered = [s for s in segs if s.chunk_id == skipped.id]
+    assert len(pipeline.calls) == 2 and recovered
+    # 拾い直した声（30 秒以降）は前のラベルと重ならない新しいラベル。付け替えなければ S2（佐藤）になる。
+    # 先頭の segment は前置きで 0〜30 秒の A と長く重なるので S1（§21 の割当の規則どおり）
+    assert all(s.speaker_id is not None for s in recovered)
+    assert {s.speaker_id for s in recovered if s.start_ms >= 30000} == {"S3"}
+    assert {(s.start_ms, s.speaker_id) for s in segs if s not in recovered} == before   # 前の segments の話者は変えない
+    assert speakers == {"S1": None, "S2": "佐藤", "S3": None}
 
 
 async def test_diarize_that_keeps_crashing_does_not_block_merge(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
@@ -5539,6 +5643,44 @@ async def test_rebuild_relinks_chunk_compressed_after_backup(client3: httpx.Asyn
     assert good is not None and good.local_path.endswith(".fake") and good.codec == "fake" and good.save_status == "verified"
     assert len(read_pcm(ctx3.settings.data_dir, good.local_path, good.sha256, FakeCodec())) == 960000
     assert bad is not None and bad.local_path == old_rows[1].local_path and bad.save_status == "missing"
+
+
+async def test_rebuild_relinks_only_when_existing_recording_is_corrupt(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                       runner3: JobRunner) -> None:
+    """行が指すファイルが残っていても壊れていれば、検証した別のファイルへ向け直す。健全なら向け直さない。代わりがなければ missing。"""
+    # Arrange: 圧縮後に行だけを圧縮前（WAV）に戻す。1 つ目の WAV は壊れたまま残り、2 つ目の WAV は元の内容で残っている
+    data_dir = ctx3.settings.data_dir
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        old_rows = sorted(repo.list_chunks(conn, "m-1"), key=lambda c: c.sequence_no)
+    intact_wav = (data_dir / old_rows[1].local_path).read_bytes()
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        for c in old_rows:
+            repo.update_chunk(conn, c.id, local_path=c.local_path, codec="wav", sha256_flac=None, size_bytes=c.size_bytes)
+    (data_dir / old_rows[0].local_path).write_bytes(b"garbage")
+    (data_dir / old_rows[1].local_path).write_bytes(intact_wav)
+    # Act
+    with ctx3.db.write_sync() as conn:
+        report = rebuild(conn, data_dir, ctx3.codec)
+        first = repo.get_chunk(conn, old_rows[0].id)
+        second = repo.get_chunk(conn, old_rows[1].id)
+    # Assert: 壊れた方だけを圧縮ファイルへ向け直し、健全な WAV を指す方はそのまま
+    assert (report.chunks_relinked, report.chunks_marked_missing) == (1, 0)
+    assert first is not None and first.local_path.endswith(".fake") and first.save_status == "verified"
+    assert second is not None and second.local_path == old_rows[1].local_path and second.save_status == "verified"
+    # Act: 2 つ目の WAV も壊し、代わりの圧縮ファイルを消す
+    (data_dir / old_rows[1].local_path).write_bytes(b"garbage")
+    (data_dir / old_rows[1].local_path).with_suffix(".fake").unlink()
+    with ctx3.db.write_sync() as conn:
+        again = rebuild(conn, data_dir, ctx3.codec)
+        second = repo.get_chunk(conn, old_rows[1].id)
+        first = repo.get_chunk(conn, old_rows[0].id)
+    # Assert: 代わりがなければ missing。向け直した 1 つ目は健全なので、壊れた WAV へ戻さない
+    assert (again.chunks_relinked, again.chunks_marked_missing) == (0, 1)
+    assert second is not None and second.save_status == "missing"
+    assert first is not None and first.local_path.endswith(".fake") and first.save_status == "verified"
 
 
 async def test_rebuild_keeps_end_time_from_phase2_snapshot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
@@ -6071,6 +6213,7 @@ def test_doctor_rebuild_refuses_while_server_is_running(tmp_path: Path, monkeypa
 | Live の小区分既定オフと警告 | `test_live_disabled_on_small_tier_by_default` |
 | 話者ラベル割当・名前は利用者・LLM 入力の `[S1:名前]` | `test_diarize_assigns_labels_and_names_are_user_assigned` |
 | 話者分離の後に transcribe の再試行で segments を置き換えても話者を引き継ぐ（分離は再実行しない） | `test_transcribe_retry_after_diarize_keeps_speakers` |
+| 無音と判定した Chunk の手動 STT は分離を作り直し、拾い直した segments だけに話者を付ける（前の話者・名前付きのラベルは変えない） | `test_manual_transcribe_of_skipped_chunk_gets_speakers_without_relabeling` |
 | 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
 | 実 Provider：無音 Chunk を挟んでも話者区間の時刻がずれない、上限は `max_speakers`、一時ファイルはデータディレクトリの中 | `test_assemble_timeline_pads_gaps_with_silence`、`test_pyannote_provider_keeps_absolute_time_across_skipped_chunk`、`test_speaker_after_silent_chunk_is_not_shifted` |
 | エコー除去 | `test_echo_from_system_is_dropped_on_mic` |
@@ -6080,6 +6223,7 @@ def test_doctor_rebuild_refuses_while_server_is_running(tmp_path: Path, monkeypa
 | バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
 | バックアップの原子性・壊れたバックアップを復元元にしない | `test_backup_failure_leaves_no_partial_file`、`test_restore_skips_broken_backup` |
 | バックアップは 24 時間に 1 回・定期処理のループが失敗で終わらない | `test_scheduler_backs_up_only_when_a_day_has_passed`、`test_scheduler_loop_survives_failed_iteration` |
+| 圧縮後の古い行を検証した圧縮ファイルへ向け直す。行が指すファイルが壊れていれば向け直し、健全なら向け直さない。代わりがなければ `missing` | `test_rebuild_relinks_chunk_compressed_after_backup`、`test_rebuild_relinks_only_when_existing_recording_is_corrupt` |
 | 起動時の復旧（バックアップあり / なし）で録音ファイルから作り直す | `test_startup_recovery_rebuilds_meetings_missing_from_database` |
 | 壊れた `meeting.json` で rebuild を止めない・確定前の会議は `recording` に戻す | `test_rebuild_drops_malformed_stop_pair`、`test_rebuild_drops_malformed_end_time`、`test_rebuild_tolerates_malformed_snapshot_fields`、`test_rebuild_tolerates_snapshot_that_is_not_an_object`、`test_rebuild_restores_unfinalized_meeting_as_recording` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
