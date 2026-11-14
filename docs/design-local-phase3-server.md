@@ -2216,7 +2216,7 @@ def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = N
 | `create_backup` | `VACUUM INTO` で `minutes-{世代番号}-{epoch ms}.sqlite` を作る | `.part` に書いてから名前を付け替える。書きかけを正規の名前で残さない。世代番号は既存の最大 + 1（同じミリ秒の 2 回目も前の世代を上書きしない） |
 | `list_backups` | 完成したバックアップを古い順に返す | ファイル名の世代番号で並べる（時刻で並べると時計の巻き戻りと追いつきで順が入れ替わる）。`.part` と規約外の名前は含めない |
 | `prune_backups` | 新しい方から `keep` 世代を残す | 中断で残った `.part` も消す |
-| `restore_latest` | 壊れた DB を退避し、復元元にできる最も新しいバックアップを置く | 候補ごとに `integrity_check` をかけ、壊れていれば 1 つ古いものへ下がる。空のファイルは検査に通るので、大きさも見る。使えるものがなければ DB を置かない（空で起動し、§18 が作り直す）。`users` もバックアップの時点に戻るので、その後に失効させた利用者のトークンがまた通る。運用者は復元の後に、失効させたままにすべき利用者をもう一度消す（§2.5） |
+| `restore_latest` | 壊れた DB を退避し、復元元にできる最も新しいバックアップを置く | DB に触る前に復旧中の控え（`minutes.sqlite.recovering`）を置き、`build_context` が `rebuild` を終えてから消す（`finish_recovery`）。途中で止まれば次の起動が控えを見て、DB が無くても初回起動とみなさずにやり直す。コピーは別名に書いてから付け替える。候補ごとに `integrity_check` をかけ、壊れていれば 1 つ古いものへ下がる。空のファイルは検査に通るので、大きさも見る。使えるものがなければ DB を置かない（空で起動し、§18 が作り直す）。`users` もバックアップの時点に戻るので、その後に失効させた利用者のトークンがまた通る。運用者は復元の後に、失効させたままにすべき利用者をもう一度消す（§2.5） |
 | `Recovery` | 起動時に DB を作り直した記録（復元元・作り直した件数） | `AppContext.recovery` に載せ、`serve` / `doctor` が警告として出す（§22） |
 
 ```python
@@ -2224,6 +2224,7 @@ def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = N
 """VACUUM INTO によるバックアップ、世代管理、起動時の integrity_check と復元。§2.4。"""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -2343,6 +2344,29 @@ def usable_backup(path: Path) -> bool:
         return False
 
 
+def recovery_marker(db_path: Path) -> Path:
+    """復旧の途中を示す控え。restore_latest が DB に触る前に置き、build_context が rebuild を終えてから消す。"""
+    return db_path.with_name(db_path.name + ".recovering")
+
+
+def pending_recovery(db_path: Path) -> Recovery | None:
+    """前回の復旧が終わっていなければ（控えが残っていれば）その記録。控えが読めなくても復旧中として扱う（復元元は不明）。"""
+    marker = recovery_marker(db_path)
+    if not marker.exists():
+        return None
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
+    source = data.get("restoredFrom") if isinstance(data, dict) else None
+    return Recovery(restored_from=Path(source) if isinstance(source, str) else None)
+
+
+def finish_recovery(db_path: Path) -> None:
+    """rebuild まで終えた。控えを消す（次の起動は通常どおり）。"""
+    recovery_marker(db_path).unlink(missing_ok=True)
+
+
 def restore_latest(db_path: Path, backups_dir: Path) -> Path | None:
     """壊れた DB を退避し、復元元にできる最も新しいバックアップをコピーする。戻り値は復元元。
 
@@ -2352,14 +2376,24 @@ def restore_latest(db_path: Path, backups_dir: Path) -> Path | None:
 
     users テーブルもバックアップの時点に戻る。バックアップの後に `user remove` で失効させた利用者は行ごと戻り、
     そのトークンがまた通る。運用者は復元の後、失効させたままにすべき利用者を `user remove` でもう一度消す（§2.5・serve の警告）。
+
+    途中で止まっても（退避の後・コピーの途中）次の起動で続きからやり直せるよう、DB に触る前に控え（recovery_marker）を置く。
+    控えがあれば open_database_with_recovery は DB が無くても初回起動とみなさない。コピーは別名に書いてから名前を付け替え、
+    書きかけの DB を正規の名前で残さない。
     """
     source = next((p for p in reversed(list_backups(backups_dir)) if usable_backup(p)), None)
+    marker = recovery_marker(db_path)
+    marker_tmp = marker.with_name(marker.name + ".part")
+    marker_tmp.write_text(json.dumps({"restoredFrom": str(source) if source is not None else None}), encoding="utf-8")
+    os.replace(marker_tmp, marker)
     if db_path.exists():
         shutil.move(str(db_path), str(db_path.with_name(f"{db_path.name}.corrupt-{int(time.time())}")))
     for extra in (db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm")):
         extra.unlink(missing_ok=True)
     if source is not None:
-        shutil.copy2(source, db_path)
+        part = db_path.with_name(db_path.name + ".restoring")
+        shutil.copy2(source, part)
+        os.replace(part, db_path)
     return source
 ```
 
@@ -4206,7 +4240,16 @@ def open_database_with_recovery(settings: Settings) -> tuple[Database, backup.Re
 
     壊れていなければ 2 番目は None。使えるバックアップがなくても起動は止めない。サーバーが動いていなければブラウザは
     Chunk を送れず、録音ファイルが残っていれば会議は作り直せる（Invariant 10）。作り直しは build_context が行う。
+
+    前回の復旧が途中で止まっていれば（backup.pending_recovery）、DB が無くても初回起動とみなさない。DB が無い・壊れていれば
+    復元からやり直し、復元済みなら作り直し（rebuild）だけをやり直す。控えが無ければ従来どおり（DB が無ければ初回起動）。
     """
+    pending = backup.pending_recovery(settings.db_path)
+    if pending is not None:
+        if settings.db_path.exists() and backup.integrity_ok(settings.db_path):
+            return Database(settings.db_path), pending
+        restored = backup.restore_latest(settings.db_path, settings.backups_dir)
+        return Database(settings.db_path), backup.Recovery(restored_from=restored)
     if backup.integrity_ok(settings.db_path):
         return Database(settings.db_path), None
     restored = backup.restore_latest(settings.db_path, settings.backups_dir)
@@ -4302,6 +4345,8 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
         # 確定済みの会議は finalized で戻り、serve の resume_finalized がジョブを作る。要約とノートは作り直せない
         with db.write_sync() as conn:
             recovery.rebuilt = rebuild(conn, settings.data_dir, codec)
+        # 作り直しまで終えてから控えを消す。ここまでに止まれば、次の起動がやり直す（rebuild は既存の行を上書きしない）
+        backup.finish_recovery(settings.db_path)
     with db.read() as conn:
         settings = settings.with_overrides(repo.get_settings(conn))
         multi_user = user_count(conn) > 0
@@ -5940,6 +5985,45 @@ async def test_startup_recovery_rebuilds_meetings_missing_from_database(
     ctx3.db = Database(settings.db_path)                                                 # fixture の close 用
 
 
+async def test_interrupted_restore_resumes_on_next_start(
+        client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner, settings: Settings,
+        stt_provider: FakeSTTProvider, llm_provider: FakeSummaryProvider, monkeypatch: pytest.MonkeyPatch) -> None:
+    """壊れた DB を退避した後、バックアップのコピー中に止まっても、次の起動は空の DB の初回起動とみなさず復旧をやり直す。"""
+    # Arrange: バックアップの後で録音した会議がある状態で DB が壊れ、復元のコピーで落ちる
+    backed_up = backup.create_backup(ctx3.db, settings.backups_dir)
+    await _completed_meeting(client3, runner3, ctx3)
+    ctx3.db.close()
+    settings.db_path.write_bytes(b"garbage" * 100)
+    real_copy = backup.shutil.copy2
+
+    def crash(src: object, dst: object) -> None:
+        raise OSError("killed during copy")
+
+    monkeypatch.setattr(backup.shutil, "copy2", crash)
+    with pytest.raises(OSError):
+        open_database_with_recovery(settings)
+    monkeypatch.setattr(backup.shutil, "copy2", real_copy)
+    assert not settings.db_path.exists() and backup.pending_recovery(settings.db_path) is not None
+    # Act: 次の起動
+    c = await build_context(settings, stt_provider=stt_provider, llm_provider=llm_provider, hardware=GPU_HW, codec=FakeCodec())
+    # Assert: 復元からやり直し、録音ファイルから作り直し、控えを消す
+    try:
+        assert c.recovery is not None and c.recovery.restored_from == backed_up
+        assert c.recovery.rebuilt.meetings_created == 1
+        assert backup.pending_recovery(settings.db_path) is None
+    finally:
+        c.stt.shutdown()
+        c.db.close()
+    # 控えが無ければ、次の起動は通常どおり（復旧なし）
+    again = await build_context(settings, stt_provider=stt_provider, llm_provider=llm_provider, hardware=GPU_HW, codec=FakeCodec())
+    try:
+        assert again.recovery is None
+    finally:
+        again.stt.shutdown()
+        again.db.close()
+    ctx3.db = Database(settings.db_path)                                                 # fixture の close 用
+
+
 async def test_startup_recovery_finalizes_meeting_backed_up_before_finalize(
         client3: httpx.AsyncClient, ctx3: AppContext, settings: Settings,
         stt_provider: FakeSTTProvider, llm_provider: FakeSummaryProvider) -> None:
@@ -6224,7 +6308,7 @@ def test_doctor_rebuild_refuses_while_server_is_running(tmp_path: Path, monkeypa
 | バックアップの原子性・壊れたバックアップを復元元にしない | `test_backup_failure_leaves_no_partial_file`、`test_restore_skips_broken_backup` |
 | バックアップは 24 時間に 1 回・定期処理のループが失敗で終わらない | `test_scheduler_backs_up_only_when_a_day_has_passed`、`test_scheduler_loop_survives_failed_iteration` |
 | 圧縮後の古い行を検証した圧縮ファイルへ向け直す。行が指すファイルが壊れていれば向け直し、健全なら向け直さない。代わりがなければ `missing` | `test_rebuild_relinks_chunk_compressed_after_backup`、`test_rebuild_relinks_only_when_existing_recording_is_corrupt` |
-| 起動時の復旧（バックアップあり / なし）で録音ファイルから作り直す | `test_startup_recovery_rebuilds_meetings_missing_from_database` |
+| 起動時の復旧（バックアップあり / なし）で録音ファイルから作り直す。復元の途中で止まっても次の起動がやり直す | `test_startup_recovery_rebuilds_meetings_missing_from_database`、`test_interrupted_restore_resumes_on_next_start` |
 | 壊れた `meeting.json` で rebuild を止めない・確定前の会議は `recording` に戻す | `test_rebuild_drops_malformed_stop_pair`、`test_rebuild_drops_malformed_end_time`、`test_rebuild_tolerates_malformed_snapshot_fields`、`test_rebuild_tolerates_snapshot_that_is_not_an_object`、`test_rebuild_restores_unfinalized_meeting_as_recording` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
 | CLI：同名の利用者の拒否と削除、serve の動作中は `doctor --rebuild` を断る | `test_user_cli_rejects_duplicate_name_and_removes_user`、`test_doctor_rebuild_refuses_while_server_is_running` |
