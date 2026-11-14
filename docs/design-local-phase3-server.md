@@ -3776,8 +3776,6 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
         raise ModelMissingError("diarization provider not available")
     with ctx.db.read() as conn:
         chunks = repo.list_chunks(conn, job.meeting_id)
-        # 撮り直して入れ替え待ちの segments にも付ける（失敗した分離の再試行は merge の後に走りうる。入れ替えで話者を失わない）
-        segments = repo.list_segments(conn, job.meeting_id) + repo_phase3.staged_segments_of_meeting(conn, job.meeting_id)
     pcm_by_source: dict[str, list[tuple[int, bytes]]] = {}
     for c in chunks:
         if c.stt_status != "completed":
@@ -3790,12 +3788,17 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
     req = DiarizationRequest(meeting_id=job.meeting_id, pcm_by_source=pcm_by_source, models_dir=str(ctx.settings.models_dir),
                              work_dir=str(ctx.settings.tmp_dir))
     result = await asyncio.to_thread(ctx.diarization.diarize, req)
-    assignments = _assign_speakers(segments, result.turns)
     async with ctx.db.write() as conn:
         # lease が失効していれば何も書かない（Phase 2 基本設計 §9.3）。分離は長く走るので、失効した旧ワーカーが
         # merge の後でラベルを上書きしたり、新しい attempt の結果を古い結果で置き換えたりする
         if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return None
+        # 割り当てる segments は書き込みトランザクションの中で読み直す。分離の実行中に completed の Chunk を撮り直すと
+        # （handle_transcribe）、前の segments にまだ話者が無いので引き継ぎ（carried）は空のまま新しい staged 行が入り、
+        # 開始時に読んだ ID だけに書くと、その行は話者の無いまま次の merge で昇格する。読み直せば staged 行にも付く。
+        # 撮り直して入れ替え待ちの segments にも付ける（失敗した分離の再試行は merge の後に走りうる。入れ替えで話者を失わない）
+        segments = repo.list_segments(conn, job.meeting_id) + repo_phase3.staged_segments_of_meeting(conn, job.meeting_id)
+        assignments = _assign_speakers(segments, result.turns)
         for sid, label, conf in assignments:
             repo_phase3.set_segment_speaker(conn, sid, label, conf)
         for label in sorted({lb for _, lb, _ in assignments if lb}):
