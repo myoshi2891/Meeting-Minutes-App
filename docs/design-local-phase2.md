@@ -970,10 +970,11 @@ v4.0 §65〜§66 の Schema Validation + Business Validation を次の順で実�
 | 1 | JSON としてパース可能 | `SCHEMA_VALIDATION`。temperature 0 で 1 回再生成。再失敗は `failed` |
 | 2 | JSON Schema 準拠（必須キー・型・配列） | 同上 |
 | 3 | 各項目の `sourceSegmentIds` が非空で、全 ID が `transcript_segments`（`merged_version = 現在版`）に実在 | **該当項目を `rejected` へ移す**（`SEGMENT_ID_NOT_FOUND` / `SEGMENT_ID_EMPTY`）。再生成しない |
-| 4 | `assignee` が非 null なら、その文字列（正規化後）が参照セグメントのテキストに出現 | 該当項目を `rejected`（`ASSIGNEE_NOT_IN_TRANSCRIPT`）。v4.0 §63「AI に話者名を推定させない」の実装 |
-| 5 | `deadline` が非 null なら、日付・曜日・相対表現（「来週」「月末」等）のいずれかが参照セグメントに出現 | 該当項目を `rejected`（`DEADLINE_NOT_IN_TRANSCRIPT`） |
+| 3a | `decisions` / `actionItems` の逐語引用（v4.0 §66.2 段階2。詳細設計 server §11 `_check_evidence`・`_supported_by`）。上から順に見て、最初に落ちた検査の理由を付ける：(1) `evidenceSpan.segmentId` が `sourceSegmentIds`（解決後）のどれかで、`[start, end)` がそのセグメント本文の範囲内 → (2) `quote` が空でなく、そのセグメント本文に逐語で出現 → (3) 本文の `[start, end)` が `quote` と一致 → (4) (1)〜(3) を通ったときだけ、決定内容（`text`）・タスク（`task`）の正規化後の文字バイグラムの 50% 以上が `quote` に出現 | 該当項目を `rejected`。(1)・(3) は `EVIDENCE_SPAN_MISMATCH`、(2) は `QUOTE_NOT_VERBATIM`、(4) は `CLAIM_NOT_SUPPORTED`。再生成しない |
+| 4 | `assignee` が非 null なら、その文字列（正規化後）が `quote`（正規化後）に出現。参照セグメント全体ではなく引用の中を見る（同じセグメントに出る別人の名前を担当者にさせない） | 該当項目を `rejected`（`ASSIGNEE_NOT_IN_TRANSCRIPT`）。v4.0 §63「AI に話者名を推定させない」の実装 |
+| 5 | `deadline` が非 null なら、日付・曜日・相対表現（「来週」「月末」等）のいずれか、または `deadline` の文字列が `quote` に出現 | 該当項目を `rejected`（`DEADLINE_NOT_IN_TRANSCRIPT`） |
 | 6 | `topics` / `decisions` / `actionItems` 内の正規化テキスト重複 | 後続を `rejected`（`DUPLICATE`） |
-| 7 | `summary` が空でない | `BUSINESS_VALIDATION`（non-retryable）。ただし 3〜6 で全項目が除外されても `summary` があれば成功扱い |
+| 7 | `summary` が空でない | `BUSINESS_VALIDATION`（non-retryable）。ただし 3〜6（3a を含む）で全項目が除外されても `summary` があれば成功扱い |
 
 「再生成ではなく除外」を採る理由は Phase 1 §3.8 の通り（軽量モデルは再生成でも同種の幻覚を再現しやすく、時間もかかる）。除外された項目は UI（§18）で「AI が生成したが根拠を確認できなかった項目」として折りたたみ表示し、利用者が元発言を見て手動で採用できる。採用操作は `meeting_notes` への書き込みであり、`meeting_summary_versions` は変更しない。
 
@@ -998,7 +999,7 @@ v4.0 §67〜§68 を継承する。再生成は新しい `version` 行を追加�
 **transcript が進んだ後の引用。** 要約の `sourceSegmentIds`（と、そのどれかを指す `evidenceSpan.segmentId`）は、生成時の transcript 版（`MeetingSummary.transcriptVersion`）の segment を指す。その後に segments の行を消して作り直す処理がある：撮り直しの入れ替え（詳細設計 §8 `repo.promote_replacements`）、手動 STT（`request_rerun_stt`）、未完了の Chunk の再試行（`handle_transcribe`）。無音区間の STT（`transcribe_silent_chunk`）は行を足すだけで消さない。消えた行を指す引用は次のように扱う（Phase 3 も同じ）。
 
 * 要約は書き換えない・消さない（`result_json` は生成時のまま。上の「旧版を削除しない」と同じ）。サーバーは引用を付け替えない。
-* クライアントは、表示中の transcript が要約より新しい版のときだけ、引用先が transcript にあるかを照合する（詳細設計 client §11 `unresolvedCitations`）。同じ版なら §12.5 の検証で全件が実在する。
+* クライアントは、表示中の transcript が要約と同じ版か新しい版のとき、引用先が transcript にあるかを照合する（詳細設計 client §11 `unresolvedCitations`）。同じ版でも照合するのは、手動 STT（`request_rerun_stt`）が segments の行を先に消し、次の版を確定するのはその後の merge だからである（その間の `GET /transcript` は同じ版のまま行が欠ける）。表示中の transcript が要約より古い（取得待ち）ときだけ照合せず、取り直しを待つ。
 * 見つからない引用は transcript へ飛ばさない。決定事項・アクションは生成時に保存した逐語引用（`quote`）を「生成時の引用」として出し、話題（引用を持たない）は「根拠の行は作り直されました」と出す。あわせて「transcript が更新されました。必要なら再生成してください」と案内する（再生成は上のとおり利用者の操作でのみ）。
 
 ---
