@@ -2525,11 +2525,13 @@ export class NotesStore {
       this.reportError(new Error("NotesStore is disposed; the server version was not accepted"));
       return;
     }
-    this.set({ json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, sync: "saved", serverNotes: null });
     // dispose() の待機中に入った編集は、サーバー版の採用で捨てた。残すと dispose() がサーバー版を saved: false で引き継ぎ、
-    // 新しいインスタンスが未保存として送り直す。この後に入った編集は setDraft が立て直すので、引き継ぎは変わらない
+    // 新しいインスタンスが未保存として送り直す。
+    // 控えの書き込みとフラグの戻しは set() より前に行う（setDraft と同じ順）。set() の onChange の中で setDraft が呼ばれると、
+    // その書き込みはこの後ろに並んで採用した版を上書きし、待機中なら editedWhileDisposing を立て直す
     this.editedWhileDisposing = false;
     void this.writeDraft({ json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, savedAt: Date.now(), saved: true });
+    this.set({ json: s.blocknoteJson, revision: s.revision, lastAppliedSummaryVersion: s.lastAppliedSummaryVersion, sync: "saved", serverNotes: null });
   }
 
   /** 差分 UI で「自分の版で上書き」を選んだとき：サーバーの revision を採用して再送。 */
@@ -2668,8 +2670,11 @@ export class NotesStore {
       // stillSame が false なら保存中に編集が入っている＝控えの内容はまだ未送信。
       // 書き込みの完了を待ってから返す。dispose() はこの完了を待つので、作り直したインスタンスの load() が
       // 古い revision の控えを読んで競合にしない（§15.1 W8）。失敗は writeDraft が onError に渡す。サーバーには保存済みで、
-      // 控えが古いまま残っても次の load() は差分 UI（conflict）になるだけで編集は失われない
-      await this.writeDraft({ json: this.state.json, revision: res.value.revision, lastAppliedSummaryVersion: this.state.lastAppliedSummaryVersion, savedAt: Date.now(), saved: stillSame });
+      // 控えが古いまま残っても次の load() は差分 UI（conflict）になるだけで編集は失われない。
+      // saved は stillSame を使い回さず比べ直す。上の set() の onChange の中で setDraft が呼ばれると this.state.json は
+      // 未送信の内容に変わっており、stillSame（true）のまま書くと送っていない編集を saved: true で控えてしまう
+      const json = this.state.json;
+      await this.writeDraft({ json, revision: res.value.revision, lastAppliedSummaryVersion: this.state.lastAppliedSummaryVersion, savedAt: Date.now(), saved: json === snapshot.json });
       return;
     }
     if (res.status === 409) {
@@ -4476,6 +4481,71 @@ describe("NotesStore", () => {
     const carry = await disposing;
     // Assert: 採用で捨てたのは採用前の編集だけ
     expect(carry).toMatchObject({ json: ["mine3"], revision: 3, saved: false });
+  });
+
+  it("保存完了の通知の中で入った編集は、送っていないので控えに saved: true で書かない", async () => {
+    // Arrange: PUT の成功（revision 1・saved）の通知の中で、エディタが続けて編集する
+    const b = build();
+    let edited = false;
+    const store: NotesStore = new NotesStore({ ...b.deps, onChange: (s) => {
+      if (edited || s.sync !== "saved" || s.revision !== 1) return;
+      edited = true;
+      store.setDraft(["ab"]);
+    } }, "m");
+    await store.load();
+    store.setDraft(["a"]);
+    // Act
+    await b.fire();
+    // Assert: 送ったのは ["a"] だけ。控えは未送信の ["ab"] を saved: false で持つ（再読み込みで送り直す）
+    expect(b.puts).toEqual([{ json: ["a"], revision: 0 }]);
+    expect(b.drafts.get("notes:m")).toMatchObject({ json: ["ab"], revision: 1, saved: false });
+  });
+
+  it("サーバー版の採用の通知の中で入った編集は、採用した版の控えに上書きされない", async () => {
+    // Arrange: conflict の状態で、採用の通知の中でエディタが編集する
+    const c = build({ serverRevision: 3 });
+    await c.drafts.set("notes:m", { json: ["draft"], revision: 1, lastAppliedSummaryVersion: null, savedAt: 1 });
+    let accepting = false;
+    const store: NotesStore = new NotesStore({ ...c.deps, onChange: () => {
+      if (!accepting) return;
+      accepting = false;
+      store.setDraft(["mine"]);
+    } }, "m");
+    await store.load();
+    // Act
+    accepting = true;
+    store.acceptServer();
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+    // Assert: 後の編集の書き込みが採用した版の書き込みの後に並ぶ
+    expect(c.drafts.get("notes:m")).toMatchObject({ json: ["mine"], revision: 3, saved: false });
+  });
+
+  it("dispose の待機中、サーバー版の採用の通知の中で入った編集は、未保存として引き継ぐ", async () => {
+    // Arrange: 下書きの書き込みを止めたまま作り直しを始める
+    const c = build({ serverRevision: 3 });
+    await c.drafts.set("notes:m", { json: ["draft"], revision: 1, lastAppliedSummaryVersion: null, savedAt: 1 });
+    let releaseSet: () => void = () => undefined;
+    const setGate = new Promise<void>((r) => (releaseSet = r));
+    let accepting = false;
+    const store: NotesStore = new NotesStore({
+      ...c.deps,
+      drafts: { get: c.deps.drafts.get, set: async (k, v) => { await setGate; await c.deps.drafts.set(k, v); } },
+      onChange: () => {
+        if (!accepting) return;
+        accepting = false;
+        store.setDraft(["mine"]);
+      },
+    }, "m");
+    await store.load();
+    store.setDraft(["before"]);
+    const disposing = store.dispose();
+    // Act: 待機中に採用し、その通知の中で編集が入る
+    accepting = true;
+    store.acceptServer();
+    releaseSet();
+    const carry = await disposing;
+    // Assert: 採用の後の編集なので、採用でフラグを下ろしても引き継ぎは消えない
+    expect(carry).toMatchObject({ json: ["mine"], revision: 3, saved: false });
   });
 
   it("下書きの書き込みが同期的に投げ、onError の中で編集が入っても、書き込みを 1 本ずつ流し、dispose は入れ子の書き込みまで待つ", async () => {
