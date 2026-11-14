@@ -2444,6 +2444,10 @@ export class NotesStore {
    * carry は作り直す前のインスタンスの dispose() の戻り値。IndexedDB に書けなかった最新の内容なので、IndexedDB の下書きより優先する
    */
   async load(carry: Draft | null = null): Promise<void> {
+    // 読み込み中（下の await の間）に setDraft が入ったら、読んだ内容で上書きしない。set() は毎回新しい state を作るので参照で比べる。
+    // 入った編集は setDraft が下書き（saved: false）に書いて保存を予約済み。revision が古ければ 409 → 差分 UI になり、編集は失われない
+    const loadingFrom = this.state;
+    const changedWhileLoading = (): boolean => this.state !== loadingFrom;
     // 引き継いだ内容は IndexedDB に無い。下書き・控えの書き込みが成功するまで持ち、その前の dispose() が返せるようにする。
     // 最初の await より前に入れる（load の途中で dispose() されても返す）。carry が null なら触らない。
     // 同じく最初の await より前に IndexedDB へ書き始める。書かないと、編集もサーバーへの保存もないまま閉じたとき
@@ -2455,6 +2459,8 @@ export class NotesStore {
     const draftRaw = carry ?? await this.deps.drafts.get(this.draftKey());
     const draft = isDraft(draftRaw) ? draftRaw : null;
     const res = await this.deps.getNotes(this.state.meetingId);
+    // 以下の分岐はどれも json を置き換えるので、ここで一度だけ判定すれば足りる（この後に await は無い）
+    if (changedWhileLoading()) return;
     if (!res.ok) {
       // サーバー未起動：下書きがあればそれで開始
       if (draft !== null) {
@@ -2628,6 +2634,9 @@ export class NotesStore {
   }
 
   private async save(): Promise<void> {
+    // dispose() の後（待機中に flush() から呼ばれた場合も含む）は送らない。古いトークンの PUT が新しいインスタンスと競合する。
+    // 未送信の編集は下書き（saved: false）か dispose() の戻り値で新しいインスタンスへ引き継がれ、そちらが送る
+    if (this.disposed) return;
     if (this.inflight !== null) {
       await this.inflight;
       // doSave の stillSame 判定の後（保存後の控えの書き込み中）に入った編集は doSave が予約しない。
