@@ -1162,6 +1162,7 @@ def promote_replacements(conn: sqlite3.Connection, meeting_id: str) -> int:
     """撮り直した Chunk の segments を staged_segments から transcript_segments へ入れ替える。戻り値は Chunk 数。
 
     run_merge が版を上げるのと同じトランザクションで呼ぶ。merge が失敗すれば入れ替えごと巻き戻り、公開中の版が残る。
+    消した行を引用している要約は書き換えない。クライアントが表示中の transcript と照合して、生成時の引用として出す（基本設計 §12.7）。
     """
     rows = conn.execute("SELECT chunk_id FROM segment_replacements WHERE meeting_id = ? ORDER BY chunk_id", (meeting_id,)).fetchall()
     for r in rows:
@@ -2066,7 +2067,10 @@ def request_regenerate_summary(conn: sqlite3.Connection, meeting_id: str) -> Non
 
 
 def request_rerun_stt(conn: sqlite3.Connection, meeting_id: str, stt_model: str | None) -> int:
-    """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。"""
+    """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。
+
+    消した segments を引用している要約は書き換えない（基本設計 §12.7「transcript が進んだ後の引用」）。
+    """
     # ジョブは行ごと消す。実行中のハンドラは lease の検査（行がない）で結果を書けなくなる（§8 lease_is_current）
     conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ?", (meeting_id,))
     # まだ merge されていない撮り直しの結果も捨てる（残すと、やり直した結果を次の merge が古い結果で上書きする）
@@ -4042,7 +4046,10 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
         pcm = read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256)
     except InvalidWavError as e:
         async with ctx.db.write() as conn:
-            repo.update_chunk(conn, chunk.id, save_status="missing")
+            # 成功時と同じく、失効した旧ワーカーは Chunk を書かない（基本設計 §9.3）。例外はそのまま投げる。
+            # 失敗の記録は Runner が行い、旧ワーカーの報告は finish_job の fencing が無視する
+            if repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                repo.update_chunk(conn, chunk.id, save_status="missing")
         raise InvalidAudioError(str(e)) from e
     result = await asyncio.to_thread(ctx.vad.detect, pcm)
     async with ctx.db.write() as conn:
@@ -6849,6 +6856,24 @@ async def test_vad_from_expired_lease_does_not_advance_chunk(client: httpx.Async
         types = [j.job_type for j in repo.list_jobs(conn, "m-1")]
     assert chunk is not None and chunk.stt_status == "pending"
     assert "transcribe_chunk" not in types
+
+
+async def test_vad_from_expired_lease_does_not_mark_chunk_missing(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    """lease を失った旧ワーカーが音声を読めなくても、Chunk を missing にしない。例外は投げる（基本設計 §9.3）。"""
+    # Arrange: vad ジョブを抱えたワーカーが落ちて回収された後、その Chunk のファイルが読めなくなる
+    await _seed(client, 1)
+    stale = await _expire_exhausted(ctx, "vad_chunk")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    with ctx.db.read() as conn:
+        before = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    assert before is not None
+    (ctx.settings.data_dir / before.local_path).write_bytes(b"corrupted")
+    # Act / Assert: 失敗は Runner の失敗処理へ渡す（旧ワーカーの報告は finish_job が無視する）
+    with pytest.raises(InvalidAudioError):
+        await handlers.handle_vad(ctx, stale)
+    with ctx.db.read() as conn:
+        after = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    assert after is not None and after.save_status == before.save_status
 
 
 async def test_merge_from_expired_lease_does_not_write_transcript(client: httpx.AsyncClient, ctx: AppContext,
