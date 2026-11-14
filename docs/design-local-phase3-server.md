@@ -984,16 +984,19 @@ def _all_chunks_terminal(conn: sqlite3.Connection, meeting_id: str) -> bool:
     return True
 
 
-def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str, diarize: bool) -> bool:
-    """全 Chunk が終端なら、話者分離が有効なら diarize_meeting、無効なら merge_transcript を生成する。"""
+def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str, diarize: bool) -> str | None:
+    """全 Chunk が終端なら、話者分離が有効なら diarize_meeting、無効なら merge_transcript を生成する。
+
+    戻り値は作ったジョブの id（作らなかった・既存なら None）。呼び出し側がコミット後にイベントを流すのに使う。
+    """
     if not _all_chunks_terminal(conn, meeting_id):
-        return False
+        return None
     if diarize:
         # diarize が既に終端（completed/failed/cancelled）なら merge へ
         if repo.count_jobs(conn, meeting_id, "diarize_meeting", ["completed", "failed", "cancelled"]) > 0:
-            return repo.insert_job(conn, meeting_id, "merge_transcript") is not None
-        return repo.insert_job(conn, meeting_id, "diarize_meeting") is not None
-    return repo.insert_job(conn, meeting_id, "merge_transcript") is not None
+            return repo.insert_job(conn, meeting_id, "merge_transcript")
+        return repo.insert_job(conn, meeting_id, "diarize_meeting")
+    return repo.insert_job(conn, meeting_id, "merge_transcript")
 
 
 def on_diarize_finished(conn: sqlite3.Connection, meeting_id: str) -> None:
@@ -1192,6 +1195,8 @@ class JobRunner:
             return
         hb.cancel()
         duration = int((time.monotonic() - started) * 1000)
+        removed: Job | None = None   # 下で消した完了済みの行の控え（消した後は読み直せない）
+        followup: str | None = None  # 作り直したジョブの id
         async with self.ctx.db.write() as conn:
             ok = repo.finish_job(conn, job.id, self.owner, job.attempts, "completed", duration_ms=duration)
             if ok and model_used is not None:
@@ -1202,12 +1207,17 @@ class JobRunner:
             if ok and job.job_type == "merge_transcript" and repo.has_replacements(conn, job.meeting_id):
                 # merge の書き込みのコミット後・この完了の記録の前（processing の間）にコミットした撮り直しは、この merge では
                 # 入れ替わっていない。handle_transcribe の delete_finished_job は processing の行を消さず、ensure_merge_job も
-                # 一意制約で作れないので、完了を記録した今、作り直す（作らないと撮り直しは次の merge まで公開されない）
+                # 一意制約で作れないので、完了を記録した今、作り直す（作らないと撮り直しは次の merge まで公開されない）。
+                # 消す前に完了を記録した行を控える。消した後の _publish_job は行を引けず、完了のイベントが流れない
+                removed = repo.get_job(conn, job.id)
                 repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
-                pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
+                followup = pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
             if ok and job.job_type == "diarize_meeting":
                 pipeline.on_diarize_finished(conn, job.meeting_id)
-        self._publish_job(job.id)
+        # どちらもコミットの後に流す（コミット前に流すと、購読側が読み直したときに行がまだない・ロールバックで消える）
+        self._publish_job(job.id, removed=removed)
+        if followup is not None:
+            self._publish_job(followup)
 
     async def _on_failure(self, job: Job, err: JobError, duration_ms: int) -> None:
         now = now_ms()
@@ -1267,9 +1277,10 @@ class JobRunner:
         except asyncio.CancelledError:
             return
 
-    def _publish_job(self, job_id: str) -> None:
+    def _publish_job(self, job_id: str, *, removed: Job | None = None) -> None:
+        """removed はコミット済みのトランザクションで消した行の控え。消した行は読み直せないので控えを流す。"""
         with self.ctx.db.read() as conn:
-            job = repo.get_job(conn, job_id)
+            job = removed if removed is not None else repo.get_job(conn, job_id)
             meeting = repo.get_meeting(conn, job.meeting_id) if job else None
         if job is None:
             return
@@ -5672,8 +5683,15 @@ async def test_restore_skips_broken_backup(ctx3: AppContext) -> None:
     # Arrange
     s = ctx3.settings
     good = backup.create_backup(ctx3.db, s.backups_dir)
-    (s.backups_dir / "minutes-9999999999999.sqlite").write_bytes(b"partial")
-    (s.backups_dir / "minutes-9999999999998.sqlite").write_bytes(b"")                 # 空のファイルは integrity_check に通るが中身がない
+    gen, stamp = backup.backup_generation(good), backup.backup_time_ms(good)
+    assert gen is not None and stamp is not None
+    # 規約どおりの名前（minutes-{世代}-{epoch ms}.sqlite）で good より新しい世代にする。規約外だと list_backups が除き、
+    # 壊れた候補を退ける経路を通らない
+    empty = s.backups_dir / f"minutes-{gen + 1}-{stamp}.sqlite"
+    corrupt = s.backups_dir / f"minutes-{gen + 2}-{stamp}.sqlite"
+    empty.write_bytes(b"")                                                               # 空のファイルは integrity_check に通るが中身がない
+    corrupt.write_bytes(b"partial")
+    assert backup.list_backups(s.backups_dir) == [good, empty, corrupt]                 # 新しい順に corrupt → empty → good を試す
     ctx3.db.close()
     s.db_path.write_bytes(b"garbage" * 100)
     # Act
