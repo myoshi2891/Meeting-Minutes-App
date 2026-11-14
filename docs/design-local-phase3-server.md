@@ -3667,8 +3667,18 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         # この Chunk の結果を置き換える。前の結果で merge が終わっていれば作り直して版を上げる（Phase 2 詳細設計 §14・手動 STT と同じ）
         current = repo.get_chunk(conn, chunk.id)
         replaced = current is not None and current.stt_status == "completed"
+        # 話者分離が終わっていると、ensure_merge_job は diarize_meeting を作り直さず merge へ進む。
+        # 消す前の segments の話者を、同じ source で時間の重なりが最大のものから新しい segments へ移す（§21 の割当と同じ規則）。
+        # 分離を再実行しないのは、ラベル（S1, S2…）が振り直されて利用者が付けた名前と食い違うため。話者の無い segments は移さない
+        previous = repo_phase3.segments_of_chunk(conn, chunk.id) if replaced else []
         repo.delete_segments_of_chunk(conn, chunk.id)
         repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
+        carried = tuple(SpeakerTurn(p.source, p.start_ms, p.end_ms, p.speaker_id,
+                                    p.speaker_confidence if p.speaker_confidence is not None else 0.0)
+                        for p in previous if p.speaker_id is not None)
+        if carried:
+            for sid, label, conf in _assign_speakers(segments, carried):
+                repo_phase3.set_segment_speaker(conn, sid, label, conf)
         if replaced:
             repo.delete_finished_job(conn, chunk.meeting_id, "merge_transcript")
         if meeting is not None and meeting.stt_model_used is None:
@@ -4894,6 +4904,25 @@ async def test_diarize_assigns_labels_and_names_are_user_assigned(client3: httpx
     assert "[mic] [S1:田中] [seg:" in text and "[system] [S2] [seg:" in text
 
 
+async def test_transcribe_retry_after_diarize_keeps_speakers(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                             diarization_provider: FakeDiarizationProvider, stt_provider: FakeSTTProvider) -> None:
+    # Arrange: 話者分離と merge まで終えた後、completed の Chunk の transcribe ジョブを再試行に戻す（コミット後の lease 切れの回収と同じ）
+    await _two_source_meeting(client3, stt_provider)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        job = next(j for j in repo.list_jobs(conn, "m-1") if j.job_type == "transcribe_chunk")
+        conn.execute("UPDATE processing_jobs SET status = 'pending', attempts = 0, next_run_at = 0 WHERE id = ?", (job.id,))
+    # Act
+    await runner3.run_until_idle()
+    # Assert: 分離は再実行せず、作り直した transcript でも差し替えた segments が元の話者を持つ
+    with ctx3.db.read() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        segs = repo.list_segments(conn, "m-1", merged_version=m.transcript_version)
+    assert m.transcript_version == 2 and len(diarization_provider.calls) == 1
+    assert {s.speaker_id for s in segs if s.source == "mic"} == {"S1"}
+    assert {s.speaker_id for s in segs if s.source == "system"} == {"S2", "S3"}
+
+
 async def test_diarize_failure_does_not_block_merge(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
                                                     diarization_provider: FakeDiarizationProvider) -> None:
     await _two_source_meeting(client3)
@@ -5763,6 +5792,7 @@ def test_doctor_rebuild_refuses_while_server_is_running(tmp_path: Path, monkeypa
 | Live State（RUNNING / DEGRADED / STOPPED） | `test_live_state_degrades_with_lag` |
 | Live の小区分既定オフと警告 | `test_live_disabled_on_small_tier_by_default` |
 | 話者ラベル割当・名前は利用者・LLM 入力の `[S1:名前]` | `test_diarize_assigns_labels_and_names_are_user_assigned` |
+| 話者分離の後に transcribe の再試行で segments を置き換えても話者を引き継ぐ（分離は再実行しない） | `test_transcribe_retry_after_diarize_keeps_speakers` |
 | 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
 | 実 Provider：無音 Chunk を挟んでも話者区間の時刻がずれない、上限は `max_speakers`、一時ファイルはデータディレクトリの中 | `test_assemble_timeline_pads_gaps_with_silence`、`test_pyannote_provider_keeps_absolute_time_across_skipped_chunk`、`test_speaker_after_silent_chunk_is_not_shifted` |
 | エコー除去 | `test_echo_from_system_is_dropped_on_mic` |
