@@ -1985,9 +1985,11 @@ def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
     repo.update_chunk(conn, chunk.id, stt_status="failed")
 
 
-def on_job_failed(conn: sqlite3.Connection, job: Job) -> None:
+def on_job_failed(conn: sqlite3.Connection, job: Job) -> str | None:
     """ジョブが failed で確定した後の後続処理。Runner（ハンドラの失敗）と Sweeper（lease 切れで回数切れ）が同じ規則を使う。
 
+    戻り値は後続処理で作ったジョブの id（作らなければ None）。呼び出し側がコミット後にイベントを流す（完了時の後続ジョブと同じ）。
+    Phase 2 の後続処理はジョブを作らないので常に None。Phase 3 の差し替え版は diarize_meeting の失敗で merge を作る。
     状態の対応は §14 の表。vad_chunk / merge_transcript の失敗では Chunk も会議も変えない（会議の failed は
     merge 済みを意味する。§21.1 MERGED_STATUSES）。Chunk の pending（vad）と merge の未完了が後続を止めたまま、
     失敗したジョブの再試行（POST /jobs/{id}/retry）を待つ。exclude_failed の対象ではない。
@@ -1999,7 +2001,8 @@ def on_job_failed(conn: sqlite3.Connection, job: Job) -> None:
     elif job.job_type in ("vad_chunk", "merge_transcript"):
         # Chunk の stt_status を failed にしない。failed は BLOCKING_STT に含まれず、他の Chunk の完了を契機に
         # その Chunk を欠いたまま merge が作られる。pending のままなら ensure_merge_job が止まる
-        return
+        return None
+    return None
 
 
 def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str) -> str | None:
@@ -2491,7 +2494,7 @@ transcribe のハンドラが結果（segments と Chunk の `completed`）を�
 
 再試行（`retry_job`）は `attempts` を 0 に戻す。vad / merge の失敗で会議を `failed` にしないのは、会議の `failed` が「merge が 1 回は終わった」を意味するためである（§21.1 `MERGED_STATUSES`。無音 Chunk の手動 STT などがこれで判定する）。vad の失敗で Chunk を `failed` にしないのは、`failed` が `BLOCKING_STT` に含まれず、他の Chunk の完了を契機にその Chunk を欠いたまま merge が作られるためである。
 
-回収したジョブ（`pending` に戻したもの・`failed` にしたもの）と、その会議の状態は、書き込みトランザクションのコミット後に `events` へ流す（Runner の `_publish_job` と同じ `job` / `meeting_status` の形。会議の状態は会議ごとに 1 回）。流さないと、SSE で見ている画面は `processing` のまま止まる。コミット前に流すと、受け取ったブラウザの `GET /jobs` が回収前の状態を読む。流す内容（ジョブは `UPDATE ... RETURNING` の行、会議は `on_job_failed` の後に読んだ行）はトランザクションの中で確定させ、コミット後に DB を読み直さない。読み直しが失敗すると、次の周は回収済みのジョブを選ばないので、そのイベントは二度と流れない。このため `sweep_once` / `run_forever` は `EventBroker` を受け取り、`repo.sweep_expired` は戻したジョブを返す。
+回収したジョブ（`pending` に戻したもの・`failed` にしたもの）と、その会議の状態は、書き込みトランザクションのコミット後に `events` へ流す（Runner の `_publish_job` と同じ `job` / `meeting_status` の形。会議の状態は会議ごとに 1 回）。流さないと、SSE で見ている画面は `processing` のまま止まる。コミット前に流すと、受け取ったブラウザの `GET /jobs` が回収前の状態を読む。流す内容（ジョブは `UPDATE ... RETURNING` の行と、`on_job_failed` が作ったジョブ（戻り値の id。Phase 2 では作らないが、Phase 3 の差し替え版は分離の失敗で merge を作る）をトランザクションの中で読んだ行、会議は `on_job_failed` の後に読んだ行）はトランザクションの中で確定させ、コミット後に DB を読み直さない。読み直しが失敗すると、次の周は回収済みのジョブを選ばないので、そのイベントは二度と流れない。このため `sweep_once` / `run_forever` は `EventBroker` を受け取り、`repo.sweep_expired` は戻したジョブを返す。
 
 常駐ループ（`sweeper.run_forever`、`JobRunner.run_forever`）は、1 周の失敗（DB のロック、ディスク満杯）を記録して次の周へ進む。例外でループを抜けると、その `asyncio.Task` は誰も待っていないので黙って終わり、サーバーは Chunk を受け取り続けるのにジョブが 1 件も動かない状態になる。記録は標準の `logging`（`minutes_local.jobs.*`）に `ERROR` で出す。ハンドラを設定していなくても標準エラーに出る。
 
@@ -2557,16 +2560,21 @@ async def sweep_once(db: Database, events: EventBroker) -> int:
         now = now_ms()
         # 回数を使い切ったものは pending に戻さず failed にする（落ち続けるジョブを永久に実行しない。§8 fail_exhausted_expired）
         exhausted = repo.fail_exhausted_expired(conn, now)
+        followups: list[Job] = []   # on_job_failed が作ったジョブ（Phase 3 の分離の失敗で作る merge）。行はトランザクションの中で読む
         for job in exhausted:
-            pipeline.on_job_failed(conn, job)
+            followup_id = pipeline.on_job_failed(conn, job)
+            followup = repo.get_job(conn, followup_id) if followup_id is not None else None
+            if followup is not None:
+                followups.append(followup)
         requeued = repo.sweep_expired(conn, now)
         if requeued or exhausted:
             repo.record_metric(conn, "lease_expired", len(requeued) + len(exhausted))
         if exhausted:
             repo.record_metric(conn, "lease_expired_exhausted", len(exhausted))
         # 流す内容はトランザクションの中で確定させる。コミット後に読み直すと、読み取りの失敗でイベントが失われ、
-        # 次の周は回収済みのジョブを選ばないので二度と流れない。ジョブは RETURNING の行（on_job_failed はジョブ行を変えない）
-        jobs = exhausted + requeued
+        # 次の周は回収済みのジョブを選ばないので二度と流れない。ジョブは RETURNING の行（on_job_failed は回収したジョブの行を変えない）と、
+        # on_job_failed が作ったジョブ（流さないと lease されるまで pending の行がイベントに出ない）
+        jobs = exhausted + requeued + followups
         meetings = {j.meeting_id: repo.get_meeting(conn, j.meeting_id) for j in jobs}
     # 配信はコミットの後。トランザクションの中で流すと、受け取ったブラウザの GET /jobs が回収前の状態を読む
     _publish(events, jobs, meetings)
@@ -3703,15 +3711,36 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 # 月・週と時期（末・上旬・中旬・下旬）の組は 1 つの表現として切り出す。別々に切り出すと、quote の別の日付の部品
 # （「今月上旬に確認し、来月下旬に提出」の「来月」と「上旬」）を寄せ集めて deadline の「来月上旬」を裏付けてしまう。
 # 組にした表現は、その部品だけの deadline（「上旬」）も裏付けない（どの月の上旬かを quote から言えないため。基本設計 §12.5 段 5）。
-# 年の付いた日付（「2026年11月20日」「26年11月20日」「令和8年11月20日」の「8年…」「2026/11/20」）も年まで 1 つの表現にする。月日だけを切り出すと、quote の 2026 年が deadline の
-# 2027 年の同じ月日を裏付けてしまう（「2026/11/20」は「26/11」と切り出され、同じ年月の別の日も通る）。年の無い月日の deadline は、
-# 年の付いた quote では裏付けない（どの年かを deadline から言えない。組にした表現と同じ扱い）
+# 年の付いた日付（「2026年11月20日」「26年11月20日」「2026/11/20」）も年まで 1 つの表現にする。月日だけを切り出すと、quote の 2026 年が deadline の
+# 2027 年の同じ月日を裏付けてしまう（「2026/11/20」は「26/11」と切り出され、同じ年月の別の日も通る）。元号の付いた年（「令和8年」「令和元年」）は
+# 元号まで含める。数字の年だけを切り出すと、令和 8 年と平成 8 年の同じ月日が同じ表現になる（「元年」は数字でないので、月日だけになる）。
+# 年の無い月日の deadline は、年の付いた quote では裏付けない（どの年かを deadline から言えない。組にした表現と同じ扱い）。
+# 週と曜日の組（「来週金曜」「来週の金曜」「next week friday」「friday next week」）も 1 つの表現にする。別々に切り出すと、quote の
+# 「今週金曜」の「金曜」と別の「来週」を寄せ集めて deadline の「来週金曜」を裏付けてしまう。
+# 照合する文字列は normalize 済みで空白が無い（「next week」は「nextweek」）。英語の週と曜日の組は空白を任意にする。空白を必須にすると
+# 組が切り出されず、「next week friday」が「friday」だけに縮んで「this week friday」に通る。
+# 組でない「next week」「this week」「end of」は空白付きのまま（normalize 済みの文字列には当たらない）にし、文字列そのものが quote に
+# 現れることを求める（期限の表現を含まない deadline と同じ扱い）。部品として切り出すと、「end of month」が「end of the week」の
+# 「end of」に、「next weekend」が「next week」に通り、別々の句の部品を寄せ集めて「end of next week」も通る
+_WEEKDAYS_JA = "月曜|火曜|水曜|木曜|金曜|土曜|日曜"
+_WEEKDAYS_EN = "monday|tuesday|wednesday|thursday|friday|saturday|sunday"
 _DEADLINE_HINTS = re.compile(
-    r"((?:\d{1,4}年)?\d{1,2}月\d{1,2}日|\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|月曜|火曜|水曜|木曜|金曜|土曜|日曜|"
+    r"((?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年)?\d{1,2}月\d{1,2}日|\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|"
+    rf"(?:再来週|今週|来週)の?(?:{_WEEKDAYS_JA})|{_WEEKDAYS_JA}|"
     r"(?:今月|来月)(?:末|上旬|中旬|下旬)|(?:今週|来週)末|今週|来週|再来週|今月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
-    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|this week|end of|tomorrow|eod|eow)",
+    rf"(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|{_WEEKDAYS_EN}|"
+    r"next week|this week|end of|tomorrow|eod|eow)",
     re.IGNORECASE,
 )
+# 英語の「曜日 + 週」（「friday next week」）。比べる形を「週 + 曜日」にそろえる（_hint_key）
+_EN_DAY_THEN_WEEK = re.compile(rf"({_WEEKDAYS_EN})(?:of)?(next|this)week")
+
+
+def _hint_key(hint: str) -> str:
+    """切り出した期限の表現を比べる形にする。大文字小文字・空白・「の」（「来週の金曜」）を落とし、英語の曜日と週の順序をそろえる。"""
+    key = re.sub(r"[\sの]", "", hint.lower())
+    m = _EN_DAY_THEN_WEEK.fullmatch(key)
+    return f"{m.group(2)}week{m.group(1)}" if m else key
 
 
 def parse_draft(content: str) -> MeetingSummaryDraft:
@@ -3788,7 +3817,8 @@ def _deadline_supported(deadline: str, quote_norm: str) -> bool:
     """deadline が quote に裏付けられているか（段 5）。quote に期限らしい表現があるだけでは通さない。
 
     deadline に期限の表現（_DEADLINE_HINTS）があれば、そのすべてが quote にも現れることを求める
-    （「来週金曜」は「来週」と「金曜」の両方。quote の「来週」は deadline の「月末」「11月20日」を裏付けない）。
+    （「来週中に11月20日」は「来週」と「11月20日」の両方。quote の「来週」は deadline の「月末」「11月20日」を裏付けない）。
+    「来週金曜」のような週と曜日の組は 1 つの表現で、比べるのは _hint_key でそろえた形（「来週の金曜」も同じ）。
     表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たる候補は
     「再来週」だけなので、「再来週」は 1 つの表現になる）。
     相対表現を日付に換算した deadline（quote は「来週」、deadline は「11月20日」）は通さない。換算の基準
@@ -3796,10 +3826,10 @@ def _deadline_supported(deadline: str, quote_norm: str) -> bool:
     期限の表現を含まない deadline（「次回の定例まで」）は、正規化した文字列がそのまま quote に現れることを求める
     """
     d = normalize(deadline)
-    wanted = {m.lower() for m in _DEADLINE_HINTS.findall(d)}
+    wanted = {_hint_key(m) for m in _DEADLINE_HINTS.findall(d)}
     if not wanted:
         return d != "" and d in quote_norm
-    return wanted <= {m.lower() for m in _DEADLINE_HINTS.findall(quote_norm)}
+    return wanted <= {_hint_key(m) for m in _DEADLINE_HINTS.findall(quote_norm)}
 
 
 def _check_evidence(ids: list[str], quote: str, span: EvidenceSpan, index: SegmentIndex) -> tuple[str, list[RejectionReason]]:
@@ -7516,9 +7546,78 @@ def test_deadline_year_must_match_the_quote() -> None:
     assert reasons_for("11月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("2026/12/1") == []
     assert reasons_for("2026/12/2") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
-    # 2 桁の年（「26年」。元号の年も同じ形）も年まで比べる
+    # 2 桁の年（「26年」）も年まで比べる。元号の付いた年は元号まで比べる（test_deadline_era_must_match_the_quote）
     assert reasons_for("26年3月5日") == []
     assert reasons_for("27年3月5日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_deadline_era_must_match_the_quote() -> None:
+    """元号の付いた日付は元号まで 1 つの表現。quote の令和 8 年は deadline の平成 8 年の同じ月日を裏付けない（段 5）。"""
+    # Arrange
+    sid = "ffffffff-6666-4000-8000-000000000006"
+    quote = "鈴木さんが令和8年11月20日と令和元年5月1日までに提出します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ元号・同じ年なら通り、元号が違えば年の数字と月日が同じでも落ちる（元年も同じ）
+    assert reasons_for("令和8年11月20日") == []
+    assert reasons_for("平成8年11月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("令和元年5月1日") == []
+    assert reasons_for("平成元年5月1日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_week_and_weekday_are_matched_as_a_pair() -> None:
+    """週と曜日の組は 1 つの表現。quote の「今週金曜」と別の「来週」を寄せ集めて deadline の「来週金曜」を裏付けない（段 5）。
+
+    英語も同じ。normalize は空白を落とすので、「next week friday」が「friday」だけに縮んで「this week friday」に通ることもない。
+    """
+    # Arrange
+    sid = "abababab-7777-4000-8000-000000000007"
+    quote = "鈴木さんが今週金曜に確認し、来週提出します。佐藤さんはthis week fridayにレビューし、next weekに送ります"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "確認して提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: quote にある組は、書き方（「の」・語順）が違っても通る
+    assert reasons_for("今週金曜") == []
+    assert reasons_for("今週の金曜") == []
+    assert reasons_for("this week friday") == []
+    assert reasons_for("Friday this week") == []
+    assert reasons_for("来週") == []
+    assert reasons_for("next week") == []
+    # 別の週の曜日は通さない。組の部品だけ（どの週の金曜かを言えない）も通さない
+    assert reasons_for("来週金曜") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("next week friday") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("金曜") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_english_week_phrases_are_not_matched_as_fragments() -> None:
+    """英語の「next week」「end of」は部品として切り出さない（文字列そのものが quote に現れることを求める）。
+
+    部品にすると「end of month」が「end of the week」の「end of」に、「next weekend」が「next week」に通り、
+    別々の句の部品（「end of the month」と「next week」）を寄せ集めて「end of next week」も通る（段 5）。
+    """
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "cdcdcdcd-8888-4000-8000-000000000008"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": "Suzuki", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ句なら通る
+    assert reasons_for("next week", "Suzuki will submit it next week") == []
+    assert reasons_for("end of month", "Suzuki will submit it by the end of month") == []
+    # 別の句の部品では通さない
+    assert reasons_for("end of month", "Suzuki will submit it by the end of the week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("next weekend", "Suzuki will submit it next week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("end of next week", "Suzuki checks at the end of the month, then submits next week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 
 
 def test_claim_contradicting_its_quote_passes_as_known_limitation() -> None:
@@ -8254,7 +8353,7 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
 | DLQ = failed + 再試行 | `test_retry_failed_job_via_api`、`test_failed_chunk_blocks_until_excluded` |
 | Structured Output / sourceSegmentIds / assignee 検出 | `test_validate_stage3_to_7`、`test_synthesize_single_window_retries_schema_once` |
-| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算・別の日付の部品の寄せ集め・年の違う同じ月日では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote`、`test_compound_deadline_is_not_matched_by_its_part`、`test_deadline_is_not_assembled_from_parts_of_other_dates`、`test_deadline_year_must_match_the_quote` |
+| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算・別の日付の部品の寄せ集め・年や元号の違う同じ月日・別の週の同じ曜日では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote`、`test_compound_deadline_is_not_matched_by_its_part`、`test_deadline_is_not_assembled_from_parts_of_other_dates`、`test_deadline_year_must_match_the_quote`、`test_deadline_era_must_match_the_quote`、`test_week_and_weekday_are_matched_as_a_pair`、`test_english_week_phrases_are_not_matched_as_fragments` |
 | 段 3a (4) は語彙の重なりで含意は見ない（quote と矛盾する claim も通る既知の制限） | `test_claim_contradicting_its_quote_passes_as_known_limitation` |
 | AI 再生成 / Manual Notes 保護 | `test_regenerate_creates_new_version_and_keeps_notes` |
 | Ollama 停止中に transcript まで完了 | `test_ollama_outage_leaves_transcribed_then_completes`、`test_summary_runs_once_ollama_is_started_after_the_server`、`test_ollama_without_models_is_model_missing` |
