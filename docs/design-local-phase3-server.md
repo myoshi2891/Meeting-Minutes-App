@@ -2391,7 +2391,8 @@ def pending_recovery(db_path: Path) -> Recovery | None:
         return None
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # 入れ子の深すぎる JSON は RecursionError（ValueError ではない）。読めない控えとして扱い、起動を止めない
         data = None
     source = data.get("restoredFrom") if isinstance(data, dict) else None
     return Recovery(restored_from=Path(source) if isinstance(source, str) else None)
@@ -2485,6 +2486,7 @@ class RebuildReport:
     chunks_created: int = 0
     chunks_relinked: int = 0        # 既存の行が指すファイルがなく、同じ音声の別のファイル（圧縮後の FLAC など）へ向け直した数
     chunks_marked_missing: int = 0
+    chunks_reverified: int = 0      # 前に missing にした行のファイルが戻り（直り）、行の内容と一致したので verified に戻した数
     skipped_files: list[str] | None = None
 
 
@@ -2538,7 +2540,8 @@ def _load_snapshot(path: Path) -> dict[str, Any]:
     """meeting.json を読む。ない・読めない・最上位がオブジェクトでないときは空（控えなしとして復元する）。"""
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # 入れ子の深すぎる JSON は ValueError ではなく RecursionError になる。1 つの会議の控えで rebuild・起動時の復旧を止めない
         return {}
     return loaded if isinstance(loaded, dict) else {}
 
@@ -2750,10 +2753,15 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
         # DB にあるがファイルがない Chunk を missing に。verified の Chunk はファイルがあっても読めなければ（壊れている・内容が違う）
         # missing にする（存在するだけで読める Chunk として扱わない）。確かめられない圧縮ファイル（None）はそのまま。
         # verified でない行（registered）は存在だけを見る（従来どおり）
+        # missing の行も確かめ直す。ファイルを同じ場所に戻した（直した）とき、_relink_chunk は同じパスを向け直さないので、
+        # ここで見ないと missing のまま残る。内容が行と一致したときだけ verified に戻し、それ以外（ない・違う・確かめられない）は missing のまま
         for c in repo.list_chunks(conn, meeting_id):
-            if c.save_status == "missing":
-                continue
             path = data_dir / c.local_path
+            if c.save_status == "missing":
+                if _file_matches_chunk(path, c, codec) is True:
+                    repo.update_chunk(conn, c.id, save_status="verified")
+                    report.chunks_reverified += 1
+                continue
             broken = _file_matches_chunk(path, c, codec) is False if c.save_status == "verified" else not path.exists()
             if broken:
                 repo.update_chunk(conn, c.id, save_status="missing")
@@ -6269,6 +6277,59 @@ async def test_rebuild_tolerates_malformed_snapshot_fields(client3: httpx.AsyncC
     with ctx3.db.read() as conn:
         first = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
     assert first is not None and (first.start_offset_ms, first.end_offset_ms, first.has_voice) == (0, 30000, True)
+
+
+async def test_rebuild_tolerates_deeply_nested_snapshot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """入れ子の深すぎる meeting.json（json.loads が RecursionError）でも、控えなしとして復元し、rebuild を止めない。"""
+    # Arrange
+    await _completed_meeting(client3, runner3, ctx3)
+    (ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json").write_text("[" * 100_000, encoding="utf-8")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert m is not None and m.title == "復元された会議"
+
+
+def test_deeply_nested_recovery_marker_counts_as_unreadable(settings: Settings) -> None:
+    """復旧の控えが入れ子の深すぎる JSON でも、読めない控え（復元元は不明の復旧中）として扱い、起動を止めない。"""
+    # Arrange
+    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+    backup.recovery_marker(settings.db_path).write_text("{\"a\":" * 100_000, encoding="utf-8")
+    # Act
+    recovery = backup.pending_recovery(settings.db_path)
+    # Assert
+    assert recovery is not None and recovery.restored_from is None
+
+
+async def test_rebuild_reverifies_missing_chunk_whose_file_was_restored(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                       runner3: JobRunner) -> None:
+    """missing にした行のファイルを同じ場所に戻すと、次の rebuild が内容を確かめて verified に戻す。内容が違えば missing のまま。"""
+    # Arrange: 1 つ目のファイルを壊して rebuild で missing にする
+    data_dir = ctx3.settings.data_dir
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        rows = sorted(repo.list_chunks(conn, "m-1"), key=lambda c: c.sequence_no)
+    path = data_dir / rows[0].local_path
+    intact = path.read_bytes()
+    path.write_bytes(b"garbage")
+    with ctx3.db.write_sync() as conn:
+        assert rebuild(conn, data_dir, ctx3.codec).chunks_marked_missing == 1
+    # Act: 別の内容のままもう一度、元の内容に戻してもう一度
+    with ctx3.db.write_sync() as conn:
+        still_broken = rebuild(conn, data_dir, ctx3.codec)
+        broken_row = repo.get_chunk(conn, rows[0].id)
+    path.write_bytes(intact)
+    with ctx3.db.write_sync() as conn:
+        repaired = rebuild(conn, data_dir, ctx3.codec)
+        row = repo.get_chunk(conn, rows[0].id)
+    # Assert
+    assert still_broken.chunks_reverified == 0 and broken_row is not None and broken_row.save_status == "missing"
+    assert (repaired.chunks_reverified, repaired.chunks_marked_missing) == (1, 0)
+    assert row is not None and row.save_status == "verified" and row.local_path == rows[0].local_path
 
 
 async def test_rebuild_tolerates_snapshot_that_is_not_an_object(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
