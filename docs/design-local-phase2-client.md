@@ -2370,11 +2370,14 @@ export interface NotesState {
 
 /**
  * 判定付きの書き込み。判定と書き込み・退避は 1 つの readwrite トランザクションで行う（別タブの書き込みが間に入らない）。
- * keep が true なら key に書かない。退避先（holdKey のオブジェクト）の holdId の項目は、
- * 書かなかったうえで holdIfKept なら value にし、それ以外（書いた・保存済みの控えで退避が要らない）は消す
+ * keep が true なら key に書かない。key に書くときは、上書きされる値（stored）を evict が返す項目に移す（null なら移さない）。
+ * 退避先（holdKey のオブジェクト）の holdId の項目は、書かなかったうえで holdIfKept なら value にし、
+ * それ以外（書いた・保存済みの控えで退避が要らない）は消す
  */
 export interface DraftGuard {
   readonly keep: (stored: unknown) => boolean;
+  /** key を上書きするときに呼ぶ。held は同じトランザクションで読んだ退避先の内容。holdId は返さない */
+  readonly evict: (stored: unknown, held: Readonly<Record<string, unknown>>) => string | null;
   readonly holdKey: string;
   readonly holdId: string;
   readonly holdIfKept: boolean;
@@ -2383,7 +2386,10 @@ export interface DraftGuard {
 /** IndexedDB の settings ストアのうち使う面。本番は §10.1 の IdbDraftStore。 */
 export interface DraftStore {
   get(key: string): Promise<unknown>;
-  /** guard を渡したときは DraftGuard のとおりに書く。key に書いたら true、書かなかったら false。guard なしでは戻り値を見ない */
+  /**
+   * guard を渡したときは DraftGuard のとおりに書く。key に書いたら true、書かなかったら false。
+   * NotesStore は常に guard を渡す。guard なし（そのまま書く）はテストの準備用で、戻り値を見ない
+   */
   set(key: string, value: unknown, guard?: DraftGuard): Promise<boolean | void>;
 }
 
@@ -2435,6 +2441,42 @@ function isNewerDraft(stored: unknown, carry: Draft): boolean {
   return typeof stored.savedAt === "number" && stored.savedAt > carry.savedAt;
 }
 
+/** load() が IndexedDB から採用した下書きの識別。値で比べる（IndexedDB は読むたびに別のオブジェクトを返す） */
+interface DraftIdentity {
+  readonly writer: string | undefined;
+  readonly revision: number;
+  readonly savedAt: number;
+}
+
+function sameDraft(stored: Draft, id: DraftIdentity): boolean {
+  return stored.writer === id.writer && stored.revision === id.revision && stored.savedAt === id.savedAt;
+}
+
+/** writer の無い旧ビルドの下書きを退避する項目。tabId は crypto.randomUUID() なので、この文字列と重ならない */
+const LEGACY_HOLD_ID = "legacy";
+
+/**
+ * 下書きのキーを上書きするとき、上書きされる値を退避先のどの項目に移すか（移さないなら null）。
+ * 別タブの未送信の下書きは、revision・時刻が carry や新しい編集より古く見えても、その編集が他のどこにも無いことがある
+ * （別の版の上で独立に編集して、送る前にタブが落ちた）。順序では捨てず、書いたタブの項目に移す。
+ * 移さないのは、内容がこのインスタンスに入っていると分かっている下書きと、保存済みの控え（saved: true。サーバーにある）。
+ * 前者は自分のタブの下書き（前のインスタンスのものを含め、内容はメモリ上の最新か carry に入っている）と、
+ * load() が採用した下書き（adopted。閉じた・リロードしたタブの下書きを、このインスタンスがエディタに読み込んで送る）。
+ * adopted を移すと、書いたタブはもう無いので項目を消す者がおらず、取り込み済みの内容が以後の heldDrafts に出続ける。
+ * 同じタブの項目に後から書かれた退避分があれば、それがそのタブの新しい内容なので残す
+ * （時刻を比べるのは同じタブの中だけ。タブをまたいだ時刻の大小では内容の包含は分からない）
+ */
+function evictionHoldId(stored: unknown, tabId: string, held: Readonly<Record<string, unknown>>, adopted: DraftIdentity | null): string | null {
+  if (!isDraft(stored) || stored.saved === true || stored.writer === tabId) return null;
+  if (adopted !== null && sameDraft(stored, adopted)) return null;
+  const id = stored.writer ?? LEGACY_HOLD_ID;
+  const existing = held[id];
+  if (isDraft(existing) && typeof existing.savedAt === "number" && typeof stored.savedAt === "number" && existing.savedAt > stored.savedAt) {
+    return null;
+  }
+  return id;
+}
+
 export class NotesStore {
   private state: NotesState;
   private timer: unknown = null;
@@ -2456,9 +2498,15 @@ export class NotesStore {
   private unwrittenDraft: Draft | null = null;
   /**
    * load(carry) で引き継いだ carry。以後このインスタンスの書き込みは、IndexedDB に別タブの carry より新しい下書きがあれば
-   * 上書きせず、未送信の内容をこのタブの退避先に書く（guardFor）。引き継ぎがなければ null で、書き込みは従来どおり
+   * 上書きせず、未送信の内容をこのタブの退避先に書く（guardFor）。引き継ぎがなければ null で、書き込みは常に上書きする
+   * （上書きされる別タブの未送信の下書きは、どちらでも退避先に移す）
    */
   private protectBase: Draft | null = null;
+  /**
+   * load() が IndexedDB から読んでエディタに採用した下書き（carry が無いときだけ）。上書きしても退避先へ移さない（evictionHoldId）。
+   * 別タブがその後に書き直していれば、値が変わるので移す
+   */
+  private adoptedDraft: DraftIdentity | null = null;
   private disposed = false;
   /** dispose() の開始後に入った編集がある。鎖に書き込みを足さず、dispose() の戻り値で引き継ぐ */
   private editedWhileDisposing = false;
@@ -2483,16 +2531,18 @@ export class NotesStore {
   }
 
   /**
-   * protectBase があるときの書き込みの判定。別タブ（writer が違う）の、carry より新しい下書き（isNewerDraft）は上書きしない。
-   * 自分のタブの下書き（前のインスタンスのものを含む）は常に上書きする。書かなかった未送信の内容は退避先へ、
-   * 保存済みの控え（saved: true）はサーバーにあるので退避しない
+   * 書き込みの判定。すべての書き込み（protectBase が無い通常の setDraft・控えも）に付ける。
+   * - protectBase があるとき：別タブ（writer が違う）の、carry より新しい下書き（isNewerDraft）は上書きしない。
+   *   書かなかった未送信の内容は退避先へ、保存済みの控え（saved: true）はサーバーにあるので退避しない
+   * - 上書きするとき：上書きされる別タブの未送信の下書き（別タブが load(carry) で書いた carry を含む）を、そのタブの項目に移す
+   *   （evictionHoldId）。protectBase の有無も revision の大小も問わない。自分のタブの下書きは移さずに上書きする
    */
-  private guardFor(draft: Draft): DraftGuard | undefined {
+  private guardFor(draft: Draft): DraftGuard {
     const base = this.protectBase;
-    if (base === null) return undefined;
     const tabId = this.deps.tabId;
     return {
-      keep: (stored) => isDraft(stored) && stored.writer !== tabId && isNewerDraft(stored, base),
+      keep: (stored) => base !== null && isDraft(stored) && stored.writer !== tabId && isNewerDraft(stored, base),
+      evict: (stored, held) => evictionHoldId(stored, tabId, held, this.adoptedDraft),
       holdKey: this.heldKey(),
       holdId: tabId,
       holdIfKept: draft.saved !== true,
@@ -2536,6 +2586,11 @@ export class NotesStore {
     }
     // 通知は下の分岐の set() にまとめる
     this.state = { ...this.state, heldDrafts };
+    // 以下の分岐は、下書きがあればどれもその内容をエディタに入れる（offline・dirty・saved・conflict）。
+    // carry のときは draft が carry そのもので、IndexedDB の値ではないので記録しない
+    if (carry === null && draft !== null) {
+      this.adoptedDraft = { writer: draft.writer, revision: draft.revision, savedAt: draft.savedAt };
+    }
     if (!res.ok) {
       // サーバー未起動：下書きがあればそれで開始
       if (draft !== null) {
@@ -2781,7 +2836,7 @@ export class NotesStore {
 
 ## 10.1 下書きの保存先 `src/notes/idb-draft-store.ts`
 
-`NotesStore` の `DraftStore` の本番実装。Phase 1 の `SettingsStore`（`src/storage/idb.ts`、§1.1 で変更なし）と同じ `settings` ストア・同じレコード形（`SettingsRecord`）に読み書きし、`DraftGuard` の判定・書き込み・退避先の更新を同じ readwrite トランザクションの中で行う（書かなかった内容が下書きにも退避先にも無い瞬間を作らない）。IndexedDB は範囲の重なる readwrite トランザクションをタブをまたいで作成順に 1 つずつ実行するので、判定から書き込みまでの間に別タブの書き込みは入らない（Web Locks で全タブの書き込みを囲む必要がない）。トランザクションは `set()` の呼び出しの中で同期的に作る。`load(carry)` の「最初の await より前に書き始める」は、作り直したインスタンスの読み込みより先にこのトランザクションができることで満たす。W8 で `NotesStore` を生成するとき、`drafts` にこれを渡す。
+`NotesStore` の `DraftStore` の本番実装。Phase 1 の `SettingsStore`（`src/storage/idb.ts`、§1.1 で変更なし）と同じ `settings` ストア・同じレコード形（`SettingsRecord`）に読み書きし、`DraftGuard` の判定・書き込み・退避先の更新（書かなかった内容と、上書きで追い出した別タブの未送信の下書きの退避）を同じ readwrite トランザクションの中で行う（書かなかった内容・追い出した下書きが、下書きにも退避先にも無い瞬間を作らない）。IndexedDB は範囲の重なる readwrite トランザクションをタブをまたいで作成順に 1 つずつ実行するので、判定から書き込みまでの間に別タブの書き込みは入らない（Web Locks で全タブの書き込みを囲む必要がない）。トランザクションは `set()` の呼び出しの中で同期的に作る。`load(carry)` の「最初の await より前に書き始める」は、作り直したインスタンスの読み込みより先にこのトランザクションができることで満たす。W8 で `NotesStore` を生成するとき、`drafts` にこれを渡す。
 
 ```typescript
 // src/notes/idb-draft-store.ts
@@ -2822,28 +2877,31 @@ export class IdbDraftStore implements DraftStore {
         written = true;
         return;
       }
+      // 下書きと退避先を読んでから判定する（上書きされる値を退避先へ移すため、書く前に両方要る）
       const req = store.get(key);
-      req.onsuccess = () => {
+      const heldReq = store.get(guard.holdKey);
+      heldReq.onsuccess = () => {
+        const stored = valueOf(req.result);
+        const current = valueOf(heldReq.result);
+        const held: Record<string, unknown> = typeof current === "object" && current !== null ? { ...(current as Record<string, unknown>) } : {};
         let kept: boolean;
+        let evictTo: string | null = null;
         try {
-          kept = guard.keep(valueOf(req.result));
+          kept = guard.keep(stored);
+          if (!kept) evictTo = guard.evict(stored, held);
         } catch (error) {
           failure = error;
           tx.abort();
           return;
         }
         if (!kept) {
+          if (evictTo !== null) held[evictTo] = stored;
           put(key, value);
           written = true;
         }
-        const heldReq = store.get(guard.holdKey);
-        heldReq.onsuccess = () => {
-          const current = valueOf(heldReq.result);
-          const held: Record<string, unknown> = typeof current === "object" && current !== null ? { ...(current as Record<string, unknown>) } : {};
-          if (kept && guard.holdIfKept) held[guard.holdId] = value;
-          else delete held[guard.holdId];
-          put(guard.holdKey, held);
-        };
+        if (kept && guard.holdIfKept) held[guard.holdId] = value;
+        else delete held[guard.holdId];
+        put(guard.holdKey, held);
       };
     });
   }
@@ -4278,9 +4336,14 @@ function build(opts: { serverRevision?: number; offline?: boolean } = {}) {
           drafts.set(k, v);
           return true;
         }
-        const kept = guard.keep(drafts.get(k));
-        if (!kept) drafts.set(k, v);
+        const stored = drafts.get(k);
         const held = { ...((drafts.get(guard.holdKey) ?? {}) as Record<string, unknown>) };
+        const kept = guard.keep(stored);
+        if (!kept) {
+          const evictTo = guard.evict(stored, held);
+          if (evictTo !== null) held[evictTo] = stored;
+          drafts.set(k, v);
+        }
         if (kept && guard.holdIfKept) held[guard.holdId] = v;
         else delete held[guard.holdId];
         drafts.set(guard.holdKey, held);
@@ -4699,19 +4762,79 @@ describe("NotesStore", () => {
     expect(b.drafts.get("notes:m:held")).toEqual({});
   });
 
-  it("carry を引き継いだ後でも、自分のタブの下書きは上書きし、別タブの古い下書きも上書きする", async () => {
-    // Arrange: 別タブの下書きは carry より古い（revision 1）
+  it("carry を引き継いだ後でも、自分のタブの下書きは上書きし、carry より古い revision の別タブの未送信の下書きは退避先へ移して上書きする", async () => {
+    // Arrange: 別タブの下書きは carry より古い revision 1 の上の独立した編集（送る前にタブが落ちた）
     const b = build({ serverRevision: 2 });
-    await b.drafts.set("notes:m", { json: ["old other"], revision: 1, lastAppliedSummaryVersion: null, savedAt: 9, writer: "tab-B", saved: false });
+    const oldOther = { json: ["old other"], revision: 1, lastAppliedSummaryVersion: null, savedAt: 9, writer: "tab-B", saved: false };
+    await b.drafts.set("notes:m", oldOther);
     const carry = { json: ["carried"], revision: 2, lastAppliedSummaryVersion: null, savedAt: 3, writer: "tab-A", saved: false };
     const store = new NotesStore(b.deps, "m");
     // Act
     await store.load(carry);
     store.setDraft(["edited"]);
     await Promise.resolve();
-    // Assert
+    // Assert: revision の大小では捨てない。別タブの編集は tab-B の項目に残り、次に開いたタブの heldDrafts に出る
     expect(b.drafts.get("notes:m")).toMatchObject({ json: ["edited"], writer: "tab-A", saved: false });
+    expect(b.drafts.get("notes:m:held")).toEqual({ "tab-B": oldOther });
+  });
+
+  it("carry の無い通常の書き込みも、別タブが書いた carry（未送信）を上書きするときは、そのタブの退避先へ移す", async () => {
+    // Arrange: このタブが開いた後に、別タブ（tab-B）が作り直しで load(carry) し、carry を下書きのキーに書いた（そのタブはその後落ちた）
+    const b = build();
+    const store = new NotesStore(b.deps, "m");
+    await store.load();
+    const otherCarry = { json: ["b carried"], revision: 0, lastAppliedSummaryVersion: null, savedAt: 5, writer: "tab-B", saved: false };
+    await b.drafts.set("notes:m", otherCarry);
+    // Act: このタブ（protectBase なし）が編集する
+    store.setDraft(["mine"]);
+    await Promise.resolve();
+    const later = new NotesStore({ ...b.deps, tabId: "tab-C" }, "m");
+    await later.load();
+    // Assert: 新しい編集は下書きのキーに書き、別タブの carry は失わない
+    expect(b.drafts.get("notes:m")).toMatchObject({ json: ["mine"], writer: "tab-A", saved: false });
+    expect(b.drafts.get("notes:m:held")).toEqual({ "tab-B": otherCarry });
+    expect(later.current.heldDrafts).toEqual([{ tabId: "tab-B", draft: otherCarry }]);
+  });
+
+  it("load() が採用した閉じたタブの下書きは、保存して上書きしても退避先へ移さない（以後の heldDrafts に出し続けない）", async () => {
+    // Arrange: 前のタブ（リロード前）が編集し、保存の前に閉じた。値は読むたびに別のオブジェクトにする（IndexedDB と同じ）
+    const b = build();
+    const closed = { json: ["before reload"], revision: 0, lastAppliedSummaryVersion: null, savedAt: 5, writer: "tab-OLD", saved: false };
+    await b.drafts.set("notes:m", closed);
+    const get = b.deps.drafts.get;
+    const store = new NotesStore({ ...b.deps, drafts: { ...b.deps.drafts, get: async (k) => structuredClone(await get(k)) } }, "m");
+    await store.load();
+    expect(store.current.sync).toBe("dirty");
+    // Act: 採用した下書きを送り、控えで上書きする
+    await b.fire();
+    const later = new NotesStore({ ...b.deps, tabId: "tab-C" }, "m");
+    await later.load();
+    // Assert
+    expect(b.puts).toEqual([{ json: ["before reload"], revision: 0 }]);
+    expect(b.drafts.get("notes:m")).toMatchObject({ json: ["before reload"], writer: "tab-A", saved: true });
     expect(b.drafts.get("notes:m:held")).toEqual({});
+    expect(later.current.heldDrafts).toEqual([]);
+  });
+
+  it("上書きで退避先へ移すのは別タブの未送信の下書きだけ。保存済みの控えと、同じタブの後の退避分は残す", async () => {
+    // Arrange: 別タブの保存済みの控え。tab-C は下書きのキーに書けずに後から退避した新しい内容を持つ
+    const b = build({ serverRevision: 1 });
+    const newerHeld = { json: ["c newer"], revision: 1, lastAppliedSummaryVersion: null, savedAt: 8, writer: "tab-C", saved: false };
+    await b.drafts.set("notes:m", { json: ["server"], revision: 1, lastAppliedSummaryVersion: null, savedAt: 4, writer: "tab-B", saved: true });
+    await b.drafts.set("notes:m:held", { "tab-C": newerHeld });
+    const store = new NotesStore(b.deps, "m");
+    await store.load();
+    // Act: 控えを上書きし、続けて tab-C の古い下書きを上書きする（書き込みの鎖が空くまで待ってから次を書く）
+    store.setDraft(["mine"]);
+    await new Promise((r) => setTimeout(r, 0));
+    const heldAfterSaved = b.drafts.get("notes:m:held");
+    await b.drafts.set("notes:m", { json: ["c older"], revision: 1, lastAppliedSummaryVersion: null, savedAt: 6, writer: "tab-C", saved: false });
+    store.setDraft(["mine2"]);
+    await new Promise((r) => setTimeout(r, 0));
+    // Assert
+    expect(heldAfterSaved).toEqual({ "tab-C": newerHeld });
+    expect(b.drafts.get("notes:m:held")).toEqual({ "tab-C": newerHeld });
+    expect(b.drafts.get("notes:m")).toMatchObject({ json: ["mine2"], writer: "tab-A" });
   });
 
   it("load(carry) は同じ revision で前に書かれた自分の古い下書きなら上書きする", async () => {
@@ -4973,7 +5096,8 @@ describe("IdbDraftStore", () => {
     expect(await store.get("missing")).toBeUndefined();
   });
 
-  const guard = (keep: (stored: unknown) => boolean, holdIfKept = true): DraftGuard => ({ keep, holdKey: "notes:m:held", holdId: "tab-A", holdIfKept });
+  const guard = (keep: (stored: unknown) => boolean, holdIfKept = true, evict: DraftGuard["evict"] = () => null): DraftGuard =>
+    ({ keep, evict, holdKey: "notes:m:held", holdId: "tab-A", holdIfKept });
 
   it("keep が true なら書かずに false を返し、同じトランザクションで退避先に残す。書いたら退避先から消す", async () => {
     // Arrange
@@ -4993,6 +5117,22 @@ describe("IdbDraftStore", () => {
     expect(overwritten).toBe(true);
     expect(await store.get("notes:m")).toEqual({ json: ["latest"] });
     expect(await store.get("notes:m:held")).toEqual({ "tab-B": { json: ["b"] } });
+  });
+
+  it("上書きするとき、evict が返した項目へ上書きされる値を同じトランザクションで移す", async () => {
+    // Arrange
+    const db = await openDatabase(new IDBFactory());
+    const store = new IdbDraftStore(db);
+    await store.set("notes:m", { json: ["b unsent"] });
+    await store.set("notes:m:held", { "tab-C": { json: ["c"] } });
+    const seen: Array<[unknown, unknown]> = [];
+    // Act
+    const written = await store.set("notes:m", { json: ["a"] }, guard(() => false, true, (stored, held) => { seen.push([stored, { ...held }]); return "tab-B"; }));
+    // Assert: evict には上書き前の値と退避先が渡る
+    expect(written).toBe(true);
+    expect(seen).toEqual([[{ json: ["b unsent"] }, { "tab-C": { json: ["c"] } }]]);
+    expect(await store.get("notes:m")).toEqual({ json: ["a"] });
+    expect(await store.get("notes:m:held")).toEqual({ "tab-C": { json: ["c"] }, "tab-B": { json: ["b unsent"] } });
   });
 
   it("holdIfKept が false なら、書かなかった内容を退避せず、前の退避分を消す", async () => {
