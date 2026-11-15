@@ -95,7 +95,7 @@ testpaths = ["tests"]
 * ジョブ種別 `diarize_meeting`（`priority=150`：全 `transcribe_chunk` 完了後、`merge_transcript`(200) の前）。依存関係は `transcribe 完了 → diarize → merge → summary` に変わる
 * `DiarizationProvider` 抽象 + pyannote 実 Provider（遅延 import）+ Fake。モデルは利用者が `{dataDir}/models/diarization/` に配置する。Phase 2 §7.4 のような取得の経路は用意しない（配置の規約と理由は §12）
 * 実 Provider に渡す音声は、source ごとに Chunk を絶対時刻の位置へ置いて連続させる（`assemble_timeline()`）。話者分離に渡すのは STT が完了した Chunk だけなので、無音で STT を省いた Chunk の区間は無音で埋める。単純に連結すると、省いた Chunk 1 つにつき後ろの話者区間が 30 秒ずつ前へずれ、別の人の発言にラベルが付く
-* 話者分離はサーバーのプロセス内（`asyncio.to_thread`）で走らせる。STT のようなプロセスプールには入れない（1 会議 1 回で、ワーカーにモデルを持たせておく利点がない）。その代わり、メモリ不足で OS に止められるとサーバーごと落ちる。この場合も、lease 切れの回数上限（Phase 2 §14）で `failed` になり、話者分離なしで merge へ進む（落ち続けて会議が止まったままにはならない）。同時に走らせる分離は `MAX_CONCURRENT_DIARIZE`（1）本までに絞る（`AppContext.diarize_slots`。§7）。1 本分のピーク（全 Chunk の PCM とモデル。§3 の表）しか見積もっておらず、2 本分が載ることは確かめていないため。上げるのは §24 の実機確認で最大メモリを測ってから。`requeue_running_job` で `pending` に戻した分離の次の試行も、旧い試行のスレッド（`asyncio.to_thread` は止められない）が抜けて枠を返すまで分離を始めない。
+* 話者分離はサーバーのプロセス内（`asyncio.to_thread`）で走らせる。STT のようなプロセスプールには入れない（1 会議 1 回で、ワーカーにモデルを持たせておく利点がない）。その代わり、メモリ不足で OS に止められるとサーバーごと落ちる。この場合も、lease 切れの回数上限（Phase 2 §14）で `failed` になり、話者分離なしで merge へ進む（落ち続けて会議が止まったままにはならない）。同時に走らせる分離は `MAX_CONCURRENT_DIARIZE`（1）本までに絞る（`AppContext.diarize_slots`。§7）。1 本分のピーク（全 Chunk の PCM とモデル。§3 の表）しか見積もっておらず、2 本分が載ることは確かめていないため。上げるのは §24 の実機確認で最大メモリを測ってから。`requeue_running_job` で `pending` に戻した分離の次の試行も、旧い試行のスレッド（`asyncio.to_thread` は止められない）が抜けて枠を返すまで分離を始めない。分離を待つハンドラがキャンセルされたとき（サーバーの終了など）も、枠はスレッドが抜けるまで返さない（§21 `handle_diarize` の `_release_when_done`）。
 * mic と system は**別々に**ダイアライズし、ラベルに source 接頭辞を付けない代わりに `meeting_speakers` で `(label → 名前)` を利用者が割り当てる。mic 側は通常 1 話者（利用者本人）だが、会議室のマイクで複数人が話す場合もあるため固定しない
 * ラベルは `S1..Sn`。名前は AI に推定させない（v4.0 §63、Invariant 9）
 * 分離失敗（モデル未配置・OOM 上限到達・プロセスごと落ちる失敗の繰り返し）は `merge` を止めない。`speaker_id=NULL` のまま続行し、UI に「話者分離なし」を表示
@@ -995,19 +995,24 @@ def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
     repo.update_chunk(conn, chunk.id, stt_status="failed")
 
 
-def on_job_failed(conn: sqlite3.Connection, job: Job) -> None:
-    """ジョブが failed で確定した後の後続処理。Runner（ハンドラの失敗）と Sweeper（lease 切れで回数切れ）が同じ規則を使う。"""
+def on_job_failed(conn: sqlite3.Connection, job: Job) -> str | None:
+    """ジョブが failed で確定した後の後続処理。Runner（ハンドラの失敗）と Sweeper（lease 切れで回数切れ）が同じ規則を使う。
+
+    戻り値は後続処理で作ったジョブの id（diarize_meeting の失敗で作った merge。作らなければ None）。Runner と Sweeper が
+    コミット後に流す（完了時の後続ジョブと同じ。流さないと lease されるまで pending の行がイベントに出ない）。
+    """
     if job.job_type == "transcribe_chunk":
         on_transcribe_failed(conn, job_of_chunk(conn, job))
     elif job.job_type == "synthesize_minutes":
         on_summary_failed(conn, job.meeting_id)
     elif job.job_type in ("vad_chunk", "merge_transcript"):
         # Chunk も会議も変えず、失敗したジョブの再試行を待つ（Phase 2 §12・§14 の表）
-        return
+        return None
     elif job.job_type == "diarize_meeting":
         # 話者分離の失敗は transcript を止めない（§2.2）
-        on_diarize_finished(conn, job.meeting_id)
+        return on_diarize_finished(conn, job.meeting_id)
     # live_transcribe_chunk / compress_chunk の失敗は後続に影響しない
+    return None
 
 
 def _all_chunks_terminal(conn: sqlite3.Connection, meeting_id: str) -> bool:
@@ -1279,6 +1284,7 @@ class JobRunner:
         if job.job_type == "diarize_meeting" and not err.counts_attempt:
             # モデル未配置等の無期限 retry では待たず failed にし、merge へ進める（§2.2）
             d = RetryDecision("failed", None, True)
+        followup: str | None = None  # 失敗の後続処理で作ったジョブの id（分離の失敗で作った merge）
         async with self.ctx.db.write() as conn:
             ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
                                  last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
@@ -1289,12 +1295,15 @@ class JobRunner:
             if err.error_class == "OOM" and job.job_type in GPU_HEAVY and job.job_type != "diarize_meeting":
                 self._downgrade_stt(conn, job.meeting_id, job.model_name)
             if d.next_status == "failed":
-                pipeline.on_job_failed(conn, job)
+                followup = pipeline.on_job_failed(conn, job)
             elif job.job_type == "synthesize_minutes":
                 # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
                 pipeline.on_summary_deferred(conn, job.meeting_id)
             repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
+        # 完了時と同じく、どちらもコミットの後に流す
         self._publish_job(job.id)
+        if followup is not None:
+            self._publish_job(followup)
 
     def _downgrade_stt(self, conn, meeting_id: str, ran_with: str | None) -> None:  # type: ignore[no-untyped-def]
         """会議単位でモデルを 1 段落とす（基本設計 §7.3）。ran_with は失敗したジョブが使ったモデル（lease 時点の model_name）。
@@ -3739,13 +3748,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
 from ..db import repo, repo_phase3
 from ..db.connection import now_ms
 from ..db.models import AudioChunk, Job, Segment, SummaryVersion
-from ..diarization.provider import MAX_TIMELINE_MS, DiarizationRequest, SpeakerTurn, check_timeline_span
+from ..diarization.provider import MAX_TIMELINE_MS, DiarizationRequest, DiarizationResult, SpeakerTurn, check_timeline_span
 from ..llm.caveats import caveats_for
 from ..llm.map_reduce import synthesize
 from ..llm.prompts import MIXED_NOTE_EN, MIXED_NOTE_JA, PROMPT_VERSION
@@ -3762,6 +3772,8 @@ from . import pipeline
 from .context import AppContext
 from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError
 from .selection import refresh_llm, refresh_stt
+
+log = logging.getLogger(__name__)
 
 DEFAULT_LLM_CTX_TOKENS = 8192
 
@@ -4030,6 +4042,19 @@ def _align_labels(segments: list[Segment], turns: tuple[SpeakerTurn, ...], taken
     return tuple(SpeakerTurn(t.source, t.start_ms, t.end_ms, mapping[t.label], t.confidence) for t in turns)
 
 
+def _release_when_done(slots: asyncio.Semaphore, worker: asyncio.Task[DiarizationResult]) -> None:
+    """分離のスレッドが抜けたら実行枠を返す（handle_diarize がキャンセルで先に抜けたとき）。
+
+    返すのはタスクの完了の通知（イベントループの上で呼ばれる）。スレッドの関数の finally で返すと、スレッドを始める前に
+    取り消されたときに返らず、枠が埋まったままになる。結果は捨てる（呼び出し元は抜けている）。例外は取り出して、未取得の警告を出さない
+    """
+    def done(task: asyncio.Task[DiarizationResult]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            log.warning("diarization finished after its handler was cancelled: %s", task.exception())
+        slots.release()
+    worker.add_done_callback(done)
+
+
 async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
     if ctx.diarization is None:
         raise ModelMissingError("diarization provider not available")
@@ -4037,7 +4062,11 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
     # 読んだ分（1 source あたり最大約 461 MB）を抱える。pending に戻された旧い試行（requeue_running_job）は、lease を失っても
     # asyncio.to_thread のスレッドを止められないので、スレッドが抜けて枠を返すまで次の試行は分離を始めない。
     # 待つ間も Runner の heartbeat が lease を延ばす（待っている試行は Runner の 1 枠を占める）
-    async with ctx.diarize_slots:
+    # 枠は async with で持たない。分離を待つハンドラがキャンセルされる（サーバーの終了など）と、async with はスレッドが走ったまま
+    # 枠を返し、次の試行が並んで分離を始める。スレッドを待つ間に抜けたときは、スレッドが抜けた時点で枠を返す（_release_when_done）
+    await ctx.diarize_slots.acquire()
+    worker: asyncio.Task[DiarizationResult] | None = None
+    try:
         with ctx.db.read() as conn:
             chunks = repo.list_chunks(conn, job.meeting_id)
         targets = [c for c in chunks if c.stt_status == "completed"]
@@ -4058,7 +4087,9 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
             pcm_by_source.setdefault(c.source, []).append((c.start_offset_ms, pcm))
         req = DiarizationRequest(meeting_id=job.meeting_id, pcm_by_source=pcm_by_source, models_dir=str(ctx.settings.models_dir),
                                  work_dir=str(ctx.settings.tmp_dir))
-        result = await asyncio.to_thread(ctx.diarization.diarize, req)
+        # スレッドを別のタスクで待ち、shield で包む。このハンドラがキャンセルされてもタスクは残り、スレッドの終わりを知らせる
+        worker = asyncio.create_task(asyncio.to_thread(ctx.diarization.diarize, req))
+        result = await asyncio.shield(worker)
         async with ctx.db.write() as conn:
             # lease が失効していれば何も書かない（Phase 2 基本設計 §9.3）。分離は長く走るので、失効した旧ワーカーが
             # merge の後でラベルを上書きしたり、新しい attempt の結果を古い結果で置き換えたりする
@@ -4085,6 +4116,11 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
             repo.record_metric(conn, "diarize_duration_ms", result.duration_ms, meeting_id=job.meeting_id)
             repo.record_metric(conn, "diarize_speakers", result.speaker_count, meeting_id=job.meeting_id)
         return None
+    finally:
+        if worker is None or worker.done():
+            ctx.diarize_slots.release()   # スレッドを始める前に抜けた（読み込みの失敗など）か、スレッドが抜けている
+        else:
+            _release_when_done(ctx.diarize_slots, worker)   # スレッドがまだ走っている（キャンセルで抜けた）
 
 
 # ---- merge / summary ----
@@ -5674,6 +5710,97 @@ async def test_requeued_diarize_waits_for_the_running_attempt(client3: httpx.Asy
     assert "diarize_meeting" in runner3.allowed_types()
 
 
+async def test_cancelled_diarize_keeps_the_slot_until_its_thread_exits(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """分離を待つハンドラがキャンセルされても（サーバーの終了など）、スレッドが抜けるまで実行枠を返さない（§21 handle_diarize）。"""
+    # Arrange: 分離のスレッドが走っている
+    provider = _BlockingDiarization()
+    ctx3.diarization = provider
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        repo.insert_job(conn, "m-1", "diarize_meeting")
+        job = repo_phase3.lease_job_fair(conn, "w-old", ["diarize_meeting"], now_ms())
+        assert job is not None
+    attempt = asyncio.create_task(handle_diarize(ctx3, job))
+    assert await asyncio.to_thread(provider.entered.wait, 5)
+    # Act: 待っているハンドラをキャンセルする
+    attempt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await attempt
+    # Assert: スレッドが走っている間は枠を持ち、Runner は分離を lease しない
+    assert ctx3.diarize_slots.locked()
+    assert "diarize_meeting" not in runner3.allowed_types()
+    # Act: スレッドが抜ける
+    provider.gate.set()
+    for _ in range(500):
+        if not ctx3.diarize_slots.locked():
+            break
+        await asyncio.sleep(0.01)
+    # Assert: 抜けたら枠を返す
+    assert not ctx3.diarize_slots.locked()
+    assert provider.calls == 1 and provider.max_running == 1
+
+
+def _record_published(ctx3: AppContext, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """ctx3.events.publish に流れたイベントを記録する（配信もそのまま行う）。"""
+    published: list[dict[str, Any]] = []
+    real_publish = ctx3.events.publish
+
+    def record(meeting_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(meeting_id, event)
+    monkeypatch.setattr(ctx3.events, "publish", record)
+    return published
+
+
+async def _until_diarize_job(ctx3: AppContext, runner3: JobRunner) -> None:
+    while True:
+        with ctx3.db.read() as conn:
+            if any(j.job_type == "diarize_meeting" for j in repo.list_jobs(conn, "m-1")):
+                return
+        assert await runner3.run_once() is True
+
+
+def _merge_job_ids(ctx3: AppContext) -> list[str]:
+    with ctx3.db.read() as conn:
+        return [j.id for j in repo.list_jobs(conn, "m-1") if j.job_type == "merge_transcript"]
+
+
+async def test_failed_diarize_publishes_the_merge_job_it_creates(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """ハンドラの失敗で分離が failed に確定して作った merge ジョブは、コミット後に流す（成功時の後続ジョブと同じ）。"""
+    # Arrange: 分離はモデル未配置で失敗する（待たずに failed）
+    ctx3.diarization = FakeDiarizationProvider(fail_with=ModelMissingError("no diarization model"))
+    await _two_source_meeting(client3)
+    await _until_diarize_job(ctx3, runner3)
+    published = _record_published(ctx3, monkeypatch)
+    # Act
+    assert await runner3.run_once() is True
+    # Assert: 作った merge ジョブが lease される前にイベントに出る
+    merges = _merge_job_ids(ctx3)
+    assert len(merges) == 1
+    assert any(e["type"] == "job" and e["job"]["id"] == merges[0] and e["job"]["status"] == "pending" for e in published)
+
+
+async def test_exhausted_diarize_publishes_the_merge_job_it_creates(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """lease 切れで回数を使い切って分離が failed に確定して作った merge ジョブも、Sweeper がコミット後に流す。"""
+    # Arrange: 分離のジョブが待機になるまで進める
+    await _two_source_meeting(client3)
+    await _until_diarize_job(ctx3, runner3)
+    published = _record_published(ctx3, monkeypatch)
+    # Act: lease しては結果を報告せずに落ちる、を max_attempts 回くり返す
+    for _ in range(5):
+        async with ctx3.db.write() as conn:
+            job = repo_phase3.lease_job_fair(conn, "w-dead", ["diarize_meeting"], now_ms())
+            assert job is not None
+            conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
+        await sweep_once(ctx3.db, ctx3.events)
+    # Assert
+    merges = _merge_job_ids(ctx3)
+    assert len(merges) == 1
+    assert any(e["type"] == "job" and e["job"]["id"] == merges[0] and e["job"]["status"] == "pending" for e in published)
+
+
 async def test_diarize_that_keeps_crashing_does_not_block_merge(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
     """話者分離がプロセスごと落ち続けても（メモリ不足など）、回数を使い切ったら話者分離なしで merge へ進む。"""
     # Arrange: 話者分離のジョブが待機になるまで進める
@@ -6625,7 +6752,8 @@ def test_doctor_rebuild_refuses_while_server_is_running(tmp_path: Path, monkeypa
 | 手動 STT の Chunk が分離の実行中に完了したら、実行中の分離を pending に戻して結果を捨てさせ、その Chunk を含めて分離し直してから merge する（§8 `on_transcribe_completed`・`repo_phase3.requeue_running_job`） | `test_manual_stt_finishing_during_diarize_reruns_the_diarize` |
 | 分離が手動 STT の Chunk より先に終わっても merge を作らず（`on_diarize_finished` は全 Chunk の終端を待つ）、Chunk の完了で分離を作り直す | `test_diarize_finishing_before_manual_stt_does_not_merge_early` |
 | merge の実行中（書き込みの後・完了の記録の前）に手動 STT の Chunk が初めて完了しても、結果を staged に置き、分離を作り直してから作り直した merge が話者付きで入れる（§21 `handle_transcribe`） | `test_manual_stt_committed_during_merge_rediarizes_then_remerges` |
-| 同時に走らせる話者分離は `MAX_CONCURRENT_DIARIZE` 本まで。pending に戻した分離の次の試行は、旧い試行のスレッドが抜けるまで分離を始めず、その間 Runner は分離と（STT と並べない設定なら）要約を lease しない（§7 `diarize_slots`・§9 `allowed_types`・§21 `handle_diarize`） | `test_requeued_diarize_waits_for_the_running_attempt` |
+| 同時に走らせる話者分離は `MAX_CONCURRENT_DIARIZE` 本まで。pending に戻した分離の次の試行は、旧い試行のスレッドが抜けるまで分離を始めず、その間 Runner は分離と（STT と並べない設定なら）要約を lease しない。分離を待つハンドラがキャンセルされても、スレッドが抜けるまで枠を返さない（§7 `diarize_slots`・§9 `allowed_types`・§21 `handle_diarize`） | `test_requeued_diarize_waits_for_the_running_attempt`、`test_cancelled_diarize_keeps_the_slot_until_its_thread_exits` |
+| 分離が failed で確定して作った merge ジョブ（`on_job_failed` の戻り値）は、Runner の失敗時も Sweeper の回数切れも、コミット後に流す（完了時の後続ジョブと同じ。§8 `on_job_failed`・§9 `_on_failure`・Phase 2 §14 `sweep_once`） | `test_failed_diarize_publishes_the_merge_job_it_creates`、`test_exhausted_diarize_publishes_the_merge_job_it_creates` |
 | 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
 | 実 Provider：無音 Chunk を挟んでも話者区間の時刻がずれない、上限は `max_speakers`、一時ファイルはデータディレクトリの中 | `test_assemble_timeline_pads_gaps_with_silence`、`test_pyannote_provider_keeps_absolute_time_across_skipped_chunk`、`test_speaker_after_silent_chunk_is_not_shifted` |
 | エコー除去 | `test_echo_from_system_is_dropped_on_mic` |
@@ -6694,7 +6822,7 @@ def test_doctor_rebuild_refuses_while_server_is_running(tmp_path: Path, monkeypa
 
 Step の順序で気を付ける点：
 
-* Phase 2 のファイルのうち `jobs/sweeper.py` と `db/repo.py` は Phase 3 で変更しないが、Phase 2 側の `pipeline.on_job_failed()`（Phase 2 §12）は Phase 3 の `jobs/pipeline.py` で `diarize_meeting` の分岐を足した版に置き換わる（§8）。3-b で `pipeline.py` を差し替えるときに落とさない
+* Phase 2 のファイルのうち `jobs/sweeper.py` と `db/repo.py` は Phase 3 で変更しないが、Phase 2 側の `pipeline.on_job_failed()`（Phase 2 §12）は Phase 3 の `jobs/pipeline.py` で `diarize_meeting` の分岐を足した版に置き換わる（§8）。この版は分離の失敗で作った merge ジョブの id を返し、Phase 2 の Sweeper（`sweep_once`）はその行をトランザクションの中で読んでコミット後に流す（Phase 2 の版は常に `None` を返す）。3-b で `pipeline.py` を差し替えるときに落とさない
 * 3-d の話者分離のテストは pyannote を入れずに通る（Pipeline の差し替え。§12）。`diarization` extras を入れるのは 3-h
 * 3-f の `test_flac_codec_roundtrip_is_bit_exact` は `soundfile` がなければ skip になる。`dev` extras（§1.1）を入れて、skip ではなく通過になっていることを確かめる
 
