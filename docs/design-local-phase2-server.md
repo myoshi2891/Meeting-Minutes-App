@@ -3739,7 +3739,9 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 # 組が切り出されず、「next week friday」が「friday」だけに縮んで「this week friday」に通る。
 # 組でない「next week」「this week」「end of」は空白付きのまま（normalize 済みの文字列には当たらない）にし、文字列そのものが quote に
 # 現れることを求める（期限の表現を含まない deadline と同じ扱い）。部品として切り出すと、「end of month」が「end of the week」の
-# 「end of」に、「next weekend」が「next week」に通り、別々の句の部品を寄せ集めて「end of next week」も通る
+# 「end of」に、「next weekend」が「next week」に通り、別々の句の部品を寄せ集めて「end of next week」も通る。
+# 「day after tomorrow」も 1 つの表現にする（「明後日」と同じ）。「tomorrow」だけを切り出すと、quote の「the day after tomorrow」が
+# deadline の「tomorrow」を裏付けてしまう。findall は左から切り出すので、「day」の位置で長い方が当たり、中の「tomorrow」は残らない
 _WEEKDAYS_JA = "月曜|火曜|水曜|木曜|金曜|土曜|日曜"
 _WEEKDAYS_EN = "monday|tuesday|wednesday|thursday|friday|saturday|sunday"
 _DEADLINE_HINTS = re.compile(
@@ -3747,7 +3749,7 @@ _DEADLINE_HINTS = re.compile(
     rf"(?:再来週|今週|来週)の?(?:{_WEEKDAYS_JA})|{_WEEKDAYS_JA}|"
     r"(?:今月|来月)(?:末|上旬|中旬|下旬)|(?:今週|来週)末|今週|来週|再来週|今月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
     rf"(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|{_WEEKDAYS_EN}|"
-    r"next week|this week|end of|tomorrow|eod|eow)",
+    r"next week|this week|end of|day ?after ?tomorrow|tomorrow|eod|eow)",
     re.IGNORECASE,
 )
 # 英語の「曜日 + 週」（「friday next week」）。比べる形を「週 + 曜日」にそろえる（_hint_key）
@@ -7749,6 +7751,22 @@ def test_english_week_phrases_are_not_matched_as_fragments() -> None:
     assert reasons_for("end of month", "Suzuki will submit it by the end of the week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("next weekend", "Suzuki will submit it next week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("end of next week", "Suzuki checks at the end of the month, then submits next week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_day_after_tomorrow_is_one_expression() -> None:
+    """「day after tomorrow」は 1 つの表現。quote のその中の「tomorrow」は deadline の「tomorrow」を裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "abababab-7777-4000-8000-000000000007"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": "Suzuki", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert
+    assert reasons_for("tomorrow", "Suzuki will submit the day after tomorrow") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("tomorrow", "Suzuki will submit it tomorrow") == []
+    assert reasons_for("day after tomorrow", "Suzuki will submit the day after tomorrow") == []
+    assert reasons_for("the day after tomorrow", "Suzuki will submit it the day after tomorrow") == []
 
 
 def test_deadline_without_hints_matches_only_a_whole_phrase() -> None:
