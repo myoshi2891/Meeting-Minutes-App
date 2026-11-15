@@ -2619,7 +2619,14 @@ export class NotesStore {
     }
     const draftRaw = carry ?? await this.deps.drafts.get(this.draftKey());
     const draft = isDraft(draftRaw) ? draftRaw : null;
-    const heldRaw = await this.deps.drafts.get(this.heldKey());
+    // 退避先は別タブの分の一覧を出すためだけに読む。読めなくても下書き・サーバーの採用と保存の予約は止めない
+    // （止めると carry や未送信の下書きがエディタに入らず、保存も予約されない）。失敗は onError に渡し、一覧は空で進める
+    let heldRaw: unknown = undefined;
+    try {
+      heldRaw = await this.deps.drafts.get(this.heldKey());
+    } catch (error) {
+      this.reportError(error);
+    }
     const res = await this.deps.getNotes(this.state.meetingId);
     // 別タブの退避分（自分のタブの項目は自分の内容なので出さない）
     const held = typeof heldRaw === "object" && heldRaw !== null ? Object.entries(heldRaw as Record<string, unknown>) : [];
@@ -2708,7 +2715,8 @@ export class NotesStore {
    * 書けなかった・作り直しが始まったときは消さない（取り込んだ内容は、このインスタンスのメモリか dispose() の戻り値にしか無い）。
    * 見るのは取り込んだ編集そのものの書き込み。後の編集（onError の中の setDraft など）の書き込みが成功しても、それは取り込む前の
    * 内容のことがあるので、取り込んだ内容が IndexedDB にある根拠にならない。取り込みの書き込みが成功しても、書き込みを待つ間に
-   * 後の編集が内容を置き換えていれば（今の内容が sameContent で取り込んだ内容と違えば）消さない。下書きは後の編集で上書きされている。
+   * 後の編集が内容か要約の版を置き換えていれば（今の内容が sameContent で取り込んだ内容と違うか、lastAppliedSummaryVersion が
+   * 取り込んだ下書きの版と違えば）消さない。下書きは後の編集で上書きされている。
    * 要約の版（lastAppliedSummaryVersion）は、取り込んだ下書きが持つ版を引き継ぐ（その内容が反映した版）。
    * 今の内容に未送信の編集（hasUnsentEdits）があれば、replaceUnsent を付けない呼び出しは何も変えずに "unsent" を返す。
    * 取り込みはエディタの内容を置き換え、このタブの下書きも上書きする（自分のタブの下書きは退避先へ移さない。evictionHoldId）ので、
@@ -2729,8 +2737,10 @@ export class NotesStore {
     while (this.pendingDraftWrites > 0) await this.draftWrites;
     if (!(await imported) || this.unwrittenDraft !== null || this.disposed) return "kept";
     // 後の編集（取り込みを知らせた onChange の中の setDraft など）が内容を置き換えていれば、取り込んだ内容は下書きにもメモリにも無い。
-    // 消すのは、今の内容が取り込んだ内容と同じ（sameContent。エディタが読み込んだ内容をそのまま返したエコー）ときだけ
+    // 消すのは、今の内容が取り込んだ内容と同じ（sameContent。エディタが読み込んだ内容をそのまま返したエコー）で、要約の版も
+    // 同じときだけ。版だけを変えた編集でも、下書きは別の版で上書きされ、取り込んだ版は退避先にしか残っていない
     if (!sameContent(this.state.json, entry.draft.json)) return "kept";
+    if (this.state.lastAppliedSummaryVersion !== entry.draft.lastAppliedSummaryVersion) return "kept";
     let removed: boolean;
     try {
       removed = await this.deps.drafts.consumeHeld(this.heldKey(), entry.tabId, (current) => isDraft(current) && sameDraft(current, selected));
@@ -3224,6 +3234,7 @@ export interface UnresolvedCitation {
  * evidenceSpan.segmentId はサーバーの検証で sourceSegmentIds のどれかに限られるので、sourceSegmentIds だけを見ればよい。
  * 同じ版でも照合する。手動 STT（request_rerun_stt）は segments の行を先に消し、次の版は後の merge で確定するので、
  * その間の transcript は同じ版のまま引用先が欠ける。transcript が要約より古い（取得待ち）ときだけ照合しない（取り直すと解消する）。
+ * このときの空は「照合しなかった」で、引用がそろった意味ではない。描画は citationNotice の pending で見分ける
  */
 export function unresolvedCitations(state: UiState): ReadonlyArray<UnresolvedCitation> {
   if (state.summary === null || state.transcript === null) return [];
@@ -3243,6 +3254,11 @@ export function unresolvedCitations(state: UiState): ReadonlyArray<UnresolvedCit
 
 /** 要約の項目ごとの、飛べない引用の代わりに出す文言（§15.1 W12）。 */
 export interface CitationNotice {
+  /**
+   * 表示中の transcript が要約より古いか、まだ無い（取得待ち）。照合できないので items は空で、W12 はどの項目にも根拠リンクを出さない
+   * （飛び先の行が要約の版のものか分からない）。transcript を取り直して要約と同じ版以降になると false になる
+   */
+  readonly pending: boolean;
   /** 要約欄の先頭に出す案内。飛べない引用がなければ null（このとき items は空） */
   readonly banner: string | null;
   /** 項目（kind と index）ごとに、根拠リンクの代わりに出す文言 */
@@ -3252,12 +3268,18 @@ export interface CitationNotice {
 /**
  * 要約欄の描画用（基本設計 §12.7）。unresolvedCitations を項目ごとの文言にする。
  * 決定事項・アクションは保存した逐語引用を「生成時の引用」として出し、話題は「根拠の行は作り直されました」と出す。
- * 該当する項目では transcript へのリンクを出さない（描画側は kind と index で引く）
+ * 該当する項目では transcript へのリンクを出さない（描画側は kind と index で引く）。
+ * transcript が要約より古い・まだ無いときは pending を返す（unresolvedCitations の空は「照合しなかった」で、引用がそろった意味ではない）
  */
 export function citationNotice(state: UiState): CitationNotice {
+  // unresolvedCitations は照合しないとき（取得待ち）も空を返すので、「飛べない引用が無い」と区別してここで判定する
+  if (state.summary !== null && (state.transcript === null || state.summary.summary.transcriptVersion > state.transcript.transcriptVersion)) {
+    return { pending: true, banner: null, items: [] };
+  }
   const unresolved = unresolvedCitations(state);
-  if (unresolved.length === 0) return { banner: null, items: [] };
+  if (unresolved.length === 0) return { pending: false, banner: null, items: [] };
   return {
+    pending: false,
     banner: "transcript が更新されました。必要なら再生成してください。",
     items: unresolved.map((u) => ({
       kind: u.kind,
@@ -5090,6 +5112,52 @@ describe("NotesStore", () => {
     expect(b.drafts.get("notes:m:held")).toEqual({ "tab-B": fromB });
   });
 
+  it("取り込んだ後の編集が要約の版だけを置き換えたら、内容が同じでも項目を消さない", async () => {
+    // Arrange: 取り込みを知らせた onChange の中で、エディタが同じ内容を別の要約の版で一度だけ書き直す
+    const b = build();
+    const fromB = { json: ["b"], revision: 0, lastAppliedSummaryVersion: 3, savedAt: 5, writer: "tab-B", writeId: "tab-B:1", saved: false };
+    await b.drafts.set("notes:m:held", { "tab-B": fromB });
+    let importing = false;
+    const store: NotesStore = new NotesStore({ ...b.deps, onChange: () => {
+      if (!importing) return;
+      importing = false;
+      store.setDraft(["b"], 4);
+    } }, "m");
+    await store.load();
+    importing = true;
+    // Act
+    const result = await store.importHeldDraft({ tabId: "tab-B", draft: fromB });
+    // Assert: 下書きは版 4 で上書きされ、退避分の版 3 は退避先にしか無いので残す
+    expect(result).toBe("kept");
+    expect(b.drafts.get("notes:m")).toMatchObject({ json: ["b"], lastAppliedSummaryVersion: 4 });
+    expect(b.drafts.get("notes:m:held")).toEqual({ "tab-B": fromB });
+  });
+
+  it("退避先の読み込みが失敗しても、load() は退避分なしとして下書きの採用と保存の予約まで進め、失敗を onError に渡す", async () => {
+    // Arrange: 同じ版から編集した未送信の下書きがある。退避先のキーの get だけが失敗する
+    const b = build({ serverRevision: 1 });
+    await b.drafts.set("notes:m", { json: ["mine"], revision: 1, lastAppliedSummaryVersion: null, savedAt: 5, writer: "tab-A", writeId: "tab-A:1", saved: false });
+    const errors: Error[] = [];
+    const deps: NotesStoreDeps = {
+      ...b.deps,
+      drafts: {
+        ...b.deps.drafts,
+        get: async (k) => {
+          if (k === "notes:m:held") throw new Error("held read failed");
+          return b.drafts.get(k);
+        },
+      },
+      onError: (e) => errors.push(e),
+    };
+    const store = new NotesStore(deps, "m");
+    // Act
+    await store.load();
+    // Assert
+    expect(store.current).toMatchObject({ json: ["mine"], revision: 1, sync: "dirty", heldDrafts: [] });
+    expect(b.timers).toHaveLength(1);
+    expect(errors.map((e) => e.message)).toEqual(["held read failed"]);
+  });
+
   it("エディタが取り込んだ内容をキーの順序だけ変えて返したら、同じ内容として項目を消す", async () => {
     // Arrange: onChange の中で、エディタが読み込んだ内容を作り直したオブジェクト（キーの順序が違う）で一度だけ返す
     const b = build();
@@ -5674,14 +5742,18 @@ describe("UI reducer", () => {
     expect(sameVersion).toEqual(missingB);
     expect(advanced).toEqual(missingB);
     // 描画用の文言（§15.1 W12）：引用先がそろっていれば案内も項目の文言も出さない
-    expect(citationNotice(reduce(base, { type: "transcript_loaded", transcript: tr(1, ["seg-a", "seg-b"]) }))).toEqual({ banner: null, items: [] });
+    expect(citationNotice(reduce(base, { type: "transcript_loaded", transcript: tr(1, ["seg-a", "seg-b"]) }))).toEqual({ pending: false, banner: null, items: [] });
     expect(citationNotice(reduce(base, { type: "transcript_loaded", transcript: tr(2, ["seg-a", "seg-new"]) }))).toEqual({
+      pending: false,
       banner: "transcript が更新されました。必要なら再生成してください。",
       items: [
         { kind: "topic", index: 0, text: "根拠の行は作り直されました" },
         { kind: "decision", index: 0, text: "生成時の引用：「旧い引用」" },
       ],
     });
+    // 表示中の transcript が要約より古い・まだ無い（取得待ち）：照合できないので pending にし、根拠リンクを出させない
+    expect(citationNotice(reduce(base, { type: "transcript_loaded", transcript: tr(0, ["seg-a", "seg-b"]) }))).toEqual({ pending: true, banner: null, items: [] });
+    expect(citationNotice(base)).toEqual({ pending: true, banner: null, items: [] });
   });
 
   it("失敗ジョブとバナー", () => {
@@ -5772,7 +5844,7 @@ describe("UI reducer", () => {
 | W9 | 同期誤差（`MultiSourceRecorder` の集計と `GET /meetings/{id}` の `syncDriftMs`）をヘッダに出す | `main.ts` | 基本設計 §16.3・§18 | 表示文言の純関数をテストする（Phase 1 の `recording-view.ts` と同じ方式） |
 | W10 | System Audio の取得ボタンと、取得できなかったとき（拒否・音声トラックなし）の Mic のみへの切り替え表示 | `main.ts`・`index.html` | §5、基本設計 §16.1 | `DegradedReason` の 2 値（§2）ごとの文言 |
 | W11 | 確定待ちの内訳（`main.ts` の `listByMeeting(id, "mic")` → `pendingCountsText`）に System の Chunk も含める | `main.ts`・`recording-view.ts` | Phase 1 §31.4 | System の未送信が残る会議で件数に出る。欠番・末尾の判定は source ごと |
-| W12 | 要約欄の描画で `citationNotice(state)`（§11。中で `unresolvedCitations` を呼ぶ）を使う。`banner` が null でなければ要約欄の先頭に出す。項目ごとに `kind`・`index` で `items` を引き、該当する項目は根拠リンク（transcript へ飛ぶ）の代わりに `text` を出す（決定事項・アクションは保存した `quote`、話題は「根拠の行は作り直されました」）。該当しない項目は従来どおりリンクを出す | `main.ts` | 基本設計 §12.7、§11 | 文言は `ui-state.test.ts`（§12.6）で確かめる。描画は、transcript が要約と同じ版か進んだ版で引用先が消えた状態を `reduce` で作り、`main.ts` の要約欄の描画関数の出力に案内・`quote`・話題の文言が出て、該当項目に根拠リンクが無いことを `app.test.ts` で確かめる |
+| W12 | 要約欄の描画で `citationNotice(state)`（§11。中で `unresolvedCitations` を呼ぶ）を使う。`pending` が true（表示中の transcript が要約より古い・まだ無い）の間は、どの項目にも根拠リンクを出さない（照合できず、飛び先が要約の版の行か分からない）。transcript を取り直して `pending` が false になってから、下の規則でリンクを出す。`banner` が null でなければ要約欄の先頭に出す。項目ごとに `kind`・`index` で `items` を引き、該当する項目は根拠リンク（transcript へ飛ぶ）の代わりに `text` を出す（決定事項・アクションは保存した `quote`、話題は「根拠の行は作り直されました」）。該当しない項目は従来どおりリンクを出す | `main.ts` | 基本設計 §12.7、§11 | 文言は `ui-state.test.ts`（§12.6）で確かめる。描画は、transcript が要約と同じ版か進んだ版で引用先が消えた状態を `reduce` で作り、`main.ts` の要約欄の描画関数の出力に案内・`quote`・話題の文言が出て、該当項目に根拠リンクが無いことを `app.test.ts` で確かめる。transcript が要約より古い状態（`pending`）では、どの項目にも根拠リンクが無いことも確かめる |
 | W13 | ノート欄に `NotesState.heldDrafts`（別タブが退避した未送信の下書き。閉じた・落ちたタブの分を含む）を一覧で出す。項目ごとに書いたタブ・時刻・内容を見せ、利用者が選んだ内容をエディタへ取り込む（`NotesStore.importHeldDraft`。`setDraft` と同じ経路で取り込み、取り込んだ編集そのものの下書きを書けてから、その項目を退避先から消す。後の編集の書き込みの成功では消さない。書き込みを待つ間に後の編集が内容を置き換えたとき（今の内容が取り込んだ内容と違うとき。キーの順序だけの違いはエディタのエコーとして同じとみなす。それ以外の違いは残す側に倒す）も消さない。要約の版 `lastAppliedSummaryVersion` は取り込んだ下書きのものを引き継ぐ）。取り込みはエディタの内容とこのタブの下書きを置き換えるので、今の内容に未送信の編集（`hasUnsentEdits()`）があれば、`importHeldDraft` は何も変えずに `"unsent"` を返す。UI は置き換えてよいかを利用者に確かめ、了承されたら `{ replaceUnsent: true }` で呼び直す（確かめずに付けない）。消すのは `DraftStore.consumeHeld` の 1 つのトランザクションで、項目が選んだ時点と同じ書き込み（`writeId` まで比べる）のときだけ。選んだ後に書き直された項目は残し、他の項目には触らない。`setDraft` だけで取り込むと項目が消えず、取り込み済みの内容が以後の一覧に出続ける。自動では採用しない | `main.ts` | §10 `guardFor`・`DraftGuard`・`importHeldDraft`・`consumeHeld` | `notes-store.test.ts`（退避した carry が別のタブの `load()` で `heldDrafts` に出る。取り込むと選んだ項目だけ消え、書き直された項目は残る。取り込みの書き込みが失敗すれば後の書き込みが成功しても残る。後の編集が内容を置き換えれば残り、キーの順序だけ違うエコーなら消える。取り込んだ下書きの要約の版を引き継ぐ。未送信の編集があれば `replaceUnsent` なしでは断る）。描画は空のとき何も出さず、1 件以上で一覧が出ることを `app.test.ts` で確かめる。`"unsent"` が返ったら確認を出し、了承したときだけ `{ replaceUnsent: true }` で呼び直し、断れば内容が変わらないことも `app.test.ts` で確かめる |
 
 Phase 1 のソースで source を `"mic"` に固定している箇所は、`recording-controller.ts` のメタデータ（§4 で引数化）、`finalizer.ts`（§7）、`recovery.ts`（W6。変更不要）、`main.ts`（W11）の 4 つである。実装の最後に `grep -rn '"mic"' src` で、これ以外に増えていないことを確かめる。
