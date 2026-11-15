@@ -3696,9 +3696,11 @@ from ..merge.normalize import normalize
 from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionReason, SummaryActionItem, SummaryDecision, SummaryTopic
 
 # 期限らしい表現（日本語・英語）。網羅性は基本設計 §28 の持ち越し事項。
+# 選択（|）は左の候補から試して最初に当たったものを採る（最長一致ではない）。複合形（「来月末」）は、その一部（「来月」）より前に置く。
+# 置かないと「来月末」が「来月」と切り出され、quote の「来月上旬」が deadline の「来月末」を裏付けてしまう（_deadline_supported）
 _DEADLINE_HINTS = re.compile(
     r"(\d{1,2}月\d{1,2}日|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|月曜|火曜|水曜|木曜|金曜|土曜|日曜|"
-    r"今週|来週|再来週|今月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
+    r"今月末|来月末|今週末|来週末|今週|来週|再来週|今月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|this week|end of|tomorrow|eod|eow)",
     re.IGNORECASE,
 )
@@ -3760,11 +3762,36 @@ def _supported_by(claim: str, quote_norm: str, threshold: float = 0.5) -> bool:
     検証がLLMの出力に依存して意味を失う。claim の文字バイグラムのうち quote に
     現れる割合を見る。全く別の内容を書いた場合は 0 になり、要約的な言い換えは通る。
     落ちた項目は破棄ではなく「要確認送り」（v4.0 §66.2）なので、閾値は控えめにする。
+
+    測るのは語彙の重なりであって含意ではない。quote を否定・反転した claim（「据え置きで決定」に対する
+    「据え置きを見送り」、「予定です」に対する「予定ではない」）も、文字の多くが重なれば通る。否定・極性の検査は
+    入れない（日本語の否定は語尾・助詞・語彙の言い換えで表れ、決定的な規則では誤検出と見逃しが多い）。
+    逐語の quote と根拠位置は段階2 の前段で保証され、UI は採用した項目ごとに根拠リンク（sourceSegmentIds から
+    Transcript の該当行へスクロール。基本設計 §18）を出すので、矛盾は利用者が元発言と照らして気づく前提とする
+    （基本設計 §12.5 段 3a の既知の制限）
     """
     grams = _bigrams(normalize(claim))
     if not grams:
         return False
     return len(grams & _bigrams(quote_norm)) / len(grams) >= threshold
+
+
+def _deadline_supported(deadline: str, quote_norm: str) -> bool:
+    """deadline が quote に裏付けられているか（段 5）。quote に期限らしい表現があるだけでは通さない。
+
+    deadline に期限の表現（_DEADLINE_HINTS）があれば、そのすべてが quote にも現れることを求める
+    （「来週金曜」は「来週」と「金曜」の両方。quote の「来週」は deadline の「月末」「11月20日」を裏付けない）。
+    表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たる候補は
+    「再来週」だけなので、「再来週」は 1 つの表現になる）。
+    相対表現を日付に換算した deadline（quote は「来週」、deadline は「11月20日」）は通さない。換算の基準
+    （会議の日付・タイムゾーン）をこの検証は持たず、換算の正しさを確かめられない。
+    期限の表現を含まない deadline（「次回の定例まで」）は、正規化した文字列がそのまま quote に現れることを求める
+    """
+    d = normalize(deadline)
+    wanted = {m.lower() for m in _DEADLINE_HINTS.findall(d)}
+    if not wanted:
+        return d != "" and d in quote_norm
+    return wanted <= {m.lower() for m in _DEADLINE_HINTS.findall(quote_norm)}
 
 
 def _check_evidence(ids: list[str], quote: str, span: EvidenceSpan, index: SegmentIndex) -> tuple[str, list[RejectionReason]]:
@@ -3855,7 +3882,7 @@ def validate(draft: MeetingSummaryDraft, index: SegmentIndex) -> tuple[MeetingSu
         evidence = quote_norm
         if a.assignee and normalize(a.assignee) not in evidence:
             reasons.append("ASSIGNEE_NOT_IN_TRANSCRIPT")            # 段 4（v4.0 §63）
-        if a.deadline and not (_DEADLINE_HINTS.search(evidence) or normalize(a.deadline) in evidence):
+        if a.deadline and not _deadline_supported(a.deadline, evidence):
             reasons.append("DEADLINE_NOT_IN_TRANSCRIPT")            # 段 5
         if not quote_reasons and not _supported_by(a.task, quote_norm):
             reasons.append("CLAIM_NOT_SUPPORTED")
@@ -7387,6 +7414,54 @@ def test_validate_rejects_unquoted_and_misplaced_claims() -> None:
     ]
 
 
+def test_deadline_needs_the_same_expression_in_quote() -> None:
+    """quote に期限らしい表現があるだけでは、別の期限を通さない（段 5）。"""
+    # Arrange: QA は「田中さんが来週までに仕様書を更新します」
+    index = SegmentIndex(SEGS)
+    deadlines = ["来週", "来週中", "月末", "11月20日", "再来週", "次回の定例まで"]
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "仕様書を更新", "assignee": "田中", "deadline": deadline, "sourceSegmentIds": [A[:8]], **EV_A}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons]
+    # Act
+    results = {d: reasons_for(d) for d in deadlines}
+    # Assert: 「来週」と、「来週」を言い換えた期限は通る。別の相対表現・日付に換算した期限・quote に無い文言は落ちる
+    assert results == {
+        "来週": [], "来週中": [],
+        "月末": ["DEADLINE_NOT_IN_TRANSCRIPT"], "11月20日": ["DEADLINE_NOT_IN_TRANSCRIPT"],
+        "再来週": ["DEADLINE_NOT_IN_TRANSCRIPT"], "次回の定例まで": ["DEADLINE_NOT_IN_TRANSCRIPT"],
+    }
+
+
+def test_compound_deadline_is_not_matched_by_its_part() -> None:
+    """「来月末」は 1 つの表現。quote の「来月上旬」は「来月」を含んでも「来月末」を裏付けない（段 5）。"""
+    # Arrange
+    sid = "cccccccc-3333-4000-8000-000000000003"
+    quote = "鈴木さんが来月上旬に見積もりを出します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "見積もりを出す", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons]
+    # Act / Assert
+    assert reasons_for("来月上旬") == []
+    assert reasons_for("来月末") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_claim_contradicting_its_quote_passes_as_known_limitation() -> None:
+    """段 3a (4) は語彙の重なりで、含意は見ない。quote を否定した claim も通る（既知の制限。基本設計 §12.5）。"""
+    # Arrange: QB は「予算は据え置きで決定しました」
+    index = SegmentIndex(SEGS)
+    draft = _draft(decisions=[{"text": "予算は据え置きで決定しなかった", "sourceSegmentIds": [B[:8]], **EV_B}])
+    # Act
+    accepted, rejected, _ = validate(draft, index)
+    # Assert
+    assert [d.text for d in accepted.decisions] == ["予算は据え置きで決定しなかった"] and rejected == []
+
+
 def test_split_windows_respects_line_boundaries() -> None:
     lines = [f"[00:{i:02d}] [mic] [seg:{i:08x}] 発言{i}" for i in range(20)]
     w = split_windows(lines, max_chars=120)
@@ -8027,6 +8102,8 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
 | DLQ = failed + 再試行 | `test_retry_failed_job_via_api`、`test_failed_chunk_blocks_until_excluded` |
 | Structured Output / sourceSegmentIds / assignee 検出 | `test_validate_stage3_to_7`、`test_synthesize_single_window_retries_schema_once` |
+| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote` |
+| 段 3a (4) は語彙の重なりで含意は見ない（quote と矛盾する claim も通る既知の制限） | `test_claim_contradicting_its_quote_passes_as_known_limitation` |
 | AI 再生成 / Manual Notes 保護 | `test_regenerate_creates_new_version_and_keeps_notes` |
 | Ollama 停止中に transcript まで完了 | `test_ollama_outage_leaves_transcribed_then_completes`、`test_summary_runs_once_ollama_is_started_after_the_server`、`test_ollama_without_models_is_model_missing` |
 | ハードウェア区分と実行デバイス（Apple Silicon は CPU の int8） | `test_apple_silicon_runs_whisper_on_cpu_int8`、`test_cuda_keeps_tier_compute_type_and_small_gpu_uses_the_gpu`、`test_cpu_only_and_forced_model_follow_the_backend` |
