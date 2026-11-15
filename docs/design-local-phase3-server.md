@@ -3803,14 +3803,19 @@ def _stt_model_for(ctx: AppContext, meeting_id: str, conn) -> str | None:  # typ
 
 def _publish_created_job(ctx: AppContext, job_id: str) -> None:
     """ハンドラのトランザクションで作ったジョブを、コミットの後に Runner._publish_job と同じ形で流す（Phase 2 §13）。"""
-    with ctx.db.read() as conn:
-        job = repo.get_job(conn, job_id)
-        meeting = repo.get_meeting(conn, job.meeting_id) if job else None
-    if job is None:
-        return
-    ctx.events.publish(job.meeting_id, {"type": "job", "job": job.model_dump()})
-    if meeting is not None:
-        ctx.events.publish(job.meeting_id, {"type": "meeting_status", "status": meeting.status})
+    # 書き込みはコミット済み。読み直し・配信の失敗を Runner へ伝えると、終わった試行が失敗として記録され再試行される。
+    # 記録だけして戻る（購読側は再接続時の補完で追いつく。§13）。Exception だけを捕まえ、CancelledError は止めない
+    try:
+        with ctx.db.read() as conn:
+            job = repo.get_job(conn, job_id)
+            meeting = repo.get_meeting(conn, job.meeting_id) if job else None
+        if job is None:
+            return
+        ctx.events.publish(job.meeting_id, {"type": "job", "job": job.model_dump()})
+        if meeting is not None:
+            ctx.events.publish(job.meeting_id, {"type": "meeting_status", "status": meeting.status})
+    except Exception:
+        log.exception("failed to publish created job %s after commit", job_id)
 
 
 # ---- vad ----
@@ -4187,6 +4192,14 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
         # lease が失効していれば要約も会議の completed も書かない（基本設計 §9.3）。Sweeper が回数切れで failed にした後に
         # 書くと、failed のジョブと completed の会議が組になる。検査と書き込みは同じトランザクションで行う
         if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return llm_model
+        # 合成の間に merge（撮り直しの入れ替え・手動 STT の後）が transcript の版を進めていれば、古い版の要約を保存せず、
+        # 会議も completed にしない（merge が transcribed にした状態のまま）。merge の on_merge_completed が作ろうとする要約ジョブは、
+        # 実行中のこの行が一意制約（uq_summary_job）で先にあるので作られない。この試行を取り消して同じ行を pending に戻し、
+        # 新しい版で合成し直す（まだ要約を保存していないので、§12.7 の「進んだ後の再生成」ではなく元の要求の続き）
+        current = repo.get_meeting(conn, job.meeting_id)
+        if current is not None and current.transcript_version != meeting.transcript_version:
+            repo.requeue_job(conn, job.id, job.lease_owner or "", job.attempts)
             return llm_model
         version = repo.next_summary_version(conn, job.meeting_id)
         repo.insert_summary(conn, SummaryVersion(
