@@ -3731,6 +3731,8 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 # 月・週と時期（末・上旬・中旬・下旬）の組は 1 つの表現として切り出す。別々に切り出すと、quote の別の日付の部品
 # （「今月上旬に確認し、来月下旬に提出」の「来月」と「上旬」）を寄せ集めて deadline の「来月上旬」を裏付けてしまう。
 # 組にした表現は、その部品だけの deadline（「上旬」）も裏付けない（どの月の上旬かを quote から言えないため。基本設計 §12.5 段 5）。
+# 組の間には「の」を挟んでよい（「来月の末」「来週の末」「今月の上旬」。_hint_key が落とすので「来月末」と同じ表現になる）。
+# 挟めないと「来月の末」が「来月」だけに縮み、quote の「来月に提出」が deadline の「来月の末」を裏付けてしまう。
 # 年の付いた日付（「2026年11月20日」「26年11月20日」「2026/11/20」「26/11/20」）も年まで 1 つの表現にする。月日だけを切り出すと、quote の 2026 年が deadline の
 # 2027 年の同じ月日を裏付けてしまう（「2026/11/20」は「26/11」と切り出され、同じ年月の別の日も通る。2 桁の年の「26/11/20」も
 # 年まで切り出さないと「26/11」に縮み、「26/11/21」と同じ表現になる）。元号の付いた年（「令和8年」「令和元年」）は
@@ -3763,7 +3765,7 @@ _DEADLINE_HINTS = re.compile(
     r"((?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年|(?:再来年|来年|今年|去年)の?)?\d{1,2}月\d{1,2}日|(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})"
     rf"(?:の?{_TIME})?|{_TIME}|"
     rf"(?:再来週|今週|来週)の?(?:{_WEEKDAYS_JA})|{_WEEKDAYS_JA}|"
-    r"(?:再来月|今月|来月)(?:末|上旬|中旬|下旬)|(?:再来週|今週|来週)末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
+    r"(?:再来月|今月|来月)の?(?:末|上旬|中旬|下旬)|(?:再来週|今週|来週)の?末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
     rf"{_EN_DEADLINE_ALTS})",
     re.IGNORECASE,
 )
@@ -7730,6 +7732,25 @@ def test_compound_deadline_is_not_matched_by_its_part() -> None:
     # Act / Assert
     assert reasons_for("来月上旬") == []
     assert reasons_for("来月末") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_month_qualifier_after_no_is_one_expression() -> None:
+    """「来月の末」は「来月末」と同じ 1 つの表現。quote の「来月の末」は裏付け、「来月に提出」は裏付けない（段 5）。"""
+    # Arrange
+    sid = "dddddddd-4444-4000-8000-000000000044"
+
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        index = SegmentIndex({sid: quote})
+        item = {"task": "見積もりを出す", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]],
+                "quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert
+    assert reasons_for("来月の末", "鈴木さんが来月の末までに見積もりを出します") == []
+    assert reasons_for("来月末", "鈴木さんが来月の末までに見積もりを出します") == []
+    assert reasons_for("来月の末", "鈴木さんが来月に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("来週の末", "鈴木さんが来週に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("今月の上旬", "鈴木さんが今月上旬に見積もりを出します") == []
 
 
 def test_deadline_is_not_assembled_from_parts_of_other_dates() -> None:
