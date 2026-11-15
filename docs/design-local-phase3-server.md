@@ -127,7 +127,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * ブラウザ側 WAV 生成は変えない。`compress_chunk` ジョブ（`priority=400`、最低優先）が `completed` から `compress_after_days`（既定 7 日）経過した会議の Chunk を FLAC 化する
 * `AudioCodec` 抽象（`encode` / `decode`）。実 Provider は `soundfile`（libsndfile、extras）。Fake は「マジック + 無圧縮 PCM」の自前コンテナで、検証ロジック（復元一致・不一致時の保持）をテストする
 * 圧縮の原子性：メモリ上で符号化 → 復元して `build_wav(pcm)` の sha256 が `audio_chunks.sha256`（WAV 値、不変）と一致することを確かめる → `write_atomic` で `.flac` を書く → `local_path` / `codec='flac'` / `sha256_flac` 更新 → WAV 削除。不一致は `.flac` を書かずに `INVALID_AUDIO`（non-retryable）。WAV は残る
-* 圧縮と他の処理の競合：(a) 切り替えの更新は lease の現行の所有者だけが行い、Chunk の `local_path` / `sha256` が読んだ時のままであることも確かめる。STT の再実行（ジョブを行ごと消す）や再 PUT の修復（WAV に書き戻す）が先に起きていたら、WAV のまま残して作った `.flac` を消す。圧縮ファイルは試行ごとに別の一時ファイル（`*.staging`）に書き、lease の確認と同じ書き込みロックの下で最終パスへ置き換える。後始末で消すのはその試行の一時ファイルだけなので、lease を失った旧い試行が、別の試行の確定した圧縮ファイルを上書き・削除することはない。(b) 音声を読む側（VAD・STT・話者分離）は、読み取りに失敗したら Chunk の行を読み直し、パスが変わっていれば新しいパスから読む（`read_chunk_pcm()`）。読み直さないと、置き換わった直後の読み取りが「ファイルなし」になり、正常な Chunk を `missing` にしてしまう。(c) 更新のコミット後・WAV の削除前に落ちたら、やり直しのジョブが残った WAV を消す
+* 圧縮と他の処理の競合：(a) 切り替えの更新は lease の現行の所有者だけが行い、Chunk の `local_path` / `sha256` が読んだ時のままであることも確かめる。STT の再実行（ジョブを行ごと消す）や再 PUT の修復（WAV に書き戻す）が先に起きていたら、WAV のまま残して作った `.flac` を消す。圧縮ファイルは試行ごとに別の一時ファイル（`*.staging`）に書き、lease の確認と同じ書き込みロックの下で最終パスへ置き換える。後始末で消すのはその試行の一時ファイルだけなので、lease を失った旧い試行が、別の試行の確定した圧縮ファイルを上書き・削除することはない。(b) 音声を読む側（VAD・STT・話者分離）は、読み取りに失敗したら Chunk の行を読み直し、パスが変わっていれば新しいパスから読む（`read_chunk_pcm()`）。読み直さないと、置き換わった直後の読み取りが「ファイルなし」になり、正常な Chunk を `missing` にしてしまう。(c) 更新のコミット後・WAV の削除前に落ちたら、やり直しのジョブが残った WAV を消す。消すのは書き込みロックの下で、lease が現行で、Chunk がまだ圧縮済み（読んだときと同じパス）のときだけ。読んだ後に再 PUT の修復が WAV に書き戻していれば、その WAV が正なので残す
 * `read_pcm` は拡張子で分岐し、FLAC の場合も WAV sha256 で照合する（`sha256` 列の意味を変えない）
 * バックアップ：`VACUUM INTO {dataDir}/backups/minutes-{世代番号}-{epoch ms}.sqlite`。**直近のバックアップから 24 時間たっていたら作る**（起動時と 1 時間ごとに判定。基準はファイル名の時刻で、プロセスの起動からの経過ではない）。世代数 `backup_generations`（既定 7）。起動のたびに作ると、短時間に再起動を 7 回くり返しただけで古い世代がすべて押し出される。使うたびにサーバーを起動する使い方でも 1 日 1 世代になる。世代管理・復元元の選択・期日の判定の「新しい順」は名前の時刻ではなく世代番号（既存の最大 + 1、ファイル名に残る）で決める。時刻で並べると、時計が戻った後に作った世代が前の世代より古い扱いになり、時計が追いつくと元の順に戻って、どちらでも新しい世代を消す・古い世代から復元する。最新の世代の時刻が現在より未来なら（作った後に時計が戻った）期日として作る（戻った後に作った世代は番号が最大なので、作った直後に消さず、毎周作り直さない）。`completed` 遷移ごとのバックアップは行わない（DB 全体の複製なので会議 1 件ごとには重く、世代もその分早く回る。失われるのは最長 24 時間分の要約とノートで、録音と transcript は録音ファイルから作り直せる）
 * バックアップは `.part` に書いてから名前を付け替える。書きかけ・失敗したファイルは正規の名前では残らず、復元元にも世代管理の対象にもならない
@@ -145,6 +145,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * TLS：`doctor --init-tls --host <hostname or IP>` で自己署名証明書（`cryptography`、extras `lan`）。ブラウザは初回に証明書の受け入れが必要（断定しない事項 §3）
 * 認証：`users` テーブル（`id`, `name`, `token_hash`, `created_at`）。`minutes-local user add <name>` がトークンを 1 回だけ表示する（同名は拒否）。`user remove <id>` で失効させる（トークンを漏らした・利用者が抜けた。会議と録音は消さない）。`user list` で一覧。`users` が空なら従来の `token` ファイルで `local` ユーザーとして動作（後方互換）。DB をバックアップから復元すると（§2.4）`users` もその時点に戻り、バックアップの後に `user remove` で失効させた利用者のトークンがまた通る。運用者は復元の後に `user list` で確かめ、失効させたままにすべき利用者を `user remove` でもう一度消す（serve は復元の警告でこれを促す）
 * 単一利用者と複数利用者の切り替えは**起動時に決まる**（`AppContext.multi_user`）。最初の利用者を追加した後・最後の利用者を削除した後は、サーバーの再起動で反映する。複数利用者の間の追加・削除は再起動なしで効く（トークンは要求ごとに `users` を引く）。複数利用者に切り替えると `token` ファイルは使えなくなり、それまでに録音した会議（所有者 `local`）は誰からも見えなくなる（利用者を全員削除して単一利用者に戻すと見える）。既存の会議を特定の利用者へ引き継ぐ手段は本書の範囲外（§3）
+* 所有者の居ない会議の復元：rebuild（§2.4）は所有者を `recordings/{userId}/` の階層で決めるので、DB をバックアップなしで作り直して `users` が空になると、複数利用者のときの会議（所有者は各利用者の ID）は残るが、サーバーは単一利用者（`local`）で動き、どのトークンからも見えない（404）。`user add` は新しい ID を振るので、同じ ID の利用者は作り直せない。付け替えの手段も設けない（上の項目と同じ。所有者を変えるコマンドは認可の境界を動かすので、別に設計する）。rebuild は `users` に行の無い所有者 ID（`local` を除く）を `RebuildReport.owners_without_user` に入れ、起動時の復旧の警告と `doctor --rebuild` の出力がその ID・見えないこと・取る手順を表示する（`_warn_unowned`）。手順は、サーバーを止めて `{dataDir}/backups/` のうちその利用者を含むバックアップで DB を置き換え、`doctor --rebuild` でバックアップの後の会議を足すこと。置き換えると、そのバックアップの後に `user remove` した利用者のトークンも戻るので、`user list` で確かめて消し直す。そのバックアップが無ければ会議は API から開けない（音声は `recordings/{userId}/` に残る）。`user remove` した利用者の会議も録音を消さないので同じく報告されるが、これは想定どおりで、戻さない（警告もそう書く）。既知の制限とする
 * 認可：認証ミドルウェアが `/v1/meetings/{id}/...` と `/v1/jobs/{id}/...` の所有者を照合し、他人の会議は `404`（存在を漏らさない）。`GET /v1/meetings` は自分の会議のみ
 * ファイル階層：`recordings/{userId}/{meetingId}/{source}/{seq}.wav`。マイグレーション 012 が既存の `recordings/{meetingId}/` を `recordings/local/{meetingId}/` へ移動し `local_path` を更新する。旧ディレクトリは新しい階層を作る前に `{dataDir}/.migrate-012/` へ退避してから統合する（会議 ID が `local` だと旧ディレクトリと新しい階層の親が重なるため）
 * ジョブの公平性：`lease_job` を「利用者ごとの実行中ジョブ数が少ない利用者を優先」に変更（`ORDER BY running_per_user, priority, created_at`）。GPU は依然 1 台なので、同時実行数の上限は Phase 2 と同じ
@@ -161,6 +162,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 | pyannote のモデルの配置と API（版による違い） | 配布形態・`config.yaml` の書式・Pipeline の戻り値は pyannote.audio の版で変わる。本書は pyannote 本体を実行していない | 本書が固定するのは Provider の外側の契約だけ（§12：`config.yaml` の場所、通信させない、連続した WAV を渡す、区間を絶対時刻で返す）。実物の配置手順と戻り値の形は Step 3-h で確かめ、§12 の表を実測で更新する |
 | 話者分離の所要時間とメモリ（CPU） | 会議の長さに比例し、CPU では実時間に近い時間がかかりうる。全 Chunk の PCM をメモリに載せる（60 分で 1 source あたり約 115 MB、WAV 化でその倍） | 実行中は heartbeat が lease を延ばす（Phase 2 §13）。タイムアウトは設けない。1 source のタイムラインが 4 時間（`MAX_TIMELINE_MS`、約 461 MB）を超える会議は、PCM を読む前に `INVALID_AUDIO` で話者分離なしにする（§12 `handle_diarize` が Chunk の行の時刻で確かめ（`check_timeline_span`）、読み込み中の量と `assemble_timeline` の確保前にも確かめる。開始時刻の壊れた Chunk で際限なく読み込み・確保しない）。プロセスごと落ちた場合は lease 切れの回数上限で `failed` → 話者分離なしで続行（§2.2） |
 | 複数利用者への切り替え時の既存会議 | 所有者 `local` の会議をどの利用者に引き継ぐかは運用の判断 | 引き継ぎの手段は設けない。`user add` が切り替えの影響を表示する（§22） |
+| `users` を失った後に復元した会議 | バックアップなしで DB を作り直すと、利用者の ID の階層から復元した会議の所有者が `users` に居ない | 付け替えの手段は設けない。警告で ID と手順（その利用者を含むバックアップがあれば置き換え → `doctor --rebuild` → `user list` で消し直し）を示す。`user remove` した利用者の会議も報告され、それは戻さない（§2.5） |
 | Whisper の言語判定精度（短い Chunk・混在） | `detect_language` は先頭 30 秒の特徴量で判定し、確信度が低いことがある | 確信度をセグメントごとに `usage_metrics(language_prob)` に記録。< 0.6 のフォールバック率を監視 |
 | Live STT が録音に影響しない | 同一マシンで STT が走ると CPU/GPU が競合する | ブラウザ側 `NO_AUDIO_FRAMES` 発生時に Live を自動停止（client 文書 §8）。`usage_metrics(live_lag_ms)` を記録 |
 | FLAC ライブラリ（libsndfile）の可用性 | OS ごとに配布形態が異なる | extras 未導入なら `compress_chunk` を生成しない（`ctx.codec is None`） |
@@ -2492,10 +2494,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeGuard
 
+from ..auth.users import LOCAL_USER_ID
 from ..db import repo
 from ..db.connection import now_ms
 from ..db.models import AudioChunk, Meeting
@@ -2513,6 +2516,9 @@ class RebuildReport:
     chunks_marked_missing: int = 0
     chunks_reverified: int = 0      # 前に missing にした行のファイルが戻り（直り）、行の内容と一致したので verified に戻した数
     skipped_files: list[str] | None = None
+    # 走査した会議の所有者（ディレクトリの利用者 ID）のうち、users に行が無いもの（local を除く）。その会議はどのトークンからも
+    # 見えない（404）。DB を失って users が空になった・その利用者を追加する前のバックアップから戻した場合に起きる。§2.5
+    owners_without_user: list[str] = field(default_factory=list)
 
 
 def write_meeting_json(data_dir: Path, meeting: Meeting, chunks: list[AudioChunk]) -> Path:
@@ -2791,6 +2797,11 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
             if broken:
                 repo.update_chunk(conn, c.id, save_status="missing")
                 report.chunks_marked_missing += 1
+    # 既存の会議も含めて数える（doctor --rebuild をやり直しても、見えないままの会議を報告し続ける）
+    owners = {p.parent.name for p in recordings.glob("*/*") if p.is_dir()} - {LOCAL_USER_ID}
+    report.owners_without_user = sorted(
+        o for o in owners if conn.execute("SELECT 1 FROM users WHERE id = ?", (o,)).fetchone() is None
+    )
     return report
 ```
 
@@ -4224,8 +4235,14 @@ async def handle_compress(ctx: AppContext, job: Job) -> str | None:
     with ctx.db.read() as conn:
         chunk = pipeline.job_of_chunk(conn, job)
     if chunk.codec != "wav":
-        # 切り替えのコミット後・WAV の削除前に落ちた回のやり直し。残っている WAV を消す（圧縮済みが正なので、消してよい）
-        (ctx.settings.data_dir / chunk.local_path).with_suffix(".wav").unlink(missing_ok=True)
+        # 切り替えのコミット後・WAV の削除前に落ちた回のやり直し。残っている WAV を消す（圧縮済みが正なので、消してよい）。
+        # 消すのは書き込みロックの下で、lease が現行で、Chunk がまだ読んだ圧縮済みのファイルを指しているときだけ。
+        # 読んだ後に再 PUT の修復（書き込みロックの下で WAV に書き戻す）が入っていると、その WAV が正なので残す
+        async with ctx.db.write() as conn:
+            current = repo.get_chunk(conn, chunk.id)
+            if (repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts)
+                    and current is not None and current.codec != "wav" and current.local_path == chunk.local_path):
+                (ctx.settings.data_dir / chunk.local_path).with_suffix(".wav").unlink(missing_ok=True)
         return codec.name
     wav_path = ctx.settings.data_dir / chunk.local_path
     if not wav_path.exists():
@@ -4295,7 +4312,7 @@ Phase 2 §22 からの変更点。
 | `serve` | ロック → 一時ディレクトリ（`{dataDir}/tmp`）を空にする → `build_context` → 復旧していれば警告を標準エラーに出す → 以降は Phase 2 と同じ（bind → トークン → sweep → `resume_finalized` → Runner・Sweeper・定期処理のループ）。復旧で `finalized` に戻った会議は `resume_finalized` がジョブを作る |
 | `doctor`（serve が動いていない） | ロックを取り、`build_context(recover=True)`。壊れた DB はここでも復旧する |
 | `doctor`（serve が動いている） | ロックが取れないので `build_context(recover=False)`。使用中の DB を退避・復元しない。DB が開けなければ「サーバーを再起動して復旧する」と出して終了コード 1 |
-| `doctor --rebuild` | ロックが取れなければ何もせず終了コード 1（「サーバーを止めてから」）。取れたら `rebuild` を実行して件数を出す |
+| `doctor --rebuild` | ロックが取れなければ何もせず終了コード 1（「サーバーを止めてから」）。取れたら `rebuild` を実行して件数を出す。`users` に行の無い所有者の会議があれば、その ID と手順を警告する（`_warn_unowned`。§2.5） |
 | `doctor --init-tls [--host …]` | 証明書を作って終了する（DB もロックも触らない）。既存の証明書は上書きする（端末側の受け入れはやり直しになる） |
 | `user add <name>` | 同名は終了コード 1（トレースバックにしない）。最初の 1 人のときは、再起動で複数利用者に切り替わること・`token` ファイルが使えなくなること・既存の会議が見えなくなることを表示する（§2.5） |
 | `user remove <id>` | 利用者を削除する。トークンは次の要求から通らない。会議と録音は消さない。最後の 1 人のときは、再起動で単一利用者に戻ることを表示する。該当なしは終了コード 1 |
@@ -4560,6 +4577,23 @@ def _warn_recovery(recovery: Recovery | None) -> None:
           "Summaries and notes saved after the backup are lost; rebuilt meetings are transcribed again. "
           "Users removed after the backup are restored and their tokens work again; run `minutes-local user list` "
           "and remove them again with `minutes-local user remove <id>`.", file=sys.stderr)
+    _warn_unowned(r.owners_without_user)
+
+
+def _warn_unowned(owners: list[str]) -> None:
+    """users に行の無い利用者の会議を知らせる（§2.5）。所有者の付け替えはできないので、取れる手段を書く。
+
+    user remove で消した利用者の会議もここに出る（録音は消さない）。その場合は想定どおりで、戻さない。
+    バックアップで置き換えるとその後に消した利用者のトークンも戻るので、置き換えたら user list で確かめて消し直す
+    """
+    if not owners:
+        return
+    print(f"WARNING: meetings under recordings/<id>/ belong to users that are not registered: {', '.join(owners)}. "
+          "No token can open them (the API answers 404). If these users were removed with `minutes-local user remove`, "
+          "this is expected; do not restore them. Otherwise, if a backup in <dataDir>/backups/ contains these users, stop the server, "
+          "replace the database with it and run `minutes-local doctor --rebuild`; then run `minutes-local user list` and remove "
+          "again any user that was removed after that backup. Without such a backup the meetings cannot be reassigned to another "
+          "user; the audio files stay under recordings/<id>/.", file=sys.stderr)
 
 
 def _cmd_token(args: argparse.Namespace) -> int:
@@ -4606,6 +4640,7 @@ def _doctor_report(s: Settings, *, rebuild_requested: bool, recover: bool) -> in
         with ctx.db.write_sync() as conn:
             report = rebuild(conn, s.data_dir, ctx.codec)
         print(f"rebuild      : meetings+{report.meetings_created} chunks+{report.chunks_created} missing={report.chunks_marked_missing} skipped={report.skipped_files}")
+        _warn_unowned(report.owners_without_user)
     m, hw = ctx.models, ctx.hardware
     print(f"dataDir      : {s.data_dir}")
     print(f"sqlite       : {ctx.db.path}")
@@ -6074,6 +6109,30 @@ async def test_rebuild_from_recordings(client3: httpx.AsyncClient, ctx3: AppCont
     assert report.meetings_created == 1 and report.chunks_created == 2 and report.skipped_files == []
     assert m is not None and m.local_user_id == "local" and m.status == "finalized" and m.title == "t"
     assert after == before
+    assert report.owners_without_user == []          # 単一利用者の local は users に行が無くても見える
+
+
+async def test_rebuild_reports_owners_without_user(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """users に行の無い利用者の階層から復元した会議は、その所有者 ID を報告する（どのトークンからも見えない。§2.4）。"""
+    # Arrange: DB を失って users も空。録音は利用者 u-gone の階層にある
+    await _completed_meeting(client3, runner3, ctx3)
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+    recordings = ctx3.settings.data_dir / "recordings"
+    (recordings / "u-gone").mkdir()
+    os.replace(recordings / "local" / "m-1", recordings / "u-gone" / "m-1")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert report.meetings_created == 1 and m is not None and m.local_user_id == "u-gone"
+    assert report.owners_without_user == ["u-gone"]
+    # Act / Assert: その利用者を含むバックアップから users が戻れば、もう報告しない
+    with ctx3.db.write_sync() as conn:
+        conn.execute("INSERT INTO users (id, name, token_hash, created_at) VALUES ('u-gone', 'gone', 'h', 0)")
+        again = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+    assert again.owners_without_user == []
 
 
 async def test_rebuild_relinks_chunk_compressed_after_backup(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
@@ -6317,19 +6376,52 @@ async def test_compress_stale_attempt_keeps_committed_file(client3: httpx.AsyncC
     assert not list(final.parent.glob("*.staging"))
 
 
+async def _leased_again(ctx3: AppContext, job_id: str):  # type: ignore[no-untyped-def]
+    """完了済みのジョブを、やり直しの試行が lease し直した状態にする（落ちた試行の後に Sweeper が戻し、別の試行が取った）。"""
+    async with ctx3.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_owner = 'w-retry', attempts = attempts + 1, status = 'processing' WHERE id = ?",
+                     (job_id,))
+        job = repo.get_job(conn, job_id)
+    assert job is not None
+    return job
+
+
 async def test_compress_retry_removes_wav_left_by_crash(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
     """切り替えのコミット後・WAV の削除前に落ちた場合、やり直しのジョブが残った WAV を消す。"""
-    # Arrange: 圧縮済みの Chunk の隣に WAV が残っている
+    # Arrange: 圧縮済みの Chunk の隣に WAV が残っていて、やり直しの試行がジョブを lease している
     await _completed_meeting(client3, runner3, ctx3)
     await scheduler.schedule_compression(ctx3)
     await runner3.run_until_idle()
-    chunk, job = await _compress_job(ctx3)
+    chunk, done = await _compress_job(ctx3)
+    job = await _leased_again(ctx3, done.id)
     leftover = (ctx3.settings.data_dir / chunk.local_path).with_suffix(".wav")
     leftover.write_bytes(b"left by crash")
     # Act
     await handle_compress(ctx3, job)
     # Assert
     assert not leftover.exists() and (ctx3.settings.data_dir / chunk.local_path).exists()
+
+
+async def test_compress_retry_keeps_wav_repaired_after_read(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """やり直しの試行が圧縮済みの行を読んだ後に、再 PUT の修復が WAV に書き戻していたら、その WAV を消さない。"""
+    # Arrange: 圧縮した後、やり直しの試行が読む行（圧縮済み）を取っておく。その後に圧縮ファイルが壊れ、再 PUT が WAV に書き戻す
+    await _completed_meeting(client3, runner3, ctx3)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    stale, done = await _compress_job(ctx3)
+    job = await _leased_again(ctx3, done.id)
+    (ctx3.settings.data_dir / stale.local_path).write_bytes(b"xx")
+    r = await put_chunk(client3, "m-1", 0, sine_pcm(30))
+    assert r.status_code == 200
+    monkeypatch.setattr("minutes_local.jobs.pipeline.job_of_chunk", lambda _conn, _job: stale)
+    # Act
+    await handle_compress(ctx3, job)
+    # Assert: 書き戻した WAV が残り、読める
+    with ctx3.db.read() as conn:
+        repaired = repo.get_chunk(conn, stale.id)
+    assert repaired is not None and repaired.codec == "wav"
+    assert len(read_pcm(ctx3.settings.data_dir, repaired.local_path, repaired.sha256)) == 960000
 
 
 # ---- バックアップ ----
