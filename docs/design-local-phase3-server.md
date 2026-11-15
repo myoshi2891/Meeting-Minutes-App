@@ -756,6 +756,21 @@ def primary_language(ratio: dict[str, float]) -> tuple[str | None, float]:
 
 # ---- Live ----
 
+def requeue_running_job(conn: sqlite3.Connection, meeting_id: str, job_type: str) -> bool:
+    """実行中（leased / processing）の会議単位のジョブを pending に戻す。戻したら True。
+
+    lease_owner を消すので、実行中のワーカーは lease_is_current・finish_job・heartbeat_job のどれも通らず、結果を書かない
+    （Phase 2 基本設計 §9.3 の fencing）。attempts は戻さない：次の lease で進み、同じ owner の文字列で lease し直しても
+    旧ワーカーと区別できる。戻した実行も 1 回と数えるので、max_attempts はその分早く尽きる
+    """
+    cur = conn.execute(
+        "UPDATE processing_jobs SET status = 'pending', lease_owner = NULL, lease_until = NULL, next_run_at = 0, updated_at = ? "
+        "WHERE meeting_id = ? AND job_type = ? AND status IN ('leased','processing')",
+        (now_ms(), meeting_id, job_type),
+    )
+    return cur.rowcount > 0
+
+
 def segments_of_chunk(conn: sqlite3.Connection, chunk_id: str) -> list[Segment]:
     rows = conn.execute("SELECT * FROM transcript_segments WHERE chunk_id = ? ORDER BY segment_index", (chunk_id,)).fetchall()
     return [_row(Segment, r) for r in rows]
@@ -893,7 +908,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from ..db import repo
+from ..db import repo, repo_phase3
 from ..db.models import AudioChunk, Job
 from ..storage.files import sha256_file
 
@@ -941,7 +956,20 @@ def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: boo
 
 
 def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk, diarize: bool) -> None:
+    current = repo.get_chunk(conn, chunk.id)
+    first_completion = current is None or current.stt_status != "completed"
     repo.update_chunk(conn, chunk.id, stt_status="completed")
+    if diarize and first_completion:
+        # 話者分離の入力は、分離の開始時に completed だった Chunk（handle_diarize の targets）。後から初めて completed になった
+        # Chunk（無音と判定した Chunk の手動 STT。transcribe_silent_chunk）の音声には話者区間が無い。
+        # 撮り直し（前から completed）は前の segments の話者を引き継ぐので対象にしない（handle_transcribe の carried）
+        # - 実行中（leased / processing）：pending に戻す。実行中のワーカーの結果は lease の検査で捨てられ（finish_job も通らず
+        #   on_diarize_finished は呼ばれない）、次の lease がこの Chunk を含めて分離し直す。行は同じなので一意制約は保つ
+        # - 終端（completed / failed / cancelled）：この Chunk より先に終わった分離。消して、下の ensure_merge_job に作り直させる
+        #   （残すと ensure_merge_job は分離を済んだものとみなして merge へ進む）
+        # - pending / retrying：まだ入力を読んでいないので何もしない
+        repo_phase3.requeue_running_job(conn, chunk.meeting_id, "diarize_meeting")
+        repo.delete_finished_job(conn, chunk.meeting_id, "diarize_meeting")
     ensure_merge_job(conn, chunk.meeting_id, diarize)
 
 
@@ -1000,7 +1028,14 @@ def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str, diarize: bool) -
 
 
 def on_diarize_finished(conn: sqlite3.Connection, meeting_id: str) -> None:
-    """成功・失敗いずれでも merge へ進む（分離失敗は transcript を止めない）。"""
+    """成功・失敗いずれでも merge へ進む（分離失敗は transcript を止めない）。
+
+    ensure_merge_job と同じく、全 Chunk が終端になるまで merge を作らない。分離の実行中に手動 STT（transcribe_silent_chunk）で
+    queued に戻った Chunk があると、その STT より先に merge が走り、拾い直した segments が話者の無いまま公開される。
+    その Chunk が completed になると on_transcribe_completed がこの行を消し、ensure_merge_job が分離から作り直す
+    """
+    if not _all_chunks_terminal(conn, meeting_id):
+        return
     repo.insert_job(conn, meeting_id, "merge_transcript")
 
 
@@ -3531,7 +3566,10 @@ async def transcribe_silent_chunk(meeting_id: str, source: str, sequence_no: int
         repo.delete_finished_job(conn, meeting_id, "merge_transcript")
         # 完了済みの話者分離も消す。分離は completed の Chunk だけを入力にしたので、この Chunk の音声の区間には話者区間がない。
         # 残すと ensure_merge_job が分離を作り直さずに merge へ進み、拾い直した segments は話者の無いまま公開される。
-        # 作り直した分離は、話者の付いた segments を変えず、話者の無い segments だけに付ける（handle_diarize の _align_labels）
+        # 作り直した分離は、話者の付いた segments を変えず、話者の無い segments だけに付ける（handle_diarize の _align_labels）。
+        # 分離が実行待ち・実行中なら、ここでは消せない（一意制約の行は 1 つ）。この Chunk の STT の完了時に
+        # on_transcribe_completed が、実行中の分離を pending に戻すか、先に終わった分離を消して作り直させる。
+        # 分離が先に終わっても、on_diarize_finished はこの Chunk が終端になるまで merge を作らない
         repo.delete_finished_job(conn, meeting_id, "diarize_meeting")
         repo.record_metric(conn, "vad_manual_transcribe", 1, meeting_id=meeting_id)
     return {"jobId": job_id}
@@ -5102,7 +5140,7 @@ import pytest
 from minutes_local.config import Thresholds
 from minutes_local.db import repo, repo_phase3
 from minutes_local.db.connection import now_ms
-from minutes_local.db.models import Segment
+from minutes_local.db.models import Job, Segment
 from minutes_local.diarization.fake_provider import FakeDiarizationProvider
 from minutes_local.diarization.provider import MAX_TIMELINE_MS, DiarizationRequest, assemble_timeline
 from minutes_local.diarization.pyannote_provider import PyannoteDiarizationProvider
@@ -5110,6 +5148,7 @@ from minutes_local.storage.files import parse_wav_header
 from minutes_local.jobs.context import AppContext
 from minutes_local.jobs import handlers as handlers_module
 from minutes_local.jobs.handlers import handle_diarize
+from minutes_local.jobs.pipeline import on_diarize_finished
 from minutes_local.jobs.retry import InvalidAudioError, ModelMissingError
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.jobs.sweeper import sweep_once
@@ -5401,6 +5440,83 @@ async def test_manual_transcribe_of_skipped_chunk_gets_speakers_without_relabeli
     assert {s.speaker_id for s in recovered if s.start_ms >= 30000} == {"S3"}
     assert {(s.start_ms, s.speaker_id) for s in segs if s not in recovered} == before   # 前の segments の話者は変えない
     assert speakers == {"S1": None, "S2": "佐藤", "S3": None}
+
+
+async def _skipped_chunk_queued_for_manual_stt(client3: httpx.AsyncClient, ctx3: AppContext,
+                                               runner3: JobRunner) -> tuple[_FakePipeline, str]:
+    """中央の Chunk を無音と判定させて merge まで進め、その Chunk を手動 STT に回す（STT はまだ走らせない）。"""
+    pipeline = _FakePipeline([(0.0, 30.0, "A"), (60.0, 90.0, "B")])
+    ctx3.diarization = PyannoteDiarizationProvider(pipeline=pipeline)
+    ctx3.vad = FakeVADProvider(rms_threshold=0.1)
+    await create_meeting(client3)
+    for seq, pcm in enumerate([sine_pcm(30), sine_pcm(30, amplitude=0.02), sine_pcm(30)]):
+        await put_chunk(client3, "m-1", seq, pcm)
+    await finalize(client3, "m-1", mic=3)
+    await runner3.run_until_idle()
+    with ctx3.db.read() as conn:
+        skipped = repo.get_chunk_by_key(conn, "m-1", "mic", 1)
+        assert skipped is not None and skipped.stt_status == "skipped"
+    pipeline.tracks = [(0.0, 30.0, "A"), (30.0, 60.0, "C"), (60.0, 90.0, "B")]
+    assert (await client3.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+    return pipeline, skipped.id
+
+
+async def _diarize_without_the_queued_chunk(ctx3: AppContext) -> Job:
+    """話者分離を別のワーカーで lease し、手動 STT の Chunk が queued のうちに分離を終える（入力に含まれない）。"""
+    async with ctx3.db.write() as conn:
+        assert repo.insert_job(conn, "m-1", "diarize_meeting") is not None
+        old = repo_phase3.lease_job_fair(conn, "w-old", ["diarize_meeting"], now_ms())
+        assert old is not None
+    assert await handle_diarize(ctx3, old) is None
+    return old
+
+
+async def _report_diarize_completed(ctx3: AppContext, job: Job) -> None:
+    """Runner の完了処理と同じ：完了を記録できたときだけ on_diarize_finished を呼ぶ。"""
+    async with ctx3.db.write() as conn:
+        if repo.finish_job(conn, job.id, job.lease_owner or "", job.attempts, "completed"):
+            on_diarize_finished(conn, "m-1")
+
+
+def _assert_recovered_chunk_has_speakers(ctx3: AppContext, chunk_id: str) -> None:
+    with ctx3.db.read() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        assert m is not None and m.transcript_version == 2
+        recovered = [s for s in repo.list_segments(conn, "m-1", merged_version=2) if s.chunk_id == chunk_id]
+    assert recovered and all(s.speaker_id is not None for s in recovered)
+    assert {s.speaker_id for s in recovered if s.start_ms >= 30000} == {"S3"}
+
+
+async def test_manual_stt_finishing_during_diarize_reruns_the_diarize(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                      runner3: JobRunner) -> None:
+    """分離の実行中に手動 STT の Chunk が完了すると、実行中の分離は結果を残さず、その Chunk を含めて分離し直してから merge する。"""
+    # Arrange: 分離が Chunk を読まずに結果を書いた後、完了を報告する前に、手動 STT が完了する
+    pipeline, chunk_id = await _skipped_chunk_queued_for_manual_stt(client3, ctx3, runner3)
+    old = await _diarize_without_the_queued_chunk(ctx3)
+    assert await runner3.run_once() is True                        # 手動 STT（分離は lease 中なので merge は作れない）
+    # Act: 旧ワーカーが完了を報告し、残りを流す
+    await _report_diarize_completed(ctx3, old)
+    await runner3.run_until_idle()
+    # Assert: 分離は 3 回（最初・入力の古い分離・作り直し）。拾い直した segments に話者が付く
+    assert len(pipeline.calls) == 3
+    _assert_recovered_chunk_has_speakers(ctx3, chunk_id)
+
+
+async def test_diarize_finishing_before_manual_stt_does_not_merge_early(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                        runner3: JobRunner) -> None:
+    """手動 STT の Chunk より先に分離が終わっても merge を作らず、Chunk の完了後に分離を作り直してから merge する。"""
+    # Arrange
+    pipeline, chunk_id = await _skipped_chunk_queued_for_manual_stt(client3, ctx3, runner3)
+    old = await _diarize_without_the_queued_chunk(ctx3)
+    # Act: 分離が手動 STT より先に完了する
+    await _report_diarize_completed(ctx3, old)
+    with ctx3.db.read() as conn:
+        merge_jobs = [j for j in repo.list_jobs(conn, "m-1") if j.job_type == "merge_transcript"]
+    await runner3.run_until_idle()
+    # Assert: Chunk が queued の間は merge を作らない。作り直した分離が拾い直した segments に話者を付ける
+    assert merge_jobs == []
+    assert len(pipeline.calls) == 3
+    _assert_recovered_chunk_has_speakers(ctx3, chunk_id)
 
 
 async def test_diarize_that_keeps_crashing_does_not_block_merge(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
@@ -6298,6 +6414,8 @@ def test_doctor_rebuild_refuses_while_server_is_running(tmp_path: Path, monkeypa
 | 話者ラベル割当・名前は利用者・LLM 入力の `[S1:名前]` | `test_diarize_assigns_labels_and_names_are_user_assigned` |
 | 話者分離の後に transcribe の再試行で segments を置き換えても話者を引き継ぐ（分離は再実行しない） | `test_transcribe_retry_after_diarize_keeps_speakers` |
 | 無音と判定した Chunk の手動 STT は分離を作り直し、拾い直した segments だけに話者を付ける（前の話者・名前付きのラベルは変えない） | `test_manual_transcribe_of_skipped_chunk_gets_speakers_without_relabeling` |
+| 手動 STT の Chunk が分離の実行中に完了したら、実行中の分離を pending に戻して結果を捨てさせ、その Chunk を含めて分離し直してから merge する（§8 `on_transcribe_completed`・`repo_phase3.requeue_running_job`） | `test_manual_stt_finishing_during_diarize_reruns_the_diarize` |
+| 分離が手動 STT の Chunk より先に終わっても merge を作らず（`on_diarize_finished` は全 Chunk の終端を待つ）、Chunk の完了で分離を作り直す | `test_diarize_finishing_before_manual_stt_does_not_merge_early` |
 | 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
 | 実 Provider：無音 Chunk を挟んでも話者区間の時刻がずれない、上限は `max_speakers`、一時ファイルはデータディレクトリの中 | `test_assemble_timeline_pads_gaps_with_silence`、`test_pyannote_provider_keeps_absolute_time_across_skipped_chunk`、`test_speaker_after_silent_chunk_is_not_shifted` |
 | エコー除去 | `test_echo_from_system_is_dropped_on_mic` |
