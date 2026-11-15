@@ -1967,9 +1967,10 @@ def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: boo
     return True
 
 
-def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
+def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk) -> str | None:
+    """戻り値は作った merge ジョブの id（ensure_merge_job）。呼び出し側がコミット後にイベントを流す。"""
     repo.update_chunk(conn, chunk.id, stt_status="completed")
-    ensure_merge_job(conn, chunk.meeting_id)
+    return ensure_merge_job(conn, chunk.meeting_id)
 
 
 def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
@@ -2370,14 +2371,15 @@ class JobRunner:
         hb.cancel()
         duration = int((time.monotonic() - started) * 1000)
         removed: Job | None = None   # 下で消した完了済みの行の控え（消した後は読み直せない）
-        followup: str | None = None  # 作り直したジョブの id
+        followup: str | None = None  # この完了処理で作った・作り直したジョブの id
         async with self.ctx.db.write() as conn:
             ok = repo.finish_job(conn, job.id, self.owner, job.attempts, "completed", duration_ms=duration)
             if ok and model_used is not None:
                 conn.execute("UPDATE processing_jobs SET model_name = ? WHERE id = ?", (model_used, job.id))
             if ok and job.job_type in ("vad_chunk", "transcribe_chunk"):
-                # 自分自身が processing のままではハンドラ内の ensure_merge_job が成立しないため、完了確定後に再判定する
-                pipeline.ensure_merge_job(conn, job.meeting_id)
+                # 自分自身が processing のままではハンドラ内の ensure_merge_job が成立しないため、完了確定後に再判定する。
+                # 作った merge は下で流す（流さないと lease されるまで pending の行がイベントに出ない）
+                followup = pipeline.ensure_merge_job(conn, job.meeting_id)
             if ok and job.job_type == "merge_transcript" and repo.has_replacements(conn, job.meeting_id):
                 # merge の書き込みのコミット後・この完了の記録の前（processing の間）にコミットした撮り直しは、この merge では
                 # 入れ替わっていない。handle_transcribe の delete_finished_job は processing の行を消さず、ensure_merge_job も
@@ -2480,7 +2482,7 @@ lease が切れたジョブの扱いは 2 通りある（基本設計 §9.3）�
 | `merge_transcript` | 変えない | 変えない（`transcribing`） | 要約ジョブを作らない | 失敗したジョブの再試行。除外の対象ではない |
 | `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2）。ただし既に `completed` なら変えない（下記） | なし | 再試行、または要約の再生成 |
 
-transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、その Chunk の segments を新しい結果で置き換える。Chunk がまだ `completed` でなければ、同じ書き込みトランザクションで segments を消してから入れる。`completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments`（Chunk ごとの印は `segment_replacements`）に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（`repo.promote_replacements`）。その場で消すと、作り直す merge がコミットするまで transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにその merge が入れ替えてから新しい segments を読む。merge が実行中（`processing`）なら、その merge が入れ替えを書いた後に撮り直しがコミットされていることがある。`delete_finished_job` は実行中の行を消さず、`ensure_merge_job` も一意制約で作れないので、Runner が merge の完了を記録するときに入れ替え待ち（`repo.has_replacements`）を見て、残っていれば merge を作り直す。手動 STT（§12 `request_rerun_stt`）は、まだ入れ替えていない撮り直しの結果も捨てる。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
+transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、その Chunk の segments を新しい結果で置き換える。Chunk がまだ `completed` でなければ、同じ書き込みトランザクションで segments を消してから入れる。`completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments`（Chunk ごとの印は `segment_replacements`）に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（`repo.promote_replacements`）。その場で消すと、作り直す merge がコミットするまで transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにその merge が入れ替えてから新しい segments を読む。merge が実行中（`processing`）なら、その merge が入れ替えを書いた後に撮り直しがコミットされていることがある。`delete_finished_job` は実行中の行を消さず、`ensure_merge_job` も一意制約で作れないので、Runner が merge の完了を記録するときに入れ替え待ち（`repo.has_replacements`）を見て、残っていれば merge を作り直す。初めて完了する Chunk（手動 STT の無音 Chunk）も、実行中（`leased` / `processing`）の merge があれば同じく `staged_segments` に置く。その merge の書き込みの後にコミットすると版に入らず、入れ替え待ちが無いので作り直されもしない。`handle_transcribe` は初めての完了でも完了済みの merge を消す。手動 STT を受け付けた時点で実行中だった merge（`transcribe_silent_chunk` は消せない）が先に終わっていると、残った行が一意制約で作り直しを止める。ハンドラの中の `on_transcribe_completed` が作った merge（最後の Chunk の完了）は、`handle_transcribe` がコミットの後に流す（Runner の完了処理の `ensure_merge_job` は既存で `None` を返す）。vad の完了で Runner が作った merge も Runner が流す。手動 STT（§12 `request_rerun_stt`）は、まだ入れ替えていない撮り直しの結果も捨てる。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
 
 要約・VAD も同じ隙間（ハンドラのコミットと `finish_job` の間）で回収されうる。どれもハンドラの結果とジョブの完了を 1 トランザクションにはせず（Runner とハンドラの契約が変わる）、後続処理の側で書き込み済みの結果を認める。
 
@@ -3700,9 +3702,12 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 # 置かないと「来月末」が「来月」と切り出され、quote の「来月上旬」が deadline の「来月末」を裏付けてしまう（_deadline_supported）。
 # 月・週と時期（末・上旬・中旬・下旬）の組は 1 つの表現として切り出す。別々に切り出すと、quote の別の日付の部品
 # （「今月上旬に確認し、来月下旬に提出」の「来月」と「上旬」）を寄せ集めて deadline の「来月上旬」を裏付けてしまう。
-# 組にした表現は、その部品だけの deadline（「上旬」）も裏付けない（どの月の上旬かを quote から言えないため。基本設計 §12.5 段 5）
+# 組にした表現は、その部品だけの deadline（「上旬」）も裏付けない（どの月の上旬かを quote から言えないため。基本設計 §12.5 段 5）。
+# 年の付いた日付（「2026年11月20日」「26年11月20日」「令和8年11月20日」の「8年…」「2026/11/20」）も年まで 1 つの表現にする。月日だけを切り出すと、quote の 2026 年が deadline の
+# 2027 年の同じ月日を裏付けてしまう（「2026/11/20」は「26/11」と切り出され、同じ年月の別の日も通る）。年の無い月日の deadline は、
+# 年の付いた quote では裏付けない（どの年かを deadline から言えない。組にした表現と同じ扱い）
 _DEADLINE_HINTS = re.compile(
-    r"(\d{1,2}月\d{1,2}日|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|月曜|火曜|水曜|木曜|金曜|土曜|日曜|"
+    r"((?:\d{1,4}年)?\d{1,2}月\d{1,2}日|\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|月曜|火曜|水曜|木曜|金曜|土曜|日曜|"
     r"(?:今月|来月)(?:末|上旬|中旬|下旬)|(?:今週|来週)末|今週|来週|再来週|今月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|this week|end of|tomorrow|eod|eow)",
     re.IGNORECASE,
@@ -4101,6 +4106,18 @@ def _stt_model_for(ctx: AppContext, meeting_id: str, conn) -> str | None:  # typ
     return ctx.models.stt.name if ctx.models.stt else None
 
 
+def _publish_created_job(ctx: AppContext, job_id: str) -> None:
+    """ハンドラのトランザクションで作ったジョブを、コミットの後に Runner._publish_job と同じ形で流す（§13）。"""
+    with ctx.db.read() as conn:
+        job = repo.get_job(conn, job_id)
+        meeting = repo.get_meeting(conn, job.meeting_id) if job else None
+    if job is None:
+        return
+    ctx.events.publish(job.meeting_id, {"type": "job", "job": job.model_dump()})
+    if meeting is not None:
+        ctx.events.publish(job.meeting_id, {"type": "meeting_status", "status": meeting.status})
+
+
 async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
     with ctx.db.read() as conn:
         chunk = pipeline.job_of_chunk(conn, job)
@@ -4154,7 +4171,11 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         # segments が残っている。INSERT OR IGNORE だけでは、件数や区切りが変わった新しい結果と古い行が混ざる（§14）
         current = repo.get_chunk(conn, chunk.id)
         replaced = current is not None and current.stt_status == "completed"
-        if replaced:
+        # 実行中（leased / processing）の merge があれば、初めての完了（手動 STT。§21 transcribe_silent_chunk）でも staged に置く。
+        # その merge の書き込みの後にコミットすると版に入らず、ensure_merge_job も一意制約で merge を作れない。
+        # staged なら、Runner が merge の完了を記録するときに入れ替え待ち（has_replacements）を見て作り直す
+        merge_running = repo.count_jobs(conn, chunk.meeting_id, "merge_transcript", ["leased", "processing"]) > 0
+        if replaced or merge_running:
             # 前の結果は公開中の版（merged_version）に載っていることがある。ここで消すと、作り直す merge がコミットするまで
             # transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。新しい結果は staged_segments に置き、
             # 次の merge が版を上げるのと同じトランザクションで入れ替える（repo.promote_replacements）
@@ -4164,16 +4185,21 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
             # 完了前の attempt の行はどの版にも載っていない（merge は全 Chunk の完了後）ので、その場で置き換える
             repo.delete_segments_of_chunk(conn, chunk.id)
             repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
-        if replaced:
-            # 前の結果で merge が終わっていれば、新しい結果は作り直す merge まで入れ替わらない。完了済みの merge ジョブを消し、
-            # 下の on_transcribe_completed → ensure_merge_job で作り直して版を上げる（手動 STT と同じ。要約は自動では作り直さない）
-            repo.delete_finished_job(conn, chunk.meeting_id, "merge_transcript")
+        # 前の結果で merge が終わっていれば、新しい結果は作り直す merge まで入れ替わらない。完了済みの merge ジョブを消し、
+        # 下の on_transcribe_completed → ensure_merge_job で作り直して版を上げる（手動 STT と同じ。要約は自動では作り直さない）。
+        # 初めての完了でも消す：手動 STT を受け付けた時点で実行中だった merge（transcribe_silent_chunk は消せない）が先に終わっていると、
+        # 残した完了済みの行が一意制約で作り直しを止め、この Chunk は transcript に入らない
+        repo.delete_finished_job(conn, chunk.meeting_id, "merge_transcript")
         if meeting.stt_model_used is None:
             repo.update_meeting(conn, chunk.meeting_id, stt_model_used=model_name)
         repo.record_metric(conn, "stt_seconds", chunk.duration_ms / 1000, model_name=model_name, meeting_id=chunk.meeting_id)
         if result.model_load_ms:
             repo.record_metric(conn, "stt_model_load_ms", result.model_load_ms, model_name=model_name)
-        pipeline.on_transcribe_completed(conn, chunk)
+        created = pipeline.on_transcribe_completed(conn, chunk)
+    # 作った merge はコミットの後に流す。Runner の完了処理の ensure_merge_job は既存（一意制約）で None を返すので、
+    # ここで流さないと lease されるまで pending の行がイベントに出ない
+    if created is not None:
+        _publish_created_job(ctx, created)
     return model_name
 
 
@@ -4761,7 +4787,7 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
 | エンドポイント | 前提 | 満たさないとき | 理由 |
 | --- | --- | --- | --- |
 | `POST …/transcript/rerun` | 会議が確定後（`transcribing`〜`failed`）。`sttModel` は `null` か配置済みのモデル | 422 `VALIDATION` | 確定前に通すと会議が `transcribing` に進み、以後の Chunk の PUT が 409 になる（録音の保存が止まる）。未配置のモデルは、既存の transcript を消した後で全 Chunk が `MODEL_MISSING` の待機に入る |
-| `POST …/chunks/{source}/{seq}/transcribe` | 会議が merge 済み（`transcribed`〜`failed`）。Chunk の `stt_status` が `skipped` | 422 `VALIDATION`（Chunk がなければ 404） | `skipped` 以外には transcribe ジョブが既にあり（一意制約）、ジョブなしで `queued` にすると merge が永久に止まる。受け付けたら完了済みの merge ジョブを消し、STT の完了後に transcript の版が上がる。要約は自動では作り直さず、会議は `transcribed` に戻る |
+| `POST …/chunks/{source}/{seq}/transcribe` | 会議が merge 済み（`transcribed`〜`failed`）。Chunk の `stt_status` が `skipped` | 422 `VALIDATION`（Chunk がなければ 404） | `skipped` 以外には transcribe ジョブが既にあり（一意制約）、ジョブなしで `queued` にすると merge が永久に止まる。受け付けたら完了済みの merge ジョブを消し、STT の完了後に transcript の版が上がる。実行中の merge は消せないので、STT の完了時に `handle_transcribe` が結果を `staged_segments` に置くか（merge が実行中）、先に終わった merge を消して作り直させる（§14）。要約は自動では作り直さず、会議は `transcribed` に戻る |
 | `PUT /v1/settings` | `language` は `ja` / `en` / `auto`、`sttModel` は Whisper のモデル名、`vadSamplingRatio` は 0〜1（`common.clean_settings`） | 422 `VALIDATION`。1 つも保存しない | `sttModel` / `llmModel` の空文字は「指定を外して自動選定に戻す」。変更したら `refresh_stt` / `refresh_llm` で選定をやり直す（§13.1） |
 | `POST …/jobs/exclude-failed`（§21.4） | 会議が存在する | 404 `NOT_FOUND` | 確かめないと外部キー違反で 500 になる |
 
@@ -7472,6 +7498,29 @@ def test_deadline_is_not_assembled_from_parts_of_other_dates() -> None:
     assert reasons_for("来月上旬") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 
 
+def test_deadline_year_must_match_the_quote() -> None:
+    """年の付いた日付は年まで 1 つの表現。quote の 2026 年は deadline の 2027 年の同じ月日を裏付けない（段 5）。"""
+    # Arrange
+    sid = "eeeeeeee-5555-4000-8000-000000000005"
+    quote = "鈴木さんが2026年11月20日と2026/12/1と26年3月5日までに提出します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ年なら通り、年が違えば月日が同じでも落ちる。年の無い月日も、どの年かを quote から言えないので通さない
+    assert reasons_for("2026年11月20日") == []
+    assert reasons_for("2027年11月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("2026/12/1") == []
+    assert reasons_for("2026/12/2") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 2 桁の年（「26年」。元号の年も同じ形）も年まで比べる
+    assert reasons_for("26年3月5日") == []
+    assert reasons_for("27年3月5日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
 def test_claim_contradicting_its_quote_passes_as_known_limitation() -> None:
     """段 3a (4) は語彙の重なりで、含意は見ない。quote を否定した claim も通る（既知の制限。基本設計 §12.5）。"""
     # Arrange: QB は「予算は据え置きで決定しました」
@@ -7523,6 +7572,7 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 
 from minutes_local.api.sse import format_event
 from minutes_local.db import repo
@@ -7531,7 +7581,7 @@ from minutes_local.jobs.events import EventBroker
 from minutes_local.jobs.retry import ProviderUnreachableError
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.llm.fake_provider import FakeSummaryProvider
-from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm, valid_summary_response
+from tests.conftest import create_meeting, finalize, put_chunk, silence_pcm, sine_pcm, valid_summary_response
 
 
 async def test_event_broker_delivers_and_drops_when_full() -> None:
@@ -7604,6 +7654,23 @@ async def test_runner_publishes_job_events(client: httpx.AsyncClient, ctx: AppCo
     await asyncio.wait_for(t, 5)
     types = [e["type"] for e in received]
     assert "job" in types and "transcript_version" in types and types[-1] == "summary_version"
+
+
+@pytest.mark.parametrize("silent", [False, True])
+async def test_created_merge_job_is_published_while_pending(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                                            monkeypatch: pytest.MonkeyPatch, silent: bool) -> None:
+    """transcribe の完了（silent=False）・vad の完了（silent=True）で作った merge は、lease される前（pending）にも流す（§13）。"""
+    # Arrange
+    await create_meeting(client)
+    await put_chunk(client, "m-1", 0, silence_pcm(30) if silent else sine_pcm(30))
+    await finalize(client, "m-1", mic=1)
+    published: list[dict] = []  # type: ignore[type-arg]
+    monkeypatch.setattr(ctx.events, "publish", lambda _meeting_id, event: published.append(event))
+    # Act
+    await runner.run_until_idle()
+    # Assert: 作った時点の pending から流れる（流さないと、lease されるまで UI は待ちの merge を知らない）
+    merges = [e["job"]["status"] for e in published if e.get("type") == "job" and e["job"]["job_type"] == "merge_transcript"]
+    assert merges[0] == "pending" and "completed" in merges
 
 
 async def test_ollama_outage_leaves_transcribed_then_completes(client: httpx.AsyncClient, ctx: AppContext,
@@ -8007,8 +8074,12 @@ STT の再実行・無音 Chunk の手動 STT・設定の変更・失敗の除�
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from minutes_local.db import repo
+from minutes_local.db.connection import now_ms
+from minutes_local.db.models import Job
+from minutes_local.jobs import handlers
 from minutes_local.jobs.context import AppContext
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.vad.fake_provider import FakeVADProvider
@@ -8069,6 +8140,66 @@ async def test_manual_transcribe_of_skipped_chunk_reaches_the_transcript(client:
     assert d["status"] == "transcribed" and d["latestSummaryVersion"] == 1
 
 
+async def test_manual_stt_committed_during_merge_schedules_followup_merge(client: httpx.AsyncClient, ctx: AppContext,
+                                                                         runner: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """merge の書き込みの後・完了の記録の前に、手動 STT の Chunk が初めて完了しても、その merge の後に作り直す merge が入れる（§12）。"""
+    # Arrange: 1 つ目の Chunk の手動 STT で merge を作り直させ、その merge の実行中に 2 つ目の Chunk の手動 STT を完了させる
+    await _all_skipped_meeting(client, ctx, runner)
+    assert (await client.post("/v1/meetings/m-1/chunks/mic/0/transcribe")).status_code == 202
+    real_merge = runner.handlers["merge_transcript"]
+    done_during_merge = False
+
+    async def merge_then_transcribe(c: AppContext, merge_job: Job) -> str | None:
+        nonlocal done_during_merge
+        result = await real_merge(c, merge_job)
+        if not done_during_merge:
+            done_during_merge = True
+            assert (await client.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+            async with c.db.write() as conn:
+                job = repo.lease_job(conn, "w-manual", ["transcribe_chunk"], now_ms())
+                assert job is not None
+            await handlers.handle_transcribe(c, job)
+            async with c.db.write() as conn:
+                assert repo.finish_job(conn, job.id, "w-manual", job.attempts, "completed")
+        return result
+
+    monkeypatch.setitem(runner.handlers, "merge_transcript", merge_then_transcribe)   # HANDLERS は共有なのでテスト後に戻す
+    # Act
+    await runner.run_until_idle()
+    # Assert: 作り直した merge（版 3）に両方の Chunk が入る
+    d = await _detail(client)
+    t = (await client.get("/v1/meetings/m-1/transcript")).json()
+    assert done_during_merge and d["transcriptVersion"] == 3
+    assert {s["chunkSequenceNo"] for s in t["segments"]} == {0, 1}
+
+
+async def test_manual_stt_finishing_after_running_merge_remerges(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """受け付けた時点で実行中だった merge（消せない）が先に終わっても、その Chunk の STT の完了で merge を作り直す（§12）。"""
+    # Arrange: 1 つ目の Chunk の手動 STT で作り直した merge の実行中に、2 つ目の Chunk の手動 STT を受け付ける
+    await _all_skipped_meeting(client, ctx, runner)
+    assert (await client.post("/v1/meetings/m-1/chunks/mic/0/transcribe")).status_code == 202
+    real_merge = runner.handlers["merge_transcript"]
+    requested = False
+
+    async def merge_then_request(c: AppContext, merge_job: Job) -> str | None:
+        nonlocal requested
+        result = await real_merge(c, merge_job)
+        if not requested:
+            requested = True
+            assert (await client.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+        return result
+
+    monkeypatch.setitem(runner.handlers, "merge_transcript", merge_then_request)
+    # Act
+    await runner.run_until_idle()
+    # Assert: 完了済みの merge が残ったままだと、2 つ目の Chunk は版 2 の後の transcript に入らない
+    d = await _detail(client)
+    t = (await client.get("/v1/meetings/m-1/transcript")).json()
+    assert requested and d["transcriptVersion"] == 3
+    assert {s["chunkSequenceNo"] for s in t["segments"]} == {0, 1}
+
+
 async def test_manual_transcribe_is_refused_unless_the_chunk_is_skipped(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
     await _all_skipped_meeting(client, ctx, runner)
     assert (await client.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
@@ -8123,7 +8254,7 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
 | DLQ = failed + 再試行 | `test_retry_failed_job_via_api`、`test_failed_chunk_blocks_until_excluded` |
 | Structured Output / sourceSegmentIds / assignee 検出 | `test_validate_stage3_to_7`、`test_synthesize_single_window_retries_schema_once` |
-| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote` |
+| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算・別の日付の部品の寄せ集め・年の違う同じ月日では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote`、`test_compound_deadline_is_not_matched_by_its_part`、`test_deadline_is_not_assembled_from_parts_of_other_dates`、`test_deadline_year_must_match_the_quote` |
 | 段 3a (4) は語彙の重なりで含意は見ない（quote と矛盾する claim も通る既知の制限） | `test_claim_contradicting_its_quote_passes_as_known_limitation` |
 | AI 再生成 / Manual Notes 保護 | `test_regenerate_creates_new_version_and_keeps_notes` |
 | Ollama 停止中に transcript まで完了 | `test_ollama_outage_leaves_transcribed_then_completes`、`test_summary_runs_once_ollama_is_started_after_the_server`、`test_ollama_without_models_is_model_missing` |
@@ -8131,7 +8262,8 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | モデル未配置で待機 → 配置後に再開 | `test_transcribe_runs_once_a_model_is_placed_after_the_server`、`test_download_result_is_visible_and_reselects_the_model` |
 | モデル取得の allowlist（外向き通信の唯一の例外） | `test_download_checks_the_redirect_target_before_requesting_it`、`test_download_follows_the_hf_cdn_redirect`、`test_whisper_files_per_model`、`test_download_failure_is_reported_not_lost` |
 | SSE の長時間接続（keepalive） | `test_sse_stream_survives_keepalive` |
-| VAD false negative の手動 STT | `test_manual_transcribe_of_skipped_chunk_reaches_the_transcript`、`test_manual_transcribe_is_refused_unless_the_chunk_is_skipped`、`test_manual_transcribe_is_refused_before_the_transcript_exists` |
+| ハンドラ・完了処理で作った merge を pending のうちに流す | `test_runner_publishes_job_events`、`test_created_merge_job_is_published_while_pending` |
+| VAD false negative の手動 STT（merge の実行中に受け付け・完了しても、作り直した merge が入れる） | `test_manual_transcribe_of_skipped_chunk_reaches_the_transcript`、`test_manual_transcribe_is_refused_unless_the_chunk_is_skipped`、`test_manual_transcribe_is_refused_before_the_transcript_exists`、`test_manual_stt_committed_during_merge_schedules_followup_merge`、`test_manual_stt_finishing_after_running_merge_remerges` |
 | 録音中の操作が保存を止めない | `test_rerun_is_refused_while_recording_and_upload_continues`、`test_rerun_rejects_a_model_that_is_not_installed` |
 | 設定値の検証・存在しない会議 | `test_settings_are_validated_and_model_can_be_reset_to_auto`、`test_exclude_failed_on_unknown_meeting_is_404` |
 | STT 実行中は要約を lease しない | `test_allowed_types_excludes_summary_while_stt_running` |
