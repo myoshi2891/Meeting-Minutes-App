@@ -3735,6 +3735,8 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 # 2027 年の同じ月日を裏付けてしまう（「2026/11/20」は「26/11」と切り出され、同じ年月の別の日も通る。2 桁の年の「26/11/20」も
 # 年まで切り出さないと「26/11」に縮み、「26/11/21」と同じ表現になる）。元号の付いた年（「令和8年」「令和元年」）は
 # 元号まで含める。数字の年だけを切り出すと、令和 8 年と平成 8 年の同じ月日が同じ表現になる（「元年」は数字でないので、月日だけになる）。
+# 相対の年（「再来年」「来年」「今年」「去年」。「の」は挟んでよい）も月日と 1 つの表現にする。月日だけを切り出すと、quote の
+# 「再来年11月20日」が deadline の「来年11月20日」を裏付けてしまう。「再来年」は「来年」より前に置く（「再来月」と同じ理由）。
 # 年の無い月日の deadline は、年の付いた quote では裏付けない（どの年かを deadline から言えない。組にした表現と同じ扱い）。
 # 週と曜日の組（「来週金曜」「来週の金曜」「next week friday」「friday next week」）も 1 つの表現にする。別々に切り出すと、quote の
 # 「今週金曜」の「金曜」と別の「来週」を寄せ集めて deadline の「来週金曜」を裏付けてしまう。
@@ -3758,7 +3760,7 @@ _EN_DEADLINE_ALTS = (
     rf"{_WEEKDAYS_EN}|next week|this week|end of|day ?after ?tomorrow|tomorrow|eod|eow"
 )
 _DEADLINE_HINTS = re.compile(
-    r"((?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年)?\d{1,2}月\d{1,2}日|(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})"
+    r"((?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年|(?:再来年|来年|今年|去年)の?)?\d{1,2}月\d{1,2}日|(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})"
     rf"(?:の?{_TIME})?|{_TIME}|"
     rf"(?:再来週|今週|来週)の?(?:{_WEEKDAYS_JA})|{_WEEKDAYS_JA}|"
     r"(?:再来月|今月|来月)(?:末|上旬|中旬|下旬)|(?:再来週|今週|来週)末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
@@ -3863,7 +3865,7 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     「来週金曜」のような週と曜日の組は 1 つの表現で、比べるのは _hint_key でそろえた形（「来週の金曜」も同じ）。
     日付と時刻（「11月20日午後5時」）も 1 つの表現で、quote の「11月20日午前9時」は通らない。
     表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たるのは
-    「再」で始まる候補（「再来週」「再来週末」「再来月」「再来月末」）だけなので、それぞれ 1 つの表現になる）。
+    「再」で始まる候補（「再来週」「再来週末」「再来月」「再来月末」「再来年11月20日」）だけなので、それぞれ 1 つの表現になる）。
     quote の英語の表現は、正規化前の quote で語として現れるものだけを数える（_quote_hints。正規化すると語の境目が消え、
     「Simon day」が「monday」に当たる）。
     相対表現を日付に換算した deadline（quote は「来週」、deadline は「11月20日」）は通さない。換算の基準
@@ -7604,7 +7606,7 @@ from minutes_local.jobs.retry import BusinessValidationError, SchemaValidationEr
 from minutes_local.llm.fake_provider import FakeSummaryProvider
 from minutes_local.llm.map_reduce import split_windows, synthesize
 from minutes_local.llm.schema import MeetingSummaryDraft
-from minutes_local.llm.validate import SegmentIndex, parse_draft, validate
+from minutes_local.llm.validate import SegmentIndex, _deadline_supported, parse_draft, validate
 from tests.conftest import valid_summary_response
 
 SEGS = {
@@ -7769,6 +7771,19 @@ def test_deadline_year_must_match_the_quote() -> None:
     # 2 桁の年（「26年」）も年まで比べる。元号の付いた年は元号まで比べる（test_deadline_era_must_match_the_quote）
     assert reasons_for("26年3月5日") == []
     assert reasons_for("27年3月5日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_deadline_relative_year_must_match_the_quote() -> None:
+    """相対の年（再来年・来年・今年・去年）の付いた日付は年まで 1 つの表現。quote の「再来年11月20日」は deadline の「来年11月20日」を裏付けない（段 5）。"""
+    # Arrange
+    farther, same = "再来年11月20日までに提出", "来年11月20日までに提出"
+    # Act / Assert: 年が違えば月日が同じでも落ちる。同じ相対の年なら通る（「の」を挟んでもよい）
+    assert not _deadline_supported("来年11月20日", farther)
+    assert _deadline_supported("来年11月20日", same)
+    assert _deadline_supported("来年11月20日", "来年の11月20日までに提出")
+    assert _deadline_supported("再来年11月20日", "再来年11月20日までに提出")
+    assert not _deadline_supported("今年11月20日", "去年11月20日までに提出")
+    assert not _deadline_supported("11月20日", "来年11月20日までに提出")
 
 
 def test_deadline_era_must_match_the_quote() -> None:
@@ -8721,7 +8736,7 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
 | DLQ = failed + 再試行 | `test_retry_failed_job_via_api`、`test_failed_chunk_blocks_until_excluded` |
 | Structured Output / sourceSegmentIds / assignee 検出 | `test_validate_stage3_to_7`、`test_synthesize_single_window_retries_schema_once` |
-| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算・別の日付の部品の寄せ集め・年や元号の違う同じ月日・別の週の同じ曜日では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote`、`test_compound_deadline_is_not_matched_by_its_part`、`test_deadline_is_not_assembled_from_parts_of_other_dates`、`test_deadline_year_must_match_the_quote`、`test_deadline_era_must_match_the_quote`、`test_week_and_weekday_are_matched_as_a_pair`、`test_english_week_phrases_are_not_matched_as_fragments` |
+| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算・別の日付の部品の寄せ集め・年や元号の違う同じ月日・別の週の同じ曜日では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote`、`test_compound_deadline_is_not_matched_by_its_part`、`test_deadline_is_not_assembled_from_parts_of_other_dates`、`test_deadline_year_must_match_the_quote`、`test_deadline_relative_year_must_match_the_quote`、`test_deadline_era_must_match_the_quote`、`test_week_and_weekday_are_matched_as_a_pair`、`test_english_week_phrases_are_not_matched_as_fragments` |
 | 段 3a (4) は語彙の重なりで含意は見ない（quote と矛盾する claim も通る既知の制限） | `test_claim_contradicting_its_quote_passes_as_known_limitation` |
 | AI 再生成 / Manual Notes 保護 | `test_regenerate_creates_new_version_and_keeps_notes` |
 | Ollama 停止中に transcript まで完了 | `test_ollama_outage_leaves_transcribed_then_completes`、`test_summary_runs_once_ollama_is_started_after_the_server`、`test_ollama_without_models_is_model_missing` |
