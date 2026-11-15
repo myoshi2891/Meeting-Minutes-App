@@ -884,6 +884,9 @@ class AppContext:
     # 話者分離の実行枠（handle_diarize）。asyncio.to_thread のスレッドは止められないので、pending に戻した分離
     # （requeue_running_job）の次の試行は、旧い試行のスレッドが抜けて枠を返すまで待つ
     diarize_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(MAX_CONCURRENT_DIARIZE))
+    # 実行中の STT（ライブを含む）のハンドラの数（JobRunner._run_handler が数える）。STT の再実行（request_rerun_stt）が
+    # ジョブの行を消しても推論は止まらないので、行が無くても抜けるまで分離を lease しない（JobRunner.allowed_types）
+    stt_in_flight: int = 0
 
     @property
     def diarization_active(self) -> bool:
@@ -1132,7 +1135,7 @@ def job_of_chunk(conn: sqlite3.Connection, job: Job) -> AudioChunk:
 
 # 9. Runner `jobs/runner.py`（変更）
 
-変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` と STT は GPU で重ねない（双方向の排他。分離は STT の実行中に lease せず、STT（ライブを含む）は分離の実行中に lease しない。合算の VRAM を実測していないため。§3）。分離の実行中は、行（`leased` / `processing`）に加えて実行枠（`ctx.diarize_slots`）が埋まっていることでも判定する（pending に戻した分離の旧い試行のスレッドは行に出ない。枠が埋まっている間は次の分離も lease しない）、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す。
+変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` と STT は GPU で重ねない（双方向の排他。分離は STT の実行中に lease せず、STT（ライブを含む）は分離の実行中に lease しない。合算の VRAM を実測していないため。§3）。分離の実行中は、行（`leased` / `processing`）に加えて実行枠（`ctx.diarize_slots`）が埋まっていることでも判定する（pending に戻した分離の旧い試行のスレッドは行に出ない。枠が埋まっている間は次の分離も lease しない）。STT の実行中は、行に加えて実行中のハンドラの数（`ctx.stt_in_flight`。`_run_handler` が数える）でも判定する（STT の再実行 `request_rerun_stt` が行を消しても、旧い試行の推論はハンドラが抜けるまで GPU を使う）、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す。
 
 ```python
 # minutes_local/jobs/runner.py
@@ -1160,6 +1163,7 @@ Handler = Callable[[AppContext, Job], Awaitable[str | None]]
 HEARTBEAT_INTERVAL_S = 60.0
 LEASE_MS = 300_000
 GPU_HEAVY = ("transcribe_chunk", "live_transcribe_chunk", "diarize_meeting")
+STT_TYPES = ("transcribe_chunk", "live_transcribe_chunk")
 
 
 class JobRunner:
@@ -1174,8 +1178,11 @@ class JobRunner:
     def allowed_types(self) -> list[str]:
         types = ["vad_chunk", "merge_transcript", "compress_chunk"]
         with self.ctx.db.read() as conn:
-            stt_running = sum(repo.count_jobs(conn, None, t, ["leased", "processing"]) for t in ("transcribe_chunk", "live_transcribe_chunk"))
+            stt_rows = sum(repo.count_jobs(conn, None, t, ["leased", "processing"]) for t in STT_TYPES)
             diarize_rows = repo.count_jobs(conn, None, "diarize_meeting", ["leased", "processing"])
+        # 行に加えて実行中のハンドラ（ctx.stt_in_flight）も数える。STT の再実行（request_rerun_stt）が行を消した旧い試行は
+        # 行に出ないが、推論が終わってハンドラが抜けるまで GPU を使う。行だけで判定すると、その推論と並んで分離を lease する
+        stt_running = stt_rows + self.ctx.stt_in_flight
         # 実行枠（ctx.diarize_slots）が埋まっていれば分離が走っている。pending に戻した分離（requeue_running_job）の旧い試行は
         # 行を見ても分からないが、スレッドが抜けるまで枠を持つ。行だけで判定すると、そのスレッドと並んで次の分離や要約を lease する
         diarize_slots_full = self.ctx.diarize_slots.locked()
@@ -1251,7 +1258,7 @@ class JobRunner:
         hb = asyncio.create_task(self._heartbeat(job.id))
         started = time.monotonic()
         try:
-            model_used = await handler(self.ctx, job)
+            model_used = await self._run_handler(handler, job)
         except BaseException as exc:  # noqa: BLE001 - JobError に正規化して記録する
             hb.cancel()
             if isinstance(exc, asyncio.CancelledError):
@@ -1284,6 +1291,20 @@ class JobRunner:
         self._publish_job(job.id, removed=removed)
         if followup is not None:
             self._publish_job(followup)
+
+    async def _run_handler(self, handler: Handler, job: Job) -> str | None:
+        """ハンドラを実行する。STT は抜けるまで ctx.stt_in_flight に数える（allowed_types が分離を lease しない）。
+
+        抜けるのは推論が終わったとき（行を消されていれば lease の検査で結果を捨てる）か、タイムアウトでプールを作り直したとき
+        （ワーカーごと止まる。Phase 2 §13 PoolExecutor）
+        """
+        if job.job_type not in STT_TYPES:
+            return await handler(self.ctx, job)
+        self.ctx.stt_in_flight += 1
+        try:
+            return await handler(self.ctx, job)
+        finally:
+            self.ctx.stt_in_flight -= 1
 
     async def _on_failure(self, job: Job, err: JobError, duration_ms: int) -> None:
         now = now_ms()
@@ -1610,7 +1631,7 @@ def check_timeline_span(spans: list[tuple[str, int, int]], max_ms: int = MAX_TIM
 
     全 Chunk の PCM を読んでから assemble_timeline で弾くと、上限を超える会議でもその前に全部をメモリに載せる。
     長さは Chunk の行の時刻で決め、ファイルの大きさは使わない（圧縮済みの Chunk はファイルが小さい）。
-    行の時刻より長く復号される Chunk は、handle_diarize の読み込み中の上限と assemble_timeline が弾く。
+    行の時刻より長く復号される Chunk は、handle_diarize のスレッド（_load_and_diarize）の読み込み中の上限と assemble_timeline が弾く。
     """
     bounds: dict[str, tuple[int, int]] = {}
     for source, start_ms, end_ms in spans:
@@ -3771,7 +3792,7 @@ from pathlib import Path
 from ..db import repo, repo_phase3
 from ..db.connection import now_ms
 from ..db.models import AudioChunk, Job, Segment, SummaryVersion
-from ..diarization.provider import MAX_TIMELINE_MS, DiarizationRequest, DiarizationResult, SpeakerTurn, check_timeline_span
+from ..diarization.provider import MAX_TIMELINE_MS, DiarizationProvider, DiarizationRequest, DiarizationResult, SpeakerTurn, check_timeline_span
 from ..llm.caveats import caveats_for
 from ..llm.map_reduce import synthesize
 from ..llm.prompts import MIXED_NOTE_EN, MIXED_NOTE_JA, PROMPT_VERSION
@@ -4097,6 +4118,30 @@ def _release_when_done(slots: asyncio.Semaphore, worker: asyncio.Task[Diarizatio
     worker.add_done_callback(done)
 
 
+def _load_and_diarize(ctx: AppContext, provider: DiarizationProvider, meeting_id: str, targets: list[AudioChunk]) -> DiarizationResult:
+    """分離のスレッドの本体。Chunk の PCM を読んで復号し（FLAC を含む）、分離する。
+
+    読み込みと復号もスレッドで行う。イベントループで行うと、1 source あたり最大約 461 MB の読み込みと復号の間、API・SSE・
+    heartbeat が止まる。分離と同じスレッドにまとめるのは、実行枠（diarize_slots）の返却をスレッドの終わりに一本化するため
+    （読み込みだけを別のスレッドにすると、その間にハンドラがキャンセルされたとき、読み込みが続いたまま枠が返る）
+    """
+    pcm_by_source: dict[str, list[tuple[int, bytes]]] = {}
+    loaded: dict[str, int] = {}
+    for c in targets:
+        try:
+            pcm = read_chunk_pcm(ctx, c)
+        except InvalidWavError:
+            continue
+        # 行の時刻より長く復号される Chunk があっても、読んだ量が上限（16 kHz・PCM16 で 1 ms = 32 バイト）を超えた時点でやめる
+        loaded[c.source] = loaded.get(c.source, 0) + len(pcm)
+        if loaded[c.source] > MAX_TIMELINE_MS * 32:
+            raise InvalidAudioError(f"diarization input too large: {c.source} {loaded[c.source]} bytes")
+        pcm_by_source.setdefault(c.source, []).append((c.start_offset_ms, pcm))
+    req = DiarizationRequest(meeting_id=meeting_id, pcm_by_source=pcm_by_source, models_dir=str(ctx.settings.models_dir),
+                             work_dir=str(ctx.settings.tmp_dir))
+    return provider.diarize(req)
+
+
 async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
     if ctx.diarization is None:
         raise ModelMissingError("diarization provider not available")
@@ -4115,22 +4160,9 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
         # PCM を読む前に、行の時刻で 1 source のタイムラインの長さを確かめる（assemble_timeline と同じ上限。§9 の表）。
         # 超えれば InvalidAudioError（再試行しない）で、話者分離なしで merge へ進む（§2.2）
         check_timeline_span([(c.source, c.start_offset_ms, c.end_offset_ms) for c in targets])
-        pcm_by_source: dict[str, list[tuple[int, bytes]]] = {}
-        loaded: dict[str, int] = {}
-        for c in targets:
-            try:
-                pcm = read_chunk_pcm(ctx, c)
-            except InvalidWavError:
-                continue
-            # 行の時刻より長く復号される Chunk があっても、読んだ量が上限（16 kHz・PCM16 で 1 ms = 32 バイト）を超えた時点でやめる
-            loaded[c.source] = loaded.get(c.source, 0) + len(pcm)
-            if loaded[c.source] > MAX_TIMELINE_MS * 32:
-                raise InvalidAudioError(f"diarization input too large: {c.source} {loaded[c.source]} bytes")
-            pcm_by_source.setdefault(c.source, []).append((c.start_offset_ms, pcm))
-        req = DiarizationRequest(meeting_id=job.meeting_id, pcm_by_source=pcm_by_source, models_dir=str(ctx.settings.models_dir),
-                                 work_dir=str(ctx.settings.tmp_dir))
+        # PCM の読み込み・復号（読んだ量の上限の確認を含む）と分離を 1 つのスレッドで行う（_load_and_diarize）。
         # スレッドを別のタスクで待ち、shield で包む。このハンドラがキャンセルされてもタスクは残り、スレッドの終わりを知らせる
-        worker = asyncio.create_task(asyncio.to_thread(ctx.diarization.diarize, req))
+        worker = asyncio.create_task(asyncio.to_thread(_load_and_diarize, ctx, ctx.diarization, job.meeting_id, targets))
         result = await asyncio.shield(worker)
         async with ctx.db.write() as conn:
             # lease が失効していれば何も書かない（Phase 2 基本設計 §9.3）。分離は長く走るので、失効した旧ワーカーが
@@ -4160,7 +4192,7 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
         return None
     finally:
         if worker is None or worker.done():
-            ctx.diarize_slots.release()   # スレッドを始める前に抜けた（読み込みの失敗など）か、スレッドが抜けている
+            ctx.diarize_slots.release()   # スレッドを始める前に抜けた（タイムラインの上限など）か、スレッドが抜けている
         else:
             _release_when_done(ctx.diarize_slots, worker)   # スレッドがまだ走っている（キャンセルで抜けた）
 
@@ -5328,7 +5360,7 @@ from minutes_local.storage.files import parse_wav_header
 from minutes_local.jobs.context import AppContext
 from minutes_local.jobs import handlers as handlers_module
 from minutes_local.jobs.handlers import handle_diarize
-from minutes_local.jobs.pipeline import on_diarize_finished
+from minutes_local.jobs.pipeline import on_diarize_finished, request_rerun_stt
 from minutes_local.jobs.retry import InvalidAudioError, ModelMissingError
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.jobs.sweeper import sweep_once
@@ -5454,6 +5486,44 @@ async def test_diarize_rejects_too_long_timeline_before_reading_pcm(client3: htt
     assert reads_in_diarize == [] and diarization_provider.calls == []
     assert jobs["diarize_meeting"].status == "failed" and jobs["diarize_meeting"].error_class == "INVALID_AUDIO"
     assert jobs["merge_transcript"].status == "completed"
+
+
+async def test_diarize_reads_chunk_pcm_off_the_event_loop(client3: httpx.AsyncClient, runner3: JobRunner,
+                                                         diarization_provider: FakeDiarizationProvider,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """話者分離の Chunk の読み込みと復号は、イベントループではなくワーカースレッドで行う（§21 handle_diarize）。"""
+    # Arrange: 分離のハンドラの中の read_chunk_pcm が、イベントループの上で呼ばれたかを記録する
+    await _two_source_meeting(client3)
+    on_loop: list[bool] = []
+    in_diarize = False
+    real_read = handlers_module.read_chunk_pcm
+
+    def spy(c: AppContext, chunk: Any) -> bytes:
+        if in_diarize:
+            try:
+                asyncio.get_running_loop()
+                on_loop.append(True)
+            except RuntimeError:
+                on_loop.append(False)
+        return real_read(c, chunk)
+
+    real_diarize = runner3.handlers["diarize_meeting"]
+
+    async def diarize_flagged(c: AppContext, job: Any) -> str | None:
+        nonlocal in_diarize
+        in_diarize = True
+        try:
+            return await real_diarize(c, job)
+        finally:
+            in_diarize = False
+
+    monkeypatch.setattr(handlers_module, "read_chunk_pcm", spy)
+    monkeypatch.setitem(runner3.handlers, "diarize_meeting", diarize_flagged)   # HANDLERS は共有なのでテストの後に戻す
+    # Act
+    await runner3.run_until_idle()
+    # Assert: 4 Chunk をすべてイベントループの外で読み、分離も 1 回走った
+    assert on_loop == [False] * 4
+    assert len(diarization_provider.calls) == 1
 
 
 async def test_diarize_model_missing_does_not_wait(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
@@ -5859,6 +5929,45 @@ async def test_stt_is_not_leased_while_diarization_runs(client3: httpx.AsyncClie
         ctx3.diarize_slots.release()
     # Act / Assert: 分離が終われば STT をまた lease する
     assert stt <= set(runner3.allowed_types())
+
+
+async def test_withdrawn_running_stt_blocks_diarize_until_it_ends(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    """STT の再実行（request_rerun_stt）が行を消した実行中の STT も、その試行が抜けるまで分離を lease させない（§9 allowed_types）。
+
+    行を消しても推論は止まらない（ハンドラは推論の後の lease の検査で結果を捨てる）。行だけで判定すると、推論と分離が GPU で重なる
+    """
+    # Arrange: STT のハンドラが推論の途中で止まっている
+    await _two_source_meeting(client3)
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    async def blocking_stt(c: AppContext, job: Job) -> str | None:
+        entered.set()
+        await gate.wait()
+        return None
+
+    monkeypatch.setitem(runner3.handlers, "transcribe_chunk", blocking_stt)   # HANDLERS は共有なのでテストの後に戻す
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE meeting_id = 'm-1'")
+        chunk = repo.list_chunks(conn, "m-1")[0]
+        repo.insert_job(conn, "m-1", "transcribe_chunk", chunk_id=chunk.id)
+        job = repo_phase3.lease_job_fair(conn, runner3.owner, ["transcribe_chunk"], now_ms())
+        assert job is not None
+    running = asyncio.create_task(runner3._execute(job))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert "diarize_meeting" not in runner3.allowed_types()
+        # Act: STT の再実行がジョブの行を消す（実行中の試行は止まらない）
+        async with ctx3.db.write() as conn:
+            request_rerun_stt(conn, "m-1", None)
+        # Assert: 行は無くても、旧い試行が走っている間は分離を lease しない
+        assert "diarize_meeting" not in runner3.allowed_types()
+    finally:
+        # Act: 旧い試行が抜ける（失敗しても止まったタスクを残さない）
+        gate.set()
+        await asyncio.wait_for(running, 5)
+    # Assert: 抜けたら分離を lease できる
+    assert "diarize_meeting" in runner3.allowed_types()
 
 
 def _record_published(ctx3: AppContext, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
