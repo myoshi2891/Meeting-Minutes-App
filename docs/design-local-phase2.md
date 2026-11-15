@@ -604,6 +604,7 @@ stateDiagram-v2
     retrying --> pending : next_run_at 到達（backoff）
     leased --> pending : Sweeper が lease 期限切れを検出（attempts < max_attempts）
     processing --> pending : Sweeper が lease 期限切れを検出（ワーカークラッシュ、attempts < max_attempts）
+    processing --> pending : 要約の合成の間に transcript の版が進んだ（要約は保存しない。§12.7）
     leased --> failed : Sweeper が lease 期限切れを検出（attempts >= max_attempts）
     processing --> failed : Sweeper が lease 期限切れを検出（attempts >= max_attempts）
     pending --> cancelled : 会議削除 / 利用者キャンセル
@@ -659,7 +660,7 @@ v4.0 §50〜§51 をローカルの障害種別に読み替える。
 | `TIMEOUT` | STT / LLM が上限時間を超過 | yes | backoff |
 | `INVALID_AUDIO` | WAV ヘッダ不正、sha256 不一致 | **no** | `audio_chunks.save_status = 'missing'`、UI で該当 Chunk を表示。録音原本はブラウザ IndexedDB から再送可能（Phase 1 §23） |
 | `SCHEMA_VALIDATION` | LLM 出力が JSON schema 不一致 | yes（1 回のみ） | 再生成時は temperature を下げる。2 回目失敗で `failed` |
-| `BUSINESS_VALIDATION` | `sourceSegmentIds` 全滅など | **no** | §12.5。除外後に残る項目が 0 の場合のみ `failed` |
+| `BUSINESS_VALIDATION` | `summary` が空 | **no** | §12.5 段 7。段 3〜6 で全項目が除外されても、`summary` があれば成功扱い |
 | `INTERNAL` | その他例外 | yes | backoff |
 
 バックオフは Phase 1 §9.3 と同じ系列（2s, 5s, 10s, 30s, 60s …）に ±20% ジッター。`max_attempts` 既定 5。上限到達は `failed` とし、v4.0 §52〜§53 の DLQ に相当する扱い（UI に「文字起こしに失敗しました [再試行]」）。DLQ という別キューは作らない。`failed` 行そのものが DLQ である。
@@ -697,6 +698,7 @@ stateDiagram-v2
     transcribing --> transcribed : merge_transcript completed
     transcribed --> summarizing : synthesize_minutes leased
     summarizing --> completed : summary version 保存
+    summarizing --> transcribed : 合成の間に merge が transcript の版を進めた（要約は保存せず、同じジョブで合成し直す。§12.7）
     summarizing --> failed : summary failed（transcript は残る）
     failed --> summarizing : 要約の再試行・再生成
     failed --> transcribing : 利用者が STT 再実行
@@ -905,7 +907,7 @@ export interface SummaryActionItem {
   readonly sourceSegmentIds: ReadonlyArray<string>;
   /** 引用元セグメント本文からの逐語引用。サーバー側で位置と逐語一致を検証済み（v4.0 §66.2）。§12.7 の「生成時の引用」に使う */
   readonly quote: string;
-  /** segmentId は sourceSegmentIds のどれか */
+  /** segmentId は sourceSegmentIds のどれか（保存する形は完全 ID。LLM が返す短縮 ID はサーバーが解決して保存する。詳細設計 server §19 `_resolved_span`） */
   readonly evidenceSpan: EvidenceSpan;
 }
 
@@ -971,8 +973,8 @@ v4.0 §65〜§66 の Schema Validation + Business Validation を次の順で実�
 | 2 | JSON Schema 準拠（必須キー・型・配列） | 同上 |
 | 3 | 各項目の `sourceSegmentIds` が非空で、全 ID が `transcript_segments`（`merged_version = 現在版`）に実在 | **該当項目を `rejected` へ移す**（`SEGMENT_ID_NOT_FOUND` / `SEGMENT_ID_EMPTY`）。再生成しない |
 | 3a | `decisions` / `actionItems` の逐語引用（v4.0 §66.2 段階2。詳細設計 server §11 `_check_evidence`・`_supported_by`）。上から順に見て、最初に落ちた検査の理由を付ける：(1) `evidenceSpan.segmentId` が `sourceSegmentIds`（解決後）のどれかで、`[start, end)` がそのセグメント本文の範囲内 → (2) `quote` が空でなく、そのセグメント本文に逐語で出現 → (3) 本文の `[start, end)` が `quote` と一致 → (4) (1)〜(3) を通ったときだけ、決定内容（`text`）・タスク（`task`）の正規化後の文字バイグラムの 50% 以上が `quote` に出現。(4) が測るのは語彙の重なりで、含意ではない：`quote` を否定・反転した主張（「据え置きで決定しました」に対する「据え置きで決定しなかった」）も文字が重なれば通る。否定・極性の検査は入れず、既知の制限として受け入れる（日本語の否定は語尾・助詞・言い換えで表れ、決定的な規則では誤検出と見逃しが多い。逐語の `quote` と根拠の位置は (1)〜(3) で保証され、UI は採用した項目ごとに根拠リンク（`sourceSegmentIds` から Transcript の該当行へスクロール。§18）を出すので、利用者が元発言と照らして矛盾に気づける） | 該当項目を `rejected`。(1)・(3) は `EVIDENCE_SPAN_MISMATCH`、(2) は `QUOTE_NOT_VERBATIM`、(4) は `CLAIM_NOT_SUPPORTED`。再生成しない |
-| 4 | `assignee` が非 null なら、その文字列（正規化後）が `quote`（正規化後）に出現。参照セグメント全体ではなく引用の中を見る（同じセグメントに出る別人の名前を担当者にさせない） | 該当項目を `rejected`（`ASSIGNEE_NOT_IN_TRANSCRIPT`）。v4.0 §63「AI に話者名を推定させない」の実装 |
-| 5 | `deadline` が非 null なら、`deadline` の期限表現（日付・曜日・相対表現。「来週」「月末」等）のすべてが `quote` にも出現する。期限表現を含まない `deadline`（「次回の定例まで」）は、正規化後の文字列がそのまま `quote` に出現する。`quote` に期限表現があるだけでは通さない（`quote` の「来週」は `deadline` の「月末」を裏付けない）。月・週と時期の組（「来月上旬」「今週末」）は 1 つの表現として比べ、`quote` の別の日付の部品を寄せ集めて通さない（「今月上旬に確認し、来月下旬に提出」は「来月上旬」を裏付けない）。週と曜日の組（「来週金曜」「next week friday」）も 1 つの表現として比べ、`quote` の「今週金曜」と別の「来週」を寄せ集めて通さない（「の」の有無と英語の語順「friday next week」は同じ表現とみなす。英語の組は正規化で空白が落ちた形でも切り出す。空白を必須にすると「next week friday」が「friday」だけに縮んで「this week friday」に通る。組でない英語の「next week」「end of」は部品として切り出さず、文字列そのものが `quote` に現れることを求める。部品にすると「end of month」が「end of the week」に、「next weekend」が「next week」に通る）。年の付いた日付（「2026年11月20日」「26年11月20日」「2026/11/20」）も年まで 1 つの表現として比べ、年の違う同じ月日を通さない。元号の付いた年（「令和8年」「令和元年」）は元号まで比べ、元号の違う同じ年・月日を通さない。年の無い月日の `deadline` は、年の付いた `quote` では裏付けない。相対表現を日付に換算した `deadline`（`quote` は「来週」、`deadline` は「11月20日」）も通さない：換算の基準（会議の日付・タイムゾーン）を検証は持たず、換算の正しさを確かめられない。詳細設計 server §19.4 `_deadline_supported` | 該当項目を `rejected`（`DEADLINE_NOT_IN_TRANSCRIPT`） |
+| 4 | `assignee` が非 null なら、その文字列（正規化後）が `quote`（正規化後）に出現。参照セグメント全体ではなく引用の中を見る（同じセグメントに出る別人の名前を担当者にさせない）。確かめるのは名前が `quote` にあることで、その人がこの項目のタスクに掛かることではない：1 つの `quote` に複数の人とタスクがある（「田中さんが資料を作り、鈴木さんが会場を予約」）と、別のタスクの人も通る。どの人がどのタスクに掛かるかは係り受けの解析が要り、決定的な規則では誤検出と見逃しが多いので、既知の制限として受け入れる（段 3a (4) の否定と同じ扱い。UI の根拠リンクで利用者が元発言と照らす） | 該当項目を `rejected`（`ASSIGNEE_NOT_IN_TRANSCRIPT`）。v4.0 §63「AI に話者名を推定させない」の実装 |
+| 5 | `deadline` が非 null なら、`deadline` の期限表現（日付・曜日・相対表現。「来週」「月末」等）のすべてが `quote` にも出現する。期限表現を含まない `deadline`（「次回の定例まで」）は、正規化後の文字列がそのまま `quote` に出現する。`quote` に期限表現があるだけでは通さない（`quote` の「来週」は `deadline` の「月末」を裏付けない）。月・週と時期の組（「来月上旬」「今週末」）は 1 つの表現として比べ、`quote` の別の日付の部品を寄せ集めて通さない（「今月上旬に確認し、来月下旬に提出」は「来月上旬」を裏付けない）。週と曜日の組（「来週金曜」「next week friday」）も 1 つの表現として比べ、`quote` の「今週金曜」と別の「来週」を寄せ集めて通さない（「の」の有無と英語の語順「friday next week」は同じ表現とみなす。英語の組は正規化で空白が落ちた形でも切り出す。空白を必須にすると「next week friday」が「friday」だけに縮んで「this week friday」に通る。組でない英語の「next week」「end of」は部品として切り出さず、文字列そのものが `quote` に現れることを求める。部品にすると「end of month」が「end of the week」に、「next weekend」が「next week」に通る）。年の付いた日付（「2026年11月20日」「26年11月20日」「2026/11/20」）も年まで 1 つの表現として比べ、年の違う同じ月日を通さない。元号の付いた年（「令和8年」「令和元年」）は元号まで比べ、元号の違う同じ年・月日を通さない。年の無い月日の `deadline` は、年の付いた `quote` では裏付けない。相対表現を日付に換算した `deadline`（`quote` は「来週」、`deadline` は「11月20日」）も通さない：換算の基準（会議の日付・タイムゾーン）を検証は持たず、換算の正しさを確かめられない。期限表現を含まない `deadline` が英数字で始まる・終わるときは、`quote` の中でも英数字に挟まれない句全体として現れることを求める（「next week」は「next weekend」に、「end of month」は「end of monthly」に通らない）。日本語は語の境目を文字から決められないので部分文字列で比べる。確かめるのは期限表現が `quote` にあることで、その期限がこの項目のタスクに掛かることではない：1 つの `quote` に複数のタスクと期限がある（「今月上旬に確認し、来月下旬に提出」）と、別のタスクの期限も通る。段 4 と同じ理由で既知の制限とする。詳細設計 server §19.4 `_deadline_supported` | 該当項目を `rejected`（`DEADLINE_NOT_IN_TRANSCRIPT`） |
 | 6 | `topics` / `decisions` / `actionItems` 内の正規化テキスト重複 | 後続を `rejected`（`DUPLICATE`） |
 | 7 | `summary` が空でない | `BUSINESS_VALIDATION`（non-retryable）。ただし 3〜6（3a を含む）で全項目が除外されても `summary` があれば成功扱い |
 
@@ -996,10 +998,12 @@ Phase 1 §3.8 で先送りした注記テーブルを、静的な設定ファイ
 
 v4.0 §67〜§68 を継承する。再生成は新しい `version` 行を追加し、旧版を削除しない。`transcript_version` が進んだ後の再生成は自動では起動せず、UI の「再生成」操作でのみ起動する（利用者が transcript を修正した直後に AI が勝手に上書きする体験を避ける）。
 
+**合成の間に transcript が進んだとき。** 要約の合成中に merge（撮り直しの入れ替え・手動 STT の後）が `transcript_version` を進めたら、その要約は保存せず、会議も `completed` にしない。同じ要約ジョブを `pending` に戻し、新しい版で合成し直す（詳細設計 server §20 `handle_summary`、§8 `repo.requeue_job`）。merge は要約ジョブを作ろうとするが、実行中の行が一意制約で先にあるので作れず、そのまま保存すると新しい版の transcript に古い版の要約が組になる。まだ要約を保存していないので、上の「進んだ後の再生成」ではなく元の要求（初回の要約・利用者の再生成）の続きとして扱う。
+
 **transcript が進んだ後の引用。** 要約の `sourceSegmentIds`（と、そのどれかを指す `evidenceSpan.segmentId`）は、生成時の transcript 版（`MeetingSummary.transcriptVersion`）の segment を指す。その後に segments の行を消して作り直す処理がある：撮り直しの入れ替え（詳細設計 §8 `repo.promote_replacements`）、手動 STT（`request_rerun_stt`）、未完了の Chunk の再試行（`handle_transcribe`）。無音区間の STT（`transcribe_silent_chunk`）は行を足すだけで消さない。消えた行を指す引用は次のように扱う（Phase 3 も同じ）。
 
 * 要約は書き換えない・消さない（`result_json` は生成時のまま。上の「旧版を削除しない」と同じ）。サーバーは引用を付け替えない。
-* クライアントは、表示中の transcript が要約と同じ版か新しい版のとき、引用先が transcript にあるかを照合する（詳細設計 client §11 `unresolvedCitations`）。同じ版でも照合するのは、手動 STT（`request_rerun_stt`）が segments の行を先に消し、次の版を確定するのはその後の merge だからである（その間の `GET /transcript` は同じ版のまま行が欠ける）。表示中の transcript が要約より古い（取得待ち）ときだけ照合せず、取り直しを待つ。
+* クライアントは、表示中の transcript が要約と同じ版か新しい版のとき、引用先が transcript にあるかを照合する（詳細設計 client §11 `unresolvedCitations`）。同じ版でも照合するのは、手動 STT（`request_rerun_stt`）が segments の行を先に消し、次の版を確定するのはその後の merge だからである（その間の `GET /transcript` は同じ版のまま行が欠ける）。表示中の transcript が要約より古い（取得待ち）・まだ無いときだけ照合せず、取り直しを待つ。この間は、どの項目にも transcript への根拠リンクを出さない（飛び先が要約の版の行か分からない。詳細設計 client §11 `citationNotice` の `pending`、§15.1 W12）。
 * 見つからない引用は transcript へ飛ばさない。決定事項・アクションは生成時に保存した逐語引用（`quote`）を「生成時の引用」として出し、話題（引用を持たない）は「根拠の行は作り直されました」と出す。あわせて「transcript が更新されました。必要なら再生成してください」と案内する（再生成は上のとおり利用者の操作でのみ）。
 
 ---
