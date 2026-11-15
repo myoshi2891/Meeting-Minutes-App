@@ -3697,10 +3697,13 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 
 # 期限らしい表現（日本語・英語）。網羅性は基本設計 §28 の持ち越し事項。
 # 選択（|）は左の候補から試して最初に当たったものを採る（最長一致ではない）。複合形（「来月末」）は、その一部（「来月」）より前に置く。
-# 置かないと「来月末」が「来月」と切り出され、quote の「来月上旬」が deadline の「来月末」を裏付けてしまう（_deadline_supported）
+# 置かないと「来月末」が「来月」と切り出され、quote の「来月上旬」が deadline の「来月末」を裏付けてしまう（_deadline_supported）。
+# 月・週と時期（末・上旬・中旬・下旬）の組は 1 つの表現として切り出す。別々に切り出すと、quote の別の日付の部品
+# （「今月上旬に確認し、来月下旬に提出」の「来月」と「上旬」）を寄せ集めて deadline の「来月上旬」を裏付けてしまう。
+# 組にした表現は、その部品だけの deadline（「上旬」）も裏付けない（どの月の上旬かを quote から言えないため。基本設計 §12.5 段 5）
 _DEADLINE_HINTS = re.compile(
     r"(\d{1,2}月\d{1,2}日|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|月曜|火曜|水曜|木曜|金曜|土曜|日曜|"
-    r"今月末|来月末|今週末|来週末|今週|来週|再来週|今月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
+    r"(?:今月|来月)(?:末|上旬|中旬|下旬)|(?:今週|来週)末|今週|来週|再来週|今月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|this week|end of|tomorrow|eod|eow)",
     re.IGNORECASE,
 )
@@ -7449,6 +7452,24 @@ def test_compound_deadline_is_not_matched_by_its_part() -> None:
     # Act / Assert
     assert reasons_for("来月上旬") == []
     assert reasons_for("来月末") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_deadline_is_not_assembled_from_parts_of_other_dates() -> None:
+    """quote の別々の日付の部品（「今月上旬」の「上旬」と「来月下旬」の「来月」）を寄せ集めても「来月上旬」を裏付けない（段 5）。"""
+    # Arrange
+    sid = "dddddddd-4444-4000-8000-000000000004"
+    quote = "鈴木さんが今月上旬に確認し、来月下旬に提出します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "確認して提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: quote にある組だけが通る
+    assert reasons_for("来月下旬") == []
+    assert reasons_for("今月上旬") == []
+    assert reasons_for("来月上旬") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 
 
 def test_claim_contradicting_its_quote_passes_as_known_limitation() -> None:
