@@ -3731,12 +3731,15 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 # 月・週と時期（末・上旬・中旬・下旬）の組は 1 つの表現として切り出す。別々に切り出すと、quote の別の日付の部品
 # （「今月上旬に確認し、来月下旬に提出」の「来月」と「上旬」）を寄せ集めて deadline の「来月上旬」を裏付けてしまう。
 # 組にした表現は、その部品だけの deadline（「上旬」）も裏付けない（どの月の上旬かを quote から言えないため。基本設計 §12.5 段 5）。
-# 年の付いた日付（「2026年11月20日」「26年11月20日」「2026/11/20」）も年まで 1 つの表現にする。月日だけを切り出すと、quote の 2026 年が deadline の
-# 2027 年の同じ月日を裏付けてしまう（「2026/11/20」は「26/11」と切り出され、同じ年月の別の日も通る）。元号の付いた年（「令和8年」「令和元年」）は
+# 年の付いた日付（「2026年11月20日」「26年11月20日」「2026/11/20」「26/11/20」）も年まで 1 つの表現にする。月日だけを切り出すと、quote の 2026 年が deadline の
+# 2027 年の同じ月日を裏付けてしまう（「2026/11/20」は「26/11」と切り出され、同じ年月の別の日も通る。2 桁の年の「26/11/20」も
+# 年まで切り出さないと「26/11」に縮み、「26/11/21」と同じ表現になる）。元号の付いた年（「令和8年」「令和元年」）は
 # 元号まで含める。数字の年だけを切り出すと、令和 8 年と平成 8 年の同じ月日が同じ表現になる（「元年」は数字でないので、月日だけになる）。
 # 年の無い月日の deadline は、年の付いた quote では裏付けない（どの年かを deadline から言えない。組にした表現と同じ扱い）。
 # 週と曜日の組（「来週金曜」「来週の金曜」「next week friday」「friday next week」）も 1 つの表現にする。別々に切り出すと、quote の
 # 「今週金曜」の「金曜」と別の「来週」を寄せ集めて deadline の「来週金曜」を裏付けてしまう。
+# 英語の「next friday」「this friday」も 1 つの表現にする。曜日だけを切り出すと、quote の「this friday」が deadline の「next friday」を
+# 裏付けてしまう（週の修飾が落ちる）。「next friday」と「friday next week」は言い方が違うので別の表現として比べる（通さない側に倒す）
 # 照合する文字列は normalize 済みで空白が無い（「next week」は「nextweek」）。英語の週と曜日の組は空白を任意にする。空白を必須にすると
 # 組が切り出されず、「next week friday」が「friday」だけに縮んで「this week friday」に通る。
 # 組でない「next week」「this week」「end of」は空白付きのまま（normalize 済みの文字列には当たらない）にし、文字列そのものが quote に
@@ -3747,11 +3750,11 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 _WEEKDAYS_JA = "月曜|火曜|水曜|木曜|金曜|土曜|日曜"
 _WEEKDAYS_EN = "monday|tuesday|wednesday|thursday|friday|saturday|sunday"
 _EN_DEADLINE_ALTS = (
-    rf"(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|{_WEEKDAYS_EN}|"
-    r"next week|this week|end of|day ?after ?tomorrow|tomorrow|eod|eow"
+    rf"(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|(?:next|this) ?(?:{_WEEKDAYS_EN})|"
+    rf"{_WEEKDAYS_EN}|next week|this week|end of|day ?after ?tomorrow|tomorrow|eod|eow"
 )
 _DEADLINE_HINTS = re.compile(
-    r"((?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年)?\d{1,2}月\d{1,2}日|\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|"
+    r"((?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年)?\d{1,2}月\d{1,2}日|(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|"
     rf"(?:再来週|今週|来週)の?(?:{_WEEKDAYS_JA})|{_WEEKDAYS_JA}|"
     r"(?:再来月|今月|来月)(?:末|上旬|中旬|下旬)|(?:再来週|今週|来週)末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
     rf"{_EN_DEADLINE_ALTS})",
@@ -3762,7 +3765,8 @@ _DEADLINE_HINTS = re.compile(
 # 「next week」「this week」「end of」はここでは除く（deadline 側の正規化した文字列には当たらず、quote 側だけに出ても使われないが、
 # 部品として扱わないことをはっきりさせる）
 _EN_DEADLINE_HINTS = re.compile(
-    rf"(?<![a-z0-9])(?:(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|{_WEEKDAYS_EN}|"
+    rf"(?<![a-z0-9])(?:(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|"
+    rf"(?:next|this) ?(?:{_WEEKDAYS_EN})|{_WEEKDAYS_EN}|"
     r"day ?after ?tomorrow|tomorrow|eod|eow)(?![a-z0-9])",
 )
 # 英語の「曜日 + 週」（「friday next week」）。比べる形を「週 + 曜日」にそろえる（_hint_key）
@@ -7862,6 +7866,38 @@ def test_month_after_next_is_not_next_month() -> None:
     assert reasons_for("再来月", "鈴木さんが再来月に提出します") == []
     assert reasons_for("再来週末", "鈴木さんが再来週に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("再来週末", "鈴木さんが再来週末に提出します") == []
+
+
+def test_two_digit_year_slash_date_is_matched_as_a_full_date() -> None:
+    """2 桁の年の「26/11/20」も年まで 1 つの表現。quote の「26/11/21」は deadline の「26/11/20」を裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "c3c3c3c3-1212-4000-8000-000000000012"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 日が違えば通さない。同じ日付なら通る。年の無い月日は年の付いた quote では裏付けない
+    assert reasons_for("26/11/20", "鈴木さんが26/11/21までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("26/11/20", "鈴木さんが26/11/20までに提出します") == []
+    assert reasons_for("11/20", "鈴木さんが26/11/20までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_next_or_this_weekday_keeps_the_week_qualifier() -> None:
+    """「next friday」「this friday」は 1 つの表現。quote の「this friday」は deadline の「next friday」を裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "d4d4d4d4-1313-4000-8000-000000000013"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": "Suzuki", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 週の修飾が違えば通さない。同じなら区切り・大文字小文字が違っても通る
+    assert reasons_for("next friday", "Suzuki will submit it this Friday") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("this friday", "Suzuki will submit it next Friday") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("Next Friday", "Suzuki will submit it next friday.") == []
+    # 修飾の無い曜日も、修飾付きの quote では裏付けない（どの週の金曜かを deadline から言えない）
+    assert reasons_for("friday", "Suzuki will submit it next Friday") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 
 
 def test_english_deadline_hints_need_word_boundaries_in_the_quote() -> None:
