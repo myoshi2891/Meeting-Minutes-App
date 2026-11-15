@@ -1135,7 +1135,7 @@ def job_of_chunk(conn: sqlite3.Connection, job: Job) -> AudioChunk:
 
 # 9. Runner `jobs/runner.py`（変更）
 
-変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` と STT は GPU で重ねない（双方向の排他。分離は STT の実行中に lease せず、STT（ライブを含む）は分離の実行中に lease しない。合算の VRAM を実測していないため。§3）。分離の実行中は、行（`leased` / `processing`）に加えて実行枠（`ctx.diarize_slots`）が埋まっていることでも判定する（pending に戻した分離の旧い試行のスレッドは行に出ない。枠が埋まっている間は次の分離も lease しない）。STT の実行中は、行に加えて実行中のハンドラの数（`ctx.stt_in_flight`。`_run_handler` が数える）でも判定する（STT の再実行 `request_rerun_stt` が行を消しても、旧い試行の推論はハンドラが抜けるまで GPU を使う）、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す。
+変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` と STT は GPU で重ねない（双方向の排他。分離は STT の実行中に lease せず、STT（ライブを含む）は分離の実行中に lease しない。合算の VRAM を実測していないため。§3）。分離の実行中は、行（`leased` / `processing`）に加えて実行枠（`ctx.diarize_slots`）が埋まっていることでも判定する（pending に戻した分離の旧い試行のスレッドは行に出ない。行がある間も枠が埋まっている間も、次の分離を lease しない。lease した分離が枠を取る前に、別の Runner が次の分離を lease して枠を待たないため）。STT の実行中は、行に加えて実行中のハンドラの数（`ctx.stt_in_flight`。`_run_handler` が数える）でも判定する（STT の再実行 `request_rerun_stt` が行を消しても、旧い試行の推論はハンドラが抜けるまで GPU を使う）、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す。
 
 ```python
 # minutes_local/jobs/runner.py
@@ -1193,8 +1193,9 @@ class JobRunner:
         if not diarize_running:
             types[1:1] = ["live_transcribe_chunk", "transcribe_chunk"]
         # diarize は STT 実行中には lease しない（GPU 排他）。
-        # 枠が埋まっている間も lease しない（lease しても枠を待つだけで、Runner の 1 枠を何時間も塞ぐ）
-        if stt_running == 0 and not diarize_slots_full:
+        # 分離の実行中（行または枠）も lease しない（lease しても枠を待つだけで、Runner の 1 枠を何時間も塞ぐ）。
+        # 枠だけで判定すると、lease した分離が枠を取る前（handle_diarize の acquire の前）に別の Runner が次の分離を lease する
+        if stt_running == 0 and not diarize_running:
             types.append("diarize_meeting")
         if (stt_running == 0 and not diarize_running) or self.ctx.models.allow_concurrent_stt_and_llm:
             types.append("synthesize_minutes")
@@ -5874,6 +5875,9 @@ async def test_requeued_diarize_waits_for_the_running_attempt(client3: httpx.Asy
     assert await old_attempt is None
     assert await new_attempt is None
     assert provider.calls == 2 and provider.max_running == 1
+    # Act / Assert: 次の試行の行を Runner と同じく完了にすれば（行も枠も空く）、分離をまた lease できる
+    async with ctx3.db.write() as conn:
+        assert repo.finish_job(conn, fresh.id, "w-new", fresh.attempts, "completed")
     assert "diarize_meeting" in runner3.allowed_types()
 
 
@@ -5929,6 +5933,24 @@ async def test_stt_is_not_leased_while_diarization_runs(client3: httpx.AsyncClie
         ctx3.diarize_slots.release()
     # Act / Assert: 分離が終われば STT をまた lease する
     assert stt <= set(runner3.allowed_types())
+
+
+async def test_leased_diarize_blocks_next_diarize_before_taking_the_slot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """lease した分離が実行枠を取る前（handle_diarize の acquire の前）でも、次の分離を lease しない（§9 allowed_types）。
+
+    枠だけで判定すると、別の Runner が次の分離を lease し、枠を待つ間 Runner の 1 枠を塞ぐ
+    """
+    # Arrange: 分離の行が lease されたが、まだ枠を取っていない
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        repo.insert_job(conn, "m-1", "diarize_meeting")
+        job = repo_phase3.lease_job_fair(conn, "w-1", ["diarize_meeting"], now_ms())
+        assert job is not None
+    assert not ctx3.diarize_slots.locked()
+    # Act
+    types = runner3.allowed_types()
+    # Assert
+    assert "diarize_meeting" not in types
 
 
 async def test_withdrawn_running_stt_blocks_diarize_until_it_ends(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
@@ -7089,7 +7111,7 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | 手動 STT の Chunk が分離の実行中に完了したら、実行中の分離を pending に戻して結果を捨てさせ、その Chunk を含めて分離し直してから merge する（§8 `on_transcribe_completed`・`repo_phase3.requeue_running_job`） | `test_manual_stt_finishing_during_diarize_reruns_the_diarize` |
 | 分離が手動 STT の Chunk より先に終わっても merge を作らず（`on_diarize_finished` は全 Chunk の終端を待つ）、Chunk の完了で分離を作り直す | `test_diarize_finishing_before_manual_stt_does_not_merge_early` |
 | merge の実行中（書き込みの後・完了の記録の前）に手動 STT の Chunk が初めて完了しても、結果を staged に置き、分離を作り直してから作り直した merge が話者付きで入れる（§21 `handle_transcribe`） | `test_manual_stt_committed_during_merge_rediarizes_then_remerges` |
-| 同時に走らせる話者分離は `MAX_CONCURRENT_DIARIZE` 本まで。pending に戻した分離の次の試行は、旧い試行のスレッドが抜けるまで分離を始めず、その間 Runner は分離と（STT と並べない設定なら）要約を lease しない。分離を待つハンドラがキャンセルされても、スレッドが抜けるまで枠を返さない（§7 `diarize_slots`・§9 `allowed_types`・§21 `handle_diarize`） | `test_requeued_diarize_waits_for_the_running_attempt`、`test_cancelled_diarize_keeps_the_slot_until_its_thread_exits` |
+| 同時に走らせる話者分離は `MAX_CONCURRENT_DIARIZE` 本まで。pending に戻した分離の次の試行は、旧い試行のスレッドが抜けるまで分離を始めず、その間 Runner は分離と（STT と並べない設定なら）要約を lease しない。lease した分離の行がある間も（枠を取る前でも）次の分離を lease しない。分離を待つハンドラがキャンセルされても、スレッドが抜けるまで枠を返さない（§7 `diarize_slots`・§9 `allowed_types`・§21 `handle_diarize`） | `test_requeued_diarize_waits_for_the_running_attempt`、`test_cancelled_diarize_keeps_the_slot_until_its_thread_exits`、`test_leased_diarize_blocks_next_diarize_before_taking_the_slot` |
 | 分離が failed で確定して作った merge ジョブ（`on_job_failed` の戻り値）は、Runner の失敗時も Sweeper の回数切れも、コミット後に流す（完了時の後続ジョブと同じ。§8 `on_job_failed`・§9 `_on_failure`・Phase 2 §14 `sweep_once`） | `test_failed_diarize_publishes_the_merge_job_it_creates`、`test_exhausted_diarize_publishes_the_merge_job_it_creates` |
 | 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
 | 実 Provider：無音 Chunk を挟んでも話者区間の時刻がずれない、上限は `max_speakers`、一時ファイルはデータディレクトリの中 | `test_assemble_timeline_pads_gaps_with_silence`、`test_pyannote_provider_keeps_absolute_time_across_skipped_chunk`、`test_speaker_after_silent_chunk_is_not_shifted` |
