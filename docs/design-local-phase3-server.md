@@ -95,7 +95,7 @@ testpaths = ["tests"]
 * ジョブ種別 `diarize_meeting`（`priority=150`：全 `transcribe_chunk` 完了後、`merge_transcript`(200) の前）。依存関係は `transcribe 完了 → diarize → merge → summary` に変わる
 * `DiarizationProvider` 抽象 + pyannote 実 Provider（遅延 import）+ Fake。モデルは利用者が `{dataDir}/models/diarization/` に配置する。Phase 2 §7.4 のような取得の経路は用意しない（配置の規約と理由は §12）
 * 実 Provider に渡す音声は、source ごとに Chunk を絶対時刻の位置へ置いて連続させる（`assemble_timeline()`）。話者分離に渡すのは STT が完了した Chunk だけなので、無音で STT を省いた Chunk の区間は無音で埋める。単純に連結すると、省いた Chunk 1 つにつき後ろの話者区間が 30 秒ずつ前へずれ、別の人の発言にラベルが付く
-* 話者分離はサーバーのプロセス内（`asyncio.to_thread`）で走らせる。STT のようなプロセスプールには入れない（1 会議 1 回で、ワーカーにモデルを持たせておく利点がない）。その代わり、メモリ不足で OS に止められるとサーバーごと落ちる。この場合も、lease 切れの回数上限（Phase 2 §14）で `failed` になり、話者分離なしで merge へ進む（落ち続けて会議が止まったままにはならない）
+* 話者分離はサーバーのプロセス内（`asyncio.to_thread`）で走らせる。STT のようなプロセスプールには入れない（1 会議 1 回で、ワーカーにモデルを持たせておく利点がない）。その代わり、メモリ不足で OS に止められるとサーバーごと落ちる。この場合も、lease 切れの回数上限（Phase 2 §14）で `failed` になり、話者分離なしで merge へ進む（落ち続けて会議が止まったままにはならない）。同時に走らせる分離は `MAX_CONCURRENT_DIARIZE`（1）本までに絞る（`AppContext.diarize_slots`。§7）。1 本分のピーク（全 Chunk の PCM とモデル。§3 の表）しか見積もっておらず、2 本分が載ることは確かめていないため。上げるのは §24 の実機確認で最大メモリを測ってから。`requeue_running_job` で `pending` に戻した分離の次の試行も、旧い試行のスレッド（`asyncio.to_thread` は止められない）が抜けて枠を返すまで分離を始めない。
 * mic と system は**別々に**ダイアライズし、ラベルに source 接頭辞を付けない代わりに `meeting_speakers` で `(label → 名前)` を利用者が割り当てる。mic 側は通常 1 話者（利用者本人）だが、会議室のマイクで複数人が話す場合もあるため固定しない
 * ラベルは `S1..Sn`。名前は AI に推定させない（v4.0 §63、Invariant 9）
 * 分離失敗（モデル未配置・OOM 上限到達・プロセスごと落ちる失敗の繰り返し）は `merge` を止めない。`speaker_id=NULL` のまま続行し、UI に「話者分離なし」を表示
@@ -825,6 +825,7 @@ Phase 3 の Provider（話者分離・言語判定・コーデック）と LAN �
 """ジョブハンドラと API が共有する依存。Phase 3 で diarization / language / codec / 利用者モードを追加。"""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 from ..config import Settings
@@ -840,6 +841,11 @@ from ..stt.language import LanguageDetector
 from ..storage.models_dir import ModelDownloads
 from ..vad.provider import VADProvider
 from .events import EventBroker
+
+# 同時に走らせる話者分離（DiarizationProvider.diarize）の上限。1 回の分離は全 Chunk の PCM（60 分で 1 source あたり約 115 MB、
+# WAV 化でその倍。上限は 1 source 4 時間 = 約 461 MB）とモデルを同じプロセスに載せる（§3 の表）。2 本分が載る余裕は確かめていない
+# （§24 の実機確認で 60 分・2 source の最大メモリを測る）。上げるのは、その実測で 2 本分のピークがメモリに収まると確かめてから
+MAX_CONCURRENT_DIARIZE = 1
 
 
 @dataclass
@@ -873,6 +879,9 @@ class AppContext:
     multi_user: bool = False       # users テーブルが空でなければ True（起動時に決める。切り替えは再起動で反映。§2.5）
     tls_enabled: bool = False
     recovery: Recovery | None = None   # 起動時に壊れた DB を作り直したときの記録（§2.4）。正常な起動では None
+    # 話者分離の実行枠（handle_diarize）。asyncio.to_thread のスレッドは止められないので、pending に戻した分離
+    # （requeue_running_job）の次の試行は、旧い試行のスレッドが抜けて枠を返すまで待つ
+    diarize_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(MAX_CONCURRENT_DIARIZE))
 
     @property
     def diarization_active(self) -> bool:
@@ -955,7 +964,8 @@ def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: boo
     return True
 
 
-def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk, diarize: bool) -> None:
+def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk, diarize: bool) -> str | None:
+    """戻り値は作ったジョブ（diarize_meeting か merge_transcript）の id（ensure_merge_job）。呼び出し側がコミット後にイベントを流す。"""
     current = repo.get_chunk(conn, chunk.id)
     first_completion = current is None or current.stt_status != "completed"
     repo.update_chunk(conn, chunk.id, stt_status="completed")
@@ -970,7 +980,7 @@ def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk, diarize
         # - pending / retrying：まだ入力を読んでいないので何もしない
         repo_phase3.requeue_running_job(conn, chunk.meeting_id, "diarize_meeting")
         repo.delete_finished_job(conn, chunk.meeting_id, "diarize_meeting")
-    ensure_merge_job(conn, chunk.meeting_id, diarize)
+    return ensure_merge_job(conn, chunk.meeting_id, diarize)
 
 
 def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
@@ -1027,16 +1037,16 @@ def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str, diarize: bool) -
     return repo.insert_job(conn, meeting_id, "merge_transcript")
 
 
-def on_diarize_finished(conn: sqlite3.Connection, meeting_id: str) -> None:
-    """成功・失敗いずれでも merge へ進む（分離失敗は transcript を止めない）。
+def on_diarize_finished(conn: sqlite3.Connection, meeting_id: str) -> str | None:
+    """成功・失敗いずれでも merge へ進む（分離失敗は transcript を止めない）。戻り値は作った merge ジョブの id。
 
     ensure_merge_job と同じく、全 Chunk が終端になるまで merge を作らない。分離の実行中に手動 STT（transcribe_silent_chunk）で
     queued に戻った Chunk があると、その STT より先に merge が走り、拾い直した segments が話者の無いまま公開される。
     その Chunk が completed になると on_transcribe_completed がこの行を消し、ensure_merge_job が分離から作り直す
     """
     if not _all_chunks_terminal(conn, meeting_id):
-        return
-    repo.insert_job(conn, meeting_id, "merge_transcript")
+        return None
+    return repo.insert_job(conn, meeting_id, "merge_transcript")
 
 
 def exclude_failed(conn: sqlite3.Connection, meeting_id: str, diarize: bool = False) -> int:
@@ -1115,7 +1125,7 @@ def job_of_chunk(conn: sqlite3.Connection, job: Job) -> AudioChunk:
 
 # 9. Runner `jobs/runner.py`（変更）
 
-変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` は STT と同じ GPU 排他規則、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す。
+変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` は STT と同じ GPU 排他規則。分離の実行中は、行（`leased` / `processing`）に加えて実行枠（`ctx.diarize_slots`）が埋まっていることでも判定する（pending に戻した分離の旧い試行のスレッドは行に出ない。枠が埋まっている間は次の分離も lease しない）、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す。
 
 ```python
 # minutes_local/jobs/runner.py
@@ -1158,11 +1168,16 @@ class JobRunner:
         types = ["vad_chunk", "live_transcribe_chunk", "transcribe_chunk", "merge_transcript", "compress_chunk"]
         with self.ctx.db.read() as conn:
             stt_running = sum(repo.count_jobs(conn, None, t, ["leased", "processing"]) for t in ("transcribe_chunk", "live_transcribe_chunk"))
-            diarize_running = repo.count_jobs(conn, None, "diarize_meeting", ["leased", "processing"])
-        # diarize は STT 実行中には lease しない（GPU 排他）。STT は diarize 実行中でも動く（diarize は 1 会議 1 ジョブで短い）
-        if stt_running == 0:
+            diarize_rows = repo.count_jobs(conn, None, "diarize_meeting", ["leased", "processing"])
+        # 実行枠（ctx.diarize_slots）が埋まっていれば分離が走っている。pending に戻した分離（requeue_running_job）の旧い試行は
+        # 行を見ても分からないが、スレッドが抜けるまで枠を持つ。行だけで判定すると、そのスレッドと並んで次の分離や要約を lease する
+        diarize_slots_full = self.ctx.diarize_slots.locked()
+        diarize_running = diarize_rows > 0 or diarize_slots_full
+        # diarize は STT 実行中には lease しない（GPU 排他）。STT は diarize 実行中でも動く（diarize は 1 会議 1 ジョブで短い）。
+        # 枠が埋まっている間も lease しない（lease しても枠を待つだけで、Runner の 1 枠を何時間も塞ぐ）
+        if stt_running == 0 and not diarize_slots_full:
             types.append("diarize_meeting")
-        if (stt_running == 0 and diarize_running == 0) or self.ctx.models.allow_concurrent_stt_and_llm:
+        if (stt_running == 0 and not diarize_running) or self.ctx.models.allow_concurrent_stt_and_llm:
             types.append("synthesize_minutes")
         return types
 
@@ -1234,14 +1249,15 @@ class JobRunner:
         hb.cancel()
         duration = int((time.monotonic() - started) * 1000)
         removed: Job | None = None   # 下で消した完了済みの行の控え（消した後は読み直せない）
-        followup: str | None = None  # 作り直したジョブの id
+        followup: str | None = None  # この完了処理で作った・作り直したジョブの id
         async with self.ctx.db.write() as conn:
             ok = repo.finish_job(conn, job.id, self.owner, job.attempts, "completed", duration_ms=duration)
             if ok and model_used is not None:
                 conn.execute("UPDATE processing_jobs SET model_name = ? WHERE id = ?", (model_used, job.id))
             if ok and job.job_type in ("vad_chunk", "transcribe_chunk"):
-                # 自分自身が processing のままではハンドラ内の ensure_merge_job が成立しないため、完了確定後に再判定する
-                pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
+                # 自分自身が processing のままではハンドラ内の ensure_merge_job が成立しないため、完了確定後に再判定する。
+                # 作ったジョブは下で流す（流さないと lease されるまで pending の行がイベントに出ない）
+                followup = pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
             if ok and job.job_type == "merge_transcript" and repo.has_replacements(conn, job.meeting_id):
                 # merge の書き込みのコミット後・この完了の記録の前（processing の間）にコミットした撮り直しは、この merge では
                 # 入れ替わっていない。handle_transcribe の delete_finished_job は processing の行を消さず、ensure_merge_job も
@@ -1251,7 +1267,7 @@ class JobRunner:
                 repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
                 followup = pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
             if ok and job.job_type == "diarize_meeting":
-                pipeline.on_diarize_finished(conn, job.meeting_id)
+                followup = pipeline.on_diarize_finished(conn, job.meeting_id)
         # どちらもコミットの後に流す（コミット前に流すと、購読側が読み直したときに行がまだない・ロールバックで消える）
         self._publish_job(job.id, removed=removed)
         if followup is not None:
@@ -3773,6 +3789,18 @@ def _stt_model_for(ctx: AppContext, meeting_id: str, conn) -> str | None:  # typ
     return ctx.models.stt.name if ctx.models.stt else None
 
 
+def _publish_created_job(ctx: AppContext, job_id: str) -> None:
+    """ハンドラのトランザクションで作ったジョブを、コミットの後に Runner._publish_job と同じ形で流す（Phase 2 §13）。"""
+    with ctx.db.read() as conn:
+        job = repo.get_job(conn, job_id)
+        meeting = repo.get_meeting(conn, job.meeting_id) if job else None
+    if job is None:
+        return
+    ctx.events.publish(job.meeting_id, {"type": "job", "job": job.model_dump()})
+    if meeting is not None:
+        ctx.events.publish(job.meeting_id, {"type": "meeting_status", "status": meeting.status})
+
+
 # ---- vad ----
 
 async def handle_vad(ctx: AppContext, job: Job) -> str | None:
@@ -3878,8 +3906,10 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         async with ctx.db.write() as conn:
             if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
                 return None
-            pipeline.on_transcribe_completed(conn, chunk, ctx.diarization_active)
+            created = pipeline.on_transcribe_completed(conn, chunk, ctx.diarization_active)
             repo.record_metric(conn, "stt_reused_live", 1, meeting_id=chunk.meeting_id)
+        if created is not None:
+            _publish_created_job(ctx, created)
         return None
     result, prefix_ms, model_name, language, guess = await _run_stt(ctx, job, chunk, with_overlap=True)
     segments = _segments_from(result, chunk, prefix_ms, language)
@@ -3895,7 +3925,11 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         # 置き換える前の segments の話者を、同じ source で時間の重なりが最大のものから新しい segments へ移す（§21 の割当と同じ規則）。
         # 分離を再実行しないのは、ラベル（S1, S2…）が振り直されて利用者が付けた名前と食い違うため。話者の無い segments は移さない
         previous = repo_phase3.segments_of_chunk(conn, chunk.id) if replaced else []
-        if replaced:
+        # 実行中の merge があれば、初めての完了（手動 STT）でも staged に置く。その merge の書き込みの後にコミットすると版に入らず、
+        # 一意制約で merge も作れない。Runner が merge の完了で入れ替え待ちを見て作り直す（Phase 2 §12 handle_transcribe）。
+        # 話者分離を作り直していれば、分離は staged 行にも話者を付け、その完了後の merge が入れ替える
+        merge_running = repo.count_jobs(conn, chunk.meeting_id, "merge_transcript", ["leased", "processing"]) > 0
+        if replaced or merge_running:
             # 前の結果は公開中の版に載っていることがあるので消さず、次の merge が版を上げるのと同じトランザクションで入れ替える
             # （Phase 2 §12 handle_transcribe・repo.promote_replacements）。下の話者の付け直しは staged_segments にも届く
             repo.stage_replacement(conn, chunk.meeting_id, chunk.id)
@@ -3909,8 +3943,9 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         if carried:
             for sid, label, conf in _assign_speakers(segments, carried):
                 repo_phase3.set_segment_speaker(conn, sid, label, conf)
-        if replaced:
-            repo.delete_finished_job(conn, chunk.meeting_id, "merge_transcript")
+        # 初めての完了でも完了済みの merge を消す。手動 STT を受け付けた時点で実行中だった merge が先に終わっていると、
+        # 残した行が一意制約で作り直しを止める（Phase 2 §12 handle_transcribe）
+        repo.delete_finished_job(conn, chunk.meeting_id, "merge_transcript")
         if meeting is not None and meeting.stt_model_used is None:
             repo.update_meeting(conn, chunk.meeting_id, stt_model_used=model_name)
         repo.record_metric(conn, "stt_seconds", chunk.duration_ms / 1000, model_name=model_name, meeting_id=chunk.meeting_id)
@@ -3919,7 +3954,10 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         if guess is not None:
             repo.record_metric(conn, "language_prob", guess.probability, meeting_id=chunk.meeting_id)
         repo_phase3.save_language_ratio(conn, chunk.meeting_id, repo_phase3.language_ratio(conn, chunk.meeting_id))
-        pipeline.on_transcribe_completed(conn, chunk, ctx.diarization_active)
+        created = pipeline.on_transcribe_completed(conn, chunk, ctx.diarization_active)
+    # 作ったジョブはコミットの後に流す（Runner の完了処理の ensure_merge_job は既存で None を返す）
+    if created is not None:
+        _publish_created_job(ctx, created)
     return model_name
 
 
@@ -3995,53 +4033,58 @@ def _align_labels(segments: list[Segment], turns: tuple[SpeakerTurn, ...], taken
 async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
     if ctx.diarization is None:
         raise ModelMissingError("diarization provider not available")
-    with ctx.db.read() as conn:
-        chunks = repo.list_chunks(conn, job.meeting_id)
-    targets = [c for c in chunks if c.stt_status == "completed"]
-    # PCM を読む前に、行の時刻で 1 source のタイムラインの長さを確かめる（assemble_timeline と同じ上限。§9 の表）。
-    # 超えれば InvalidAudioError（再試行しない）で、話者分離なしで merge へ進む（§2.2）
-    check_timeline_span([(c.source, c.start_offset_ms, c.end_offset_ms) for c in targets])
-    pcm_by_source: dict[str, list[tuple[int, bytes]]] = {}
-    loaded: dict[str, int] = {}
-    for c in targets:
-        try:
-            pcm = read_chunk_pcm(ctx, c)
-        except InvalidWavError:
-            continue
-        # 行の時刻より長く復号される Chunk があっても、読んだ量が上限（16 kHz・PCM16 で 1 ms = 32 バイト）を超えた時点でやめる
-        loaded[c.source] = loaded.get(c.source, 0) + len(pcm)
-        if loaded[c.source] > MAX_TIMELINE_MS * 32:
-            raise InvalidAudioError(f"diarization input too large: {c.source} {loaded[c.source]} bytes")
-        pcm_by_source.setdefault(c.source, []).append((c.start_offset_ms, pcm))
-    req = DiarizationRequest(meeting_id=job.meeting_id, pcm_by_source=pcm_by_source, models_dir=str(ctx.settings.models_dir),
-                             work_dir=str(ctx.settings.tmp_dir))
-    result = await asyncio.to_thread(ctx.diarization.diarize, req)
-    async with ctx.db.write() as conn:
-        # lease が失効していれば何も書かない（Phase 2 基本設計 §9.3）。分離は長く走るので、失効した旧ワーカーが
-        # merge の後でラベルを上書きしたり、新しい attempt の結果を古い結果で置き換えたりする
-        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
-            return None
-        # 割り当てる segments は書き込みトランザクションの中で読み直す。分離の実行中に completed の Chunk を撮り直すと
-        # （handle_transcribe）、前の segments にまだ話者が無いので引き継ぎ（carried）は空のまま新しい staged 行が入り、
-        # 開始時に読んだ ID だけに書くと、その行は話者の無いまま次の merge で昇格する。読み直せば staged 行にも付く。
-        # 撮り直して入れ替え待ちの segments にも付ける（失敗した分離の再試行は merge の後に走りうる。入れ替えで話者を失わない）
-        segments = repo.list_segments(conn, job.meeting_id) + repo_phase3.staged_segments_of_meeting(conn, job.meeting_id)
-        turns = result.turns
-        if any(s.speaker_id is not None for s in segments):
-            # 作り直した分離（無音と判定した Chunk を手動 STT した後。transcribe_silent_chunk）。話者の付いた segments は変えず、
-            # 話者の無い segments（拾い直した音声）だけに、前のラベルへ付け替えた区間で付ける。失敗すれば何も変えずに merge へ進む
-            taken = {s.speaker_id for s in segments if s.speaker_id is not None} | {sp.label for sp in repo_phase3.list_speakers(conn, job.meeting_id)}
-            turns = _align_labels(segments, turns, taken)
-            segments = [s for s in segments if s.speaker_id is None]
-        assignments = _assign_speakers(segments, turns)
-        for sid, label, conf in assignments:
-            repo_phase3.set_segment_speaker(conn, sid, label, conf)
-        for label in sorted({lb for _, lb, _ in assignments if lb}):
-            conn.execute("INSERT OR IGNORE INTO meeting_speakers (meeting_id, label, name, updated_at) VALUES (?,?,NULL,?)",
-                         (job.meeting_id, label, now_ms()))
-        repo.record_metric(conn, "diarize_duration_ms", result.duration_ms, meeting_id=job.meeting_id)
-        repo.record_metric(conn, "diarize_speakers", result.speaker_count, meeting_id=job.meeting_id)
-    return None
+    # 実行枠（ctx.diarize_slots。上限は MAX_CONCURRENT_DIARIZE）を取ってから Chunk を読む。PCM を読んだ後に待つと、待つ間も
+    # 読んだ分（1 source あたり最大約 461 MB）を抱える。pending に戻された旧い試行（requeue_running_job）は、lease を失っても
+    # asyncio.to_thread のスレッドを止められないので、スレッドが抜けて枠を返すまで次の試行は分離を始めない。
+    # 待つ間も Runner の heartbeat が lease を延ばす（待っている試行は Runner の 1 枠を占める）
+    async with ctx.diarize_slots:
+        with ctx.db.read() as conn:
+            chunks = repo.list_chunks(conn, job.meeting_id)
+        targets = [c for c in chunks if c.stt_status == "completed"]
+        # PCM を読む前に、行の時刻で 1 source のタイムラインの長さを確かめる（assemble_timeline と同じ上限。§9 の表）。
+        # 超えれば InvalidAudioError（再試行しない）で、話者分離なしで merge へ進む（§2.2）
+        check_timeline_span([(c.source, c.start_offset_ms, c.end_offset_ms) for c in targets])
+        pcm_by_source: dict[str, list[tuple[int, bytes]]] = {}
+        loaded: dict[str, int] = {}
+        for c in targets:
+            try:
+                pcm = read_chunk_pcm(ctx, c)
+            except InvalidWavError:
+                continue
+            # 行の時刻より長く復号される Chunk があっても、読んだ量が上限（16 kHz・PCM16 で 1 ms = 32 バイト）を超えた時点でやめる
+            loaded[c.source] = loaded.get(c.source, 0) + len(pcm)
+            if loaded[c.source] > MAX_TIMELINE_MS * 32:
+                raise InvalidAudioError(f"diarization input too large: {c.source} {loaded[c.source]} bytes")
+            pcm_by_source.setdefault(c.source, []).append((c.start_offset_ms, pcm))
+        req = DiarizationRequest(meeting_id=job.meeting_id, pcm_by_source=pcm_by_source, models_dir=str(ctx.settings.models_dir),
+                                 work_dir=str(ctx.settings.tmp_dir))
+        result = await asyncio.to_thread(ctx.diarization.diarize, req)
+        async with ctx.db.write() as conn:
+            # lease が失効していれば何も書かない（Phase 2 基本設計 §9.3）。分離は長く走るので、失効した旧ワーカーが
+            # merge の後でラベルを上書きしたり、新しい attempt の結果を古い結果で置き換えたりする
+            if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                return None
+            # 割り当てる segments は書き込みトランザクションの中で読み直す。分離の実行中に completed の Chunk を撮り直すと
+            # （handle_transcribe）、前の segments にまだ話者が無いので引き継ぎ（carried）は空のまま新しい staged 行が入り、
+            # 開始時に読んだ ID だけに書くと、その行は話者の無いまま次の merge で昇格する。読み直せば staged 行にも付く。
+            # 撮り直して入れ替え待ちの segments にも付ける（失敗した分離の再試行は merge の後に走りうる。入れ替えで話者を失わない）
+            segments = repo.list_segments(conn, job.meeting_id) + repo_phase3.staged_segments_of_meeting(conn, job.meeting_id)
+            turns = result.turns
+            if any(s.speaker_id is not None for s in segments):
+                # 作り直した分離（無音と判定した Chunk を手動 STT した後。transcribe_silent_chunk）。話者の付いた segments は変えず、
+                # 話者の無い segments（拾い直した音声）だけに、前のラベルへ付け替えた区間で付ける。失敗すれば何も変えずに merge へ進む
+                taken = {s.speaker_id for s in segments if s.speaker_id is not None} | {sp.label for sp in repo_phase3.list_speakers(conn, job.meeting_id)}
+                turns = _align_labels(segments, turns, taken)
+                segments = [s for s in segments if s.speaker_id is None]
+            assignments = _assign_speakers(segments, turns)
+            for sid, label, conf in assignments:
+                repo_phase3.set_segment_speaker(conn, sid, label, conf)
+            for label in sorted({lb for _, lb, _ in assignments if lb}):
+                conn.execute("INSERT OR IGNORE INTO meeting_speakers (meeting_id, label, name, updated_at) VALUES (?,?,NULL,?)",
+                             (job.meeting_id, label, now_ms()))
+            repo.record_metric(conn, "diarize_duration_ms", result.duration_ms, meeting_id=job.meeting_id)
+            repo.record_metric(conn, "diarize_speakers", result.speaker_count, meeting_id=job.meeting_id)
+        return None
 
 
 # ---- merge / summary ----
@@ -5137,7 +5180,9 @@ async def test_live_disabled_on_small_tier_by_default(client: httpx.AsyncClient,
 # tests/test_diarization.py
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -5150,7 +5195,7 @@ from minutes_local.db import repo, repo_phase3
 from minutes_local.db.connection import now_ms
 from minutes_local.db.models import Job, Segment
 from minutes_local.diarization.fake_provider import FakeDiarizationProvider
-from minutes_local.diarization.provider import MAX_TIMELINE_MS, DiarizationRequest, assemble_timeline
+from minutes_local.diarization.provider import MAX_TIMELINE_MS, DiarizationRequest, DiarizationResult, assemble_timeline
 from minutes_local.diarization.pyannote_provider import PyannoteDiarizationProvider
 from minutes_local.storage.files import parse_wav_header
 from minutes_local.jobs.context import AppContext
@@ -5525,6 +5570,108 @@ async def test_diarize_finishing_before_manual_stt_does_not_merge_early(client3:
     assert merge_jobs == []
     assert len(pipeline.calls) == 3
     _assert_recovered_chunk_has_speakers(ctx3, chunk_id)
+
+
+async def test_manual_stt_committed_during_merge_rediarizes_then_remerges(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                         runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """merge の書き込みの後・完了の記録の前に手動 STT の Chunk が初めて完了すると、分離を作り直し、その後の merge が話者付きで入れる。"""
+    # Arrange: 2 つ目・3 つ目の Chunk を無音と判定させて merge まで進め、2 つ目を手動 STT に回す
+    pipeline = _FakePipeline([(0.0, 30.0, "A"), (30.0, 60.0, "C"), (60.0, 90.0, "B")])
+    ctx3.diarization = PyannoteDiarizationProvider(pipeline=pipeline)
+    ctx3.vad = FakeVADProvider(rms_threshold=0.1)
+    await create_meeting(client3)
+    for seq, pcm in enumerate([sine_pcm(30), sine_pcm(30, amplitude=0.02), sine_pcm(30, amplitude=0.02)]):
+        await put_chunk(client3, "m-1", seq, pcm)
+    await finalize(client3, "m-1", mic=3)
+    await runner3.run_until_idle()
+    assert (await client3.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+    real_merge = runner3.handlers["merge_transcript"]
+    done_during_merge = False
+
+    async def merge_then_transcribe(c: AppContext, merge_job: Job) -> str | None:
+        nonlocal done_during_merge
+        result = await real_merge(c, merge_job)
+        if not done_during_merge:
+            # 2 つ目の Chunk で作り直した merge の実行中に、3 つ目の Chunk の手動 STT を完了させる
+            done_during_merge = True
+            assert (await client3.post("/v1/meetings/m-1/chunks/mic/2/transcribe")).status_code == 202
+            async with c.db.write() as conn:
+                job = repo_phase3.lease_job_fair(conn, "w-manual", ["transcribe_chunk"], now_ms())
+                assert job is not None
+            await handlers_module.handle_transcribe(c, job)
+            async with c.db.write() as conn:
+                assert repo.finish_job(conn, job.id, "w-manual", job.attempts, "completed")
+        return result
+
+    monkeypatch.setitem(runner3.handlers, "merge_transcript", merge_then_transcribe)   # HANDLERS は共有なのでテスト後に戻す
+    # Act
+    await runner3.run_until_idle()
+    # Assert: 版 3 に 3 つ目の Chunk が話者付きで入る
+    with ctx3.db.read() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        last = repo.get_chunk_by_key(conn, "m-1", "mic", 2)
+        assert m is not None and last is not None
+        recovered = [s for s in repo.list_segments(conn, "m-1", merged_version=m.transcript_version) if s.chunk_id == last.id]
+    assert done_during_merge and m.transcript_version == 3
+    assert recovered and all(s.speaker_id is not None for s in recovered)
+
+
+class _BlockingDiarization:
+    """最初の呼び出しを gate が開くまで止める話者分離。同時に走っている呼び出しの最大数を記録する。"""
+
+    def __init__(self) -> None:
+        self.entered, self.gate = threading.Event(), threading.Event()
+        self.calls = 0
+        self.running = 0
+        self.max_running = 0
+        self._lock = threading.Lock()
+
+    def diarize(self, req: DiarizationRequest) -> DiarizationResult:
+        with self._lock:
+            self.calls += 1
+            self.running += 1
+            self.max_running = max(self.max_running, self.running)
+            first = self.calls == 1
+        try:
+            if first:
+                self.entered.set()
+                self.gate.wait(5)
+            return DiarizationResult(turns=(), speaker_count=0)
+        finally:
+            with self._lock:
+                self.running -= 1
+
+
+async def test_requeued_diarize_waits_for_the_running_attempt(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """pending に戻した分離（requeue_running_job）の次の試行は、旧い試行のスレッドが抜けるまで分離を始めない（§21 handle_diarize）。"""
+    # Arrange: 旧い試行が分離の実行中に pending へ戻され、次の試行が lease される
+    provider = _BlockingDiarization()
+    ctx3.diarization = provider
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        repo.insert_job(conn, "m-1", "diarize_meeting")
+        old = repo_phase3.lease_job_fair(conn, "w-old", ["diarize_meeting"], now_ms())
+        assert old is not None
+    old_attempt = asyncio.create_task(handle_diarize(ctx3, old))
+    assert await asyncio.to_thread(provider.entered.wait, 5)
+    async with ctx3.db.write() as conn:
+        assert repo_phase3.requeue_running_job(conn, "m-1", "diarize_meeting")
+        fresh = repo_phase3.lease_job_fair(conn, "w-new", ["diarize_meeting"], now_ms())
+        assert fresh is not None
+    # Assert: 行は pending に戻っても、旧い試行のスレッドが枠を持つ間は Runner が分離（と STT と並べない要約）を lease しない
+    types = runner3.allowed_types()
+    assert "diarize_meeting" not in types
+    assert "synthesize_minutes" not in types or ctx3.models.allow_concurrent_stt_and_llm
+    new_attempt = asyncio.create_task(handle_diarize(ctx3, fresh))
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    # Act / Assert: 旧い試行が抜けるまで、次の試行は分離を始めない
+    assert provider.calls == 1
+    provider.gate.set()
+    assert await old_attempt is None
+    assert await new_attempt is None
+    assert provider.calls == 2 and provider.max_running == 1
+    assert "diarize_meeting" in runner3.allowed_types()
 
 
 async def test_diarize_that_keeps_crashing_does_not_block_merge(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
@@ -6477,6 +6624,8 @@ def test_doctor_rebuild_refuses_while_server_is_running(tmp_path: Path, monkeypa
 | 無音と判定した Chunk の手動 STT は分離を作り直し、拾い直した segments だけに話者を付ける（前の話者・名前付きのラベルは変えない） | `test_manual_transcribe_of_skipped_chunk_gets_speakers_without_relabeling` |
 | 手動 STT の Chunk が分離の実行中に完了したら、実行中の分離を pending に戻して結果を捨てさせ、その Chunk を含めて分離し直してから merge する（§8 `on_transcribe_completed`・`repo_phase3.requeue_running_job`） | `test_manual_stt_finishing_during_diarize_reruns_the_diarize` |
 | 分離が手動 STT の Chunk より先に終わっても merge を作らず（`on_diarize_finished` は全 Chunk の終端を待つ）、Chunk の完了で分離を作り直す | `test_diarize_finishing_before_manual_stt_does_not_merge_early` |
+| merge の実行中（書き込みの後・完了の記録の前）に手動 STT の Chunk が初めて完了しても、結果を staged に置き、分離を作り直してから作り直した merge が話者付きで入れる（§21 `handle_transcribe`） | `test_manual_stt_committed_during_merge_rediarizes_then_remerges` |
+| 同時に走らせる話者分離は `MAX_CONCURRENT_DIARIZE` 本まで。pending に戻した分離の次の試行は、旧い試行のスレッドが抜けるまで分離を始めず、その間 Runner は分離と（STT と並べない設定なら）要約を lease しない（§7 `diarize_slots`・§9 `allowed_types`・§21 `handle_diarize`） | `test_requeued_diarize_waits_for_the_running_attempt` |
 | 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
 | 実 Provider：無音 Chunk を挟んでも話者区間の時刻がずれない、上限は `max_speakers`、一時ファイルはデータディレクトリの中 | `test_assemble_timeline_pads_gaps_with_silence`、`test_pyannote_provider_keeps_absolute_time_across_skipped_chunk`、`test_speaker_after_silent_chunk_is_not_shifted` |
 | エコー除去 | `test_echo_from_system_is_dropped_on_mic` |
