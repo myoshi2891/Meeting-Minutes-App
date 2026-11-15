@@ -3726,6 +3726,8 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 # 期限らしい表現（日本語・英語）。網羅性は基本設計 §28 の持ち越し事項。
 # 選択（|）は左の候補から試して最初に当たったものを採る（最長一致ではない）。複合形（「来月末」）は、その一部（「来月」）より前に置く。
 # 置かないと「来月末」が「来月」と切り出され、quote の「来月上旬」が deadline の「来月末」を裏付けてしまう（_deadline_supported）。
+# 「再来月」「再来週」も、組（「再来月末」「再来週末」）と単独の両方を持つ。無いと「再」の位置で何も当たらず、次の「来」の位置で
+# 「来月末」が切り出され、quote の「再来月末」が deadline の「来月末」を裏付けてしまう（「再来週末」は「再来週」に縮む）。
 # 月・週と時期（末・上旬・中旬・下旬）の組は 1 つの表現として切り出す。別々に切り出すと、quote の別の日付の部品
 # （「今月上旬に確認し、来月下旬に提出」の「来月」と「上旬」）を寄せ集めて deadline の「来月上旬」を裏付けてしまう。
 # 組にした表現は、その部品だけの deadline（「上旬」）も裏付けない（どの月の上旬かを quote から言えないため。基本設計 §12.5 段 5）。
@@ -3744,13 +3746,24 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 # deadline の「tomorrow」を裏付けてしまう。findall は左から切り出すので、「day」の位置で長い方が当たり、中の「tomorrow」は残らない
 _WEEKDAYS_JA = "月曜|火曜|水曜|木曜|金曜|土曜|日曜"
 _WEEKDAYS_EN = "monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+_EN_DEADLINE_ALTS = (
+    rf"(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|{_WEEKDAYS_EN}|"
+    r"next week|this week|end of|day ?after ?tomorrow|tomorrow|eod|eow"
+)
 _DEADLINE_HINTS = re.compile(
     r"((?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年)?\d{1,2}月\d{1,2}日|\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|"
     rf"(?:再来週|今週|来週)の?(?:{_WEEKDAYS_JA})|{_WEEKDAYS_JA}|"
-    r"(?:今月|来月)(?:末|上旬|中旬|下旬)|(?:今週|来週)末|今週|来週|再来週|今月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
-    rf"(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|{_WEEKDAYS_EN}|"
-    r"next week|this week|end of|day ?after ?tomorrow|tomorrow|eod|eow)",
+    r"(?:再来月|今月|来月)(?:末|上旬|中旬|下旬)|(?:再来週|今週|来週)末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
+    rf"{_EN_DEADLINE_ALTS})",
     re.IGNORECASE,
+)
+# 英語の候補だけを、正規化前の quote から語の境目つきで切り出す（_deadline_supported）。normalize は空白を落とすので、
+# 正規化した文字列では「Simon day」が「simonday」になって「monday」に、「meow」が「eow」に、「deodorant」が「eod」に当たる。
+# 「next week」「this week」「end of」はここでは除く（deadline 側の正規化した文字列には当たらず、quote 側だけに出ても使われないが、
+# 部品として扱わないことをはっきりさせる）
+_EN_DEADLINE_HINTS = re.compile(
+    rf"(?<![a-z0-9])(?:(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|{_WEEKDAYS_EN}|"
+    r"day ?after ?tomorrow|tomorrow|eod|eow)(?![a-z0-9])",
 )
 # 英語の「曜日 + 週」（「friday next week」）。比べる形を「週 + 曜日」にそろえる（_hint_key）
 _EN_DAY_THEN_WEEK = re.compile(rf"({_WEEKDAYS_EN})(?:of)?(next|this)week")
@@ -3839,8 +3852,10 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     deadline に期限の表現（_DEADLINE_HINTS）があれば、そのすべてが quote にも現れることを求める
     （「来週中に11月20日」は「来週」と「11月20日」の両方。quote の「来週」は deadline の「月末」「11月20日」を裏付けない）。
     「来週金曜」のような週と曜日の組は 1 つの表現で、比べるのは _hint_key でそろえた形（「来週の金曜」も同じ）。
-    表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たる候補は
-    「再来週」だけなので、「再来週」は 1 つの表現になる）。
+    表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たるのは
+    「再」で始まる候補（「再来週」「再来週末」「再来月」「再来月末」）だけなので、それぞれ 1 つの表現になる）。
+    quote の英語の表現は、正規化前の quote で語として現れるものだけを数える（_quote_hints。正規化すると語の境目が消え、
+    「Simon day」が「monday」に当たる）。
     相対表現を日付に換算した deadline（quote は「来週」、deadline は「11月20日」）は通さない。換算の基準
     （会議の日付・タイムゾーン）をこの検証は持たず、換算の正しさを確かめられない。
     期限の表現を含まない deadline（「次回の定例まで」）は、正規化した文字列がそのまま quote に現れることを求める。
@@ -3854,15 +3869,31 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     （基本設計 §12.5 段 4・5。段 3a (4) の否定と同じ扱い。UI の根拠リンクで利用者が元発言と照らす）
     """
     d = normalize(deadline)
-    quote_norm = normalize(quote)
     wanted = {_hint_key(m) for m in _DEADLINE_HINTS.findall(d)}
     if not wanted:
         return d != "" and _phrase_in(d, quote)
-    return wanted <= {_hint_key(m) for m in _DEADLINE_HINTS.findall(quote_norm)}
+    return wanted <= _quote_hints(quote)
+
+
+def _quote_hints(quote: str) -> set[str]:
+    """quote の期限の表現（_hint_key でそろえた形）。
+
+    日本語・数字の表現は正規化した文字列から切り出す（区切りの違い「来週、金曜」を問わない）。英語の表現（英字を含むもの）は
+    そこから捨て、正規化前の quote（_spaced。区切りを空白に置き換える）から語の境目つきで切り出す（_EN_DEADLINE_HINTS）。
+    正規化した文字列では語の境目が分からず、「Simon day」が「monday」に、「meow」が「eow」に当たる
+    """
+    japanese = {_hint_key(m) for m in _DEADLINE_HINTS.findall(normalize(quote)) if not re.search(r"[a-z]", m)}
+    english = {_hint_key(m) for m in _EN_DEADLINE_HINTS.findall(_spaced(quote))}
+    return japanese | english
 
 
 # normalize（merge/normalize.py の _PUNCT）が落とす文字。_phrase_in は落とさずに空白へ置き換え、語の境目として残す
 _SEPARATORS = re.compile(r"[。、，．,.!?！？「」()（）\[\]【】…・\s　]+")
+
+
+def _spaced(quote: str) -> str:
+    """normalize と同じ NFKC・小文字にし、normalize が落とす区切りを空白に置き換える（語の境目を残す）。"""
+    return _SEPARATORS.sub(" ", unicodedata.normalize("NFKC", quote).lower())
 
 
 def _is_ascii_alnum(c: str) -> bool:
@@ -3876,7 +3907,7 @@ def _phrase_in(phrase_norm: str, quote: str) -> bool:
     phrase の先頭・末尾が英数字なら、quote の中でその外側が英数字でないことを求める（「next week」は「next weekend」に当たらない）。
     日本語は語の境目を文字から決められないので、先頭・末尾が英数字でなければ外側を見ない（「次回の定例まで」は「次回の定例までに」に当たる）
     """
-    spaced = _SEPARATORS.sub(" ", unicodedata.normalize("NFKC", quote).lower())
+    spaced = _spaced(quote)
     body = r"\s*".join(re.escape(c) for c in phrase_norm)
     before = r"(?<![a-z0-9])" if _is_ascii_alnum(phrase_norm[0]) else ""
     after = r"(?![a-z0-9])" if _is_ascii_alnum(phrase_norm[-1]) else ""
@@ -4136,7 +4167,7 @@ import logging
 
 from ..db import repo
 from ..db.connection import now_ms
-from ..db.models import Job, Segment, SummaryVersion
+from ..db.models import AudioChunk, Job, Segment, SummaryVersion
 from ..llm.caveats import caveats_for
 from ..llm.map_reduce import synthesize
 from ..llm.prompts import PROMPT_VERSION
@@ -4176,12 +4207,21 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
     try:
         pcm = read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256)
     except InvalidWavError as e:
+        repaired: bytes | None = None
         async with ctx.db.write() as conn:
             # 成功時と同じく、失効した旧ワーカーは Chunk を書かない（基本設計 §9.3）。例外はそのまま投げる。
             # 失敗の記録は Runner が行い、旧ワーカーの報告は finish_job の fencing が無視する
             if repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
-                repo.update_chunk(conn, chunk.id, save_status="missing")
-        raise InvalidAudioError(str(e)) from e
+                # 読めなかった後・このロックを取る前に再 PUT の修復（書き込みロックの下で書き戻す。§21.2）が入っていれば、
+                # ファイルは無事。同じトランザクションで行を読み直して照合し、無事なら missing にせず VAD を続ける。
+                # 確かめずに missing にすると、修復した Chunk を欠損と記録し、再試行しない INVALID_AUDIO で VAD が止まる
+                current = repo.get_chunk(conn, chunk.id)
+                repaired = await asyncio.to_thread(_read_stored_pcm, ctx, current) if current is not None else None
+                if repaired is None:
+                    repo.update_chunk(conn, chunk.id, save_status="missing")
+        if repaired is None:
+            raise InvalidAudioError(str(e)) from e
+        pcm = repaired
     result = await asyncio.to_thread(ctx.vad.detect, pcm)
     async with ctx.db.write() as conn:
         # 失効した旧ワーカーが書くと、failed の vad ジョブを残したまま Chunk が進む。再試行の VAD は
@@ -4193,6 +4233,14 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
             repo.update_chunk(conn, chunk.id, has_voice=result.has_voice, server_vad_score=result.voiced_ratio,
                               vad_source="server_silero")
     return None
+
+
+def _read_stored_pcm(ctx: AppContext, chunk: AudioChunk) -> bytes | None:
+    """保存済みの WAV を読み、sha256 まで照合する。読めなければ None（pipeline.chunk_file_intact と同じ規則：欠損・破損・OSError）。"""
+    try:
+        return read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256)
+    except (InvalidWavError, OSError):
+        return None
 
 
 def _stt_model_for(ctx: AppContext, meeting_id: str, conn) -> str | None:  # type: ignore[no-untyped-def]
@@ -7095,6 +7143,35 @@ async def test_vad_from_expired_lease_does_not_mark_chunk_missing(client: httpx.
     assert after is not None and after.save_status == before.save_status
 
 
+async def test_vad_does_not_mark_chunk_missing_after_repair(client: httpx.AsyncClient, ctx: AppContext,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """VAD が音声を読めなかった後、missing を書く前に再 PUT の修復がファイルを書き戻していれば、missing にせず VAD を続ける。"""
+    # Arrange: VAD が読む時点ではファイルが壊れていて、VAD が書き込みロックを取る直前に修復が書き戻す
+    await _seed(client, 1)
+    async with ctx.db.write() as conn:
+        vad = repo.lease_job(conn, "w-1", ["vad_chunk"], now_ms())
+        assert vad is not None
+        chunk = repo.get_chunk(conn, vad.chunk_id or "")
+    assert chunk is not None
+    path = ctx.settings.data_dir / chunk.local_path
+    original = path.read_bytes()
+    path.write_bytes(b"corrupted")
+    real_write = ctx.db.write
+
+    def write_after_repair():  # type: ignore[no-untyped-def]
+        path.write_bytes(original)     # 修復は書き込みロックの下で書き戻す。VAD のトランザクションより先にコミットした
+        return real_write()
+    monkeypatch.setattr(ctx.db, "write", write_after_repair)
+    # Act
+    await handlers.handle_vad(ctx, vad)
+    # Assert: Chunk は missing にならず、VAD の結果で次へ進む
+    monkeypatch.undo()
+    with ctx.db.read() as conn:
+        after = repo.get_chunk(conn, chunk.id)
+    assert after is not None and after.save_status != "missing"
+    assert after.stt_status != "pending"
+
+
 async def test_merge_from_expired_lease_does_not_write_transcript(client: httpx.AsyncClient, ctx: AppContext,
                                                                   runner: JobRunner) -> None:
     """lease を失った旧ワーカーの merge は書かない。書くと failed の merge ジョブを残したまま transcript が進み、要約ジョブまで作る（基本設計 §9.3）。"""
@@ -7767,6 +7844,45 @@ def test_day_after_tomorrow_is_one_expression() -> None:
     assert reasons_for("tomorrow", "Suzuki will submit it tomorrow") == []
     assert reasons_for("day after tomorrow", "Suzuki will submit the day after tomorrow") == []
     assert reasons_for("the day after tomorrow", "Suzuki will submit it the day after tomorrow") == []
+
+
+def test_month_after_next_is_not_next_month() -> None:
+    """「再来月末」「再来週末」は 1 つの表現。quote のその中の「来月末」「再来週」は deadline の「来月末」「再来週末」を裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "a1a1a1a1-1010-4000-8000-000000000010"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert
+    assert reasons_for("来月末", "鈴木さんが再来月末までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("再来月末", "鈴木さんが再来月末までに提出します") == []
+    assert reasons_for("来月", "鈴木さんが再来月に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("再来月", "鈴木さんが再来月に提出します") == []
+    assert reasons_for("再来週末", "鈴木さんが再来週に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("再来週末", "鈴木さんが再来週末に提出します") == []
+
+
+def test_english_deadline_hints_need_word_boundaries_in_the_quote() -> None:
+    """英語の期限の表現は、quote の中で語として現れるときだけ数える。正規化で空白が落ちて別の語にまたがった並びは数えない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "b2b2b2b2-1111-4000-8000-000000000011"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": "Suzuki", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 語をまたいだ・語の一部の並びは通さない
+    assert reasons_for("Monday", "Suzuki will ask Simon day by day") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("EOW", "Suzuki heard the cat meow") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("EOD", "Suzuki will bring the deodorant") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("Friday", "Suzuki works on Fridays") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 語として現れれば、区切り・大文字小文字・日本語に挟まれていても通る
+    assert reasons_for("Monday", "Suzuki will submit it on Monday.") == []
+    assert reasons_for("EOD", "Suzuki submits by EOD, then reviews") == []
+    assert reasons_for("friday next week", "Suzuki submits it Friday, next week") == []
+    assert reasons_for("tomorrow", "鈴木さんはtomorrowに提出") == []
 
 
 def test_deadline_without_hints_matches_only_a_whole_phrase() -> None:
