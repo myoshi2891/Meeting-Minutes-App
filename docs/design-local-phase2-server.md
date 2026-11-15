@@ -3748,13 +3748,18 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 # 「day after tomorrow」も 1 つの表現にする（「明後日」と同じ）。「tomorrow」だけを切り出すと、quote の「the day after tomorrow」が
 # deadline の「tomorrow」を裏付けてしまう。findall は左から切り出すので、「day」の位置で長い方が当たり、中の「tomorrow」は残らない
 _WEEKDAYS_JA = "月曜|火曜|水曜|木曜|金曜|土曜|日曜"
+# 時刻（「午後5時」「17時30分」「5時半」「17:00」）。日付の後に付けば日付と 1 つの表現にする（「の」は挟んでよい。_hint_key が落とす）。
+# 日付だけを切り出すと、quote の「11月20日午前9時」が deadline の「11月20日午後5時」を裏付けてしまう（時刻が落ちる）。
+# 時刻だけの表現も切り出す（「午後5時」は「午前9時」と別の表現）。「2時間」の「2時」は時刻ではないので当てない
+_TIME = r"(?:(?:午前|午後)?\d{1,2}時(?!間)(?:\d{1,2}分|半)?|\d{1,2}:\d{2})"
 _WEEKDAYS_EN = "monday|tuesday|wednesday|thursday|friday|saturday|sunday"
 _EN_DEADLINE_ALTS = (
     rf"(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|(?:next|this) ?(?:{_WEEKDAYS_EN})|"
     rf"{_WEEKDAYS_EN}|next week|this week|end of|day ?after ?tomorrow|tomorrow|eod|eow"
 )
 _DEADLINE_HINTS = re.compile(
-    r"((?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年)?\d{1,2}月\d{1,2}日|(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|"
+    r"((?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年)?\d{1,2}月\d{1,2}日|(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})"
+    rf"(?:の?{_TIME})?|{_TIME}|"
     rf"(?:再来週|今週|来週)の?(?:{_WEEKDAYS_JA})|{_WEEKDAYS_JA}|"
     r"(?:再来月|今月|来月)(?:末|上旬|中旬|下旬)|(?:再来週|今週|来週)末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
     rf"{_EN_DEADLINE_ALTS})",
@@ -3856,6 +3861,7 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     deadline に期限の表現（_DEADLINE_HINTS）があれば、そのすべてが quote にも現れることを求める
     （「来週中に11月20日」は「来週」と「11月20日」の両方。quote の「来週」は deadline の「月末」「11月20日」を裏付けない）。
     「来週金曜」のような週と曜日の組は 1 つの表現で、比べるのは _hint_key でそろえた形（「来週の金曜」も同じ）。
+    日付と時刻（「11月20日午後5時」）も 1 つの表現で、quote の「11月20日午前9時」は通らない。
     表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たるのは
     「再」で始まる候補（「再来週」「再来週末」「再来月」「再来月末」）だけなので、それぞれ 1 つの表現になる）。
     quote の英語の表現は、正規化前の quote で語として現れるものだけを数える（_quote_hints。正規化すると語の境目が消え、
@@ -7782,6 +7788,29 @@ def test_deadline_era_must_match_the_quote() -> None:
     assert reasons_for("平成8年11月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("令和元年5月1日") == []
     assert reasons_for("平成元年5月1日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_deadline_time_must_match_the_quote() -> None:
+    """日付と時刻は 1 つの表現。quote の「11月20日午前9時」は deadline の「11月20日午後5時」を裏付けない（段 5）。"""
+    # Arrange
+    sid = "cdcdcdcd-8888-4000-8000-000000000008"
+    quote = "鈴木さんが11月20日午前9時までに提出し、11/21 17:00に共有します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ日付・同じ時刻なら通り（「の」の有無は問わない）、日付が同じでも時刻が違えば落ちる
+    assert reasons_for("11月20日午前9時") == []
+    assert reasons_for("11月20日の午前9時") == []
+    assert reasons_for("11月20日午後5時") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11/21 17:00") == []
+    assert reasons_for("11/21 9:00") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 時刻の付いた quote は、時刻の無い同じ日付の deadline を裏付けない（年の無い月日と同じ扱い）。時刻だけの deadline も同じ
+    assert reasons_for("11月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("午前9時") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 
 
 def test_week_and_weekday_are_matched_as_a_pair() -> None:
