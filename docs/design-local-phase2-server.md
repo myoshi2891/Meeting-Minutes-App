@@ -3756,14 +3756,23 @@ _WEEKDAYS_JA = "月曜|火曜|水曜|木曜|金曜|土曜|日曜"
 # 日付だけを切り出すと、quote の「11月20日午前9時」が deadline の「11月20日午後5時」を裏付けてしまう（時刻が落ちる）。
 # 時刻だけの表現も切り出す（「午後5時」は「午前9時」と別の表現）。「2時間」の「2時」は時刻ではないので当てない
 _TIME = r"(?:(?:午前|午後)?\d{1,2}時(?!間)(?:\d{1,2}分|半)?|\d{1,2}:\d{2})"
+# 英語の時刻（「5pm」「9 am」「5:30pm」）。日付・英語の曜日（「next friday 5pm」「tomorrow at 9am」）の後に付けば 1 つの表現にする
+# （「at」は挟んでよい。_hint_key が落とす）。別々に切り出すと、quote の「next Friday 9am」が deadline の「next Friday 5pm」を裏付け、
+# 別の句の曜日と時刻（「next Friday 9am and Monday 5pm」）を寄せ集めても通ってしまう。_TIME より前に試す（「5:30pm」を「5:30」と
+# 切り出して am / pm を落とさない）。12 時間制と 24 時間制（「5pm」と「17:00」）は換算せず、別の表現として比べる（通さない側に倒す）。
+# 時刻が前に来る言い方（「5pm next friday」）は時刻と曜日を別々に切り出すので、「next friday 5pm」とは別の表現になる（通さない側）
+_TIME_EN = r"\d{1,2}(?::\d{2})? ?(?:am|pm)"
 _WEEKDAYS_EN = "monday|tuesday|wednesday|thursday|friday|saturday|sunday"
-_EN_DEADLINE_ALTS = (
+# 英語の日（曜日・週と曜日の組・tomorrow）。後ろに時刻を付けてよい
+_EN_DAY = (
     rf"(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|(?:next|this) ?(?:{_WEEKDAYS_EN})|"
-    rf"{_WEEKDAYS_EN}|next week|this week|end of|day ?after ?tomorrow|tomorrow|eod|eow"
+    rf"{_WEEKDAYS_EN}|day ?after ?tomorrow|tomorrow"
 )
+_EN_DAY_TIME = rf"(?:{_EN_DAY})(?: ?(?:at ?)?{_TIME_EN})?"
+_EN_DEADLINE_ALTS = rf"{_EN_DAY_TIME}|next week|this week|end of|eod|eow"
 _DEADLINE_HINTS = re.compile(
     r"((?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年|(?:再来年|来年|今年|去年)の?)?\d{1,2}月\d{1,2}日|(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})"
-    rf"(?:の?{_TIME})?|{_TIME}|"
+    rf"(?:の?(?:{_TIME_EN}|{_TIME}))?|{_TIME_EN}|{_TIME}|"
     rf"(?:再来週|今週|来週)の?(?:{_WEEKDAYS_JA})|{_WEEKDAYS_JA}|"
     r"(?:再来月|今月|来月)の?(?:末|上旬|中旬|下旬)|(?:再来週|今週|来週)の?末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
     rf"{_EN_DEADLINE_ALTS})",
@@ -3773,20 +3782,22 @@ _DEADLINE_HINTS = re.compile(
 # 正規化した文字列では「Simon day」が「simonday」になって「monday」に、「meow」が「eow」に、「deodorant」が「eod」に当たる。
 # 「next week」「this week」「end of」はここでは除く（deadline 側の正規化した文字列には当たらず、quote 側だけに出ても使われないが、
 # 部品として扱わないことをはっきりさせる）
+# 時刻だけの表現（「5pm」）も、時刻の付いた曜日（「next friday 5pm」）もここで切り出す
 _EN_DEADLINE_HINTS = re.compile(
-    rf"(?<![a-z0-9])(?:(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|"
-    rf"(?:next|this) ?(?:{_WEEKDAYS_EN})|{_WEEKDAYS_EN}|"
-    r"day ?after ?tomorrow|tomorrow|eod|eow)(?![a-z0-9])",
+    rf"(?<![a-z0-9])(?:{_EN_DAY_TIME}|{_TIME_EN}|eod|eow)(?![a-z0-9])",
 )
-# 英語の「曜日 + 週」（「friday next week」）。比べる形を「週 + 曜日」にそろえる（_hint_key）
-_EN_DAY_THEN_WEEK = re.compile(rf"({_WEEKDAYS_EN})(?:of)?(next|this)week")
+# 日付の後ろの英語の時刻（「11月20日5pm」の「5pm」）。_quote_hints が、日本語・数字の表現から英字を含むものを捨てるときに、
+# これだけは英字として数えない（日付と 1 つの表現なので、捨てると同じ日付・時刻の quote でも通らない）
+_TRAILING_TIME_EN = re.compile(rf"{_TIME_EN}$")
+# 英語の「曜日 + 週」（「friday next week」。後ろの時刻はそのまま残す）。比べる形を「週 + 曜日」にそろえる（_hint_key）
+_EN_DAY_THEN_WEEK = re.compile(rf"({_WEEKDAYS_EN})(?:of)?(next|this)week(.*)")
 
 
 def _hint_key(hint: str) -> str:
-    """切り出した期限の表現を比べる形にする。大文字小文字・空白・「の」（「来週の金曜」）を落とし、英語の曜日と週の順序をそろえる。"""
-    key = re.sub(r"[\sの]", "", hint.lower())
+    """切り出した期限の表現を比べる形にする。大文字小文字・空白・「の」（「来週の金曜」）・時刻の前の「at」を落とし、英語の曜日と週の順序をそろえる。"""
+    key = re.sub(r"at(?=\d)", "", re.sub(r"[\sの]", "", hint.lower()))
     m = _EN_DAY_THEN_WEEK.fullmatch(key)
-    return f"{m.group(2)}week{m.group(1)}" if m else key
+    return f"{m.group(2)}week{m.group(1)}{m.group(3)}" if m else key
 
 
 def parse_draft(content: str) -> MeetingSummaryDraft:
@@ -3865,7 +3876,8 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     deadline に期限の表現（_DEADLINE_HINTS）があれば、そのすべてが quote にも現れることを求める
     （「来週中に11月20日」は「来週」と「11月20日」の両方。quote の「来週」は deadline の「月末」「11月20日」を裏付けない）。
     「来週金曜」のような週と曜日の組は 1 つの表現で、比べるのは _hint_key でそろえた形（「来週の金曜」も同じ）。
-    日付と時刻（「11月20日午後5時」）も 1 つの表現で、quote の「11月20日午前9時」は通らない。
+    日付と時刻（「11月20日午後5時」）も 1 つの表現で、quote の「11月20日午前9時」は通らない。英語の時刻も同じで、
+    曜日・日付と時刻（「next friday 5pm」「11/20 5pm」。「at」の有無は問わない）を 1 つの表現として比べ、quote の「next Friday 9am」は通らない。
     表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たるのは
     「再」で始まる候補（「再来週」「再来週末」「再来月」「再来月末」「再来年11月20日」）だけなので、それぞれ 1 つの表現になる）。
     quote の英語の表現は、正規化前の quote で語として現れるものだけを数える（_quote_hints。正規化すると語の境目が消え、
@@ -3896,9 +3908,16 @@ def _quote_hints(quote: str) -> set[str]:
     そこから捨て、正規化前の quote（_spaced。区切りを空白に置き換える）から語の境目つきで切り出す（_EN_DEADLINE_HINTS）。
     正規化した文字列では語の境目が分からず、「Simon day」が「monday」に、「meow」が「eow」に当たる
     """
-    japanese = {_hint_key(m) for m in _DEADLINE_HINTS.findall(normalize(quote)) if not re.search(r"[a-z]", m)}
+    japanese = {_hint_key(m) for m in _DEADLINE_HINTS.findall(normalize(quote)) if _is_japanese_hint(m)}
     english = {_hint_key(m) for m in _EN_DEADLINE_HINTS.findall(_spaced(quote))}
     return japanese | english
+
+
+def _is_japanese_hint(hint: str) -> bool:
+    """日本語・数字の表現か。英字を含むものは英語の表現（_EN_DEADLINE_HINTS が語の境目つきで切り出す）。
+    日付の後ろの英語の時刻（「11月20日5pm」）だけは日付と 1 つの表現なので、英字として数えない（時刻だけの「5pm」は英語の表現）。"""
+    rest = _TRAILING_TIME_EN.sub("", hint)
+    return rest != "" and not re.search(r"[a-z]", rest)
 
 
 # normalize（merge/normalize.py の _PUNCT）が落とす文字。_phrase_in は落とさずに空白へ置き換え、語の境目として残す
@@ -7963,6 +7982,31 @@ def test_next_or_this_weekday_keeps_the_week_qualifier() -> None:
     assert reasons_for("Next Friday", "Suzuki will submit it next friday.") == []
     # 修飾の無い曜日も、修飾付きの quote では裏付けない（どの週の金曜かを deadline から言えない）
     assert reasons_for("friday", "Suzuki will submit it next Friday") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_english_time_must_match_the_quote() -> None:
+    """英語の時刻（「5pm」「9 am」「5:30pm」）も日付・曜日と 1 つの表現。quote の「next Friday 9am」は deadline の「next Friday 5pm」を裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "e5e5e5e5-1414-4000-8000-000000000014"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": "Suzuki", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 曜日が同じでも時刻が違えば通さない
+    assert reasons_for("next Friday 5pm", "Suzuki will submit next Friday 9am") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("tomorrow 5pm", "Suzuki will submit tomorrow 9am") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 別の句の曜日と時刻を寄せ集めて通さない
+    assert reasons_for("next Friday 5pm", "Suzuki submits next Friday 9am and reviews Monday 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 日付に付いた英語の時刻も同じ。「5:30」を日本語の時刻として切り出して am / pm を落とさない
+    assert reasons_for("11/20 5pm", "鈴木さんが11/20 9amまでに提出") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11月20日 5:30pm", "鈴木さんが11月20日5:30amまでに提出") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("5pm", "Suzuki will submit it at 9am") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 同じなら、空白・大文字小文字・「at」の有無が違っても通る
+    assert reasons_for("next Friday 5pm", "Suzuki will submit it next friday at 5 PM.") == []
+    assert reasons_for("11/20 5pm", "鈴木さんが11/20 5pmまでに提出") == []
+    assert reasons_for("11月20日 5:30pm", "鈴木さんが11月20日5:30pmまでに提出") == []
+    assert reasons_for("5pm", "Suzuki will submit it by 5 pm") == []
 
 
 def test_english_deadline_hints_need_word_boundaries_in_the_quote() -> None:
