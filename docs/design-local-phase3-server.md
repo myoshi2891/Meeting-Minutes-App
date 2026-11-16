@@ -794,6 +794,17 @@ def live_segments_since(conn: sqlite3.Connection, meeting_id: str, since_created
     return [_row(Segment, r) for r in rows]
 
 
+def discard_meeting_job(conn: sqlite3.Connection, meeting_id: str, job_type: str) -> bool:
+    """会議単位のジョブの行を状態を問わず消す。消したら True。
+
+    実行中（leased / processing）の行を消すと、そのワーカーは lease_is_current・finish_job・heartbeat_job のどれも通らず、結果を書かない
+    （requeue_running_job と同じ fencing）。pending に戻さないのは、戻すと消したかった条件（分離の作り直し）が済む前に lease されうるため。
+    次の行は呼び出し側の規則（on_diarize_finished など）が作る
+    """
+    cur = conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ? AND job_type = ?", (meeting_id, job_type))
+    return cur.rowcount > 0
+
+
 def oldest_open_job_age_ms(conn: sqlite3.Connection, meeting_id: str, job_type: str, now: int) -> int | None:
     row = conn.execute(
         "SELECT MIN(created_at) AS c FROM processing_jobs WHERE meeting_id = ? AND job_type = ? AND status IN ('pending','leased','processing','retrying')",
@@ -985,6 +996,11 @@ def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk, diarize
         # - pending / retrying：まだ入力を読んでいないので何もしない
         repo_phase3.requeue_running_job(conn, chunk.meeting_id, "diarize_meeting")
         repo.delete_finished_job(conn, chunk.meeting_id, "diarize_meeting")
+        # merge の行は状態を問わず消す。lease 済みの merge が書く前（handle_transcribe は実行中の merge を見て結果を staged に置く）だと、
+        # その merge が作り直す分離より先に staged 行を昇格させ、話者の無い segments を公開する。完了まで行が残ると
+        # on_diarize_finished も一意制約で merge を作れない。消せば実行中のワーカーは lease の検査で書かず、作り直した分離の完了が
+        # merge を作る（on_diarize_finished）。pending に戻すと分離より先に lease されうる（repo_phase3.discard_meeting_job）
+        repo_phase3.discard_meeting_job(conn, chunk.meeting_id, "merge_transcript")
     return ensure_merge_job(conn, chunk.meeting_id, diarize)
 
 
@@ -4003,7 +4019,8 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         previous = repo_phase3.segments_of_chunk(conn, chunk.id) if replaced else []
         # 実行中の merge があれば、初めての完了（手動 STT）でも staged に置く。その merge の書き込みの後にコミットすると版に入らず、
         # 一意制約で merge も作れない。Runner が merge の完了で入れ替え待ちを見て作り直す（Phase 2 §12 handle_transcribe）。
-        # 話者分離を作り直していれば、分離は staged 行にも話者を付け、その完了後の merge が入れ替える
+        # 話者分離を作り直すとき（初めての完了）は、on_transcribe_completed が実行中の merge の行を消す（書く前なら書かせない）。
+        # 分離は staged 行にも話者を付け、その完了後の merge が入れ替える
         merge_running = repo.count_jobs(conn, chunk.meeting_id, "merge_transcript", ["leased", "processing"]) > 0
         if replaced or merge_running:
             # 前の結果は公開中の版に載っていることがあるので消さず、次の merge が版を上げるのと同じトランザクションで入れ替える
@@ -5820,6 +5837,31 @@ async def test_manual_stt_committed_during_merge_rediarizes_then_remerges(client
     assert recovered and all(s.speaker_id is not None for s in recovered)
 
 
+async def test_manual_stt_committed_before_leased_merge_writes_discards_that_merge(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                                    runner3: JobRunner) -> None:
+    """lease 済みの merge が書く前に手動 STT の Chunk が初めて完了すると、その merge は書かず、作り直した分離の後の merge が話者付きで入れる。"""
+    # Arrange: 中央の Chunk を手動 STT に回し、merge を別のワーカーで lease しておく（まだ書いていない）
+    pipeline, chunk_id = await _skipped_chunk_queued_for_manual_stt(client3, ctx3, runner3)
+    async with ctx3.db.write() as conn:
+        assert repo.insert_job(conn, "m-1", "merge_transcript") is not None
+        merge = repo_phase3.lease_job_fair(conn, "w-merge", ["merge_transcript"], now_ms())
+        assert merge is not None
+        stt = repo_phase3.lease_job_fair(conn, runner3.owner, ["transcribe_chunk"], now_ms())
+        assert stt is not None
+    # Act: 手動 STT が先にコミットし、その後に lease 済みの merge が書こうとする
+    await runner3._execute(stt)
+    await handlers_module.handle_merge(ctx3, merge)
+    with ctx3.db.read() as conn:
+        after_stale_merge = repo.get_meeting(conn, "m-1")
+        published = [s for s in repo.list_segments(conn, "m-1", merged_version=2) if s.chunk_id == chunk_id]
+    await runner3.run_until_idle()
+    # Assert: 古い merge は話者の無い segments を公開しない。分離を作り直した後の merge が版 2 に話者付きで入れる
+    assert after_stale_merge is not None and after_stale_merge.transcript_version == 1
+    assert published == []
+    assert len(pipeline.calls) == 2
+    _assert_recovered_chunk_has_speakers(ctx3, chunk_id)
+
+
 class _BlockingDiarization:
     """最初の呼び出しを gate が開くまで止める話者分離。同時に走っている呼び出しの最大数を記録する。"""
 
@@ -7111,6 +7153,7 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | 手動 STT の Chunk が分離の実行中に完了したら、実行中の分離を pending に戻して結果を捨てさせ、その Chunk を含めて分離し直してから merge する（§8 `on_transcribe_completed`・`repo_phase3.requeue_running_job`） | `test_manual_stt_finishing_during_diarize_reruns_the_diarize` |
 | 分離が手動 STT の Chunk より先に終わっても merge を作らず（`on_diarize_finished` は全 Chunk の終端を待つ）、Chunk の完了で分離を作り直す | `test_diarize_finishing_before_manual_stt_does_not_merge_early` |
 | merge の実行中（書き込みの後・完了の記録の前）に手動 STT の Chunk が初めて完了しても、結果を staged に置き、分離を作り直してから作り直した merge が話者付きで入れる（§21 `handle_transcribe`） | `test_manual_stt_committed_during_merge_rediarizes_then_remerges` |
+| lease 済みの merge が書く前に手動 STT の Chunk が初めて完了すると、その merge の行を消して書かせず（話者の無い segments を公開しない）、作り直した分離の完了後の merge が話者付きで入れる（§8 `on_transcribe_completed`・`repo_phase3.discard_meeting_job`） | `test_manual_stt_committed_before_leased_merge_writes_discards_that_merge` |
 | 同時に走らせる話者分離は `MAX_CONCURRENT_DIARIZE` 本まで。pending に戻した分離の次の試行は、旧い試行のスレッドが抜けるまで分離を始めず、その間 Runner は分離と（STT と並べない設定なら）要約を lease しない。lease した分離の行がある間も（枠を取る前でも）次の分離を lease しない。分離を待つハンドラがキャンセルされても、スレッドが抜けるまで枠を返さない（§7 `diarize_slots`・§9 `allowed_types`・§21 `handle_diarize`） | `test_requeued_diarize_waits_for_the_running_attempt`、`test_cancelled_diarize_keeps_the_slot_until_its_thread_exits`、`test_leased_diarize_blocks_next_diarize_before_taking_the_slot` |
 | 分離が failed で確定して作った merge ジョブ（`on_job_failed` の戻り値）は、Runner の失敗時も Sweeper の回数切れも、コミット後に流す（完了時の後続ジョブと同じ。§8 `on_job_failed`・§9 `_on_failure`・Phase 2 §14 `sweep_once`） | `test_failed_diarize_publishes_the_merge_job_it_creates`、`test_exhausted_diarize_publishes_the_merge_job_it_creates` |
 | 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
