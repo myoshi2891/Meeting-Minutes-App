@@ -3797,6 +3797,8 @@ _EN_DEADLINE_HINTS = re.compile(
 # 日付の後ろの英語の時刻（「11月20日5pm」の「5pm」）。_quote_hints が、日本語・数字の表現から英字を含むものを捨てるときに、
 # これだけは英字として数えない（日付と 1 つの表現なので、捨てると同じ日付・時刻の quote でも通らない）
 _TRAILING_TIME_EN = re.compile(rf"{_TIME_EN}$")
+# 期限の表現を切り出した残りの、組にならなかった英語の週の修飾（normalize 済みで空白が無い。_deadline_supported）
+_EN_UNPAIRED_WEEK = re.compile(r"(?:next|this)week")
 # 英語の「曜日 + 週」（「friday next week」。後ろの時刻はそのまま残す）。比べる形を「週 + 曜日」にそろえる（_hint_key）
 _EN_DAY_THEN_WEEK = re.compile(rf"({_WEEKDAYS_EN})(?:of)?(next|this)week(.*)")
 
@@ -3895,6 +3897,8 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     （会議の日付・タイムゾーン）をこの検証は持たず、換算の正しさを確かめられない。
     期限の表現を含まない deadline（「次回の定例まで」）は、正規化した文字列がそのまま quote に現れることを求める。
     英数字で始まる・終わる deadline は、quote の中でも英数字に挟まれない句全体として現れることを求める（_phrase_in）。
+    期限の表現と、組にならない週の修飾（「next week 5pm」「5pm next week」）を併せ持つ deadline は、表現のすべてに加えて
+    deadline 全体が句として quote に現れることを求める（時刻だけで比べると週の修飾が落ち、quote の「this week 5pm」が通る）。
     部分文字列で比べると、「next week」が「next weekend」の、「end of month」が「end of monthly」の先頭に当たる。
     quote は正規化前のもの（正規化は空白を落とし、語の境目が分からなくなる）。
 
@@ -3907,6 +3911,10 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     wanted = {_hint_key(m) for m in _DEADLINE_HINTS.findall(d)}
     if not wanted:
         return d != "" and _phrase_in(d, quote)
+    # 組にならない週の修飾（「next week 5pm」の「next week」）は表現として切り出されないので、時刻だけで比べると修飾が落ち、
+    # quote の「this week 5pm」が通る。残っていれば deadline 全体が句として quote に現れることも求める（期限の表現を含まない deadline と同じ扱い）
+    if _EN_UNPAIRED_WEEK.search(_DEADLINE_HINTS.sub("", d)):
+        return wanted <= _quote_hints(quote) and _phrase_in(d, quote)
     return wanted <= _quote_hints(quote)
 
 
@@ -7976,6 +7984,13 @@ def test_english_week_phrases_are_not_matched_as_fragments() -> None:
     assert reasons_for("end of month", "Suzuki will submit it by the end of the week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("next weekend", "Suzuki will submit it next week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("end of next week", "Suzuki checks at the end of the month, then submits next week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 時刻と組にならない週の修飾も落とさない（時刻が合っても週が違えば通さない）
+    assert reasons_for("next week 5pm", "Suzuki will submit it next week 5pm") == []
+    assert reasons_for("next week 5pm", "Suzuki will submit it this week 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("next week 5pm", "Suzuki will submit it at 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("5pm next week", "Suzuki will submit it 5pm this week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 句全体で比べるので、間に語の入る言い方（「next week at 5pm」）は通さない側に倒す（組の形の「at」の省略はここでは効かない）
+    assert reasons_for("next week 5pm", "Suzuki will submit it next week at 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 
 
 def test_day_after_tomorrow_is_one_expression() -> None:
