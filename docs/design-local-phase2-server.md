@@ -114,7 +114,7 @@ testpaths = ["tests"]
 | SQLite 書き込みは 1 接続 | `Database.write()` のみが `BEGIN IMMEDIATE` を発行。`asyncio.Lock` で直列化 | `grep -r "BEGIN" minutes_local/` が `db/connection.py` のみ |
 | ワーカーは DB を触らない | `stt/worker.py` は `minutes_local.db` を import しない。結果は dataclass で返す | import 検査テスト（§23.1） |
 | Provider 抽象 + Fake | STT / VAD / LLM は `Protocol` で定義し、実 Provider と Fake Provider を差し替え可能にする | テストは Fake のみ使う |
-| 外部通信は 2 モジュールのみ | `httpx` の import は `llm/ollama_provider.py` と `storage/models_dir.py` に限定 | import 検査テスト（§23.1） |
+| 外部通信は 2 モジュールのみ | `httpx` の import は `llm/ollama_provider.py` と `storage/models_dir.py` に限定。ほかの通信手段（`urllib.request`・`http.client`・`socket`・`subprocess`・asyncio の接続と子プロセス・`os.system` など）も許可したモジュールだけ（`socket` は待ち受けの `bootstrap.py`、`subprocess` は `bootstrap.py`・`hw/detect.py`。どちらも外へ接続しない） | import 検査テスト（§23.2） |
 | 例外を握りつぶさない | ジョブハンドラの例外は `JobError` 階層に正規化して `processing_jobs.error_class` に記録。`except Exception: pass` を書かない | コードレビュー |
 | 早期リターン | 判定の入れ子を避ける | — |
 
@@ -3735,7 +3735,8 @@ from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionRe
 # 挟めないと「来月の末」が「来月」だけに縮み、quote の「来月に提出」が deadline の「来月の末」を裏付けてしまう。
 # 年の付いた日付（「2026年11月20日」「26年11月20日」「2026/11/20」「26/11/20」）も年まで 1 つの表現にする。月日だけを切り出すと、quote の 2026 年が deadline の
 # 2027 年の同じ月日を裏付けてしまう（「2026/11/20」は「26/11」と切り出され、同じ年月の別の日も通る。2 桁の年の「26/11/20」も
-# 年まで切り出さないと「26/11」に縮み、「26/11/21」と同じ表現になる）。元号の付いた年（「令和8年」「令和元年」）は
+# 年まで切り出さないと「26/11」に縮み、「26/11/21」と同じ表現になる）。年が後ろの「11/20/2026」も年まで切り出す。スラッシュの日付は
+# 後ろに数字が続く位置で止めない（止めると「11/20/2026」が「11/20/20」に縮み、「11/20/2027」と同じ表現になる）。元号の付いた年（「令和8年」「令和元年」）は
 # 元号まで含める。数字の年だけを切り出すと、令和 8 年と平成 8 年の同じ月日が同じ表現になる（「元年」は数字でないので、月日だけになる）。
 # 相対の年（「再来年」「来年」「今年」「去年」。「の」は挟んでよい）も月日と 1 つの表現にする。月日だけを切り出すと、quote の
 # 「再来年11月20日」が deadline の「来年11月20日」を裏付けてしまう。「再来年」は「来年」より前に置く（「再来月」と同じ理由）。
@@ -3777,13 +3778,20 @@ _EN_DAY = (
 )
 _EN_DAY_TIME = rf"(?:{_EN_DAY})(?: ?(?:at ?)?{_TIME_EN})?"
 _EN_DEADLINE_ALTS = rf"{_EN_DAY_TIME}|next week|this week|end of|eod|eow"
+# 3 つ組のスラッシュの日付の終わり。後ろに数字が続くなら、それが時刻の始まり（normalize が空白を落とした「26/11/20 5pm」の「26/11/205pm」）の
+# ときだけ止まる。数字だけで止めると「11/20/2026」が「11/20/20」に縮んで「11/20/2027」と同じ表現になる
+_SLASH_DATE_END = r"(?:(?!\d)|(?=" + _TIME_EN + "|" + _TIME + "))"
 # 後ろに時刻を付けてよい日本語・数字の表現：日付（年・元号・相対の年を含む）、日本語の曜日（週の修飾・「日」を含む）、相対の月と日、相対の月の時期。
 # _DEADLINE_HINTS と _ATTACHED_TIME_EN で共有する
 _DATE = (
     r"(?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年|(?:再来年|来年|今年|去年)の?)?\d{1,2}月\d{1,2}日|"
-    r"(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})"
+    r"(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}" + _SLASH_DATE_END + r"|\d{1,2}/\d{1,2}/\d{4}" + _SLASH_DATE_END +
+    r"|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})"
 )
 _DAY_JA = rf"(?:(?:再来週|今週|来週)の?)?(?:{_WEEKDAYS_JA})日?"
+# 日付の後ろの曜日（「11月20日金曜」「11月20日の金曜日」）も日付と 1 つの表現にする（時刻と同じ。後ろの時刻もさらに付けてよい）。
+# 別々に切り出すと、quote の「11月20日に確認し、金曜に提出」の別の句の日付と曜日を寄せ集めて deadline の「11月20日金曜」を裏付けてしまう
+_DATE_WEEKDAY_JA = rf"(?:の?(?:{_WEEKDAYS_JA})日?)?"
 _MONTH_DAY_JA = r"(?:再来月|今月|来月)の?\d{1,2}日"
 # 相対の月の時期（「来月上旬」「今月の末」）。後ろの時刻（「来月上旬午後5時」）も 1 つの表現にする（日付と同じ）。別々に切り出すと、quote の
 # 「今月上旬午後5時」の時刻と別の句の「来月上旬」を寄せ集めて deadline の「来月上旬午後5時」を裏付けてしまう
@@ -3791,7 +3799,7 @@ _MONTH_PERIOD_JA = r"(?:再来月|今月|来月)の?(?:末|上旬|中旬|下旬)
 # 週末（「来週末」「来週の末」「週末」）も同じ。後ろの時刻（「来週末午後5時」）と 1 つの表現にする
 _WEEK_END_JA = r"(?:(?:再来週|今週|来週)の?末|週末)"
 _DEADLINE_HINTS = re.compile(
-    rf"({_DATE}{_TIME_SUFFIX}|{_TIME_EN}|{_TIME}|"
+    rf"({_DATE}{_DATE_WEEKDAY_JA}{_TIME_SUFFIX}|{_TIME_EN}|{_TIME}|"
     rf"{_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_PERIOD_JA}{_TIME_SUFFIX}|"
@@ -3908,7 +3916,8 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     deadline に期限の表現（_DEADLINE_HINTS）があれば、そのすべてが quote にも現れることを求める
     （「来週中に11月20日」は「来週」と「11月20日」の両方。quote の「来週」は deadline の「月末」「11月20日」を裏付けない）。
     「来週金曜」のような週と曜日の組は 1 つの表現で、比べるのは _hint_key でそろえた形（「来週の金曜」も同じ）。
-    日付と時刻（「11月20日午後5時」）も 1 つの表現で、quote の「11月20日午前9時」は通らない。曜日と時刻（「来週金曜9時」）・
+    日付と時刻（「11月20日午後5時」）も 1 つの表現で、quote の「11月20日午前9時」は通らない。日付と曜日（「11月20日金曜」）も同じで、
+    quote の「11月20日に確認し、金曜に提出」の寄せ集めでは通らず、曜日の付いた quote は曜日の無い deadline「11月20日」も裏付けない。曜日と時刻（「来週金曜9時」）・
     相対の月と日（「来月20日」）も同じで、quote の別の句の曜日と時刻や、「来月21日」の「来月」では通らない。英語の時刻も同じで、
     曜日・日付と時刻（「next friday 5pm」「11/20 5pm」。「at」の有無は問わない）を 1 つの表現として比べ、quote の「next Friday 9am」は通らない。
     表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たるのは
@@ -5880,10 +5889,11 @@ ChunkFactory = Callable[[float], bytes]
 
 ```python
 # tests/test_imports.py
-"""§4 の規則：httpx は 2 モジュールのみ、STT ワーカー系は DB を import しない。"""
+"""§4 の規則：httpx は 2 モジュールのみ（ほかの通信手段も許可したモジュールだけ）、STT ワーカー系は DB を import しない。"""
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import minutes_local
@@ -5910,6 +5920,58 @@ def test_httpx_only_in_allowed_modules() -> None:
         rel = p.relative_to(ROOT).as_posix()
         if "httpx" in _imports(p) and rel not in HTTPX_ALLOWED:
             offenders.append(rel)
+    assert offenders == []
+
+
+# httpx 以外の通信手段も、許可したモジュールだけが使う（外へ出る経路を httpx の 2 モジュールに絞る規則を、別の手段ですり抜けない）。
+# socket は待ち受けのソケットを作るだけ（bootstrap.bind_listen_socket）、subprocess は icacls・whoami・GPU の検出で、どちらも外へ接続しない。
+# 足すときは、外へ接続しないことを確かめてからここに書く
+NETWORK_ALLOWED: dict[str, set[str]] = {
+    "httpx": HTTPX_ALLOWED,
+    "socket": {"bootstrap.py"},
+    "subprocess": {"bootstrap.py", "hw/detect.py"},
+    "urllib.request": set(), "http.client": set(), "ftplib": set(), "smtplib": set(),
+    "requests": set(), "aiohttp": set(), "urllib3": set(), "websockets": set(),
+}
+# import を見るだけでは拾えない、どのモジュールからでも呼べる接続・子プロセスの起動（asyncio と os の関数）
+NETWORK_CALLS = {"open_connection", "open_unix_connection", "create_connection", "create_datagram_endpoint",
+                 "create_subprocess_exec", "create_subprocess_shell", "urlopen"}
+OS_PROCESS_CALLS = re.compile(r"system|popen|exec\w*|spawn\w*|posix_spawn\w*")
+
+
+def _imported_modules(path: Path) -> set[str]:
+    """import したモジュールの完全な名前。「from urllib import request」は「urllib.request」も数える。"""
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
+            names.update(f"{node.module}.{a.name}" for a in node.names)
+    return names
+
+
+def _network_calls(path: Path) -> set[str]:
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.Attribute):
+            continue
+        if node.attr in NETWORK_CALLS:
+            found.add(node.attr)
+        elif isinstance(node.value, ast.Name) and node.value.id == "os" and OS_PROCESS_CALLS.fullmatch(node.attr):
+            found.add(f"os.{node.attr}")
+    return found
+
+
+def test_network_modules_only_in_allowed_modules() -> None:
+    offenders = []
+    for p in ROOT.rglob("*.py"):
+        rel = p.relative_to(ROOT).as_posix()
+        for name in _imported_modules(p):
+            for module, allowed in NETWORK_ALLOWED.items():
+                if (name == module or name.startswith(module + ".")) and rel not in allowed:
+                    offenders.append(f"{rel}: {name}")
+        offenders.extend(f"{rel}: {call}" for call in sorted(_network_calls(p)))
     assert offenders == []
 
 
@@ -8172,6 +8234,46 @@ def test_two_digit_year_slash_date_is_matched_as_a_full_date() -> None:
     assert reasons_for("11/20", "鈴木さんが26/11/20までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 
 
+def test_slash_date_with_trailing_year_is_matched_as_a_full_date() -> None:
+    """年が後ろの「11/20/2026」も年まで 1 つの表現。「11/20/20」で切れて quote の「11/20/2027」が裏付けることはない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "c3c3c3c3-1212-4000-8000-000000000013"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 年が違えば通さない。同じ日付なら通る。年の無い月日も従来どおり通る
+    assert reasons_for("11/20/2026", "鈴木さんが11/20/2027までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11/20/2026", "鈴木さんが11/20/2026までに提出します") == []
+    assert reasons_for("2026/11/20", "鈴木さんが2027/11/20までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("2026/11/20", "鈴木さんが2026/11/20までに提出します") == []
+    assert reasons_for("11/20", "鈴木さんが11/20までに提出します") == []
+    # 時刻が付いても年で止まる（normalize で空白が落ちて年と時刻の数字が続く）
+    assert reasons_for("11/20/2026 5pm", "鈴木さんが11/20/2027 5pmまでに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11/20/2026 17時", "鈴木さんが11/20/2026 17時までに提出します") == []
+    assert reasons_for("26/11/20 5pm", "鈴木さんが26/11/20 5pmまでに提出します") == []
+    assert reasons_for("26/11/20 17:00", "鈴木さんが26/11/20 17:30までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_date_followed_by_weekday_is_one_hint() -> None:
+    """日付と曜日（「11月20日金曜」）は 1 つの表現。quote の別の句の日付と曜日を寄せ集めても裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "c3c3c3c3-1212-4000-8000-000000000014"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ日付と曜日なら通る（「の」「曜日」の違いは問わない）。曜日が違う・別の句の寄せ集めは通さない
+    assert reasons_for("11月20日金曜", "鈴木さんが11月20日金曜日までに提出します") == []
+    assert reasons_for("11月20日の金曜", "鈴木さんが11月20日金曜までに提出します") == []
+    assert reasons_for("11月20日金曜", "鈴木さんが11月20日木曜までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11月20日金曜", "鈴木さんが11月20日に確認し、金曜に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 曜日の付いた quote は曜日の無い deadline を裏付けない（時刻・年の付いた quote と同じ扱い）
+    assert reasons_for("11月20日", "鈴木さんが11月20日金曜までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
 def test_next_or_this_weekday_keeps_the_week_qualifier() -> None:
     """「next friday」「this friday」は 1 つの表現。quote の「this friday」は deadline の「next friday」を裏付けない（段 5）。"""
     def reasons_for(deadline: str, quote: str) -> list[str]:
@@ -9024,7 +9126,7 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | 録音中の操作が保存を止めない | `test_rerun_is_refused_while_recording_and_upload_continues`、`test_rerun_rejects_a_model_that_is_not_installed` |
 | 設定値の検証・存在しない会議 | `test_settings_are_validated_and_model_can_be_reset_to_auto`、`test_exclude_failed_on_unknown_meeting_is_404` |
 | STT 実行中は要約を lease しない | `test_allowed_types_excludes_summary_while_stt_running` |
-| 外部通信ゼロ（モジュール規則） | `test_httpx_only_in_allowed_modules` |
+| 外部通信ゼロ（モジュール規則） | `test_httpx_only_in_allowed_modules`・`test_network_modules_only_in_allowed_modules` |
 | 既存 DB のアップグレード（列補完） | `test_phase1_db_gains_missing_columns_and_keeps_rows`、`test_migrate_is_idempotent` |
 | lease 失効ワーカーの結果を書かせない | `test_expired_worker_cannot_write_segments` |
 | 空の正規化テキストを重複扱いしない | `test_similarity_treats_empty_normalized_text_as_different`、`test_empty_candidates_are_kept_both` |
