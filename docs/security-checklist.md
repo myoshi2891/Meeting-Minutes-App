@@ -105,7 +105,7 @@ Minutes で確認が必要だと現時点で分かっているセキュリティ
 | SE-01 | サーバーは loopback にだけ待ち受ける | `lsof -nP -iTCP:43117 -sTCP:LISTEN` が `127.0.0.1:43117` だけを示す。P2 で `serve --bind 0.0.0.0` を渡したとき、TLS が無いので拒否する | P1・P2 | P1 は実装（[__main__.py](../minutes_local/__main__.py#L13) で固定）。P2 は要確認（`--bind` の値をそのまま渡しており、拒否する記述を見つけられなかった） | |
 | SE-02 | 外へ通信できるモジュールは 2 つだけ | `httpx` を import するのが `llm/ollama_provider.py` と `storage/models_dir.py` だけ（依存規則の検査、P2 server §23.2） | P2 | 設計 | |
 | SE-03 | モデルの取得は明示操作のときだけ、許可したホストへ | 起動時・ジョブ実行時に取得が走らない。取得は https と `DOWNLOAD_ALLOWLIST` のホストだけで、リダイレクトは要求を出す前に 1 段ずつ検査する（最大 5 段）。許可外へのリダイレクトは `failed` | P2 | 設計（テストは P2 server §23.8.2） | |
-| SE-04 | 取得の要求に会議のデータもトークンも載らない | 取得中の要求を記録し、要求のパスがモデルのパスだけであること。ヘッダはプロトコル上必要なもの（`Host`、httpx 既定の `User-Agent`・`Accept`・`Accept-Encoding`・`Connection`）を許し、ヘッダと本文に会議のデータ・アプリのトークン・`HF_TOKEN` が無い。環境変数 `HF_TOKEN` があっても付かない | P2 | 設計（httpx を直接使い、ヘッダを付けない） | |
+| SE-04 | 取得の要求に会議のデータもトークンも載らない | 取得中の要求（リダイレクトで出す 1 段ごとの要求を含む）を記録し、要求のパスがモデルのパスだけであること。どの要求のクエリ文字列にも会議のデータ・アプリのトークン・`HF_TOKEN` が無い。ヘッダはプロトコル上必要なもの（`Host`、httpx 既定の `User-Agent`・`Accept`・`Accept-Encoding`・`Connection`）を許し、ヘッダと本文に会議のデータ・アプリのトークン・`HF_TOKEN` が無い。環境変数 `HF_TOKEN` があっても付かない | P2 | 設計（httpx を直接使い、ヘッダを付けない） | |
 | SE-05 | STT のモデルが無いとき、取りに行かずに失敗する | モデルのディレクトリを空にして STT を走らせ、外向きの接続が出ずに `ModelMissing` で失敗する。`WhisperModel` にはモデル名ではなくパスを渡す。`HF_HUB_OFFLINE=1` を P2 でも設定するか決める | P2 | パス渡しは設計。環境変数は P3 からで、P2 は未規定 | |
 | SE-06 | 話者分離が通信しない | ネットワークをつないだまま分離を 1 回実行し、終了後 60 秒待っても外向きの接続が無い。pyannote.audio 3.x と 4.x の両方で行う（`HF_HUB_OFFLINE`・`PYANNOTE_METRICS_ENABLED=false`、版は `>=3.1,<4.1`） | P3 | 設計（P3 server §24 の確認表）。実測は未 | |
 | SE-07 | そのほかの依存がテレメトリ・更新確認を送らない | STT・要約・分離の実行中に、サーバーのプロセスの接続を OS 側で見る（macOS: `lsof -nP -i -a -p <pid>`、`nettop -p <pid>`）。loopback 以外への接続が無い。対象: onnxruntime・ctranslate2・huggingface_hub・torch | P2・P3 | 未規定（手順があるのは pyannote だけ） | |
@@ -308,7 +308,7 @@ Minutes で確認が必要だと現時点で分かっているセキュリティ
 | RP-03 | 文書とテストに実物を書かない | 設計書・PROGRESS・テストに、実際のトークン（64 桁の 16 進）と実際の会議の内容が無い | P1 | 未確認 | |
 | RP-04 | テストは合成した音声を使う | `test/`・`server_tests/` が実際の録音を読まない | P1 | 未確認 | |
 | RP-05 | `private/` の中身が外部のサービスへ送られない | 実際の録音（`private/phase1-data`）が追跡外で、レビューサービスの対象に入らない | P1 | 実装（`private/*` を無視） | |
-| RP-06 | コードに秘密を埋め込まない | `grep -rnE "(token\|secret\|password)\s*[:=]\s*[\"'][A-Za-z0-9]{16,}" src minutes_local` が 0 件 | P1 | 未確認 | |
+| RP-06 | コードに秘密を埋め込まない | `grep -rniE "(token\|secret\|password)[a-z0-9_]*[\"']?[[:space:]]*(:[[:space:]]*[a-z_][a-z0-9_.]*[[:space:]]*)?[:=][[:space:]]*[\"'][a-z0-9_+/=-]{16,}" src minutes_local` が 0 件（大文字小文字を問わず、`apiToken`・`API_TOKEN`・`authToken`・`clientSecret` のように語を含む識別子、型注釈付きの代入（`apiToken: string = "…"`・`api_token: str = "…"`）、引用符付きのキー（`"token": "…"`）も拾う。値は 16 文字以上の英数字・`_`・`-`・`+`・`/`・`=`。2026-11-18 に macOS の grep で、この 8 つの形が当たり、短い値・関数呼び出しが当たらないことと、現状の `src` `minutes_local` で 0 件であることを確かめた） | P1 | 実装（2026-11-18 に 0 件を確認） | |
 
 ## 16. プライバシーと同意
 
