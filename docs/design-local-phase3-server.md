@@ -132,7 +132,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * バックアップ：`VACUUM INTO {dataDir}/backups/minutes-{世代番号}-{epoch ms}.sqlite`。**直近のバックアップから 24 時間たっていたら作る**（起動時と 1 時間ごとに判定。基準はファイル名の時刻で、プロセスの起動からの経過ではない）。世代数 `backup_generations`（既定 7）。起動のたびに作ると、短時間に再起動を 7 回くり返しただけで古い世代がすべて押し出される。使うたびにサーバーを起動する使い方でも 1 日 1 世代になる。世代管理・復元元の選択・期日の判定の「新しい順」は名前の時刻ではなく世代番号（既存の最大 + 1、ファイル名に残る）で決める。時刻で並べると、時計が戻った後に作った世代が前の世代より古い扱いになり、時計が追いつくと元の順に戻って、どちらでも新しい世代を消す・古い世代から復元する。最新の世代の時刻が現在より未来なら（作った後に時計が戻った）期日として作る（戻った後に作った世代は番号が最大なので、作った直後に消さず、毎周作り直さない）。`completed` 遷移ごとのバックアップは行わない（DB 全体の複製なので会議 1 件ごとには重く、世代もその分早く回る。失われるのは最長 24 時間分の要約とノートで、録音と transcript は録音ファイルから作り直せる）
 * バックアップは `.part` に書いてから名前を付け替える。書きかけ・失敗したファイルは正規の名前では残らず、復元元にも世代管理の対象にもならない
 * 起動時 `PRAGMA integrity_check`。`ok` 以外なら、壊れたファイルを `minutes.sqlite.corrupt-{epoch}` に退避し、**検査に通る最も新しいバックアップ**を復元して開く（最新が壊れていれば 1 つ古いものへ下がる）。使えるバックアップが 1 つもなければ**空の DB で起動する**（起動を止めない。サーバーが動いていなければブラウザは Chunk を送れない）
-* 復元の直後に、録音ファイルから DB にない会議と Chunk を作り直す（下の rebuild と同じ処理を `build_context` が自動で行う）。バックアップより後に録音した会議は DB にないが、ファイルは残っているためである。作り直した会議は transcript から処理し直す。バックアップより後の要約とノートは失われる。起動時に、復元元と作り直した件数を標準エラーに警告として出す（黙って古い状態に戻さない）
+* 復元の直後に、録音ファイルから DB にない会議と Chunk を作り直す（下の rebuild と同じ処理を `build_context` が自動で行う）。バックアップより後に録音した会議は DB にないが、ファイルは残っているためである。作り直した会議は transcript から処理し直す。バックアップより後の要約とノートは失われる。バックアップより後に行った手動の文字起こし（無音と判定した Chunk の手動 STT。`POST .../chunks/{source}/{sequenceNo}/transcribe`）も失われ、その Chunk は `skipped` のまま残る（バックアップの時点で STT の前なら、処理し直しで再び `skipped` になる）。手動の STT はもう一度実行する。起動時に、復元元と作り直した件数を標準エラーに警告として出す（黙って古い状態に戻さない）
 * `doctor --rebuild`：`recordings/` を走査し、`meeting.json`（finalize 時に書く。Phase 1 §13 の規約を Phase 3 で実装）と WAV/FLAC ヘッダから `meetings` / `audio_chunks` の欠損行を再構築する。既存行は上書きしない。**serve が動いているデータディレクトリには実行しない**（ロックが取れなければ終了コード 1。同じ Chunk の行を 2 つのプロセスが作り合う）
 * 再構築した会議の状態：`meeting.json` に終了時刻（`endedAtEpochMs`）があれば `finalized`（確定済み。serve の起動時にジョブを作る）、作成時の控えのまま（終了時刻なし）なら **`recording`** に戻す。確定前の会議を `finalized` にすると、ブラウザが持っている未送信の Chunk の PUT を 409 で断ってしまう（Recording-First）。`recording` に戻せば、Phase 1 の Recovery が残りを送って確定する。`meeting.json` が読めない会議は `finalized` にする。確定前に取ったバックアップから戻した会議は、行が `recording` などの確定前の状態で残る。確定時の控えがあれば、既存の行も `finalized` に進め、欠けている終了時刻などを控えから補う（ブラウザは確定を終えて再送しないので、そのままでは `resume_finalized` が拾わない）
 * 逆同期：`GET /chunks` は `save_status='missing'` の Chunk を `registered=false` で返す（Phase 1 契約の `registered` フィールドの意味の範囲内）。ブラウザ側が IndexedDB の Blob から再 PUT する（client 文書 §6）
@@ -2740,6 +2740,10 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
     finalized に進め、欠けている終了時刻・総フレーム数・停止理由を控えから補う。ブラウザは確定を終えて再送しないので、
     recording のままだと resume_finalized（finalized だけを拾う）がジョブを作らず、文字起こしされないまま止まる。
 
+    Chunk の STT の状態はバックアップの時点のまま動かさない（控えにもファイルにも STT の結果は無い）。バックアップの後に行った
+    手動の STT（無音と判定した Chunk の transcribe_silent_chunk）は失われ、その Chunk は skipped のまま残る
+    （バックアップの時点で STT の前なら、処理し直しで VAD が再び skipped にする）。手動の STT はもう一度実行する。
+
     呼び出すのは、そのデータディレクトリを使う serve がいないとき（`doctor --rebuild` はロックを取る。§22）か、
     serve 自身の起動時（DB の復元の直後。§22 build_context）だけ。動いているサーバーと並行すると、同じ Chunk の行を取り合う。
     """
@@ -4016,6 +4020,9 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         # 話者分離が終わっていると、ensure_merge_job は diarize_meeting を作り直さず merge へ進む。
         # 置き換える前の segments の話者を、同じ source で時間の重なりが最大のものから新しい segments へ移す（§21 の割当と同じ規則）。
         # 分離を再実行しないのは、ラベル（S1, S2…）が振り直されて利用者が付けた名前と食い違うため。話者の無い segments は移さない
+        # 既知の制限：分離の区間（turns）は保存していないので、引き継げるのは前の話者付き segments の時間範囲だけ。それと時間が
+        # 重ならない新しい segments（前の試行が拾わなかった発話）は話者なしで残る。ここに来るのはコミット後に lease が切れたジョブの
+        # 再試行（同じ音声・同じモデル）だけで、STT の再実行（request_rerun_stt）は segments を消して pending に戻すので通らない
         previous = repo_phase3.segments_of_chunk(conn, chunk.id) if replaced else []
         # 実行中の merge があれば、初めての完了（手動 STT）でも staged に置く。その merge の書き込みの後にコミットすると版に入らず、
         # 一意制約で merge も作れない。Runner が merge の完了で入れ替え待ちを見て作り直す（Phase 2 §12 handle_transcribe）。
