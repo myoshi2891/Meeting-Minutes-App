@@ -105,7 +105,7 @@ Minutes で確認が必要だと現時点で分かっているセキュリティ
 | SE-01 | サーバーは loopback にだけ待ち受ける | `lsof -nP -iTCP:43117 -sTCP:LISTEN` が `127.0.0.1:43117` だけを示す。P2 で `serve --bind 0.0.0.0` を渡したとき、TLS が無いので拒否する | P1・P2 | P1 は実装（[__main__.py](../minutes_local/__main__.py#L13) で固定）。P2 は要確認（`--bind` の値をそのまま渡しており、拒否する記述を見つけられなかった） | |
 | SE-02 | 外へ通信できるモジュールは 2 つだけ | `httpx` を import するのが `llm/ollama_provider.py` と `storage/models_dir.py` だけ（依存規則の検査、P2 server §23.2） | P2 | 設計 | |
 | SE-03 | モデルの取得は明示操作のときだけ、許可したホストへ | 起動時・ジョブ実行時に取得が走らない。取得は https と `DOWNLOAD_ALLOWLIST` のホストだけで、リダイレクトは要求を出す前に 1 段ずつ検査する（最大 5 段）。許可外へのリダイレクトは `failed` | P2 | 設計（テストは P2 server §23.8.2） | |
-| SE-04 | 取得の要求に会議のデータもトークンも載らない | 取得中の要求を記録し、ヘッダと本文にモデルのパス以外が無い。環境変数 `HF_TOKEN` があっても付かない | P2 | 設計（httpx を直接使い、ヘッダを付けない） | |
+| SE-04 | 取得の要求に会議のデータもトークンも載らない | 取得中の要求を記録し、要求のパスがモデルのパスだけであること。ヘッダはプロトコル上必要なもの（`Host`、httpx 既定の `User-Agent`・`Accept`・`Accept-Encoding`・`Connection`）を許し、ヘッダと本文に会議のデータ・アプリのトークン・`HF_TOKEN` が無い。環境変数 `HF_TOKEN` があっても付かない | P2 | 設計（httpx を直接使い、ヘッダを付けない） | |
 | SE-05 | STT のモデルが無いとき、取りに行かずに失敗する | モデルのディレクトリを空にして STT を走らせ、外向きの接続が出ずに `ModelMissing` で失敗する。`WhisperModel` にはモデル名ではなくパスを渡す。`HF_HUB_OFFLINE=1` を P2 でも設定するか決める | P2 | パス渡しは設計。環境変数は P3 からで、P2 は未規定 | |
 | SE-06 | 話者分離が通信しない | ネットワークをつないだまま分離を 1 回実行し、終了後 60 秒待っても外向きの接続が無い。pyannote.audio 3.x と 4.x の両方で行う（`HF_HUB_OFFLINE`・`PYANNOTE_METRICS_ENABLED=false`、版は `>=3.1,<4.1`） | P3 | 設計（P3 server §24 の確認表）。実測は未 | |
 | SE-07 | そのほかの依存がテレメトリ・更新確認を送らない | STT・要約・分離の実行中に、サーバーのプロセスの接続を OS 側で見る（macOS: `lsof -nP -i -a -p <pid>`、`nettop -p <pid>`）。loopback 以外への接続が無い。対象: onnxruntime・ctranslate2・huggingface_hub・torch | P2・P3 | 未規定（手順があるのは pyannote だけ） | |
@@ -157,7 +157,7 @@ Minutes で確認が必要だと現時点で分かっているセキュリティ
 | IN-04 | SHA-256 を受信した本文から計算し直す | ヘッダの値と本文が違う PUT は 422。同じキーへ別の内容は 409 | P1・P2 | 実装 | |
 | IN-05 | `X-Chunk-Meta` を型まで検証する | Base64URL でない値・JSON でない値・オブジェクトでない値・URL と食い違う値は 422 | P1・P2 | 実装（[phase1.py](../minutes_local/phase1.py#L171)） | |
 | IN-06 | JSON の本文の長さを制限する | `title` に 10 MB の文字列を渡す。上限を決めて 422 にする | P1・P2 | 未規定（`title` に上限が無い） | |
-| IN-07 | SQL はすべてプレースホルダ | `grep -n "execute(f" minutes_local` の該当箇所が、定数（列名・プレースホルダの数）だけを埋め込んでいる | P1・P2 | 実装（[phase1.py](../minutes_local/phase1.py#L113) と L350 の 2 か所、どちらも定数） | |
+| IN-07 | SQL はすべてプレースホルダ | `grep -rn "execute(f" minutes_local` の該当箇所が、定数（列名・プレースホルダの数）だけを埋め込んでいる | P1・P2 | 実装（[phase1.py](../minutes_local/phase1.py#L113) と L350 の 2 か所、どちらも定数） | |
 | IN-08 | ディスク上のファイルから DB を作り直すとき、ファイルの中身を信用しない | rebuild（P3）に、`meeting.json` の ID・パスが細工された会議、シンボリックリンクの会議ディレクトリを置く。データディレクトリの外を読まず、書かない | P3 | 要確認（深い JSON の扱いは設計にある。パスとリンクの扱いは未確認） | |
 | IN-09 | サーバーの応答を型ガードで受ける | `src/api` に応答への `as` キャストが無く、`contracts.ts` の型ガードを通す | P1〜P3 | 実装 | |
 | IN-10 | 保存するトークンの形式を検証する | 空白・非 ASCII を含む文字列を保存しない | P1 | 実装（[app.ts](../src/app/app.ts#L20)） | |
@@ -304,7 +304,7 @@ Minutes で確認が必要だと現時点で分かっているセキュリティ
 | ID | 確認項目 | 確認方法と合格基準 | 対象 | 事前評価 | 結果 |
 | --- | --- | --- | --- | --- | --- |
 | RP-01 | 秘密と録音を追跡しない | `.gitignore` に `.env`・`*.wav`・`recordings/`・`private/*` がある。`*.sqlite*`・`token`・`*.pem`・`*.key`・`models/` を足すか決める | P1 | 実装（前半）。後半は未規定 | |
-| RP-02 | 履歴に秘密と録音が無い | `git log --all --diff-filter=A --name-only -- '*.wav' '*token*' '.env*' '*.pem' '*.key' '*.sqlite'` が空 | P1 | 実施済（2026-11-17 に空を確認） | |
+| RP-02 | 履歴に秘密と録音が無い | (1) ファイル名：`git log --all --diff-filter=A --name-only -- '*.wav' '*.flac' '*token*' '.env*' '*.pem' '*.key' '*.sqlite'` が空。(2) 内容：履歴の全版を対象に秘密を走査し、該当が無い（例: `git grep -nE '[0-9a-f]{64}' $(git rev-list --all)` でトークンの形の値を探す。gitleaks などの専用ツールを使うなら依存の追加として扱う）。2 つとも行うまで合格にしない | P1 | 一部実施（2026-11-17 にファイル名の検査（FLAC を除く）だけ空を確認。内容の走査は未） | |
 | RP-03 | 文書とテストに実物を書かない | 設計書・PROGRESS・テストに、実際のトークン（64 桁の 16 進）と実際の会議の内容が無い | P1 | 未確認 | |
 | RP-04 | テストは合成した音声を使う | `test/`・`server_tests/` が実際の録音を読まない | P1 | 未確認 | |
 | RP-05 | `private/` の中身が外部のサービスへ送られない | 実際の録音（`private/phase1-data`）が追跡外で、レビューサービスの対象に入らない | P1 | 実装（`private/*` を無視） | |
