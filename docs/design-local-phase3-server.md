@@ -1313,7 +1313,8 @@ class JobRunner:
         """ハンドラを実行する。STT は抜けるまで ctx.stt_in_flight に数える（allowed_types が分離を lease しない）。
 
         抜けるのは推論が終わったとき（行を消されていれば lease の検査で結果を捨てる）か、タイムアウトでプールを作り直したとき
-        （ワーカーごと止まる。Phase 2 §13 PoolExecutor）
+        （ワーカーごと止まる。Phase 2 §13 PoolExecutor）。ハンドラがキャンセルで抜けても推論のワーカーは止まらないので、
+        その分は _run_stt が推論の終わりまで数え続ける（_hold_stt_until_done。ここでは推論のタスクが見えない）
         """
         if job.job_type not in STT_TYPES:
             return await handler(self.ctx, job)
@@ -3971,11 +3972,35 @@ async def _run_stt(ctx: AppContext, job: Job, chunk: AudioChunk, *, with_overlap
     timeout_s = max(30.0, chunk.duration_ms / 1000 * factor)
     req = STTRequest(pcm=stt_input, model_name=model_name, compute_type=compute, device=device, models_dir=str(ctx.settings.models_dir),
                      language=language, beam_size=1 if ctx.models.tier == "cpu_only" else 5)
+    # 推論は別のタスクで待ち、shield で包む。このハンドラがキャンセルされても（サーバーの終了など）推論のワーカーは止まらない
+    # （ProcessPool の実行中のタスクも asyncio.to_thread のスレッドも cancel できない）。_run_handler の数（ctx.stt_in_flight）は
+    # ハンドラが抜けた時点で減るので、キャンセルで抜けるときは、推論が終わるかプールの作り直しでワーカーが止まって
+    # タスクが終わるまで、ここで 1 つ数えておく（_hold_stt_until_done。数えないと、その推論と並んで分離を lease する）
+    work = asyncio.ensure_future(ctx.stt.transcribe(req, timeout_s))
     try:
-        result = await ctx.stt.transcribe(req, timeout_s)
+        result = await asyncio.shield(work)
     except asyncio.TimeoutError as e:
         raise JobTimeoutError(f"stt timeout after {timeout_s:.0f}s") from e
+    except asyncio.CancelledError:
+        if not work.done():
+            _hold_stt_until_done(ctx, work)
+        raise
     return result, prefix_ms, model_name, language, guess
+
+
+def _hold_stt_until_done(ctx: AppContext, work: asyncio.Future[STTResult]) -> None:
+    """キャンセルで抜けたハンドラの推論を、終わるまで ctx.stt_in_flight に数える（allowed_types が分離を lease しない）。
+
+    _run_handler の finally が減らすより前に増やすので、数は 0 に落ちない。プールの作り直し（タイムアウト・異常終了・サーバーの終了）で
+    ワーカーが止まると、推論のタスクは BrokenProcessPool などで終わり、そこで返す（handle_diarize の _release_when_done と同じ）
+    """
+    ctx.stt_in_flight += 1
+
+    def done(task: asyncio.Future[STTResult]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            log.warning("stt finished after its handler was cancelled: %s", task.exception())
+        ctx.stt_in_flight -= 1
+    work.add_done_callback(done)
 
 
 def _segments_from(result: STTResult, chunk: AudioChunk, prefix_ms: int, language: str) -> list[Segment]:
@@ -6038,6 +6063,65 @@ async def test_withdrawn_running_stt_blocks_diarize_until_it_ends(client3: httpx
         gate.set()
         await asyncio.wait_for(running, 5)
     # Assert: 抜けたら分離を lease できる
+    assert "diarize_meeting" in runner3.allowed_types()
+
+
+class _UncancellableSTT:
+    """推論が gate で止まる STT の実行器。実物（PoolExecutor）と同じく、呼び出し側をキャンセルすると待つのはすぐやめるが、
+    推論そのもの（ワーカーの実行中のタスク）は止まらない。推論を別のタスクにして shield で待つことで模す。"""
+
+    def __init__(self) -> None:
+        self.entered, self.gate = asyncio.Event(), asyncio.Event()
+        self.inference: asyncio.Task[None] | None = None
+
+    async def _infer(self) -> None:
+        self.entered.set()
+        await self.gate.wait()
+        raise RuntimeError("stopped by the test")   # 結果は使わない（ハンドラはキャンセル済み）
+
+    async def transcribe(self, req: Any, timeout_s: float) -> Any:
+        if self.inference is None:
+            self.inference = asyncio.create_task(self._infer())
+        await asyncio.shield(self.inference)
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
+async def test_cancelled_stt_keeps_blocking_diarize_until_inference_ends(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                        runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """STT のハンドラがキャンセルされても（サーバーの終了など）、推論が終わるまで ctx.stt_in_flight に数え、分離を lease させない（§21 _run_stt）。"""
+    # Arrange: STT の推論が走っている。行は STT の再実行で消し、実行中の数だけで判定させる
+    await _two_source_meeting(client3)
+    stt = _UncancellableSTT()
+    monkeypatch.setattr(ctx3, "stt", stt)
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE meeting_id = 'm-1'")
+        chunk = repo.list_chunks(conn, "m-1")[0]
+        repo.insert_job(conn, "m-1", "transcribe_chunk", chunk_id=chunk.id)
+        job = repo_phase3.lease_job_fair(conn, runner3.owner, ["transcribe_chunk"], now_ms())
+        assert job is not None
+    running = asyncio.create_task(runner3._execute(job))
+    await asyncio.wait_for(stt.entered.wait(), 5)
+    async with ctx3.db.write() as conn:
+        request_rerun_stt(conn, "m-1", None)
+    # Act: ハンドラをキャンセルする
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, 5)
+    # Assert: ハンドラは抜けたが、推論が走っている間は数え続け、分離を lease しない
+    assert stt.inference is not None and not stt.inference.done()
+    assert ctx3.stt_in_flight == 1
+    assert "diarize_meeting" not in runner3.allowed_types()
+    # Act: 推論が終わる
+    stt.gate.set()
+    for _ in range(500):
+        if ctx3.stt_in_flight == 0:
+            break
+        await asyncio.sleep(0.01)
+    # Assert: 終わったら数を返し、分離を lease できる
+    assert ctx3.stt_in_flight == 0
     assert "diarize_meeting" in runner3.allowed_types()
 
 
