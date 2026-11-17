@@ -3777,11 +3777,18 @@ _EN_DAY = (
 )
 _EN_DAY_TIME = rf"(?:{_EN_DAY})(?: ?(?:at ?)?{_TIME_EN})?"
 _EN_DEADLINE_ALTS = rf"{_EN_DAY_TIME}|next week|this week|end of|eod|eow"
+# 後ろに時刻を付けてよい日本語・数字の表現：日付（年・元号・相対の年を含む）、日本語の曜日（週の修飾・「日」を含む）、相対の月と日。
+# _DEADLINE_HINTS と _ATTACHED_TIME_EN で共有する
+_DATE = (
+    r"(?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年|(?:再来年|来年|今年|去年)の?)?\d{1,2}月\d{1,2}日|"
+    r"(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})"
+)
+_DAY_JA = rf"(?:(?:再来週|今週|来週)の?)?(?:{_WEEKDAYS_JA})日?"
+_MONTH_DAY_JA = r"(?:再来月|今月|来月)の?\d{1,2}日"
 _DEADLINE_HINTS = re.compile(
-    r"((?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年|(?:再来年|来年|今年|去年)の?)?\d{1,2}月\d{1,2}日|(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})"
-    rf"{_TIME_SUFFIX}|{_TIME_EN}|{_TIME}|"
-    rf"(?:(?:再来週|今週|来週)の?)?(?:{_WEEKDAYS_JA})日?{_TIME_SUFFIX}|"
-    rf"(?:再来月|今月|来月)の?\d{{1,2}}日{_TIME_SUFFIX}|"
+    rf"({_DATE}{_TIME_SUFFIX}|{_TIME_EN}|{_TIME}|"
+    rf"{_DAY_JA}{_TIME_SUFFIX}|"
+    rf"{_MONTH_DAY_JA}{_TIME_SUFFIX}|"
     r"(?:再来月|今月|来月)の?(?:末|上旬|中旬|下旬)|(?:再来週|今週|来週)の?末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
     rf"{_EN_DEADLINE_ALTS})",
     re.IGNORECASE,
@@ -3797,6 +3804,11 @@ _EN_DEADLINE_HINTS = re.compile(
 # 日付の後ろの英語の時刻（「11月20日5pm」の「5pm」）。_quote_hints が、日本語・数字の表現から英字を含むものを捨てるときに、
 # これだけは英字として数えない（日付と 1 つの表現なので、捨てると同じ日付・時刻の quote でも通らない）
 _TRAILING_TIME_EN = re.compile(rf"{_TIME_EN}$")
+# 正規化前の quote（_spaced）で、日付・日本語の曜日・相対の月と日の後ろに付いた英語の時刻（「11/20 5pm」「金曜日の 5pm」）。
+# 正規化した quote では区切りが落ちて日付と 1 つの表現（「11/205pm」）になるので、_quote_hints は英語の表現を切り出す前にこの時刻を
+# 落とす。落とさないと、同じ時刻が時刻だけの表現（「5pm」）としても数えられ、quote の「11/20 5pm」が deadline の「5pm」を裏付けてしまう。
+# 区切りは _spaced で空白 1 つになり、「の」は挟んでよい（_TIME_SUFFIX と同じ）。「at」を挟んだもの（「11/20 at 5pm」）は日付に付かない
+_ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}) ?(?:の ?)?){_TIME_EN}")
 # 期限の表現を切り出した残りの、組にならなかった英語の週の修飾（normalize 済みで空白が無い。_deadline_supported）
 _EN_UNPAIRED_WEEK = re.compile(r"(?:next|this)week")
 # 英語の「曜日 + 週」（「friday next week」。後ろの時刻はそのまま残す）。比べる形を「週 + 曜日」にそろえる（_hint_key）
@@ -3906,6 +3918,9 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     複数のタスクと期限がある（「今月上旬に確認し、来月下旬に提出」）と、別のタスクの期限も通る。担当者（段 4）も同じ。
     どの期限・人がどのタスクに掛かるかは係り受けの解析が要り、決定的な規則では誤検出と見逃しが多いので、既知の制限とする
     （基本設計 §12.5 段 4・5。段 3a (4) の否定と同じ扱い。UI の根拠リンクで利用者が元発言と照らす）
+    期限表現の前後の向き・範囲の語（「まで」「以降」「から」「以前」「by」「after」）も比べない。deadline の「11月20日まで」は
+    quote の「11月20日以降」でも通る（同じ「11月20日」を裏付けとみなす）。向きは期限表現の外の助詞・語で表れ、言い換え（「以後」「より後」
+    「を過ぎてから」）も多いので、決定的な規則では誤検出と見逃しが多い。段 3a (4) の否定・極性と同じ理由で既知の制限とする
     """
     d = normalize(deadline)
     wanted = {_hint_key(m) for m in _DEADLINE_HINTS.findall(d)}
@@ -3923,10 +3938,12 @@ def _quote_hints(quote: str) -> set[str]:
 
     日本語・数字の表現は正規化した文字列から切り出す（区切りの違い「来週、金曜」を問わない）。英語の表現（英字を含むもの）は
     そこから捨て、正規化前の quote（_spaced。区切りを空白に置き換える）から語の境目つきで切り出す（_EN_DEADLINE_HINTS）。
-    正規化した文字列では語の境目が分からず、「Simon day」が「monday」に、「meow」が「eow」に当たる
+    正規化した文字列では語の境目が分からず、「Simon day」が「monday」に、「meow」が「eow」に当たる。
+    日付・日本語の曜日に付いた英語の時刻（「11/20 5pm」の「5pm」）は日本語の表現（「11/205pm」）が使ったので、英語の表現からは除く
+    （_ATTACHED_TIME_EN。除かないと時刻だけの deadline「5pm」を裏付ける）。別の句の時刻だけの表現（「11/20 9am、確認は5pm」の「5pm」）は残す
     """
     japanese = {_hint_key(m) for m in _DEADLINE_HINTS.findall(normalize(quote)) if _is_japanese_hint(m)}
-    english = {_hint_key(m) for m in _EN_DEADLINE_HINTS.findall(_spaced(quote))}
+    english = {_hint_key(m) for m in _EN_DEADLINE_HINTS.findall(_ATTACHED_TIME_EN.sub(r"\1", _spaced(quote)))}
     return japanese | english
 
 
@@ -8077,6 +8094,11 @@ def test_english_time_must_match_the_quote() -> None:
     assert reasons_for("11/20 5pm", "鈴木さんが11/20 9amまでに提出") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("11月20日 5:30pm", "鈴木さんが11月20日5:30amまでに提出") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("5pm", "Suzuki will submit it at 9am") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 日付・曜日に付いた時刻は、時刻だけの deadline を裏付けない（時刻の無い日付と同じ扱い）
+    assert reasons_for("5pm", "鈴木さんが11/20 5pmまでに提出") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("5pm", "鈴木さんが金曜日の 5pm までに提出") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 別の句の時刻だけの表現は、日付に付いた時刻があっても数える
+    assert reasons_for("5pm", "鈴木さんが11/20 9am、確認は5pmまで") == []
     # 同じなら、空白・大文字小文字・「at」の有無が違っても通る
     assert reasons_for("next Friday 5pm", "Suzuki will submit it next friday at 5 PM.") == []
     assert reasons_for("11/20 5pm", "鈴木さんが11/20 5pmまでに提出") == []
