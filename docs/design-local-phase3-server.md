@@ -2742,7 +2742,11 @@ def _relink_chunk(conn: sqlite3.Connection, data_dir: Path, chunk: AudioChunk, f
     restored = _chunk_from_file(f, codec)
     if restored is None or restored[1] != chunk.sha256:
         return False
-    encoded = f.read_bytes()
+    try:
+        encoded = f.read_bytes()
+    except OSError:
+        # 検証の後に読めなくなった（権限・取り外し）。この Chunk だけ向け直さず、rebuild と起動時の復元を止めない
+        return False
     repo.update_chunk(conn, chunk.id, local_path=rel, codec=_codec_of(f), size_bytes=len(encoded), save_status="verified",
                       sha256_flac=None if f.suffix == ".wav" else sha256_hex(encoded))
     return True
@@ -2807,7 +2811,8 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
             if not sdir.is_dir():
                 continue
             for f in sorted(sdir.iterdir()):
-                if f.suffix not in (".wav", ".flac", ".fake") or not f.stem.isdigit():
+                # ASCII の数字だけを連番として受ける。str.isdigit() は「²」なども真にするが int() は投げ、rebuild 全体（起動時の復元）が止まる
+                if f.suffix not in (".wav", ".flac", ".fake") or not (f.stem.isascii() and f.stem.isdigit()):
                     continue
                 seq = int(f.stem)
                 if not _is_sqlite_epoch_ms(seq):
@@ -7141,6 +7146,60 @@ async def test_rebuild_reverifies_missing_chunk_whose_file_was_restored(client3:
     assert row is not None and row.save_status == "verified" and row.local_path == rows[0].local_path
 
 
+async def test_rebuild_skips_relink_when_alternate_becomes_unreadable(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                       runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """向け直す先のファイルが検証の後に読めなくなっても、rebuild を止めずにその Chunk だけ向け直さない。"""
+    # Arrange: 圧縮後に行だけを圧縮前（WAV）に戻す。1 つ目の圧縮ファイルは 2 回目の読み取り（向け直しの直前）で失敗させる
+    data_dir = ctx3.settings.data_dir
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        old_rows = sorted(repo.list_chunks(conn, "m-1"), key=lambda c: c.sequence_no)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        for c in old_rows:
+            repo.update_chunk(conn, c.id, local_path=c.local_path, codec="wav", sha256_flac=None, size_bytes=c.size_bytes)
+    flaky = (data_dir / old_rows[0].local_path).with_suffix(".fake")
+    reads = {"n": 0}
+    original = Path.read_bytes
+
+    def read_bytes_failing_second_time(self: Path) -> bytes:
+        if self == flaky:
+            reads["n"] += 1
+            if reads["n"] == 2:
+                raise PermissionError("unreadable")
+        return original(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_failing_second_time)
+    # Act
+    with ctx3.db.write_sync() as conn:
+        report = rebuild(conn, data_dir, ctx3.codec)
+        first = repo.get_chunk(conn, old_rows[0].id)
+        second = repo.get_chunk(conn, old_rows[1].id)
+    # Assert: 読めなかった方は向け直さず（行が指す WAV はないので missing）、もう一方は向け直す
+    assert reads["n"] == 2
+    assert (report.chunks_relinked, report.chunks_marked_missing) == (1, 1)
+    assert first is not None and first.local_path == old_rows[0].local_path and first.save_status == "missing"
+    assert second is not None and second.local_path.endswith(".fake") and second.save_status == "verified"
+
+
+async def test_rebuild_skips_recording_named_with_non_ascii_digits(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                   runner3: JobRunner) -> None:
+    """連番の名前に ASCII 以外の数字（「²」は str.isdigit() が真で int() が投げる）があっても、そのファイルだけ除いて復元する。"""
+    # Arrange: 会議の行を消し、正しい録音の横に「².wav」を置く
+    await _completed_meeting(client3, runner3, ctx3)
+    mic = ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "mic"
+    (mic / "².wav").write_bytes(sorted(mic.glob("*.wav"))[0].read_bytes())
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        chunks = repo.list_chunks(conn, "m-1")
+    # Assert: 正しい録音は復元し、規約外の名前は Chunk にしない
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert sorted(c.sequence_no for c in chunks) == [0, 1]
+
+
 async def test_rebuild_tolerates_snapshot_that_is_not_an_object(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
     """meeting.json の最上位がオブジェクトでなくても、控えなしとして復元する。"""
     # Arrange
@@ -7356,7 +7415,7 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | 欠損 Chunk が `registered=false` で返り、再 PUT で復旧 | テスト済 | §20.2、§23.6 |
 | 利用者ごとの分離、公平 lease、TLS 証明書、LAN bind の TLS 必須 | テスト済（証明書生成）・実機（ブラウザ受け入れ・LAN 遅延） | §19、§20.1、§23.7 |
 | Phase 1 §12・Phase 2 §14 の契約が不変 | テスト済 | §23.1（Phase 2 テストの回帰） |
-| 外部通信ゼロ（`httpx` は 2 モジュールのみ） | テスト済 | Phase 2 `test_imports.py` が Phase 3 でも通る |
+| 外部通信ゼロ（`httpx` は 2 モジュールのみ。ほかの通信手段も許可したモジュールだけ） | テスト済 | Phase 2 `test_imports.py` が Phase 3 でも通る |
 
 ## 24.3 実装順序
 
