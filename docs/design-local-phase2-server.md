@@ -3777,7 +3777,7 @@ _EN_DAY = (
 )
 _EN_DAY_TIME = rf"(?:{_EN_DAY})(?: ?(?:at ?)?{_TIME_EN})?"
 _EN_DEADLINE_ALTS = rf"{_EN_DAY_TIME}|next week|this week|end of|eod|eow"
-# 後ろに時刻を付けてよい日本語・数字の表現：日付（年・元号・相対の年を含む）、日本語の曜日（週の修飾・「日」を含む）、相対の月と日。
+# 後ろに時刻を付けてよい日本語・数字の表現：日付（年・元号・相対の年を含む）、日本語の曜日（週の修飾・「日」を含む）、相対の月と日、相対の月の時期。
 # _DEADLINE_HINTS と _ATTACHED_TIME_EN で共有する
 _DATE = (
     r"(?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年|(?:再来年|来年|今年|去年)の?)?\d{1,2}月\d{1,2}日|"
@@ -3785,11 +3785,15 @@ _DATE = (
 )
 _DAY_JA = rf"(?:(?:再来週|今週|来週)の?)?(?:{_WEEKDAYS_JA})日?"
 _MONTH_DAY_JA = r"(?:再来月|今月|来月)の?\d{1,2}日"
+# 相対の月の時期（「来月上旬」「今月の末」）。後ろの時刻（「来月上旬午後5時」）も 1 つの表現にする（日付と同じ）。別々に切り出すと、quote の
+# 「今月上旬午後5時」の時刻と別の句の「来月上旬」を寄せ集めて deadline の「来月上旬午後5時」を裏付けてしまう
+_MONTH_PERIOD_JA = r"(?:再来月|今月|来月)の?(?:末|上旬|中旬|下旬)"
 _DEADLINE_HINTS = re.compile(
     rf"({_DATE}{_TIME_SUFFIX}|{_TIME_EN}|{_TIME}|"
     rf"{_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_DAY_JA}{_TIME_SUFFIX}|"
-    r"(?:再来月|今月|来月)の?(?:末|上旬|中旬|下旬)|(?:再来週|今週|来週)の?末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
+    rf"{_MONTH_PERIOD_JA}{_TIME_SUFFIX}|"
+    r"(?:再来週|今週|来週)の?末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
     rf"{_EN_DEADLINE_ALTS})",
     re.IGNORECASE,
 )
@@ -3804,13 +3808,14 @@ _EN_DEADLINE_HINTS = re.compile(
 # 日付の後ろの英語の時刻（「11月20日5pm」の「5pm」）。_quote_hints が、日本語・数字の表現から英字を含むものを捨てるときに、
 # これだけは英字として数えない（日付と 1 つの表現なので、捨てると同じ日付・時刻の quote でも通らない）
 _TRAILING_TIME_EN = re.compile(rf"{_TIME_EN}$")
-# 正規化前の quote（_spaced）で、日付・日本語の曜日・相対の月と日の後ろに付いた英語の時刻（「11/20 5pm」「金曜日の 5pm」）。
+# 正規化前の quote（_spaced）で、日付・日本語の曜日・相対の月と日・相対の月の時期の後ろに付いた英語の時刻（「11/20 5pm」「金曜日の 5pm」）。
 # 正規化した quote では区切りが落ちて日付と 1 つの表現（「11/205pm」）になるので、_quote_hints は英語の表現を切り出す前にこの時刻を
 # 落とす。落とさないと、同じ時刻が時刻だけの表現（「5pm」）としても数えられ、quote の「11/20 5pm」が deadline の「5pm」を裏付けてしまう。
 # 区切りは _spaced で空白 1 つになり、「の」は挟んでよい（_TIME_SUFFIX と同じ）。「at」を挟んだもの（「11/20 at 5pm」）は日付に付かない
-_ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}) ?(?:の ?)?){_TIME_EN}")
-# 期限の表現を切り出した残りの、組にならなかった英語の週の修飾（normalize 済みで空白が無い。_deadline_supported）
-_EN_UNPAIRED_WEEK = re.compile(r"(?:next|this)week")
+_ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}|{_MONTH_PERIOD_JA}) ?(?:の ?)?){_TIME_EN}")
+# 期限の表現を切り出した残りの、組にならなかった英語の週・月・年の修飾（normalize 済みで空白が無い。_deadline_supported）。
+# 月・年（「next month 5pm」「this year」）は表現として切り出さないので、残っていれば週と同じく deadline 全体を句として求める
+_EN_UNPAIRED_PERIOD = re.compile(r"(?:next|this)(?:week|month|year)")
 # 英語の「曜日 + 週」（「friday next week」。後ろの時刻はそのまま残す）。比べる形を「週 + 曜日」にそろえる（_hint_key）
 _EN_DAY_THEN_WEEK = re.compile(rf"({_WEEKDAYS_EN})(?:of)?(next|this)week(.*)")
 
@@ -3909,8 +3914,9 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     （会議の日付・タイムゾーン）をこの検証は持たず、換算の正しさを確かめられない。
     期限の表現を含まない deadline（「次回の定例まで」）は、正規化した文字列がそのまま quote に現れることを求める。
     英数字で始まる・終わる deadline は、quote の中でも英数字に挟まれない句全体として現れることを求める（_phrase_in）。
-    期限の表現と、組にならない週の修飾（「next week 5pm」「5pm next week」）を併せ持つ deadline は、表現のすべてに加えて
-    deadline 全体が句として quote に現れることを求める（時刻だけで比べると週の修飾が落ち、quote の「this week 5pm」が通る）。
+    期限の表現と、組にならない週・月・年の修飾（「next week 5pm」「5pm next week」「next month 5pm」）を併せ持つ deadline は、表現のすべてに加えて
+    deadline 全体が句として quote に現れることを求める（時刻だけで比べると修飾が落ち、quote の「this week 5pm」「this month 5pm」が通る）。
+    相対の月の時期と時刻（「来月上旬午後5時」）も 1 つの表現で、quote の「今月上旬午後5時」の時刻と別の句の「来月上旬」では通らない。
     部分文字列で比べると、「next week」が「next weekend」の、「end of month」が「end of monthly」の先頭に当たる。
     quote は正規化前のもの（正規化は空白を落とし、語の境目が分からなくなる）。
 
@@ -3926,9 +3932,10 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     wanted = {_hint_key(m) for m in _DEADLINE_HINTS.findall(d)}
     if not wanted:
         return d != "" and _phrase_in(d, quote)
-    # 組にならない週の修飾（「next week 5pm」の「next week」）は表現として切り出されないので、時刻だけで比べると修飾が落ち、
-    # quote の「this week 5pm」が通る。残っていれば deadline 全体が句として quote に現れることも求める（期限の表現を含まない deadline と同じ扱い）
-    if _EN_UNPAIRED_WEEK.search(_DEADLINE_HINTS.sub("", d)):
+    # 組にならない週・月・年の修飾（「next week 5pm」の「next week」、「next month 5pm」の「next month」）は表現として切り出されないので、
+    # 時刻だけで比べると修飾が落ち、quote の「this week 5pm」「this month 5pm」が通る。残っていれば deadline 全体が句として quote に
+    # 現れることも求める（期限の表現を含まない deadline と同じ扱い）
+    if _EN_UNPAIRED_PERIOD.search(_DEADLINE_HINTS.sub("", d)):
         return wanted <= _quote_hints(quote) and _phrase_in(d, quote)
     return wanted <= _quote_hints(quote)
 
@@ -7824,6 +7831,26 @@ def test_deadline_is_not_assembled_from_parts_of_other_dates() -> None:
     assert reasons_for("来月上旬") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 
 
+def test_month_period_and_time_are_one_expression() -> None:
+    """「来月上旬午後5時」は月の時期と時刻で 1 つの表現。quote の別の月の時期に付いた時刻を寄せ集めても裏付けない（段 5）。"""
+    # Arrange
+    sid = "dededede-4545-4000-8000-000000000045"
+
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        index = SegmentIndex({sid: quote})
+        item = {"task": "見積もりを出す", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]],
+                "quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ組（「の」の有無は問わない）なら通る
+    assert reasons_for("来月上旬午後5時", "鈴木さんが来月上旬の午後5時までに見積もりを出します") == []
+    # 別の月の時期に付いた時刻と、時刻の無い「来月上旬」を寄せ集めても通さない
+    assert reasons_for("来月上旬午後5時", "鈴木さんが今月上旬午後5時に確認し、来月上旬に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 月の時期に付いた英語の時刻は、時刻だけの deadline を裏付けない（日付に付いた時刻と同じ。_ATTACHED_TIME_EN）
+    assert reasons_for("5pm", "鈴木さんが来月上旬 5pm に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("来月上旬5pm", "鈴木さんが来月上旬 5pm に見積もりを出します") == []
+
+
 def test_deadline_year_must_match_the_quote() -> None:
     """年の付いた日付は年まで 1 つの表現。quote の 2026 年は deadline の 2027 年の同じ月日を裏付けない（段 5）。"""
     # Arrange
@@ -8006,6 +8033,10 @@ def test_english_week_phrases_are_not_matched_as_fragments() -> None:
     assert reasons_for("next week 5pm", "Suzuki will submit it this week 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("next week 5pm", "Suzuki will submit it at 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("5pm next week", "Suzuki will submit it 5pm this week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 月・年の修飾も同じ（表現として切り出されないので、時刻だけで比べると修飾が落ちる）
+    assert reasons_for("next month 5pm", "Suzuki will submit it next month 5pm") == []
+    assert reasons_for("next month 5pm", "Suzuki will submit it this month 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("this year 5pm", "Suzuki will submit it next year 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     # 句全体で比べるので、間に語の入る言い方（「next week at 5pm」）は通さない側に倒す（組の形の「at」の省略はここでは効かない）
     assert reasons_for("next week 5pm", "Suzuki will submit it next week at 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 

@@ -1006,6 +1006,10 @@ v4.0 §67〜§68 を継承する。再生成は新しい `version` 行を追加�
 * クライアントは、表示中の transcript が要約と同じ版か新しい版のとき、引用先が transcript にあるかを照合する（詳細設計 client §11 `unresolvedCitations`）。同じ版でも照合するのは、手動 STT（`request_rerun_stt`）が segments の行を先に消し、次の版を確定するのはその後の merge だからである（その間の `GET /transcript` は同じ版のまま行が欠ける）。表示中の transcript が要約より古い（取得待ち）・まだ無いときだけ照合せず、取り直しを待つ。この間は、どの項目にも transcript への根拠リンクを出さない（飛び先が要約の版の行か分からない。詳細設計 client §11 `citationNotice` の `pending`、§15.1 W12）。
 * 見つからない引用は transcript へ飛ばさない。決定事項・アクションは生成時に保存した逐語引用（`quote`）を「生成時の引用」として出し、話題（引用を持たない）は「根拠の行は作り直されました」と出す。あわせて「transcript が更新されました。必要なら再生成してください」と案内する（再生成は上のとおり利用者の操作でのみ）。
 
+**手動 STT の間の transcript（現行の設計と既知の制限）。** 手動 STT（`request_rerun_stt`）は、受け付けたトランザクションで会議の全 Chunk の segments を消し、Chunk を `pending` に戻して vad からやり直す（詳細設計 server §12）。撮り直しの入れ替え（`staged_segments`）とは違い、公開中の行を置き換えの確定まで残さない。そのため、やり直しの結果が merge で次の版になるまで、`GET /transcript` は消した行を欠いて返す。やり直しの STT が失敗した Chunk は `failed` になり、消した行は戻らない（ジョブの再試行 `POST /jobs/{id}/retry` が成功すれば作り直す。`exclude_failed` で除外すれば、その区間を欠いたまま merge する）。録音（WAV）は消さないので、再試行・もう一度の手動 STT で作り直せる。
+
+公開中の行を置き換えの確定まで残し、失敗したやり直しでも残す形は、まだ設計していない。`handle_transcribe` は Chunk が `completed` のときだけ入れ替えの経路（`staged_segments`）を通り、`pending` に戻した Chunk では行を消してから入れる。Phase 3 の `handle_transcribe` は `completed` でない Chunk に行があれば Live の結果として再利用する。行を残すだけでは、Phase 2 では最初の結果で消え、Phase 3 では STT をやり直さない。加えて、VAD が `skipped` にした Chunk の旧行、`exclude_failed` 後の merge が旧行を含めるか、Phase 3 の `meeting_speakers` の扱いを決める必要がある。これらを決めてから設計に反映する（PROGRESS「次の作業」）。
+
 ---
 
 # 13. サーバー側 VAD（`vad_chunk`）
