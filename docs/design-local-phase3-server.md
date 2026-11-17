@@ -2386,9 +2386,14 @@ def _name_parts(path: Path) -> tuple[int, int] | None:
     if not (path.name.startswith(PREFIX) and path.name.endswith(SUFFIX)):
         return None
     gen, sep, stamp = path.name[len(PREFIX):-len(SUFFIX)].partition("-")
-    if not (sep and gen.isdigit() and stamp.isdigit()):
+    # ASCII の数字だけを受ける。str.isdigit() は「²」なども真にするが int() は投げ、一覧・定期のバックアップ・復元元の選択が止まる
+    if not (sep and _is_ascii_digits(gen) and _is_ascii_digits(stamp)):
         return None
     return int(gen), int(stamp)
+
+
+def _is_ascii_digits(text: str) -> bool:
+    return text.isascii() and text.isdigit()
 
 
 def backup_generation(path: Path) -> int | None:
@@ -2515,7 +2520,7 @@ finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` 
 | 項目 | 合わないときの値 | 判定 |
 | --- | --- | --- |
 | 最上位 | 控えなし（`{}`）として扱う | JSON として読めない、オブジェクトでない、ファイルが読めない |
-| `title` | `"復元された会議"` | 空でない文字列でない |
+| `title` | `"復元された会議"` | 空でない文字列でない、UTF-8 にできない（JSON の孤立サロゲート。`_restored_title`） |
 | `sessionStartEpochMs` / `nativeSampleRate` / `consentConfirmedAt` | `0` | 0 以上・SQLite INTEGER 内の整数でない（`_int_or`） |
 | `endedAtEpochMs` / `totalAudioFrames` | `NULL` | 同上 |
 | `stopReason` と `stopDetectedAtEpochMs` | 組ごと `NULL` | `_stop_metadata()` |
@@ -2630,6 +2635,18 @@ def _is_sqlite_epoch_ms(value: object) -> TypeGuard[int]:
 def _int_or(value: object, default: int) -> int:
     """0 以上で SQLite INTEGER に収まる整数ならその値、そうでなければ default。"""
     return value if _is_sqlite_epoch_ms(value) else default
+
+
+def _restored_title(value: object) -> str:
+    """空でなく UTF-8 にできる文字列ならその値、そうでなければ「復元された会議」。
+    JSON の孤立サロゲート（"\\ud800"）は str として読めるが、SQLite への挿入で UnicodeEncodeError になり rebuild 全体が止まる。"""
+    if not isinstance(value, str) or not value:
+        return "復元された会議"
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "復元された会議"
+    return value
 
 
 def _chunk_offsets(mc: dict[str, Any], seq: int, duration: int) -> tuple[int, int] | None:
@@ -2774,7 +2791,7 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
             stop_reason, stop_detected_at = _stop_metadata(meta)
             title, ended, frames = meta.get("title"), meta.get("endedAtEpochMs"), meta.get("totalAudioFrames")
             repo.insert_meeting(conn, Meeting(
-                id=meeting_id, local_user_id=user_id, title=title if isinstance(title, str) and title else "復元された会議",
+                id=meeting_id, local_user_id=user_id, title=_restored_title(title),
                 status=_restored_status(meta),  # type: ignore[arg-type]
                 session_start_epoch_ms=_int_or(meta.get("sessionStartEpochMs"), 0),
                 native_sample_rate=_int_or(meta.get("nativeSampleRate"), 0), consent_confirmed_at=_int_or(meta.get("consentConfirmedAt"), 0),
@@ -4294,10 +4311,21 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
     if mixed:
         text = (MIXED_NOTE_EN if language == "en" else MIXED_NOTE_JA) + "\n" + text
     th = ctx.settings.thresholds
-    synth = await synthesize(ctx.llm, llm_model, language, text, DEFAULT_LLM_CTX_TOKENS, th.llm_ctx_fill_ratio)
-
-    index = SegmentIndex(seg_texts)
-    accepted, rejected, unresolved = validate(synth.draft, index)
+    try:
+        synth = await synthesize(ctx.llm, llm_model, language, text, DEFAULT_LLM_CTX_TOKENS, th.llm_ctx_fill_ratio)
+        index = SegmentIndex(seg_texts)
+        accepted, rejected, unresolved = validate(synth.draft, index)
+    except Exception:
+        # 合成・検証の失敗が、合成の間に merge が版を進めた後なら、それは古い版の transcript に対する失敗。failed にすると
+        # 会議も failed になり、新しい版の要約ジョブは実行中のこの行が一意制約で先にあるので作られていない。成功時と同じく
+        # 同じ行を pending に戻して新しい版でやり直す（requeue_job。lease の現行の所有者だけ。試行回数は戻す）。
+        # 版が同じ・lease を失っていれば、そのまま投げて Runner の _on_failure が従来どおり記録する。CancelledError は捕まえない
+        async with ctx.db.write() as conn:
+            current = repo.get_meeting(conn, job.meeting_id)
+            if (current is not None and current.transcript_version != meeting.transcript_version
+                    and repo.requeue_job(conn, job.id, job.lease_owner or "", job.attempts)):
+                return llm_model
+        raise
     total = len(synth.draft.topics) + len(synth.draft.decisions) + len(synth.draft.actionItems)
     t = now_ms()
     summary = MeetingSummary(
@@ -6832,6 +6860,24 @@ async def test_restore_skips_broken_backup(ctx3: AppContext) -> None:
     # Assert
     assert recovery is not None and recovery.restored_from == good and backup.integrity_ok(s.db_path)
     db.close()
+
+
+async def test_backup_names_with_non_ascii_digits_are_ignored(ctx3: AppContext) -> None:
+    """世代・時刻に ASCII 以外の数字（「²」は str.isdigit() が真で int() が投げる）を含む名前は規約外として除き、定期のバックアップを止めない。"""
+    # Arrange
+    s = ctx3.settings
+    good = backup.create_backup(ctx3.db, s.backups_dir)
+    odd_gen = s.backups_dir / "minutes-²-1.sqlite"
+    odd_stamp = s.backups_dir / "minutes-1-1²3.sqlite"
+    odd_gen.write_bytes(b"")
+    odd_stamp.write_bytes(b"")
+    # Act
+    listed = backup.list_backups(s.backups_dir)
+    newer = backup.create_backup(ctx3.db, s.backups_dir)
+    # Assert: 名前の解析は None を返し、一覧にも復元元にも入らない
+    assert backup.backup_generation(odd_gen) is None and backup.backup_time_ms(odd_stamp) is None
+    assert listed == [good]
+    assert backup.list_backups(s.backups_dir) == [good, newer]
     ctx3.db = Database(s.db_path)                                                        # fixture の close 用
 
 
@@ -7010,6 +7056,7 @@ async def test_rebuild_restores_unfinalized_meeting_as_recording(client3: httpx.
     {"nativeSampleRate": None},
     {"totalAudioFrames": 2**70},                                                      # SQLite INTEGER 超過
     {"title": 123},
+    {"title": "会議\ud800"},                                                           # UTF-8 にできない（孤立サロゲート）
     {"chunks": [1]},                                                                  # 要素がオブジェクトでない
     {"chunks": {"source": "mic"}},                                                    # 配列でない
     {"chunks": [{"source": "mic", "sequenceNo": "x"}]},
@@ -7043,6 +7090,17 @@ async def test_rebuild_tolerates_deeply_nested_snapshot(client3: httpx.AsyncClie
     # Assert
     assert report.meetings_created == 1 and report.chunks_created == 2
     assert m is not None and m.title == "復元された会議"
+
+
+async def test_rebuild_replaces_title_that_cannot_be_encoded(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """UTF-8 にできないタイトル（JSON の孤立サロゲート）は既定のタイトルに置き換える。正しいタイトルはそのまま残す。"""
+    # Arrange / Act
+    await _completed_meeting(client3, runner3, ctx3)
+    broken_report, broken = _rewrite_snapshot_and_rebuild(ctx3, title="会議\ud800")
+    kept_report, kept = _rewrite_snapshot_and_rebuild(ctx3, title="定例")
+    # Assert
+    assert broken_report.meetings_created == 1 and broken is not None and broken.title == "復元された会議"
+    assert kept_report.meetings_created == 1 and kept is not None and kept.title == "定例"
 
 
 def test_deeply_nested_recovery_marker_counts_as_unreadable(settings: Settings) -> None:
