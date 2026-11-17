@@ -2635,7 +2635,7 @@ stateDiagram-v2
     retrying --> pending : lease_job の next_run_at <= now 条件で再取得（状態列は retrying のまま lease される）
     leased --> pending : sweeper.sweep_once（attempts < max_attempts）
     processing --> pending : sweeper.sweep_once（attempts < max_attempts）
-    processing --> pending : handlers.handle_summary → repo.requeue_job（合成の間に transcript の版が進んだ）
+    processing --> pending : handlers.handle_summary → repo.requeue_job（合成の間に transcript の版が進んだ。合成・検証が失敗したときも）
     leased --> failed : sweeper.sweep_once（attempts >= max_attempts）
     processing --> failed : sweeper.sweep_once（attempts >= max_attempts）
     pending --> cancelled : pipeline.exclude_failed / request_rerun_stt
@@ -2660,7 +2660,7 @@ stateDiagram-v2
 | lease 切れ後の transcribe の再実行 | `handle_transcribe` は lease の検査の後、Chunk の segments を置き換える。Chunk が既に `completed` なら、新しい結果を `staged_segments` に置いて完了済みの merge ジョブを消し、作り直す merge が版を上げるのと同じトランザクションで入れ替える。`completed` でなければ同じトランザクションで消してから入れる | 前の attempt の segments に新しい結果が混ざる。前の結果で merge が終わっていると、置き換えた区間がその版から消えたまま merge が作り直されない。その場で消すと、merge のコミットまで（失敗すればその後も）公開中の版から区間が抜ける |
 | 旧ワーカーの merge 書き込み | `handlers.handle_merge` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議の `transcribed`・要約ジョブのどれも書かない | 回数切れで `failed` になった merge ジョブを残したまま transcript の版が進み、要約ジョブが作られて会議が `completed` まで進む。lease を取り直した新しいワーカーと二重に merge すると版が 2 回進む |
 | 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、要約の結果を誰も確かめないまま会議が `completed` に戻る。`finish_job` の条件はジョブ行しか守らない |
-| 合成の間に transcript の版が進んだ要約 | `handlers.handle_summary` が書き込みトランザクションで会議の `transcript_version` を読み直し、合成に使った版と違えば要約を保存せず、会議も `completed` にしない。`repo.requeue_job` で同じ行を `pending` に戻す（試行回数は戻す。lease を外すので Runner の `finish_job` は 0 行） | 撮り直しの入れ替え・手動 STT の後の merge が合成中に版を進めると、merge の `on_merge_completed` は要約ジョブを一意制約で作れない。そのまま保存すると、新しい版の transcript に古い版の要約が組になり、会議は `completed` になる |
+| 合成の間に transcript の版が進んだ要約 | `handlers.handle_summary` が書き込みトランザクションで会議の `transcript_version` を読み直し、合成に使った版と違えば要約を保存せず、会議も `completed` にしない。`repo.requeue_job` で同じ行を `pending` に戻す（試行回数は戻す。lease を外すので Runner の `finish_job` は 0 行）。合成・検証が失敗したときも、版が進んでいれば失敗として記録せずに同じく戻す（古い版に対する失敗。版が同じなら従来どおり `_on_failure`） | 撮り直しの入れ替え・手動 STT の後の merge が合成中に版を進めると、merge の `on_merge_completed` は要約ジョブを一意制約で作れない。そのまま保存すると、新しい版の transcript に古い版の要約が組になり、会議は `completed` になる |
 | lease 切れ後の要約回収 | `pipeline.on_summary_failed` は `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れて回数切れで回収されると、要約があるのに会議が `failed` になる。この場合はジョブ `failed`・会議 `completed` の組を意図して残す |
 | 回収の配信 | `sweeper._publish`（コミット後） | §14 |
 
@@ -3788,12 +3788,15 @@ _MONTH_DAY_JA = r"(?:再来月|今月|来月)の?\d{1,2}日"
 # 相対の月の時期（「来月上旬」「今月の末」）。後ろの時刻（「来月上旬午後5時」）も 1 つの表現にする（日付と同じ）。別々に切り出すと、quote の
 # 「今月上旬午後5時」の時刻と別の句の「来月上旬」を寄せ集めて deadline の「来月上旬午後5時」を裏付けてしまう
 _MONTH_PERIOD_JA = r"(?:再来月|今月|来月)の?(?:末|上旬|中旬|下旬)"
+# 週末（「来週末」「来週の末」「週末」）も同じ。後ろの時刻（「来週末午後5時」）と 1 つの表現にする
+_WEEK_END_JA = r"(?:(?:再来週|今週|来週)の?末|週末)"
 _DEADLINE_HINTS = re.compile(
     rf"({_DATE}{_TIME_SUFFIX}|{_TIME_EN}|{_TIME}|"
     rf"{_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_PERIOD_JA}{_TIME_SUFFIX}|"
-    r"(?:再来週|今週|来週)の?末|今週|来週|再来週|今月|再来月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
+    rf"{_WEEK_END_JA}{_TIME_SUFFIX}|"
+    r"今週|来週|再来週|今月|再来月|来月|月末|明日|明後日|年内|上旬|中旬|下旬|"
     rf"{_EN_DEADLINE_ALTS})",
     re.IGNORECASE,
 )
@@ -3808,14 +3811,16 @@ _EN_DEADLINE_HINTS = re.compile(
 # 日付の後ろの英語の時刻（「11月20日5pm」の「5pm」）。_quote_hints が、日本語・数字の表現から英字を含むものを捨てるときに、
 # これだけは英字として数えない（日付と 1 つの表現なので、捨てると同じ日付・時刻の quote でも通らない）
 _TRAILING_TIME_EN = re.compile(rf"{_TIME_EN}$")
-# 正規化前の quote（_spaced）で、日付・日本語の曜日・相対の月と日・相対の月の時期の後ろに付いた英語の時刻（「11/20 5pm」「金曜日の 5pm」）。
+# 正規化前の quote（_spaced）で、日付・日本語の曜日・相対の月と日・相対の月の時期・週末の後ろに付いた英語の時刻（「11/20 5pm」「金曜日の 5pm」）。
 # 正規化した quote では区切りが落ちて日付と 1 つの表現（「11/205pm」）になるので、_quote_hints は英語の表現を切り出す前にこの時刻を
 # 落とす。落とさないと、同じ時刻が時刻だけの表現（「5pm」）としても数えられ、quote の「11/20 5pm」が deadline の「5pm」を裏付けてしまう。
 # 区切りは _spaced で空白 1 つになり、「の」は挟んでよい（_TIME_SUFFIX と同じ）。「at」を挟んだもの（「11/20 at 5pm」）は日付に付かない
-_ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}|{_MONTH_PERIOD_JA}) ?(?:の ?)?){_TIME_EN}")
-# 期限の表現を切り出した残りの、組にならなかった英語の週・月・年の修飾（normalize 済みで空白が無い。_deadline_supported）。
-# 月・年（「next month 5pm」「this year」）は表現として切り出さないので、残っていれば週と同じく deadline 全体を句として求める
-_EN_UNPAIRED_PERIOD = re.compile(r"(?:next|this)(?:week|month|year)")
+_ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}|{_MONTH_PERIOD_JA}|{_WEEK_END_JA}) ?(?:の ?)?){_TIME_EN}")
+# 期限の表現を切り出した残りの、組にならなかった英語の修飾（normalize 済みで空白が無い。_deadline_supported）。
+# 週・月・年（「next month 5pm」「this year」）と時間帯（「friday afternoon」の「afternoon」）は表現として切り出さないので、
+# 残っていれば deadline 全体を句として求める（時間帯を落とすと、quote の「friday morning」が「friday afternoon」を裏付ける）。
+# 日本語の助詞・語（「来週中に11月20日」の「中に」）は対象にしない（表現の間に挟まる語で、期限を変えない）
+_EN_UNPAIRED_QUALIFIER = re.compile(r"(?:next|this)(?:week|month|year)|morning|afternoon|evening|night|noon")
 # 英語の「曜日 + 週」（「friday next week」。後ろの時刻はそのまま残す）。比べる形を「週 + 曜日」にそろえる（_hint_key）
 _EN_DAY_THEN_WEEK = re.compile(rf"({_WEEKDAYS_EN})(?:of)?(next|this)week(.*)")
 
@@ -3914,9 +3919,9 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     （会議の日付・タイムゾーン）をこの検証は持たず、換算の正しさを確かめられない。
     期限の表現を含まない deadline（「次回の定例まで」）は、正規化した文字列がそのまま quote に現れることを求める。
     英数字で始まる・終わる deadline は、quote の中でも英数字に挟まれない句全体として現れることを求める（_phrase_in）。
-    期限の表現と、組にならない週・月・年の修飾（「next week 5pm」「5pm next week」「next month 5pm」）を併せ持つ deadline は、表現のすべてに加えて
+    期限の表現と、組にならない週・月・年・時間帯の修飾（「next week 5pm」「5pm next week」「next month 5pm」「friday afternoon」）を併せ持つ deadline は、表現のすべてに加えて
     deadline 全体が句として quote に現れることを求める（時刻だけで比べると修飾が落ち、quote の「this week 5pm」「this month 5pm」が通る）。
-    相対の月の時期と時刻（「来月上旬午後5時」）も 1 つの表現で、quote の「今月上旬午後5時」の時刻と別の句の「来月上旬」では通らない。
+    相対の月の時期・週末と時刻（「来月上旬午後5時」「来週末午後5時」）も 1 つの表現で、quote の「今月上旬午後5時」の時刻と別の句の「来月上旬」では通らない。
     部分文字列で比べると、「next week」が「next weekend」の、「end of month」が「end of monthly」の先頭に当たる。
     quote は正規化前のもの（正規化は空白を落とし、語の境目が分からなくなる）。
 
@@ -3932,10 +3937,10 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     wanted = {_hint_key(m) for m in _DEADLINE_HINTS.findall(d)}
     if not wanted:
         return d != "" and _phrase_in(d, quote)
-    # 組にならない週・月・年の修飾（「next week 5pm」の「next week」、「next month 5pm」の「next month」）は表現として切り出されないので、
+    # 組にならない週・月・年・時間帯の修飾（「next week 5pm」の「next week」、「friday afternoon」の「afternoon」）は表現として切り出されないので、
     # 時刻だけで比べると修飾が落ち、quote の「this week 5pm」「this month 5pm」が通る。残っていれば deadline 全体が句として quote に
     # 現れることも求める（期限の表現を含まない deadline と同じ扱い）
-    if _EN_UNPAIRED_PERIOD.search(_DEADLINE_HINTS.sub("", d)):
+    if _EN_UNPAIRED_QUALIFIER.search(_DEADLINE_HINTS.sub("", d)):
         return wanted <= _quote_hints(quote) and _phrase_in(d, quote)
     return wanted <= _quote_hints(quote)
 
@@ -4453,10 +4458,21 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
         seg_texts = {ln.segment_id: ln.text for ln in lines}
     text = format_for_llm(lines, gaps)
     th = ctx.settings.thresholds
-    synth = await synthesize(ctx.llm, llm_model, ctx.settings.language, text, DEFAULT_LLM_CTX_TOKENS, th.llm_ctx_fill_ratio)
-
-    index = SegmentIndex(seg_texts)
-    accepted, rejected, unresolved = validate(synth.draft, index)
+    try:
+        synth = await synthesize(ctx.llm, llm_model, ctx.settings.language, text, DEFAULT_LLM_CTX_TOKENS, th.llm_ctx_fill_ratio)
+        index = SegmentIndex(seg_texts)
+        accepted, rejected, unresolved = validate(synth.draft, index)
+    except Exception:
+        # 合成・検証の失敗が、合成の間に merge が版を進めた後なら、それは古い版の transcript に対する失敗。failed にすると
+        # 会議も failed になり、新しい版の要約ジョブは実行中のこの行が一意制約で先にあるので作られていない。成功時と同じく
+        # 同じ行を pending に戻して新しい版でやり直す（requeue_job。lease の現行の所有者だけ。試行回数は戻す）。
+        # 版が同じ・lease を失っていれば、そのまま投げて Runner の _on_failure が従来どおり記録する。CancelledError は捕まえない
+        async with ctx.db.write() as conn:
+            current = repo.get_meeting(conn, job.meeting_id)
+            if (current is not None and current.transcript_version != meeting.transcript_version
+                    and repo.requeue_job(conn, job.id, job.lease_owner or "", job.attempts)):
+                return llm_model
+        raise
     total = len(synth.draft.topics) + len(synth.draft.decisions) + len(synth.draft.actionItems)
     t = now_ms()
     summary = MeetingSummary(
@@ -6855,6 +6871,45 @@ async def test_summary_is_not_saved_when_merge_advances_transcript_during_synthe
     assert job is not None and (job.status, job.lease_owner, job.attempts) == ("pending", None, before.attempts)
 
 
+async def test_summary_failure_after_merge_advances_transcript_requeues_instead_of_failing(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """合成の間に merge が版を進めた後に合成が失敗したら、failed にせず同じ行を pending に戻す（試行回数は戻す。§12.7）。
+
+    失敗は古い版に対するもの。failed にすると会議も failed になり、新しい版の要約ジョブは一意制約で作られない。
+    版が進んでいなければ従来どおり失敗として記録する。
+    """
+    # Arrange: 合成の途中で merge が版を進め、その後に再試行しない失敗が起きる
+    from minutes_local.jobs.retry import BusinessValidationError
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    advance = True
+
+    async def failing(*_args: Any, **_kwargs: Any) -> Any:
+        if advance:
+            async with ctx.db.write() as conn:
+                m = repo.get_meeting(conn, "m-1")
+                assert m is not None
+                repo.update_meeting(conn, "m-1", transcript_version=m.transcript_version + 1)
+        raise BusinessValidationError("empty summary")
+    monkeypatch.setattr(handlers, "synthesize", failing)
+    with ctx.db.read() as conn:
+        before = next(j for j in repo.list_jobs(conn, "m-1") if j.job_type == "synthesize_minutes")
+    # Act
+    assert await runner.run_once() is True
+    with ctx.db.read() as conn:
+        requeued = repo.get_job(conn, before.id)
+        meeting = repo.get_meeting(conn, "m-1")
+    # 版が進まなかった次の試行の失敗は、従来どおり failed になる
+    advance = False
+    assert await runner.run_once() is True
+    with ctx.db.read() as conn:
+        failed = repo.get_job(conn, before.id)
+    # Assert
+    assert requeued is not None and (requeued.status, requeued.lease_owner, requeued.attempts) == ("pending", None, before.attempts)
+    assert meeting is not None and meeting.status != "failed"
+    assert failed is not None and failed.status == "failed"
+
+
 async def test_publish_created_job_logs_instead_of_raising_after_commit(
         client: httpx.AsyncClient, ctx: AppContext, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     """コミット後の配信で例外が出ても Runner へ伝えない。伝えると、書き込みを終えた試行が失敗として記録・再試行される（§13）。"""
@@ -7851,6 +7906,29 @@ def test_month_period_and_time_are_one_expression() -> None:
     assert reasons_for("来月上旬5pm", "鈴木さんが来月上旬 5pm に見積もりを出します") == []
 
 
+def test_week_end_and_time_are_one_expression() -> None:
+    """「来週末午後5時」は週末と時刻で 1 つの表現。quote の別の週末に付いた時刻を寄せ集めても裏付けない（段 5）。"""
+    # Arrange
+    sid = "dfdfdfdf-4646-4000-8000-000000000046"
+
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        index = SegmentIndex({sid: quote})
+        item = {"task": "見積もりを出す", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]],
+                "quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ組（「の」の有無は問わない）なら通る
+    assert reasons_for("来週末午後5時", "鈴木さんが来週末の午後5時までに見積もりを出します") == []
+    assert reasons_for("週末17時", "鈴木さんが週末17時に見積もりを出します") == []
+    # 時刻の違う週末、別の週末に付いた時刻と時刻の無い「来週末」の寄せ集めは通さない
+    assert reasons_for("来週末午後5時", "鈴木さんが来週末午前9時に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("来週末午後5時", "鈴木さんが今週末午後5時に確認し、来週末に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 時刻の付かない週末は従来どおり（「来週の末」も「来週末」と同じ）
+    assert reasons_for("来週末", "鈴木さんが来週の末に見積もりを出します") == []
+    # 日本語の助詞・語（「中に」）は修飾として扱わない（「来週中に11月20日」は「来週」と「11月20日」の両方で比べる）
+    assert reasons_for("来週中に11月20日", "鈴木さんが来週、11月20日までに見積もりを出します") == []
+
+
 def test_deadline_year_must_match_the_quote() -> None:
     """年の付いた日付は年まで 1 つの表現。quote の 2026 年は deadline の 2027 年の同じ月日を裏付けない（段 5）。"""
     # Arrange
@@ -8037,6 +8115,10 @@ def test_english_week_phrases_are_not_matched_as_fragments() -> None:
     assert reasons_for("next month 5pm", "Suzuki will submit it next month 5pm") == []
     assert reasons_for("next month 5pm", "Suzuki will submit it this month 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("this year 5pm", "Suzuki will submit it next year 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 時間帯の修飾（「afternoon」）も表現として切り出さないので、残っていれば deadline 全体を句として求める
+    assert reasons_for("friday afternoon", "Suzuki will submit it friday afternoon") == []
+    assert reasons_for("friday afternoon", "Suzuki will submit it friday morning") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("tomorrow evening", "Suzuki will submit it tomorrow") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     # 句全体で比べるので、間に語の入る言い方（「next week at 5pm」）は通さない側に倒す（組の形の「at」の省略はここでは効かない）
     assert reasons_for("next week 5pm", "Suzuki will submit it next week at 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 

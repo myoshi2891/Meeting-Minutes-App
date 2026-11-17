@@ -998,7 +998,7 @@ Phase 1 §3.8 で先送りした注記テーブルを、静的な設定ファイ
 
 v4.0 §67〜§68 を継承する。再生成は新しい `version` 行を追加し、旧版を削除しない。`transcript_version` が進んだ後の再生成は自動では起動せず、UI の「再生成」操作でのみ起動する（利用者が transcript を修正した直後に AI が勝手に上書きする体験を避ける）。
 
-**合成の間に transcript が進んだとき。** 要約の合成中に merge（撮り直しの入れ替え・手動 STT の後）が `transcript_version` を進めたら、その要約は保存せず、会議も `completed` にしない。同じ要約ジョブを `pending` に戻し、新しい版で合成し直す（詳細設計 server §20 `handle_summary`、§8 `repo.requeue_job`）。merge は要約ジョブを作ろうとするが、実行中の行が一意制約で先にあるので作れず、そのまま保存すると新しい版の transcript に古い版の要約が組になる。まだ要約を保存していないので、上の「進んだ後の再生成」ではなく元の要求（初回の要約・利用者の再生成）の続きとして扱う。
+**合成の間に transcript が進んだとき。** 要約の合成中に merge（撮り直しの入れ替え・手動 STT の後）が `transcript_version` を進めたら、その要約は保存せず、会議も `completed` にしない。同じ要約ジョブを `pending` に戻し、新しい版で合成し直す（詳細設計 server §20 `handle_summary`、§8 `repo.requeue_job`）。合成・検証が失敗したときも、版が進んでいれば失敗として記録せずに同じく戻す（試行回数は使わない）。古い版に対する失敗で `failed` にすると、会議も `failed` になり、新しい版の要約は利用者が再試行するまで作られない。版が同じなら従来どおり失敗として扱う。merge は要約ジョブを作ろうとするが、実行中の行が一意制約で先にあるので作れず、そのまま保存すると新しい版の transcript に古い版の要約が組になる。まだ要約を保存していないので、上の「進んだ後の再生成」ではなく元の要求（初回の要約・利用者の再生成）の続きとして扱う。
 
 **transcript が進んだ後の引用。** 要約の `sourceSegmentIds`（と、そのどれかを指す `evidenceSpan.segmentId`）は、生成時の transcript 版（`MeetingSummary.transcriptVersion`）の segment を指す。その後に segments の行を消して作り直す処理がある：撮り直しの入れ替え（詳細設計 §8 `repo.promote_replacements`）、手動 STT（`request_rerun_stt`）、未完了の Chunk の再試行（`handle_transcribe`）。無音区間の STT（`transcribe_silent_chunk`）は行を足すだけで消さない。消えた行を指す引用は次のように扱う（Phase 3 も同じ）。
 
