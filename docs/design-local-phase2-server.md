@@ -463,11 +463,14 @@ CREATE INDEX IF NOT EXISTS idx_segments_meeting_time ON transcript_segments(meet
 CREATE INDEX IF NOT EXISTS idx_segments_merged ON transcript_segments(meeting_id, merged_version);
 -- 完了済みの Chunk を撮り直した結果の置き場（§12 handle_transcribe）。次の merge が版を上げるのと同じトランザクションで
 -- transcript_segments と入れ替える（repo.promote_replacements）。それまで公開中の版の行には触れない。
--- 撮り直しの結果が 0 件（無音）でも入れ替えるので、Chunk ごとの印（segment_replacements）と行（staged_segments）を分ける
+-- 撮り直しの結果が 0 件（無音）でも入れ替えるので、Chunk ごとの印（segment_replacements）と行（staged_segments）を分ける。
+-- staged_during_merge は置いた時点で終わっていなかった merge ジョブの id（無ければ NULL）。その merge が書き込みの後に回数切れで
+-- failed になったとき、作り直すかを決める（pipeline.rerun_merge_for_staged。時刻では同じミリ秒の前後が分からない）
 CREATE TABLE IF NOT EXISTS segment_replacements (
-  chunk_id   TEXT PRIMARY KEY REFERENCES audio_chunks(id) ON DELETE CASCADE,
-  meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
-  created_at INTEGER NOT NULL
+  chunk_id            TEXT PRIMARY KEY REFERENCES audio_chunks(id) ON DELETE CASCADE,
+  meeting_id          TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  created_at          INTEGER NOT NULL,
+  staged_during_merge TEXT
 );
 CREATE TABLE IF NOT EXISTS staged_segments (
   id              TEXT PRIMARY KEY,
@@ -1168,9 +1171,18 @@ def delete_segments_of_chunk(conn: sqlite3.Connection, chunk_id: str) -> None:
 
 
 def stage_replacement(conn: sqlite3.Connection, meeting_id: str, chunk_id: str) -> None:
-    """完了済みの Chunk の撮り直しを始める。前の撮り直しでまだ merge されていない結果は捨てる（staged_segments は CASCADE）。"""
+    """完了済みの Chunk の撮り直しを始める。前の撮り直しでまだ merge されていない結果は捨てる（staged_segments は CASCADE）。
+
+    この時点で終わっていない merge ジョブ（一意制約で多くて 1 行）の id を控える（has_replacements_staged_during）
+    """
     conn.execute("DELETE FROM segment_replacements WHERE chunk_id = ?", (chunk_id,))
-    conn.execute("INSERT INTO segment_replacements (chunk_id, meeting_id, created_at) VALUES (?,?,?)", (chunk_id, meeting_id, now_ms()))
+    open_merge = conn.execute(
+        "SELECT id FROM processing_jobs WHERE meeting_id = ? AND job_type = 'merge_transcript' "
+        "AND status IN ('pending','leased','processing','retrying')",
+        (meeting_id,),
+    ).fetchone()
+    conn.execute("INSERT INTO segment_replacements (chunk_id, meeting_id, created_at, staged_during_merge) VALUES (?,?,?,?)",
+                 (chunk_id, meeting_id, now_ms(), open_merge["id"] if open_merge is not None else None))
 
 
 def promote_replacements(conn: sqlite3.Connection, meeting_id: str) -> int:
@@ -1193,10 +1205,10 @@ def has_replacements(conn: sqlite3.Connection, meeting_id: str) -> bool:
     return conn.execute("SELECT 1 FROM segment_replacements WHERE meeting_id = ? LIMIT 1", (meeting_id,)).fetchone() is not None
 
 
-def has_replacements_since(conn: sqlite3.Connection, meeting_id: str, since: int) -> bool:
-    """since（epoch ms）より後に置いた、まだ入れ替えていない撮り直しがあるか（pipeline.on_job_failed の merge の分岐）。"""
+def has_replacements_staged_during(conn: sqlite3.Connection, meeting_id: str, merge_job_id: str) -> bool:
+    """merge_job_id の merge が終わる前に置いた、まだ入れ替えていない撮り直しがあるか（pipeline.on_job_failed の merge の分岐）。"""
     return conn.execute(
-        "SELECT 1 FROM segment_replacements WHERE meeting_id = ? AND created_at > ? LIMIT 1", (meeting_id, since)
+        "SELECT 1 FROM segment_replacements WHERE meeting_id = ? AND staged_during_merge = ? LIMIT 1", (meeting_id, merge_job_id)
     ).fetchone() is not None
 
 
@@ -2039,14 +2051,15 @@ def rerun_merge_for_staged(conn: sqlite3.Connection, job: Job) -> str | None:
     その間（processing）にコミットした撮り直しは staged に置かれ（handle_transcribe）、Runner が merge の完了を記録するときに
     作り直す merge が入れ替える前提だが、完了は記録されない。failed の行が一意制約で ensure_merge_job を止めるので、
     作り直さないと利用者が merge を再試行するまで撮り直しは公開されない。
-    作るのは、この merge の行より後に置いた撮り直しがあるときだけ（has_replacements_since）。書き込みの前に落ち続けて
-    回数切れになった merge もこれに当たり 1 度は作り直すが、作り直した行はその撮り直しより後にできるので、それも落ちて回数切れに
-    なれば作らない（落ち続ける merge を際限なく作り直さない。§8 fail_exhausted_expired の意図）。撮り直しは失敗した行の再試行を待つ。
-    比べる時刻は壁時計（now_ms）なので、巻き戻ると作らない側（従来どおり再試行を待つ）に倒れる。
+    作るのは、この merge が終わる前に置いた撮り直しがあるときだけ（stage_replacement が控えた merge の id。
+    has_replacements_staged_during）。前後は時刻ではなく id で決める（同じミリ秒・時計の巻き戻しでも取り違えない）。
+    書き込みの前に落ち続けて回数切れになった merge もこれに当たり 1 度は作り直すが、撮り直しが控えたのは前の行の id なので、
+    作り直した行も落ちて回数切れになれば作らない（落ち続ける merge を際限なく作り直さない。§8 fail_exhausted_expired の意図）。
+    撮り直しは失敗した行の再試行を待つ。
     作るのは ensure_merge_job で、必要な Chunk が pending のまま・vad が残る・未承認の failed transcribe があれば作らない
     （消した行の代わりは、それらが片付いたときの ensure_merge_job が作る）
     """
-    if not repo.has_replacements_since(conn, job.meeting_id, job.created_at):
+    if not repo.has_replacements_staged_during(conn, job.meeting_id, job.id):
         return None
     repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
     return ensure_merge_job(conn, job.meeting_id)
@@ -2546,10 +2559,10 @@ lease が切れたジョブの扱いは 2 通りある（基本設計 §9.3）�
 | --- | --- | --- | --- | --- |
 | `vad_chunk` | 変えない（`pending` のまま。ただし結果をコミット済みなら進んだまま。下記） | 変えない（`transcribing`） | `pending` の Chunk が `ensure_merge_job` を止める | 失敗したジョブの再試行（`POST /jobs/{id}/retry`）。再試行は Chunk を変えず（`queued` に戻すのは transcribe の再試行だけ）、VAD の完了で `pending` の Chunk を `queued` / `skipped` に進める。除外（`exclude-failed`）の対象ではない |
 | `transcribe_chunk` | `failed`（ただし既に `completed` なら変えない。下記） | 変えない（`transcribing`） | 未承認の `failed` ジョブが merge を止める | 再試行、または除外（`exclude-failed`。失敗区間は gap になる） |
-| `merge_transcript` | 変えない | 変えない（`transcribing`。ただし書き込みをコミット済みなら進んだまま。下記） | 要約ジョブを作らない。この merge の行より後に置いた入れ替え待ちの撮り直しがあれば、merge を作り直す（`rerun_merge_for_staged`。下記） | 失敗したジョブの再試行。除外の対象ではない |
+| `merge_transcript` | 変えない | 変えない（`transcribing`。ただし書き込みをコミット済みなら進んだまま。下記） | 要約ジョブを作らない。この merge が終わる前に置いた入れ替え待ちの撮り直し（控えた merge の id で判定）があれば、merge を作り直す（`rerun_merge_for_staged`。下記） | 失敗したジョブの再試行。除外の対象ではない |
 | `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2）。ただし既に `completed` なら変えない（下記） | なし | 再試行、または要約の再生成 |
 
-transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、その Chunk の segments を新しい結果で置き換える。Chunk がまだ `completed` でなければ、同じ書き込みトランザクションで segments を消してから入れる。`completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments`（Chunk ごとの印は `segment_replacements`）に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（`repo.promote_replacements`）。その場で消すと、作り直す merge がコミットするまで transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにその merge が入れ替えてから新しい segments を読む。merge が実行中（`processing`）なら、その merge が入れ替えを書いた後に撮り直しがコミットされていることがある。`delete_finished_job` は実行中の行を消さず、`ensure_merge_job` も一意制約で作れないので、Runner が merge の完了を記録するときに入れ替え待ち（`repo.has_replacements`）を見て、残っていれば merge を作り直す。merge が書き込みをコミットした後・`finish_job` の前に lease が切れて回数切れで回収されると、完了は記録されず、`failed` の行が一意制約で `ensure_merge_job` を止める。この場合は `on_job_failed` が、その merge の行より後に置いた入れ替え待ち（`repo.has_replacements_since`）を見て、残っていれば完了済みの行を消して `ensure_merge_job` で作り直す（`rerun_merge_for_staged`。必要な Chunk が `pending` のまま・vad が残る・未承認の `failed` transcribe があれば作らない）。書き込みの前に落ち続けた merge も 1 度は作り直すが、作り直した行は撮り直しより後にできるので、それも回数切れになれば作らない（落ち続ける merge を際限なく作り直さない）。初めて完了する Chunk（手動 STT の無音 Chunk）も、実行中（`leased` / `processing`）の merge があれば同じく `staged_segments` に置く。その merge の書き込みの後にコミットすると版に入らず、入れ替え待ちが無いので作り直されもしない。`handle_transcribe` は初めての完了でも完了済みの merge を消す。手動 STT を受け付けた時点で実行中だった merge（`transcribe_silent_chunk` は消せない）が先に終わっていると、残った行が一意制約で作り直しを止める。ハンドラの中の `on_transcribe_completed` が作った merge（最後の Chunk の完了）は、`handle_transcribe` がコミットの後に流す（Runner の完了処理の `ensure_merge_job` は既存で `None` を返す）。vad の完了で Runner が作った merge も Runner が流す。手動 STT（§12 `request_rerun_stt`）は、まだ入れ替えていない撮り直しの結果も捨てる。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
+transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、その Chunk の segments を新しい結果で置き換える。Chunk がまだ `completed` でなければ、同じ書き込みトランザクションで segments を消してから入れる。`completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments`（Chunk ごとの印は `segment_replacements`）に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（`repo.promote_replacements`）。その場で消すと、作り直す merge がコミットするまで transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにその merge が入れ替えてから新しい segments を読む。merge が実行中（`processing`）なら、その merge が入れ替えを書いた後に撮り直しがコミットされていることがある。`delete_finished_job` は実行中の行を消さず、`ensure_merge_job` も一意制約で作れないので、Runner が merge の完了を記録するときに入れ替え待ち（`repo.has_replacements`）を見て、残っていれば merge を作り直す。merge が書き込みをコミットした後・`finish_job` の前に lease が切れて回数切れで回収されると、完了は記録されず、`failed` の行が一意制約で `ensure_merge_job` を止める。この場合は `on_job_failed` が、その merge が終わる前に置いた入れ替え待ち（`stage_replacement` が控えた merge の id。`repo.has_replacements_staged_during`。時刻では同じミリ秒の前後が分からない）を見て、残っていれば完了済みの行を消して `ensure_merge_job` で作り直す（`rerun_merge_for_staged`。必要な Chunk が `pending` のまま・vad が残る・未承認の `failed` transcribe があれば作らない）。書き込みの前に落ち続けた merge も 1 度は作り直すが、撮り直しが控えたのは前の行の id なので、作り直した行も回数切れになれば作らない（落ち続ける merge を際限なく作り直さない）。初めて完了する Chunk（手動 STT の無音 Chunk）も、実行中（`leased` / `processing`）の merge があれば同じく `staged_segments` に置く。その merge の書き込みの後にコミットすると版に入らず、入れ替え待ちが無いので作り直されもしない。`handle_transcribe` は初めての完了でも完了済みの merge を消す。手動 STT を受け付けた時点で実行中だった merge（`transcribe_silent_chunk` は消せない）が先に終わっていると、残った行が一意制約で作り直しを止める。ハンドラの中の `on_transcribe_completed` が作った merge（最後の Chunk の完了）は、`handle_transcribe` がコミットの後に流す（Runner の完了処理の `ensure_merge_job` は既存で `None` を返す）。vad の完了で Runner が作った merge も Runner が流す。手動 STT（§12 `request_rerun_stt`）は、まだ入れ替えていない撮り直しの結果も捨てる。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
 
 要約・VAD も同じ隙間（ハンドラのコミットと `finish_job` の間）で回収されうる。どれもハンドラの結果とジョブの完了を 1 トランザクションにはせず（Runner とハンドラの契約が変わる）、後続処理の側で書き込み済みの結果を認める。
 
@@ -6006,13 +6019,18 @@ def test_httpx_only_in_allowed_modules() -> None:
 NETWORK_ALLOWED: dict[str, set[str]] = {
     "httpx": HTTPX_ALLOWED,
     "socket": {"bootstrap.py"},
+    # socket の実体（C 実装）。socket と同じ接続を作れるので、どのモジュールにも許さない（bootstrap も socket だけを使う）
+    "_socket": set(),
     "subprocess": {"bootstrap.py", "hw/detect.py"},
     "urllib.request": set(), "http.client": set(), "ftplib": set(), "smtplib": set(),
     "requests": set(), "aiohttp": set(), "urllib3": set(), "websockets": set(),
 }
-# import を見るだけでは拾えない、どのモジュールからでも呼べる接続・子プロセスの起動（asyncio と os の関数）
+# import を見るだけでは拾えない、どのモジュールからでも呼べる接続・子プロセスの起動（asyncio と os の関数）と、
+# 別の経路で得たソケットの低水準の接続（connect_ex、イベントループの sock_connect・sock_sendto）。
+# 「connect」は sqlite3.connect と区別できないので数えない（ソケットを作る socket・_socket の import で塞ぐ）
 NETWORK_CALLS = {"open_connection", "open_unix_connection", "create_connection", "create_datagram_endpoint",
-                 "create_subprocess_exec", "create_subprocess_shell", "urlopen"}
+                 "create_subprocess_exec", "create_subprocess_shell", "urlopen",
+                 "connect_ex", "sock_connect", "sock_sendto"}
 OS_PROCESS_CALLS = re.compile(r"system|popen|exec\w*|spawn\w*|posix_spawn\w*")
 
 
@@ -6054,16 +6072,35 @@ def _network_calls(path: Path) -> set[str]:
     return found
 
 
+def _network_offenders(rel: str, path: Path) -> list[str]:
+    """rel（ROOT からの相対パス）のモジュールが、許可されていない通信手段を import・呼び出ししていれば列挙する。"""
+    offenders: list[str] = []
+    for name in _imported_modules(path):
+        for module, allowed in NETWORK_ALLOWED.items():
+            if (name == module or name.startswith(module + ".")) and rel not in allowed:
+                offenders.append(f"{rel}: {name}")
+    offenders.extend(f"{rel}: {call}" for call in sorted(_network_calls(path)))
+    return offenders
+
+
 def test_network_modules_only_in_allowed_modules() -> None:
     offenders = []
     for p in ROOT.rglob("*.py"):
-        rel = p.relative_to(ROOT).as_posix()
-        for name in _imported_modules(p):
-            for module, allowed in NETWORK_ALLOWED.items():
-                if (name == module or name.startswith(module + ".")) and rel not in allowed:
-                    offenders.append(f"{rel}: {name}")
-        offenders.extend(f"{rel}: {call}" for call in sorted(_network_calls(p)))
+        offenders.extend(_network_offenders(p.relative_to(ROOT).as_posix(), p))
     assert offenders == []
+
+
+def test_low_level_socket_is_rejected_outside_allowed_modules(tmp_path: Path) -> None:
+    """socket の実体の _socket の import と、ソケットの低水準の接続（connect_ex・ループの sock_connect）も、許可していないモジュールでは違反。
+    socket だけを見ると「import _socket」で同じ接続を作れてしまう。"""
+    # Arrange
+    src = tmp_path / "m.py"
+    src.write_text("import _socket\nfrom _socket import socket as raw\ns = _socket.socket()\ns.connect_ex(('h', 1))\n"
+                   "async def f(loop, a):\n    await loop.sock_connect(s, a)\n", encoding="utf-8")
+    # Act
+    offenders = _network_offenders("jobs/m.py", src)
+    # Assert
+    assert {"jobs/m.py: _socket", "jobs/m.py: _socket.socket", "jobs/m.py: connect_ex", "jobs/m.py: sock_connect"} <= set(offenders)
 
 
 def test_network_calls_detects_from_imports(tmp_path: Path) -> None:
@@ -7464,8 +7501,6 @@ async def _stage_retry_while_merge_runs(client: httpx.AsyncClient, ctx: AppConte
     async with ctx.db.write() as conn:
         merge = repo.lease_job(conn, "w-merge", ["merge_transcript"], now_ms())
         assert merge is not None and repo.mark_processing(conn, merge.id, "w-merge", None)
-        # 撮り直しが merge の行より後に置かれたことを、同じミリ秒に収まっても確かにする
-        conn.execute("UPDATE processing_jobs SET created_at = created_at - 1000 WHERE id = ?", (merge.id,))
     if commit_merge:
         await handlers.handle_merge(ctx, merge)   # 入れ替えと版 1 をコミットする（finish_job はまだ）
     # merge が processing の間に撮り直しをコミットする（handle_transcribe は staged に置き、merge の行を消さない）
@@ -7478,6 +7513,9 @@ async def _stage_retry_while_merge_runs(client: httpx.AsyncClient, ctx: AppConte
     async with ctx.db.write() as conn:
         assert repo.finish_job(conn, again.id, "w-retry", again.attempts, "completed")
         assert repo.has_replacements(conn, "m-1")
+        # merge の行と撮り直しを同じミリ秒にする（時刻の大小では前後が分からない。前後は撮り直しが記録した merge の id で決める）
+        conn.execute("UPDATE processing_jobs SET created_at = (SELECT created_at FROM segment_replacements WHERE meeting_id = 'm-1') "
+                     "WHERE id = ?", (merge.id,))
         # merge のワーカーが finish_job の前に落ち、回数を使い切っている
         conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (merge.id,))
     return merge
@@ -8526,6 +8564,7 @@ def test_slash_date_keeps_the_separator_before_a_time() -> None:
     # 年の無い日付と 24 時間制も同じ（「12/1 17:00」が「12/11」と「7:00」にならない）
     assert reasons_for("12/1 17:00", "鈴木さんが12/11 7:00までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("12/1 17:00", "鈴木さんが12/1 17:00までに提出します") == []
+    assert reasons_for("1/2 19:00", "鈴木さんが1/21 9:00までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     # 区切りの書き方（空白・読点・「の」）は問わない
     assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/1、7pmまでに提出します") == []
     assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/1の7pmまでに提出します") == []
@@ -9383,7 +9422,7 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | GPU OOM retry + ダウングレード | `test_oom_downgrades_model_per_meeting`、`test_two_jobs_failing_with_oom_on_the_same_model_downgrade_once`、`test_downgrade_skips_models_that_are_not_installed`、`test_provider_loads_on_the_requested_device_and_keeps_one_model` |
 | ワーカークラッシュ → Sweeper → 再 lease | `test_sweeper_recovers_expired_lease_and_ignores_stale_owner`、`test_pool_is_rebuilt_after_a_worker_crash`、`test_pool_is_rebuilt_after_a_timeout` |
 | 落ち続けるジョブを永久に実行しない（lease 切れの回数上限） | `test_sweeper_fails_job_whose_lease_keeps_expiring` |
-| merge が書き込みをコミットした後に回数切れで failed になっても、その行より後に置いた撮り直しは作り直した merge が公開する。書き込みの前に落ち続ける merge は際限なく作り直さない（§12 `rerun_merge_for_staged`） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly` |
+| merge が書き込みをコミットした後に回数切れで failed になっても、その merge が終わる前に置いた撮り直しは作り直した merge が公開する（同じミリ秒でも）。書き込みの前に落ち続ける merge は際限なく作り直さない（§12 `rerun_merge_for_staged`） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly` |
 | 常駐ループが 1 周の失敗で終わらない | `test_runner_loop_survives_failed_iteration`、`test_sweeper_loop_survives_failed_iteration` |
 | invalid audio no-retry | `test_failed_chunk_blocks_until_excluded`、`test_retry_decisions` |
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
