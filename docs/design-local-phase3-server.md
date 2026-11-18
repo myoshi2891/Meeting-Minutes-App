@@ -127,7 +127,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * ブラウザ側 WAV 生成は変えない。`compress_chunk` ジョブ（`priority=400`、最低優先）が `completed` から `compress_after_days`（既定 7 日）経過した会議の Chunk を FLAC 化する
 * `AudioCodec` 抽象（`encode` / `decode`）。実 Provider は `soundfile`（libsndfile、extras）。Fake は「マジック + 無圧縮 PCM」の自前コンテナで、検証ロジック（復元一致・不一致時の保持）をテストする
 * 圧縮の原子性：メモリ上で符号化 → 復元して `build_wav(pcm)` の sha256 が `audio_chunks.sha256`（WAV 値、不変）と一致することを確かめる → `write_atomic` で `.flac` を書く → `local_path` / `codec='flac'` / `sha256_flac` 更新 → WAV 削除。不一致は `.flac` を書かずに `INVALID_AUDIO`（non-retryable）。WAV は残る
-* 圧縮と他の処理の競合：(a) 切り替えの更新は lease の現行の所有者だけが行い、Chunk の `local_path` / `sha256` が読んだ時のままであることも確かめる。STT の再実行（ジョブを行ごと消す）や再 PUT の修復（WAV に書き戻す）が先に起きていたら、WAV のまま残して作った `.flac` を消す。圧縮ファイルは試行ごとに別の一時ファイル（`*.staging`）に書き、lease の確認と同じ書き込みロックの下で最終パスへ置き換える。後始末で消すのはその試行の一時ファイルだけなので、lease を失った旧い試行が、別の試行の確定した圧縮ファイルを上書き・削除することはない。(b) 音声を読む側（VAD・STT・話者分離）は、読み取りに失敗したら Chunk の行を読み直し、パスが変わっていれば新しいパスから読む（`read_chunk_pcm()`）。読み直さないと、置き換わった直後の読み取りが「ファイルなし」になり、正常な Chunk を `missing` にしてしまう。(c) WAV を消すのは、更新のコミットの後の通常の経路も、コミット後・WAV の削除前に落ちた回のやり直しのジョブも、書き込みロックの下で lease が現行で、Chunk がまだ圧縮済み（通常の経路は切り替えた先のパス、やり直しは読んだときと同じパス）のときだけ（`_unlink_wav_if_still_compressed`）。コミットの後・読んだ後に再 PUT の修復が WAV に書き戻していれば、その WAV が正なので残す
+* 圧縮と他の処理の競合：(a) 切り替えの更新は lease の現行の所有者だけが行い、Chunk の `local_path` / `sha256` が読んだ時のままであることも確かめる。STT の再実行（ジョブを行ごと消す）や再 PUT の修復（WAV に書き戻す）が先に起きていたら、WAV のまま残して作った `.flac` を消す。圧縮ファイルは試行ごとに別の一時ファイル（`*.staging`）に書き、lease の確認と同じ書き込みロックの下で最終パスへ置き換える。後始末で消すのはその試行の一時ファイルだけなので、lease を失った旧い試行が、別の試行の確定した圧縮ファイルを上書き・削除することはない。(b) 音声を読む側（VAD・STT・話者分離）は、読み取りに失敗したら Chunk の行を読み直し、パスが変わっていれば新しいパスから読む（`read_chunk_pcm()`。存在確認の後に消えて OSError になった場合も同じ）。読み直さないと、置き換わった直後の読み取りが「ファイルなし」になり、正常な Chunk を `missing` にしてしまう。(c) WAV を消すのは、更新のコミットの後の通常の経路も、コミット後・WAV の削除前に落ちた回のやり直しのジョブも、書き込みロックの下で lease が現行で、Chunk がまだ圧縮済み（通常の経路は切り替えた先のパス、やり直しは読んだときと同じパス）のときだけ（`_unlink_wav_if_still_compressed`）。コミットの後・読んだ後に再 PUT の修復が WAV に書き戻していれば、その WAV が正なので残す
 * `read_pcm` は拡張子で分岐し、FLAC の場合も WAV sha256 で照合する（`sha256` 列の意味を変えない）
 * バックアップ：`VACUUM INTO {dataDir}/backups/minutes-{世代番号}-{epoch ms}.sqlite`。**直近のバックアップから 24 時間たっていたら作る**（起動時と 1 時間ごとに判定。基準はファイル名の時刻で、プロセスの起動からの経過ではない）。世代数 `backup_generations`（既定 7）。起動のたびに作ると、短時間に再起動を 7 回くり返しただけで古い世代がすべて押し出される。使うたびにサーバーを起動する使い方でも 1 日 1 世代になる。世代管理・復元元の選択・期日の判定の「新しい順」は名前の時刻ではなく世代番号（既存の最大 + 1、ファイル名に残る）で決める。時刻で並べると、時計が戻った後に作った世代が前の世代より古い扱いになり、時計が追いつくと元の順に戻って、どちらでも新しい世代を消す・古い世代から復元する。最新の世代の時刻が現在より未来なら（作った後に時計が戻った）期日として作る（戻った後に作った世代は番号が最大なので、作った直後に消さず、毎周作り直さない）。`completed` 遷移ごとのバックアップは行わない（DB 全体の複製なので会議 1 件ごとには重く、世代もその分早く回る。失われるのは最長 24 時間分の要約とノートで、録音と transcript は録音ファイルから作り直せる）
 * バックアップは `.part` に書いてから名前を付け替える。書きかけ・失敗したファイルは正規の名前では残らず、復元元にも世代管理の対象にもならない
@@ -145,7 +145,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * TLS：`doctor --init-tls --host <hostname or IP>` で自己署名証明書（`cryptography`、extras `lan`）。ブラウザは初回に証明書の受け入れが必要（断定しない事項 §3）
 * 認証：`users` テーブル（`id`, `name`, `token_hash`, `created_at`）。`minutes-local user add <name>` がトークンを 1 回だけ表示する（同名は拒否）。`user remove <id>` で失効させる（トークンを漏らした・利用者が抜けた。会議と録音は消さない）。`user list` で一覧。`users` が空なら従来の `token` ファイルで `local` ユーザーとして動作（後方互換）。DB をバックアップから復元すると（§2.4）`users` もその時点に戻り、バックアップの後に `user remove` で失効させた利用者のトークンがまた通る。運用者は復元の後に `user list` で確かめ、失効させたままにすべき利用者を `user remove` でもう一度消す（serve は復元の警告でこれを促す）
 * 単一利用者と複数利用者の切り替えは**起動時に決まる**（`AppContext.multi_user`）。最初の利用者を追加した後・最後の利用者を削除した後は、サーバーの再起動で反映する。複数利用者の間の追加・削除は再起動なしで効く（トークンは要求ごとに `users` を引く）。複数利用者に切り替えると `token` ファイルは使えなくなり、それまでに録音した会議（所有者 `local`）は誰からも見えなくなる（利用者を全員削除して単一利用者に戻すと見える）。既存の会議を特定の利用者へ引き継ぐ手段は本書の範囲外（§3）
-* 所有者の居ない会議の復元：rebuild（§2.4）は所有者を `recordings/{userId}/` の階層で決めるので、DB をバックアップなしで作り直して `users` が空になると、複数利用者のときの会議（所有者は各利用者の ID）は残るが、サーバーは単一利用者（`local`）で動き、どのトークンからも見えない（404）。`user add` は新しい ID を振るので、同じ ID の利用者は作り直せない。付け替えの手段も設けない（上の項目と同じ。所有者を変えるコマンドは認可の境界を動かすので、別に設計する）。rebuild は `users` に行の無い所有者 ID（`local` を除く）を `RebuildReport.owners_without_user` に入れ、起動時の復旧の警告と `doctor --rebuild` の出力がその ID・見えないこと・取る手順を表示する（`_warn_unowned`）。手順は、サーバーを止め、まず今の DB を `{dataDir}` の直下で別名へ移して残し（例：`minutes.sqlite.before-restore-<epoch>`。WAL なので `minutes.sqlite-wal`・`minutes.sqlite-shm` があれば、同じ名前の後ろに `-wal`・`-shm` を付けて一緒に移す。コピーではなく移すのは、落ちた serve の WAL が `minutes.sqlite` の隣に残ったままだと、置いたバックアップを開いたときにその WAL が適用されて壊れるため。`backups/` の下に置くと世代管理や復元元の候補に、`tmp/` の下に置くと serve の起動で消され、`recordings/` の下は rebuild が走査する）、`{dataDir}/backups/` のうちその利用者を含むバックアップで DB を置き換え、`doctor --rebuild` でバックアップの後の会議を足すこと。rebuild が戻すのは録音から作れる会議と Chunk だけなので、選んだバックアップの後に作られたノートと要約（とバックアップの後の会議の文字起こしの結果。会議はもう一度文字起こしされる）は置き換えで失われる。移した 3 つのファイルを元の名前に戻せば置き換える前の状態に戻る（そのときは所有者の居ない会議もまた見えなくなる）。置き換えると、そのバックアップの後に `user remove` した利用者のトークンも戻るので、`user list` で確かめて消し直す。そのバックアップが無ければ会議は API から開けない（音声は `recordings/{userId}/` に残る）。`user remove` した利用者の会議も録音を消さないので同じく報告されるが、これは想定どおりで、戻さない（警告もそう書く）。既知の制限とする
+* 所有者の居ない会議の復元：rebuild（§2.4）は所有者を `recordings/{userId}/` の階層で決めるので、DB をバックアップなしで作り直して `users` が空になると、複数利用者のときの会議（所有者は各利用者の ID）は残るが、サーバーは単一利用者（`local`）で動き、どのトークンからも見えない（404）。`user add` は新しい ID を振るので、同じ ID の利用者は作り直せない。付け替えの手段も設けない（上の項目と同じ。所有者を変えるコマンドは認可の境界を動かすので、別に設計する）。rebuild は `users` に行の無い所有者 ID（`local` を除く）を `RebuildReport.owners_without_user` に入れ、起動時の復旧の警告と `doctor --rebuild` の出力がその ID・見えないこと・取る手順を表示する（`_warn_unowned`）。手順は、サーバーを止め、まず今の DB を `{dataDir}` の直下で別名へ移して残し（例：`minutes.sqlite.before-restore-<epoch>`。WAL なので `minutes.sqlite-wal`・`minutes.sqlite-shm` があれば、同じ名前の後ろに `-wal`・`-shm` を付けて一緒に移す。コピーではなく移すのは、落ちた serve の WAL が `minutes.sqlite` の隣に残ったままだと、置いたバックアップを開いたときにその WAL が適用されて壊れるため。`backups/` の下に置くと世代管理や復元元の候補に、`tmp/` の下に置くと serve の起動で消され、`recordings/` の下は rebuild が走査する）、`{dataDir}/backups/` のうちその利用者を含むバックアップで DB を置き換え、`doctor --rebuild` でバックアップの後の会議を足すこと。rebuild が戻すのは録音から作れる会議と Chunk だけなので、選んだバックアップの後に作られたノートと要約（とバックアップの後の会議の文字起こしの結果。会議はもう一度文字起こしされる）は置き換えで失われる。置き換える前の状態に戻すときは、サーバーを止め、置き換えに使った `minutes.sqlite` と、あれば `minutes.sqlite-wal`・`minutes.sqlite-shm` を同じく `{dataDir}` の直下で別名へ移してから（例：`minutes.sqlite.replaced-<epoch>`。戻すファイルの隣に置き換え後の WAL が残ると、戻した DB を開いたときに適用されて壊れる）、移しておいた 3 つのファイルを元の名前に戻す（そのときは所有者の居ない会議もまた見えなくなる）。置き換えると、そのバックアップの後に `user remove` した利用者のトークンも戻るので、`user list` で確かめて消し直す。そのバックアップが無ければ会議は API から開けない（音声は `recordings/{userId}/` に残る）。`user remove` した利用者の会議も録音を消さないので同じく報告されるが、これは想定どおりで、戻さない（警告もそう書く）。既知の制限とする
 * 認可：認証ミドルウェアが `/v1/meetings/{id}/...` と `/v1/jobs/{id}/...` の所有者を照合し、他人の会議は `404`（存在を漏らさない）。`GET /v1/meetings` は自分の会議のみ
 * ファイル階層：`recordings/{userId}/{meetingId}/{source}/{seq}.wav`。マイグレーション 012 が既存の `recordings/{meetingId}/` を `recordings/local/{meetingId}/` へ移動し `local_path` を更新する。旧ディレクトリは新しい階層を作る前に `{dataDir}/.migrate-012/` へ退避してから統合する（会議 ID が `local` だと旧ディレクトリと新しい階層の親が重なるため）
 * ジョブの公平性：`lease_job` を「利用者ごとの実行中ジョブ数が少ない利用者を優先」に変更（`ORDER BY running_per_user, priority, created_at`）。GPU は依然 1 台なので、同時実行数の上限は Phase 2 と同じ
@@ -1332,24 +1332,37 @@ class JobRunner:
             d = RetryDecision("failed", None, True)
         followup: str | None = None  # 失敗の後続処理で作ったジョブの id（分離の失敗で作った merge）
         async with self.ctx.db.write() as conn:
-            ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
-                                 last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
-            if not ok:
-                return  # 旧ワーカーの報告は無視（基本設計 §9.3）
-            if not d.consume_attempt:
-                conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
-            if err.error_class == "OOM" and job.job_type in GPU_HEAVY and job.job_type != "diarize_meeting":
-                self._downgrade_stt(conn, job.meeting_id, job.model_name)
-            if d.next_status == "failed":
-                followup = pipeline.on_job_failed(conn, job)
-            elif job.job_type == "synthesize_minutes":
-                # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
-                pipeline.on_summary_deferred(conn, job.meeting_id)
-            repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
+            # 要約の失敗は、合成に使った版（handle_summary が付ける）と今の版を、この記録と同じトランザクションで比べる。
+            # 進んでいれば古い版に対する失敗なので記録せず、同じ行を pending に戻す（requeue_job。試行回数は戻す。§12.7）。
+            # lease を失っていれば requeue_job も finish_job も 0 行で、何も書かない
+            requeued = self._input_advanced(conn, job, err) and repo.requeue_job(conn, job.id, self.owner, job.attempts)
+            if not requeued:
+                ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
+                                     last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
+                if not ok:
+                    return  # 旧ワーカーの報告は無視（基本設計 §9.3）
+                if not d.consume_attempt:
+                    conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
+                if err.error_class == "OOM" and job.job_type in GPU_HEAVY and job.job_type != "diarize_meeting":
+                    self._downgrade_stt(conn, job.meeting_id, job.model_name)
+                if d.next_status == "failed":
+                    followup = pipeline.on_job_failed(conn, job)
+                elif job.job_type == "synthesize_minutes":
+                    # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
+                    pipeline.on_summary_deferred(conn, job.meeting_id)
+                repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
         # 完了時と同じく、どちらもコミットの後に流す
         self._publish_job(job.id)
         if followup is not None:
             self._publish_job(followup)
+
+    @staticmethod
+    def _input_advanced(conn, job: Job, err: JobError) -> bool:  # type: ignore[no-untyped-def]
+        """ハンドラが失敗に付けた入力の transcript の版（handle_summary）が、今の会議の版と違うか。付いていなければ False。"""
+        if err.input_transcript_version is None:
+            return False
+        current = repo.get_meeting(conn, job.meeting_id)
+        return current is not None and current.transcript_version != err.input_transcript_version
 
     def _downgrade_stt(self, conn, meeting_id: str, ran_with: str | None) -> None:  # type: ignore[no-untyped-def]
         """会議単位でモデルを 1 段落とす（基本設計 §7.3）。ran_with は失敗したジョブが使ったモデル（lease 時点の model_name）。
@@ -3851,7 +3864,7 @@ from ..stt.provider import STTRequest, STTResult
 from ..storage.files import InvalidWavError, build_wav, read_pcm, sha256_hex, write_atomic
 from . import pipeline
 from .context import AppContext
-from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError
+from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError, normalize_exception
 from .selection import refresh_llm, refresh_stt
 
 log = logging.getLogger(__name__)
@@ -3863,11 +3876,12 @@ def read_chunk_pcm(ctx: AppContext, chunk: AudioChunk) -> bytes:
     """Chunk の PCM を読む。行を読んでからファイルを開くまでの間に圧縮（§2.4）がファイルを置き換えていたら、行を読み直して読む。
 
     読み直さないと、置き換わった直後の読み取りが「ファイルなし」で失敗し、呼び出し側が正常な Chunk を missing にする。
-    パスが変わっていなければ本当の欠損・破損なので、InvalidWavError をそのまま返す。
+    read_pcm の存在確認の後・読み取りの前に置き換わると OSError（FileNotFoundError）になるので、それも読み直しの対象にする。
+    パスが変わっていなければ本当の欠損・破損なので、元の例外をそのまま返す。
     """
     try:
         return read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec)
-    except InvalidWavError:
+    except (InvalidWavError, OSError):
         with ctx.db.read() as conn:
             fresh = repo.get_chunk(conn, chunk.id)
         if fresh is None or fresh.local_path == chunk.local_path:
@@ -4320,17 +4334,17 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
         synth = await synthesize(ctx.llm, llm_model, language, text, DEFAULT_LLM_CTX_TOKENS, th.llm_ctx_fill_ratio)
         index = SegmentIndex(seg_texts)
         accepted, rejected, unresolved = validate(synth.draft, index)
-    except Exception:
-        # 合成・検証の失敗が、合成の間に merge が版を進めた後なら、それは古い版の transcript に対する失敗。failed にすると
-        # 会議も failed になり、新しい版の要約ジョブは実行中のこの行が一意制約で先にあるので作られていない。成功時と同じく
-        # 同じ行を pending に戻して新しい版でやり直す（requeue_job。lease の現行の所有者だけ。試行回数は戻す）。
-        # 版が同じ・lease を失っていれば、そのまま投げて Runner の _on_failure が従来どおり記録する。CancelledError は捕まえない
-        async with ctx.db.write() as conn:
-            current = repo.get_meeting(conn, job.meeting_id)
-            if (current is not None and current.transcript_version != meeting.transcript_version
-                    and repo.requeue_job(conn, job.id, job.lease_owner or "", job.attempts)):
-                return llm_model
-        raise
+    except Exception as exc:
+        # 合成・検証の失敗に、合成に使った transcript の版を付けて投げる。Runner の _on_failure が、失敗を記録する書き込み
+        # トランザクションの中で今の版と比べ、進んでいれば failed にせず同じ行を pending に戻す（古い版に対する失敗。failed に
+        # すると会議も failed になり、新しい版の要約ジョブは実行中のこの行が一意制約で先にあるので作られていない）。
+        # 比較をここで別のトランザクションで行うと、比較の後・失敗の記録の前に merge が版を進めたとき failed になる。
+        # CancelledError は捕まえない
+        err = normalize_exception(exc)
+        err.input_transcript_version = meeting.transcript_version
+        if err is exc:
+            raise
+        raise err from exc
     total = len(synth.draft.topics) + len(synth.draft.decisions) + len(synth.draft.actionItems)
     t = now_ms()
     summary = MeetingSummary(
@@ -4462,7 +4476,7 @@ Phase 2 §22 からの変更点。
 | `serve` | ロック → 一時ディレクトリ（`{dataDir}/tmp`）を空にする → `build_context` → 復旧していれば警告を標準エラーに出す → 以降は Phase 2 と同じ（bind → トークン → sweep → `resume_finalized` → Runner・Sweeper・定期処理のループ）。復旧で `finalized` に戻った会議は `resume_finalized` がジョブを作る |
 | `doctor`（serve が動いていない） | ロックを取り、`build_context(recover=True)`。壊れた DB はここでも復旧する |
 | `doctor`（serve が動いている） | ロックが取れないので `build_context(recover=False)`。使用中の DB を退避・復元しない。DB が開けなければ「サーバーを再起動して復旧する」と出して終了コード 1 |
-| `doctor --rebuild` | ロックが取れなければ何もせず終了コード 1（「サーバーを止めてから」）。取れたら `rebuild` を実行して件数を出す。`users` に行の無い所有者の会議があれば、その ID と手順（置き換える前に今の DB を `-wal`・`-shm` ごと `{dataDir}` の直下で別名へ移す）を警告し、選んだバックアップの後のノートと要約は移したファイルを戻さない限り失われることも示す（`_warn_unowned`。§2.5） |
+| `doctor --rebuild` | ロックが取れなければ何もせず終了コード 1（「サーバーを止めてから」）。取れたら `rebuild` を実行して件数を出す。`users` に行の無い所有者の会議があれば、その ID と手順（置き換える前に今の DB を `-wal`・`-shm` ごと `{dataDir}` の直下で別名へ移す）を警告し、選んだバックアップの後のノートと要約は移したファイルを戻さない限り失われる。戻すときはサーバーを止め、置き換えた DB を `-wal`・`-shm` ごと別名へ移してから戻すことも示す（`_warn_unowned`。§2.5） |
 | `doctor --init-tls [--host …]` | 証明書を作って終了する（DB もロックも触らない）。既存の証明書は上書きする（端末側の受け入れはやり直しになる） |
 | `user add <name>` | 同名は終了コード 1（トレースバックにしない）。最初の 1 人のときは、再起動で複数利用者に切り替わること・`token` ファイルが使えなくなること・既存の会議が見えなくなることを表示する（§2.5） |
 | `user remove <id>` | 利用者を削除する。トークンは次の要求から通らない。会議と録音は消さない。最後の 1 人のときは、再起動で単一利用者に戻ることを表示する。該当なしは終了コード 1 |
@@ -4737,6 +4751,7 @@ def _warn_unowned(owners: list[str]) -> None:
     置き換える前に今の DB を -wal・-shm ごと dataDir の直下で別名へ移させる（backups/・tmp/・recordings/ の下は起動処理・rebuild が触る）。
     コピーではなく移す：落ちた serve の WAL が隣に残ると、置いたバックアップを開いたときに適用されて壊れる。
     rebuild は録音から会議と Chunk を戻すだけなので、選んだバックアップの後のノートと要約は、移したファイルを戻さない限り失われる。
+    戻すときも、サーバーを止め、置き換えた DB を -wal・-shm ごと別名へ移してから戻させる（置き換え後の WAL が戻した DB に適用されないように）。
     バックアップで置き換えるとその後に消した利用者のトークンも戻るので、置き換えたら user list で確かめて消し直す
     """
     if not owners:
@@ -4750,7 +4765,10 @@ def _warn_unowned(owners: list[str]) -> None:
           "not under backups/, tmp/ or recordings/), then put the backup in place as minutes.sqlite and run "
           "`minutes-local doctor --rebuild`; then run `minutes-local user list` and remove again any user that was removed "
           "after that backup. Notes and summaries created after that backup are lost unless you move the set-aside files back "
-          "(rebuild only recovers meetings and chunks from the recordings). Without such a backup the meetings cannot be "
+          "(rebuild only recovers meetings and chunks from the recordings). To move them back, stop the server, first move "
+          "the replacement minutes.sqlite and its minutes.sqlite-wal and minutes.sqlite-shm (if they exist) aside to another "
+          "separate name directly under <dataDir> (for example minutes.sqlite.replaced-<epoch>), then rename the set-aside "
+          "files back to minutes.sqlite, minutes.sqlite-wal and minutes.sqlite-shm. Without such a backup the meetings cannot be "
           "reassigned to another user; the audio files stay under recordings/<id>/.", file=sys.stderr)
 
 
@@ -6690,6 +6708,29 @@ async def test_reader_follows_chunk_replaced_by_compression(client3: httpx.Async
     assert len(pcm) == 960000
 
 
+async def test_reader_follows_chunk_replaced_between_exists_and_read(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                    runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """read_pcm の存在確認の後に圧縮が WAV を消して OSError になっても、行を読み直して新しいパスから読む。"""
+    # Arrange: 圧縮前の行を持ったまま圧縮を終え、古いパスの読み取りは存在確認を通った後の FileNotFoundError にする
+    from minutes_local.jobs import handlers as handlers_module
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        stale = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    real = handlers_module.read_pcm
+
+    def racing(data_dir: Path, relative_path: str, *args: object, **kwargs: object) -> bytes:
+        if relative_path == stale.local_path:
+            raise FileNotFoundError(relative_path)
+        return real(data_dir, relative_path, *args, **kwargs)  # type: ignore[arg-type]
+    monkeypatch.setattr(handlers_module, "read_pcm", racing)
+    # Act
+    pcm = read_chunk_pcm(ctx3, stale)
+    # Assert
+    assert len(pcm) == 960000
+
+
 async def test_compress_does_not_switch_after_job_was_withdrawn(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
     """STT の再実行がジョブを消した後は、実行中だった圧縮が Chunk を切り替えない（WAV のまま、圧縮ファイルも残さない）。"""
     # Arrange: 圧縮ジョブを lease した後で、再実行がジョブを行ごと消す
@@ -7343,6 +7384,8 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
     assert "u-gone" in err
     assert "first move (do not copy) the current database aside" in err and "minutes.sqlite-wal" in err
     assert "Notes and summaries created after that backup are lost unless you move the set-aside files back" in err
+    # 戻すときも、置き換えた DB を WAL ごと先に移させる（置き換え後の WAL が戻した DB に適用されない）
+    assert "To move them back, stop the server, first move the replacement minutes.sqlite and its minutes.sqlite-wal" in err
     # Act / Assert: 報告する ID が無ければ何も出さない
     _warn_unowned([])
     assert capsys.readouterr().err == ""
