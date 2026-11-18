@@ -2642,6 +2642,12 @@ export class NotesStore {
    */
   private unwrittenDraft: Draft | null = null;
   /**
+   * 下書きの書き込みの失敗を onError に知らせている間の状態（知らせていなければ null）。"retry" は、前の失敗の onError の中で
+   * 入った編集の書き込みも失敗したとき。その onError の中の編集は書かずにメモリ（unwrittenDraft）に持つ（applyDraft）。
+   * 書くと、書き込みが失敗し続ける間、失敗 → onError → setDraft → 書き込み → 失敗 … の連鎖が止まらない
+   */
+  private reportingWriteFailure: "first" | "retry" | null = null;
+  /**
    * load(carry) で引き継いだ carry。以後このインスタンスの書き込みは、IndexedDB に別タブの carry より新しい下書きがあれば
    * 上書きせず、未送信の内容をこのタブの退避先に書く（guardFor）。引き継ぎがなければ null で、書き込みは常に上書きする
    * （上書きされる別タブの未送信の下書きは、どちらでも退避先に移す）
@@ -2866,7 +2872,10 @@ export class NotesStore {
       // 返した後に書き込みが残って新しいインスタンスの load() と競合することはない。保存の予約は schedule() がしない
       this.editedWhileDisposing = true;
     }
-    const written = this.writeDraft({ json: content, revision: this.state.revision, lastAppliedSummaryVersion, savedAt: Date.now(), writer: this.deps.tabId, writeId: nextWriteId(this.deps.tabId), saved: false });
+    // 書き込みの失敗が続いている（前の失敗の onError の中の編集の書き込みも失敗した）ときの onError の中の編集は、書かずに
+    // unwrittenDraft に持つ（dispose() が引き継ぐ）。書くと失敗 → onError → setDraft の連鎖が止まらない。onError の外の後の編集は書く
+    const hold = this.reportingWriteFailure === "retry";
+    const written = this.writeDraft({ json: content, revision: this.state.revision, lastAppliedSummaryVersion, savedAt: Date.now(), writer: this.deps.tabId, writeId: nextWriteId(this.deps.tabId), saved: false }, hold);
     this.deps.onChange(this.state);
     if (this.state.sync !== "conflict") this.schedule();
     return written;
@@ -3027,9 +3036,13 @@ export class NotesStore {
    * 下書き・控えを書く。内容は呼んだ時点で確定させ、書き込みは発行順に 1 本ずつ流す。
    * 前の書き込みがなければ、この呼び出しの中で書き始める（IndexedDB のトランザクションを直後の load() より先に作る。
    * then で 1 回遅らせると、待たずに作り直したインスタンスの load() が書き込み前の下書きを読む）
+   * hold は IndexedDB に書かず、鎖の順番が来たら unwrittenDraft に持つだけにする（書き込みの失敗が続くときの onError の中の編集。
+   * 鎖に並べるのは、先に並んだ書き込みの成功・失敗が、後から入ったこの編集を unwrittenDraft から消さないようにするため）
    */
-  private writeDraft(draft: Draft): Promise<boolean> {
+  private writeDraft(draft: Draft, hold = false): Promise<boolean> {
     const key = this.draftKey();
+    // 書き込みの失敗を知らせている間（onError の中）に並んだ書き込みか。これも失敗したら、その onError の中の編集は書かない
+    const queuedOnFailure = this.reportingWriteFailure !== null;
     // 判定は呼んだ時点で決める（protectBase は load の最初の await より前に決まり、以後変わらない）
     const base = this.guardFor(draft);
     // 上書きで退避先へ移した別タブの下書き。書けたら一覧（heldDrafts）にも足す。足さないと、移した内容は
@@ -3052,6 +3065,10 @@ export class NotesStore {
     };
     // 戻り値はこの下書きを下書きのキーに書けたか（書かなかった・失敗したら false）
     const run = async (): Promise<boolean> => {
+      if (hold) {
+        this.unwrittenDraft = draft;
+        return false;
+      }
       try {
         const written = await this.deps.drafts.set(key, draft, guard);
         for (const entry of relocated) this.showHeld(entry);
@@ -3070,7 +3087,14 @@ export class NotesStore {
       } catch (error) {
         // dispose() が返して新しいインスタンスへ引き継ぐ。後ろの書き込みが成功すれば null に戻る
         this.unwrittenDraft = draft;
-        this.reportError(error);
+        // onError の中の setDraft が見る。前の失敗の onError の中で並んだ書き込みの失敗なら "retry"（その中の編集は書かない）
+        const outer = this.reportingWriteFailure;
+        this.reportingWriteFailure = queuedOnFailure ? "retry" : "first";
+        try {
+          this.reportError(error);
+        } finally {
+          this.reportingWriteFailure = outer;
+        }
         return false;
       }
     };
@@ -6131,6 +6155,61 @@ describe("NotesStore", () => {
     expect(writes).toEqual([["nested"]]);
     expect(b.drafts.get("notes:m")).toMatchObject({ json: ["nested"], saved: false });
     expect(carry).toBeNull();
+  });
+
+  it("下書きの書き込みが失敗し続けても、onError の中の編集で書き直しを繰り返さず、最新の編集を引き継ぎ、後の編集は書ける", async () => {
+    // Arrange: 書き込みは失敗し続け、onError のたびにエディタが編集を入れる
+    const b = build();
+    let failing = true;
+    let calls = 0;
+    let edits = 0;
+    let store: NotesStore | null = null;
+    const deps: NotesStoreDeps = {
+      ...b.deps,
+      drafts: {
+        ...b.deps.drafts, get: b.deps.drafts.get,
+        set: (k, v, g) => {
+          calls++;
+          return failing ? Promise.reject(new Error("quota exceeded")) : b.deps.drafts.set(k, v, g);
+        },
+      },
+      onError: () => store?.setDraft([`e${++edits}`]),
+    };
+    store = new NotesStore(deps, "m");
+    await store.load();
+    // Act
+    store.setDraft(["a"]);
+    for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0));
+    const callsWhileFailing = calls;
+    failing = false;
+    store.setDraft(["later"]);
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+    const written = b.drafts.get("notes:m");
+    // Assert: 書き直しは onError の中の編集の 1 回まで。後の編集は書け、引き継ぐものは残らない
+    expect(callsWhileFailing).toBe(2);
+    expect(written).toMatchObject({ json: ["later"], saved: false });
+    expect(await store.dispose()).toBeNull();
+  });
+
+  it("下書きの書き込みが失敗し続けたまま作り直すと、onError の中の最新の編集を引き継ぐ", async () => {
+    // Arrange
+    const b = build();
+    let edits = 0;
+    let store: NotesStore | null = null;
+    const deps: NotesStoreDeps = {
+      ...b.deps,
+      drafts: { ...b.deps.drafts, get: b.deps.drafts.get, set: () => Promise.reject(new Error("quota exceeded")) },
+      onError: () => store?.setDraft([`e${++edits}`]),
+    };
+    store = new NotesStore(deps, "m");
+    await store.load();
+    store.setDraft(["a"]);
+    for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0));
+    // Act
+    const carry = await store.dispose();
+    // Assert: 書けなかった最新の編集（2 回目の失敗の onError の中の編集）を返す
+    expect(edits).toBe(2);
+    expect(carry).toMatchObject({ json: ["e2"], saved: false });
   });
 
   it("保存に成功した下書きは saved: true で控えられる", async () => {

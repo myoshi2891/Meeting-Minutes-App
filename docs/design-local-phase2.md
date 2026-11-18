@@ -516,8 +516,24 @@ CREATE TABLE IF NOT EXISTS segment_replacements (
   staged_during_merge TEXT   -- 置いた時点で終わっていなかった merge ジョブの id（無ければ NULL）。その merge が回数切れで failed になったとき作り直すかを決める
 );
 CREATE TABLE IF NOT EXISTS staged_segments (
-  -- 列は transcript_segments と同じ。chunk_id だけ segment_replacements(chunk_id) を参照する（ON DELETE CASCADE）
-  ...,
+  -- 列は transcript_segments と同じ（promote_replacements が同じ列名で写す）。chunk_id だけ segment_replacements(chunk_id) を参照する
+  id              TEXT PRIMARY KEY,
+  meeting_id      TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  chunk_id        TEXT NOT NULL REFERENCES segment_replacements(chunk_id) ON DELETE CASCADE,
+  source          TEXT NOT NULL CHECK (source IN ('mic','system')),
+  segment_index   INTEGER NOT NULL,
+  start_ms        INTEGER NOT NULL,
+  end_ms          INTEGER NOT NULL,
+  text            TEXT NOT NULL,
+  normalized_text TEXT,
+  language        TEXT,
+  confidence      REAL,
+  no_speech_prob  REAL,
+  merged_version  INTEGER,
+  merge_reason    TEXT,
+  speaker_id         TEXT,
+  speaker_confidence REAL,
+  created_at      INTEGER NOT NULL,
   UNIQUE (chunk_id, segment_index)
 );
 ```

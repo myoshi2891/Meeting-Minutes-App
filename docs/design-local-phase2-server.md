@@ -3885,7 +3885,8 @@ _EN_DEADLINE_ALTS = rf"{_EN_DAY_TIME}|next week|this week|end of|eod|eow"
 # ときだけ止まる。数字だけで止めると「11/20/2026」が「11/20/20」に縮んで「11/20/2027」と同じ表現になる。
 # 区切りのあった「2026/12/1 7pm」は、照合する文字列（_hint_text）に空白が残るので、日と時刻の数字がつながらない
 _SLASH_DATE_END = r"(?:(?!\d)|(?=" + _TIME_EN + "|" + _TIME + "))"
-# 後ろに時刻を付けてよい日本語・数字の表現：日付（年・元号・相対の年を含む）、日本語の曜日（週の修飾・「日」を含む）、相対の月と日、相対の月の時期。
+# 後ろに時刻を付けてよい日本語・数字の表現：日付（年・元号・相対の年を含む）、日本語の曜日（週の修飾・「日」を含む）、相対の月と日、相対の月の時期、
+# 週末、相対の日、月日の付かない相対の年。
 # _DEADLINE_HINTS と _ATTACHED_TIME_EN で共有する
 _DATE = (
     r"(?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年|(?:再来年|来年|今年|去年)の?)?\d{1,2}月\d{1,2}日|"
@@ -3909,13 +3910,15 @@ _REL_DAY_JA = r"(?:明後日|明日)"
 # 1 つの表現にする（相対の月の時期と同じ）。
 # 表現として切り出さないと _phrase_in の部分一致になり、deadline の「来年」が quote の「再来年」の中に当たる。年だけを切り出すと、
 # deadline の「来年11月」が「来年」に縮み、quote の「来年3月」が裏付けてしまう。月日の付いたもの（「来年11月20日」）は _DATE が先に取る
+# 後ろの時刻（「来年度末午後5時」）も 1 つの表現にする（相対の月の時期と同じ）。別々に切り出すと、quote の「今年度末午後5時に確認し、
+# 来年度末に提出」の別の年の時刻と「来年度末」を寄せ集めて deadline の「来年度末午後5時」を裏付けてしまう
 _REL_YEAR_JA = (
     r"(?:再来年|来年|今年|去年)(?:の?(?:\d{1,2}月|度))?"
     r"(?:の?(?:末|上旬|中旬|下旬|上半期|下半期|上期|下期|前半|後半|春|夏|秋|冬|初め|早々|明け))?"
 )
 _DEADLINE_HINTS = re.compile(
     rf"({_DATE}{_DATE_WEEKDAY_JA}{_TIME_SUFFIX}|{_TIME_EN}|{_TIME}|"
-    rf"{_REL_YEAR_JA}|"
+    rf"{_REL_YEAR_JA}{_TIME_SUFFIX}|"
     rf"{_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_PERIOD_JA}{_TIME_SUFFIX}|"
@@ -3940,7 +3943,7 @@ _TRAILING_TIME_EN = re.compile(rf"{_TIME_EN}$")
 # 日本語・数字の表現を切り出す文字列（_hint_text）では日付と 1 つの表現（「11/20 5pm」）になるので、_quote_hints は英語の表現を切り出す前にこの時刻を
 # 落とす。落とさないと、同じ時刻が時刻だけの表現（「5pm」）としても数えられ、quote の「11/20 5pm」が deadline の「5pm」を裏付けてしまう。
 # 区切りは _spaced で空白 1 つになり、「の」は挟んでよい（_TIME_SUFFIX と同じ）。「at」を挟んだもの（「11/20 at 5pm」）は日付に付かない
-_ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}|{_MONTH_PERIOD_JA}|{_WEEK_END_JA}|{_REL_DAY_JA}) ?(?:の ?)?){_TIME_EN}")
+_ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}|{_MONTH_PERIOD_JA}|{_WEEK_END_JA}|{_REL_DAY_JA}|{_REL_YEAR_JA}) ?(?:の ?)?){_TIME_EN}")
 # 期限の表現を切り出した残りの、組にならなかった英語の修飾（normalize 済みで空白が無い。_deadline_supported）。
 # 週・月・年（「next month 5pm」「this year」）と時間帯（「friday afternoon」の「afternoon」）は表現として切り出さないので、
 # 残っていれば deadline 全体を句として求める（時間帯を落とすと、quote の「friday morning」が「friday afternoon」を裏付ける）。
@@ -4054,8 +4057,8 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     英数字で始まる・終わる deadline は、quote の中でも英数字に挟まれない句全体として現れることを求める（_phrase_in）。
     期限の表現と、組にならない週・月・年・時間帯の修飾（「next week 5pm」「5pm next week」「next month 5pm」「friday afternoon」）を併せ持つ deadline は、表現のすべてに加えて
     deadline 全体が句として quote に現れることを求める（時刻だけで比べると修飾が落ち、quote の「this week 5pm」「this month 5pm」が通る）。
-    相対の月の時期・週末・相対の日と時刻（「来月上旬午後5時」「来週末午後5時」「明日午後5時」）も 1 つの表現で、quote の「今月上旬午後5時」の時刻と別の句の「来月上旬」、
-    「明日確認し、明後日午後5時に提出」の「明日」と時刻では通らない。
+    相対の月の時期・週末・相対の日・相対の年と時刻（「来月上旬午後5時」「来週末午後5時」「明日午後5時」「来年度末午後5時」）も 1 つの表現で、quote の「今月上旬午後5時」の時刻と別の句の「来月上旬」、
+    「明日確認し、明後日午後5時に提出」の「明日」と時刻、「今年度末午後5時に確認し、来年度末に提出」の別の年の時刻では通らない。
     部分文字列で比べると、「next week」が「next weekend」の、「end of month」が「end of monthly」の先頭に当たる。
     quote は正規化前のもの（正規化は空白を落とし、語の境目が分からなくなる）。
 
@@ -6082,7 +6085,8 @@ NETWORK_ALLOWED: dict[str, set[str]] = {
 }
 # import を見るだけでは拾えない、どのモジュールからでも呼べる接続・子プロセスの起動（asyncio と os の関数）と、
 # 別の経路で得たソケットの低水準の接続（connect_ex、イベントループの sock_connect・sock_sendto）。
-# 「connect」は sqlite3.connect と区別できないので数えない（ソケットを作る socket・_socket の import で塞ぐ）
+# 「connect」は socket・_socket を import したモジュール（許可した bootstrap を含む）でだけ数える（_network_calls）。どこでも数えると
+# sqlite3.connect と区別できない。import の許可だけでは、待ち受けのために socket を許したモジュールの socket.socket().connect を塞げない
 NETWORK_CALLS = {"open_connection", "open_unix_connection", "create_connection", "create_datagram_endpoint",
                  "create_subprocess_exec", "create_subprocess_shell", "urlopen",
                  "connect_ex", "sock_connect", "sock_sendto"}
@@ -6104,12 +6108,30 @@ def _imported_modules(path: Path) -> set[str]:
 def _network_calls(path: Path) -> set[str]:
     """接続・子プロセスの起動。属性の呼び出し（「asyncio.open_connection」「os.system」）と、名前で import したもの
     （「from asyncio import open_connection as oc」「from os import system」。別名を問わず元の名前で数える）の両方を拾う。
-    os を別名で import したもの（「import os as o」→「o.system」）も os として数える。"""
+    os を別名で import したもの（「import os as o」→「o.system」）も os として数える。
+    socket・_socket を import したモジュールの「.connect」も数える（受け手が socket 以外の import した名前なら数えない）。"""
     found: set[str] = set()
     tree = ast.parse(path.read_text(encoding="utf-8"))
     # 先に os を指す名前を集める（import が呼び出しより後ろにあっても拾う）
     os_names = {a.asname or a.name for node in ast.walk(tree) if isinstance(node, ast.Import)
                 for a in node.names if a.name == "os"}
+    # socket・_socket を import したモジュールでは「.connect」も接続として数える（socket.socket().connect、作ったソケットの s.connect）。
+    # 受け手が socket 以外の import した名前（sqlite3.connect、「from ..db import connection」の connection.connect）なら数えない
+    socket_modules = {"socket", "_socket"}
+    socket_imported = False
+    other_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in socket_modules:
+                    socket_imported = True
+                else:
+                    other_names.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and (node.module or "").split(".")[0] in socket_modules:
+                socket_imported = True
+            else:
+                other_names.update(a.asname or a.name for a in node.names)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.level == 0:
             for a in node.names:
@@ -6122,6 +6144,8 @@ def _network_calls(path: Path) -> set[str]:
             continue
         if node.attr in NETWORK_CALLS:
             found.add(node.attr)
+        elif node.attr == "connect" and socket_imported and not (isinstance(node.value, ast.Name) and node.value.id in other_names):
+            found.add("connect")
         elif isinstance(node.value, ast.Name) and node.value.id in os_names and OS_PROCESS_CALLS.fullmatch(node.attr):
             found.add(f"os.{node.attr}")
     return found
@@ -6168,6 +6192,27 @@ def test_network_calls_detects_from_imports(tmp_path: Path) -> None:
     found = _network_calls(src)
     # Assert: 関係の無い名前（os.path）は拾わない
     assert found == {"open_connection", "os.system", "os.spawnv", "os.popen", "os.execv"}
+
+
+def test_network_calls_detects_socket_connect(tmp_path: Path) -> None:
+    """socket を import したモジュール（許可した bootstrap を含む）の「.connect」は、外への接続として拾う（socket.socket().connect、
+    別名で import した socket、作ったソケットを変数に置いたもの）。import したほかのモジュールの connect（sqlite3.connect）は拾わない。"""
+    # Arrange
+    direct = tmp_path / "direct.py"
+    direct.write_text("import socket\nsocket.socket().connect(('h', 1))\n", encoding="utf-8")
+    aliased = tmp_path / "aliased.py"
+    aliased.write_text("import socket as so\nfrom socket import socket as S\ns = so.socket()\ns.connect(('h', 1))\nS().connect(('h', 1))\n",
+                       encoding="utf-8")
+    db_only = tmp_path / "db_only.py"
+    db_only.write_text("import socket\nimport sqlite3\nfrom ..db import connection\nsqlite3.connect(':memory:')\nconnection.connect()\n",
+                       encoding="utf-8")
+    no_socket = tmp_path / "no_socket.py"
+    no_socket.write_text("import sqlite3\nconn = sqlite3.connect(':memory:')\n", encoding="utf-8")
+    # Act / Assert
+    assert _network_calls(direct) == {"connect"}
+    assert _network_calls(aliased) == {"connect"}
+    assert _network_calls(db_only) == set()
+    assert _network_calls(no_socket) == set()
 
 
 def test_stt_worker_does_not_import_db() -> None:
@@ -8456,6 +8501,12 @@ def test_deadline_standalone_relative_year_must_match_the_quote() -> None:
     assert not _deadline_supported("来年春", "来年秋に提出")
     assert not _deadline_supported("来年度上期", "来年度下期に提出")
     assert not _deadline_supported("来年", "来年11月20日までに提出")
+    # 後ろの時刻も年と 1 つの表現。同じ年の時刻なら通り、別の年に付いた時刻と寄せ集めて裏付けない
+    assert _deadline_supported("来年度末午後5時", "来年度末の午後5時までに提出")
+    assert not _deadline_supported("来年度末午後5時", "今年度末午後5時に確認し、来年度末に提出")
+    # 相対の年に付いた英語の時刻は、時刻だけの deadline を裏付けない（_ATTACHED_TIME_EN）
+    assert not _deadline_supported("5pm", "来年度末 5pm までに提出")
+    assert _deadline_supported("来年度末5pm", "来年度末 5pm までに提出")
 
 
 def test_deadline_era_must_match_the_quote() -> None:
