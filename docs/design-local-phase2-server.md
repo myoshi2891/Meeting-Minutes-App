@@ -1193,6 +1193,13 @@ def has_replacements(conn: sqlite3.Connection, meeting_id: str) -> bool:
     return conn.execute("SELECT 1 FROM segment_replacements WHERE meeting_id = ? LIMIT 1", (meeting_id,)).fetchone() is not None
 
 
+def has_replacements_since(conn: sqlite3.Connection, meeting_id: str, since: int) -> bool:
+    """since（epoch ms）より後に置いた、まだ入れ替えていない撮り直しがあるか（pipeline.on_job_failed の merge の分岐）。"""
+    return conn.execute(
+        "SELECT 1 FROM segment_replacements WHERE meeting_id = ? AND created_at > ? LIMIT 1", (meeting_id, since)
+    ).fetchone() is not None
+
+
 def set_merge_result(conn: sqlite3.Connection, segment_id: str, merged_version: int | None, reason: str) -> None:
     conn.execute(
         "UPDATE transcript_segments SET merged_version = ?, merge_reason = ? WHERE id = ?",
@@ -2006,7 +2013,8 @@ def on_job_failed(conn: sqlite3.Connection, job: Job) -> str | None:
     """ジョブが failed で確定した後の後続処理。Runner（ハンドラの失敗）と Sweeper（lease 切れで回数切れ）が同じ規則を使う。
 
     戻り値は後続処理で作ったジョブの id（作らなければ None）。呼び出し側がコミット後にイベントを流す（完了時の後続ジョブと同じ）。
-    Phase 2 の後続処理はジョブを作らないので常に None。Phase 3 の差し替え版は diarize_meeting の失敗で merge を作る。
+    Phase 2 で作るのは、入れ替え待ちの撮り直しを公開する merge だけ（rerun_merge_for_staged）。Phase 3 の差し替え版は
+    diarize_meeting の失敗でも merge を作る。
     状態の対応は §14 の表。vad_chunk / merge_transcript の失敗では Chunk も会議も変えない（会議の failed は
     merge 済みを意味する。§21.1 MERGED_STATUSES）。Chunk の pending（vad）と merge の未完了が後続を止めたまま、
     失敗したジョブの再試行（POST /jobs/{id}/retry）を待つ。exclude_failed の対象ではない。
@@ -2015,11 +2023,33 @@ def on_job_failed(conn: sqlite3.Connection, job: Job) -> str | None:
         on_transcribe_failed(conn, job_of_chunk(conn, job))
     elif job.job_type == "synthesize_minutes":
         on_summary_failed(conn, job.meeting_id)
-    elif job.job_type in ("vad_chunk", "merge_transcript"):
+    elif job.job_type == "vad_chunk":
         # Chunk の stt_status を failed にしない。failed は BLOCKING_STT に含まれず、他の Chunk の完了を契機に
         # その Chunk を欠いたまま merge が作られる。pending のままなら ensure_merge_job が止まる
         return None
+    elif job.job_type == "merge_transcript":
+        return rerun_merge_for_staged(conn, job)
     return None
+
+
+def rerun_merge_for_staged(conn: sqlite3.Connection, job: Job) -> str | None:
+    """failed で確定した merge の後に、入れ替え待ちの撮り直しを公開する merge を作る。戻り値は作った merge の id（作らなければ None）。
+
+    merge の書き込み（入れ替えと版）をコミットした後・finish_job の前に lease が切れ、Sweeper が回数切れで failed にすることがある。
+    その間（processing）にコミットした撮り直しは staged に置かれ（handle_transcribe）、Runner が merge の完了を記録するときに
+    作り直す merge が入れ替える前提だが、完了は記録されない。failed の行が一意制約で ensure_merge_job を止めるので、
+    作り直さないと利用者が merge を再試行するまで撮り直しは公開されない。
+    作るのは、この merge の行より後に置いた撮り直しがあるときだけ（has_replacements_since）。書き込みの前に落ち続けて
+    回数切れになった merge もこれに当たり 1 度は作り直すが、作り直した行はその撮り直しより後にできるので、それも落ちて回数切れに
+    なれば作らない（落ち続ける merge を際限なく作り直さない。§8 fail_exhausted_expired の意図）。撮り直しは失敗した行の再試行を待つ。
+    比べる時刻は壁時計（now_ms）なので、巻き戻ると作らない側（従来どおり再試行を待つ）に倒れる。
+    作るのは ensure_merge_job で、必要な Chunk が pending のまま・vad が残る・未承認の failed transcribe があれば作らない
+    （消した行の代わりは、それらが片付いたときの ensure_merge_job が作る）
+    """
+    if not repo.has_replacements_since(conn, job.meeting_id, job.created_at):
+        return None
+    repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
+    return ensure_merge_job(conn, job.meeting_id)
 
 
 def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str) -> str | None:
@@ -2416,6 +2446,7 @@ class JobRunner:
     async def _on_failure(self, job: Job, err: JobError, duration_ms: int) -> None:
         now = now_ms()
         d = decide(err, job.attempts, job.max_attempts, now)
+        followup: str | None = None  # 失敗の後続処理で作ったジョブの id（入れ替え待ちの撮り直しを公開する merge）
         async with self.ctx.db.write() as conn:
             # 要約の失敗は、合成に使った版（handle_summary が付ける）と今の版を、この記録と同じトランザクションで比べる。
             # 進んでいれば古い版に対する失敗なので記録せず、同じ行を pending に戻す（requeue_job。試行回数は戻す。§12.7）。
@@ -2431,12 +2462,15 @@ class JobRunner:
                 if err.error_class == "OOM" and job.job_type == "transcribe_chunk":
                     self._downgrade_stt(conn, job.meeting_id, job.model_name)
                 if d.next_status == "failed":
-                    pipeline.on_job_failed(conn, job)
+                    followup = pipeline.on_job_failed(conn, job)
                 elif job.job_type == "synthesize_minutes":
                     # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
                     pipeline.on_summary_deferred(conn, job.meeting_id)
                 repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
+        # 完了時と同じく、どちらもコミットの後に流す
         self._publish_job(job.id)
+        if followup is not None:
+            self._publish_job(followup)
 
     @staticmethod
     def _input_advanced(conn, job: Job, err: JobError) -> bool:  # type: ignore[no-untyped-def]
@@ -2512,10 +2546,10 @@ lease が切れたジョブの扱いは 2 通りある（基本設計 §9.3）�
 | --- | --- | --- | --- | --- |
 | `vad_chunk` | 変えない（`pending` のまま。ただし結果をコミット済みなら進んだまま。下記） | 変えない（`transcribing`） | `pending` の Chunk が `ensure_merge_job` を止める | 失敗したジョブの再試行（`POST /jobs/{id}/retry`）。再試行は Chunk を変えず（`queued` に戻すのは transcribe の再試行だけ）、VAD の完了で `pending` の Chunk を `queued` / `skipped` に進める。除外（`exclude-failed`）の対象ではない |
 | `transcribe_chunk` | `failed`（ただし既に `completed` なら変えない。下記） | 変えない（`transcribing`） | 未承認の `failed` ジョブが merge を止める | 再試行、または除外（`exclude-failed`。失敗区間は gap になる） |
-| `merge_transcript` | 変えない | 変えない（`transcribing`） | 要約ジョブを作らない | 失敗したジョブの再試行。除外の対象ではない |
+| `merge_transcript` | 変えない | 変えない（`transcribing`。ただし書き込みをコミット済みなら進んだまま。下記） | 要約ジョブを作らない。この merge の行より後に置いた入れ替え待ちの撮り直しがあれば、merge を作り直す（`rerun_merge_for_staged`。下記） | 失敗したジョブの再試行。除外の対象ではない |
 | `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2）。ただし既に `completed` なら変えない（下記） | なし | 再試行、または要約の再生成 |
 
-transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、その Chunk の segments を新しい結果で置き換える。Chunk がまだ `completed` でなければ、同じ書き込みトランザクションで segments を消してから入れる。`completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments`（Chunk ごとの印は `segment_replacements`）に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（`repo.promote_replacements`）。その場で消すと、作り直す merge がコミットするまで transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにその merge が入れ替えてから新しい segments を読む。merge が実行中（`processing`）なら、その merge が入れ替えを書いた後に撮り直しがコミットされていることがある。`delete_finished_job` は実行中の行を消さず、`ensure_merge_job` も一意制約で作れないので、Runner が merge の完了を記録するときに入れ替え待ち（`repo.has_replacements`）を見て、残っていれば merge を作り直す。初めて完了する Chunk（手動 STT の無音 Chunk）も、実行中（`leased` / `processing`）の merge があれば同じく `staged_segments` に置く。その merge の書き込みの後にコミットすると版に入らず、入れ替え待ちが無いので作り直されもしない。`handle_transcribe` は初めての完了でも完了済みの merge を消す。手動 STT を受け付けた時点で実行中だった merge（`transcribe_silent_chunk` は消せない）が先に終わっていると、残った行が一意制約で作り直しを止める。ハンドラの中の `on_transcribe_completed` が作った merge（最後の Chunk の完了）は、`handle_transcribe` がコミットの後に流す（Runner の完了処理の `ensure_merge_job` は既存で `None` を返す）。vad の完了で Runner が作った merge も Runner が流す。手動 STT（§12 `request_rerun_stt`）は、まだ入れ替えていない撮り直しの結果も捨てる。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
+transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、その Chunk の segments を新しい結果で置き換える。Chunk がまだ `completed` でなければ、同じ書き込みトランザクションで segments を消してから入れる。`completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments`（Chunk ごとの印は `segment_replacements`）に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（`repo.promote_replacements`）。その場で消すと、作り直す merge がコミットするまで transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにその merge が入れ替えてから新しい segments を読む。merge が実行中（`processing`）なら、その merge が入れ替えを書いた後に撮り直しがコミットされていることがある。`delete_finished_job` は実行中の行を消さず、`ensure_merge_job` も一意制約で作れないので、Runner が merge の完了を記録するときに入れ替え待ち（`repo.has_replacements`）を見て、残っていれば merge を作り直す。merge が書き込みをコミットした後・`finish_job` の前に lease が切れて回数切れで回収されると、完了は記録されず、`failed` の行が一意制約で `ensure_merge_job` を止める。この場合は `on_job_failed` が、その merge の行より後に置いた入れ替え待ち（`repo.has_replacements_since`）を見て、残っていれば完了済みの行を消して `ensure_merge_job` で作り直す（`rerun_merge_for_staged`。必要な Chunk が `pending` のまま・vad が残る・未承認の `failed` transcribe があれば作らない）。書き込みの前に落ち続けた merge も 1 度は作り直すが、作り直した行は撮り直しより後にできるので、それも回数切れになれば作らない（落ち続ける merge を際限なく作り直さない）。初めて完了する Chunk（手動 STT の無音 Chunk）も、実行中（`leased` / `processing`）の merge があれば同じく `staged_segments` に置く。その merge の書き込みの後にコミットすると版に入らず、入れ替え待ちが無いので作り直されもしない。`handle_transcribe` は初めての完了でも完了済みの merge を消す。手動 STT を受け付けた時点で実行中だった merge（`transcribe_silent_chunk` は消せない）が先に終わっていると、残った行が一意制約で作り直しを止める。ハンドラの中の `on_transcribe_completed` が作った merge（最後の Chunk の完了）は、`handle_transcribe` がコミットの後に流す（Runner の完了処理の `ensure_merge_job` は既存で `None` を返す）。vad の完了で Runner が作った merge も Runner が流す。手動 STT（§12 `request_rerun_stt`）は、まだ入れ替えていない撮り直しの結果も捨てる。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
 
 要約・VAD も同じ隙間（ハンドラのコミットと `finish_job` の間）で回収されうる。どれもハンドラの結果とジョブの完了を 1 トランザクションにはせず（Runner とハンドラの契約が変わる）、後続処理の側で書き込み済みの結果を認める。
 
@@ -3783,8 +3817,9 @@ _TIME = r"(?:(?:午前|午後)?\d{1,2}時(?!間)(?:\d{1,2}分|半)?|\d{1,2}:\d{2
 # 切り出して am / pm を落とさない）。12 時間制と 24 時間制（「5pm」と「17:00」）は換算せず、別の表現として比べる（通さない側に倒す）。
 # 時刻が前に来る言い方（「5pm next friday」）は時刻と曜日を別々に切り出すので、「next friday 5pm」とは別の表現になる（通さない側）
 _TIME_EN = r"\d{1,2}(?::\d{2})? ?(?:am|pm)"
-# 日付・曜日の後ろに付く時刻（「の」は挟んでよい）。日付（「11月20日」「来月20日」）と曜日（「来週金曜」「月曜日」）で共有する
-_TIME_SUFFIX = rf"(?:の?(?:{_TIME_EN}|{_TIME}))?"
+# 日付・曜日の後ろに付く時刻（「の」は挟んでよい）。日付（「11月20日」「来月20日」）と曜日（「来週金曜」「月曜日」）で共有する。
+# 数字と数字の間の区切りは、照合する文字列（_hint_text）に空白 1 つで残るので、空白も挟んでよい（「2026/12/1 7pm」）
+_TIME_SUFFIX = rf"(?: ?の?(?:{_TIME_EN}|{_TIME}))?"
 _WEEKDAYS_EN = "monday|tuesday|wednesday|thursday|friday|saturday|sunday"
 # 英語の日（曜日・週と曜日の組・tomorrow）。後ろに時刻を付けてよい
 _EN_DAY = (
@@ -3793,8 +3828,9 @@ _EN_DAY = (
 )
 _EN_DAY_TIME = rf"(?:{_EN_DAY})(?: ?(?:at ?)?{_TIME_EN})?"
 _EN_DEADLINE_ALTS = rf"{_EN_DAY_TIME}|next week|this week|end of|eod|eow"
-# 3 つ組のスラッシュの日付の終わり。後ろに数字が続くなら、それが時刻の始まり（normalize が空白を落とした「26/11/20 5pm」の「26/11/205pm」）の
-# ときだけ止まる。数字だけで止めると「11/20/2026」が「11/20/20」に縮んで「11/20/2027」と同じ表現になる
+# 3 つ組のスラッシュの日付の終わり。後ろに数字が続くなら、それが時刻の始まり（区切りを書かずに続けた「26/11/205pm」）の
+# ときだけ止まる。数字だけで止めると「11/20/2026」が「11/20/20」に縮んで「11/20/2027」と同じ表現になる。
+# 区切りのあった「2026/12/1 7pm」は、照合する文字列（_hint_text）に空白が残るので、日と時刻の数字がつながらない
 _SLASH_DATE_END = r"(?:(?!\d)|(?=" + _TIME_EN + "|" + _TIME + "))"
 # 後ろに時刻を付けてよい日本語・数字の表現：日付（年・元号・相対の年を含む）、日本語の曜日（週の修飾・「日」を含む）、相対の月と日、相対の月の時期。
 # _DEADLINE_HINTS と _ATTACHED_TIME_EN で共有する
@@ -3839,7 +3875,7 @@ _EN_DEADLINE_HINTS = re.compile(
 # これだけは英字として数えない（日付と 1 つの表現なので、捨てると同じ日付・時刻の quote でも通らない）
 _TRAILING_TIME_EN = re.compile(rf"{_TIME_EN}$")
 # 正規化前の quote（_spaced）で、日付・日本語の曜日・相対の月と日・相対の月の時期・週末・相対の日の後ろに付いた英語の時刻（「11/20 5pm」「金曜日の 5pm」「明日 5pm」）。
-# 正規化した quote では区切りが落ちて日付と 1 つの表現（「11/205pm」）になるので、_quote_hints は英語の表現を切り出す前にこの時刻を
+# 日本語・数字の表現を切り出す文字列（_hint_text）では日付と 1 つの表現（「11/20 5pm」）になるので、_quote_hints は英語の表現を切り出す前にこの時刻を
 # 落とす。落とさないと、同じ時刻が時刻だけの表現（「5pm」）としても数えられ、quote の「11/20 5pm」が deadline の「5pm」を裏付けてしまう。
 # 区切りは _spaced で空白 1 つになり、「の」は挟んでよい（_TIME_SUFFIX と同じ）。「at」を挟んだもの（「11/20 at 5pm」）は日付に付かない
 _ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}|{_MONTH_PERIOD_JA}|{_WEEK_END_JA}|{_REL_DAY_JA}) ?(?:の ?)?){_TIME_EN}")
@@ -3852,9 +3888,15 @@ _EN_UNPAIRED_QUALIFIER = re.compile(r"(?:next|this)(?:week|month|year)|morning|a
 _EN_DAY_THEN_WEEK = re.compile(rf"({_WEEKDAYS_EN})(?:of)?(next|this)week(.*)")
 
 
+# 数字と数字の間の区切り（空白・「の」。_hint_text が残した空白）。_hint_key が空白 1 つにそろえる
+_DIGIT_JOINER = re.compile(r"(?<=[0-9])(?:\s*の\s*|\s+)(?=[0-9])")
+
+
 def _hint_key(hint: str) -> str:
-    """切り出した期限の表現を比べる形にする。大文字小文字・空白・「の」（「来週の金曜」）・時刻の前の「at」を落とし、「曜日」を「曜」に、英語の曜日と週の順序をそろえる。"""
-    key = re.sub(r"at(?=\d)", "", re.sub(r"[\sの]", "", hint.lower())).replace("曜日", "曜")
+    """切り出した期限の表現を比べる形にする。大文字小文字・空白・「の」（「来週の金曜」）・時刻の前の「at」を落とし、「曜日」を「曜」に、英語の曜日と週の順序をそろえる。
+    数字と数字の間の区切り（「2026/12/1 7pm」「2026/12/1の7pm」）だけは空白 1 つにそろえて残す（落とすと「2026/12/17pm」と同じ形になる）"""
+    joined = _DIGIT_JOINER.sub(" ", hint.lower())
+    key = re.sub(r"at(?=\d)", "", re.sub(r"(?<![0-9])\s+|\s+(?![0-9])|の", "", joined)).replace("曜日", "曜")
     m = _EN_DAY_THEN_WEEK.fullmatch(key)
     return f"{m.group(2)}week{m.group(1)}{m.group(3)}" if m else key
 
@@ -3963,7 +4005,7 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     「を過ぎてから」）も多いので、決定的な規則では誤検出と見逃しが多い。段 3a (4) の否定・極性と同じ理由で既知の制限とする
     """
     d = normalize(deadline)
-    wanted = {_hint_key(m) for m in _DEADLINE_HINTS.findall(d)}
+    wanted = {_hint_key(m) for m in _DEADLINE_HINTS.findall(_hint_text(deadline))}
     if not wanted:
         return d != "" and _phrase_in(d, quote)
     # 組にならない週・月・年・時間帯の修飾（「next week 5pm」の「next week」、「friday afternoon」の「afternoon」）は表現として切り出されないので、
@@ -3977,13 +4019,13 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
 def _quote_hints(quote: str) -> set[str]:
     """quote の期限の表現（_hint_key でそろえた形）。
 
-    日本語・数字の表現は正規化した文字列から切り出す（区切りの違い「来週、金曜」を問わない）。英語の表現（英字を含むもの）は
+    日本語・数字の表現は正規化した文字列（_hint_text。数字と数字の間の区切りだけは空白で残す）から切り出す（区切りの違い「来週、金曜」を問わない）。英語の表現（英字を含むもの）は
     そこから捨て、正規化前の quote（_spaced。区切りを空白に置き換える）から語の境目つきで切り出す（_EN_DEADLINE_HINTS）。
     正規化した文字列では語の境目が分からず、「Simon day」が「monday」に、「meow」が「eow」に当たる。
-    日付・日本語の曜日に付いた英語の時刻（「11/20 5pm」の「5pm」）は日本語の表現（「11/205pm」）が使ったので、英語の表現からは除く
+    日付・日本語の曜日に付いた英語の時刻（「11/20 5pm」の「5pm」）は日本語の表現（「11/20 5pm」）が使ったので、英語の表現からは除く
     （_ATTACHED_TIME_EN。除かないと時刻だけの deadline「5pm」を裏付ける）。別の句の時刻だけの表現（「11/20 9am、確認は5pm」の「5pm」）は残す
     """
-    japanese = {_hint_key(m) for m in _DEADLINE_HINTS.findall(normalize(quote)) if _is_japanese_hint(m)}
+    japanese = {_hint_key(m) for m in _DEADLINE_HINTS.findall(_hint_text(quote)) if _is_japanese_hint(m)}
     english = {_hint_key(m) for m in _EN_DEADLINE_HINTS.findall(_ATTACHED_TIME_EN.sub(r"\1", _spaced(quote)))}
     return japanese | english
 
@@ -3997,6 +4039,21 @@ def _is_japanese_hint(hint: str) -> bool:
 
 # normalize（merge/normalize.py の _PUNCT）が落とす文字。_phrase_in は落とさずに空白へ置き換え、語の境目として残す
 _SEPARATORS = re.compile(r"[。、，．,.!?！？「」()（）\[\]【】…・\s　]+")
+
+
+# 数字と数字の間にある区切り（_SEPARATORS と同じ文字の並び）。_hint_text が空白 1 つで残す
+_DIGIT_GAP = re.compile(r"(?<=[0-9])[。、，．,.!?！？「」()（）\[\]【】…・\s　]+(?=[0-9])")
+
+
+def _hint_text(text: str) -> str:
+    """期限の表現を切り出す文字列。normalize と同じ形にし、数字と数字の間の区切りだけを空白 1 つで残す。
+
+    normalize は区切りを落とすので、「2026/12/1 7pm」が「2026/12/17pm」になり、日と時刻の数字がつながって 17 日と読める
+    （quote の「2026/12/17」が裏付けてしまう）。「12/1 17:00」も「12/117:00」になり「12/11」と「7:00」に切れる。
+    deadline と quote の両方をこれで切り出し、_hint_key が区切りの書き方（空白・読点・「の」）を空白 1 つにそろえる
+    """
+    s = unicodedata.normalize("NFKC", text).lower()
+    return " ".join(_SEPARATORS.sub("", part) for part in _DIGIT_GAP.split(s))
 
 
 def _spaced(quote: str) -> str:
@@ -7381,6 +7438,97 @@ async def test_transcribe_retry_during_merge_schedules_followup_merge(client: ht
     assert latest == ["新しい一"] and pending is False
 
 
+async def _stage_retry_while_merge_runs(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                        stt_provider: FakeSTTProvider, commit_merge: bool) -> Job:
+    """merge を旧ワーカーとして lease し（commit_merge なら書き込みまでコミットし）、その間に撮り直しを staged に置く。
+
+    その後、merge の lease を回数切れの状態で切らす。戻り値は旧ワーカーが持つ merge の Job
+    """
+    def first(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(0.0, 5.0, "旧い一", -0.2, 0.05)]
+
+    def second(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(1.0, 8.0, "新しい一", -0.2, 0.05)]
+
+    # 1 回目の結果のコミット後に transcribe が回収され（再試行できる failed）、その結果で merge が作られている
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "transcribe_chunk")
+    stt_provider.script = first
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["transcribe_chunk"], now_ms())
+        assert job is not None
+    await handlers.handle_transcribe(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    async with ctx.db.write() as conn:
+        merge = repo.lease_job(conn, "w-merge", ["merge_transcript"], now_ms())
+        assert merge is not None and repo.mark_processing(conn, merge.id, "w-merge", None)
+        # 撮り直しが merge の行より後に置かれたことを、同じミリ秒に収まっても確かにする
+        conn.execute("UPDATE processing_jobs SET created_at = created_at - 1000 WHERE id = ?", (merge.id,))
+    if commit_merge:
+        await handlers.handle_merge(ctx, merge)   # 入れ替えと版 1 をコミットする（finish_job はまだ）
+    # merge が processing の間に撮り直しをコミットする（handle_transcribe は staged に置き、merge の行を消さない）
+    stt_provider.script = second
+    assert (await client.post(f"/v1/jobs/{job.id}/retry")).status_code == 200
+    async with ctx.db.write() as conn:
+        again = repo.lease_job(conn, "w-retry", ["transcribe_chunk"], now_ms())
+        assert again is not None
+    await handlers.handle_transcribe(ctx, again)
+    async with ctx.db.write() as conn:
+        assert repo.finish_job(conn, again.id, "w-retry", again.attempts, "completed")
+        assert repo.has_replacements(conn, "m-1")
+        # merge のワーカーが finish_job の前に落ち、回数を使い切っている
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (merge.id,))
+    return merge
+
+
+async def test_committed_merge_expiring_after_staged_retry_schedules_followup_merge(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, stt_provider: FakeSTTProvider) -> None:
+    """merge が書き込みをコミットした後・finish_job の前に撮り直しが staged に置かれ、lease 切れの回数切れで failed になっても、
+    作り直した merge が撮り直しを入れ替える（§14。failed の行が一意制約で ensure_merge_job を止めたままにしない）。"""
+    # Arrange
+    await _stage_retry_while_merge_runs(client, ctx, runner, stt_provider, commit_merge=True)
+    # Act: Sweeper が回数切れの merge を回収し、作り直した merge を実行する
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    with ctx.db.read() as conn:
+        merges = [j.status for j in repo.list_jobs(conn, "m-1") if j.job_type == "merge_transcript"]
+    await runner.run_until_idle()
+    # Assert: 回収の直後に merge が pending で作り直され、版 2 は新しい結果だけになる
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        latest = [s.text for s in repo.list_segments(conn, "m-1", merged_version=2)]
+        pending = repo.has_replacements(conn, "m-1")
+    assert merges == ["pending"]
+    assert meeting is not None and meeting.transcript_version == 2
+    assert latest == ["新しい一"] and pending is False
+
+
+async def test_merge_failing_without_commit_is_not_recreated_endlessly(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, stt_provider: FakeSTTProvider) -> None:
+    """書き込みの前に落ちて回数切れになった merge も 1 度は作り直すが、作り直した merge も落ちて回数切れになれば、それ以上作らない
+    （撮り直しはその行より前に置かれている。落ち続ける merge を際限なく作り直さない。§8 fail_exhausted_expired）。"""
+    # Arrange: 書き込みをコミットしない merge の間に撮り直しを置く。回収で 1 度だけ作り直される
+    await _stage_retry_while_merge_runs(client, ctx, runner, stt_provider, commit_merge=False)
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # 作り直した merge も、書き込みの前に落ちて回数を使い切る
+    async with ctx.db.write() as conn:
+        rerun = repo.lease_job(conn, "w-dead", ["merge_transcript"], now_ms())
+        assert rerun is not None
+        conn.execute("UPDATE processing_jobs SET attempts = max_attempts, lease_until = 0 WHERE id = ?", (rerun.id,))
+    # Act
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Assert: merge は作り直した行が failed で残るだけで、新しい行を作らない。撮り直しは利用者の再試行を待つ
+    with ctx.db.read() as conn:
+        merges = [(j.id, j.status) for j in repo.list_jobs(conn, "m-1") if j.job_type == "merge_transcript"]
+        pending = repo.has_replacements(conn, "m-1")
+    assert merges == [(rerun.id, "failed")] and pending is True
+    assert (await client.post(f"/v1/jobs/{rerun.id}/retry")).status_code == 200
+    await runner.run_until_idle()
+    with ctx.db.read() as conn:
+        assert repo.has_replacements(conn, "m-1") is False
+
+
 async def test_vad_from_expired_lease_does_not_advance_chunk(client: httpx.AsyncClient, ctx: AppContext) -> None:
     """lease を失った旧ワーカーの VAD 結果は書かない。書くと failed の vad ジョブを残したまま Chunk が進む（基本設計 §9.3）。"""
     # Arrange: vad ジョブを抱えたワーカーが落ち、回数切れで回収される
@@ -8355,11 +8503,32 @@ def test_slash_date_with_trailing_year_is_matched_as_a_full_date() -> None:
     assert reasons_for("2026/11/20", "鈴木さんが2027/11/20までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("2026/11/20", "鈴木さんが2026/11/20までに提出します") == []
     assert reasons_for("11/20", "鈴木さんが11/20までに提出します") == []
-    # 時刻が付いても年で止まる（normalize で空白が落ちて年と時刻の数字が続く）
+    # 時刻が付いても年で止まる（年と時刻の間の空白は _hint_text が残す）
     assert reasons_for("11/20/2026 5pm", "鈴木さんが11/20/2027 5pmまでに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
     assert reasons_for("11/20/2026 17時", "鈴木さんが11/20/2026 17時までに提出します") == []
     assert reasons_for("26/11/20 5pm", "鈴木さんが26/11/20 5pmまでに提出します") == []
     assert reasons_for("26/11/20 17:00", "鈴木さんが26/11/20 17:30までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_slash_date_keeps_the_separator_before_a_time() -> None:
+    """日付と時刻の区切りを落とさない。「2026/12/1 7pm」の日と時刻の数字がつながって 17 日にならず、quote の「2026/12/17」は裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "c3c3c3c3-1212-4000-8000-000000000015"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 別の日（17 日）・同じ日の別の時刻は通さない。同じ日付と時刻なら通る
+    assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/17までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/1 8pmまでに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/1 7pmまでに提出します") == []
+    # 年の無い日付と 24 時間制も同じ（「12/1 17:00」が「12/11」と「7:00」にならない）
+    assert reasons_for("12/1 17:00", "鈴木さんが12/11 7:00までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("12/1 17:00", "鈴木さんが12/1 17:00までに提出します") == []
+    # 区切りの書き方（空白・読点・「の」）は問わない
+    assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/1、7pmまでに提出します") == []
+    assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/1の7pmまでに提出します") == []
 
 
 def test_date_followed_by_weekday_is_one_hint() -> None:
@@ -9214,12 +9383,13 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | GPU OOM retry + ダウングレード | `test_oom_downgrades_model_per_meeting`、`test_two_jobs_failing_with_oom_on_the_same_model_downgrade_once`、`test_downgrade_skips_models_that_are_not_installed`、`test_provider_loads_on_the_requested_device_and_keeps_one_model` |
 | ワーカークラッシュ → Sweeper → 再 lease | `test_sweeper_recovers_expired_lease_and_ignores_stale_owner`、`test_pool_is_rebuilt_after_a_worker_crash`、`test_pool_is_rebuilt_after_a_timeout` |
 | 落ち続けるジョブを永久に実行しない（lease 切れの回数上限） | `test_sweeper_fails_job_whose_lease_keeps_expiring` |
+| merge が書き込みをコミットした後に回数切れで failed になっても、その行より後に置いた撮り直しは作り直した merge が公開する。書き込みの前に落ち続ける merge は際限なく作り直さない（§12 `rerun_merge_for_staged`） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly` |
 | 常駐ループが 1 周の失敗で終わらない | `test_runner_loop_survives_failed_iteration`、`test_sweeper_loop_survives_failed_iteration` |
 | invalid audio no-retry | `test_failed_chunk_blocks_until_excluded`、`test_retry_decisions` |
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
 | DLQ = failed + 再試行 | `test_retry_failed_job_via_api`、`test_failed_chunk_blocks_until_excluded` |
 | Structured Output / sourceSegmentIds / assignee 検出 | `test_validate_stage3_to_7`、`test_synthesize_single_window_retries_schema_once` |
-| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算・別の日付の部品の寄せ集め・年や元号の違う同じ月日・別の週の同じ曜日では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote`、`test_compound_deadline_is_not_matched_by_its_part`、`test_deadline_is_not_assembled_from_parts_of_other_dates`、`test_deadline_year_must_match_the_quote`、`test_deadline_relative_year_must_match_the_quote`、`test_deadline_era_must_match_the_quote`、`test_week_and_weekday_are_matched_as_a_pair`、`test_english_week_phrases_are_not_matched_as_fragments` |
+| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算・別の日付の部品の寄せ集め・年や元号の違う同じ月日・別の週の同じ曜日では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote`、`test_compound_deadline_is_not_matched_by_its_part`、`test_deadline_is_not_assembled_from_parts_of_other_dates`、`test_deadline_year_must_match_the_quote`、`test_deadline_relative_year_must_match_the_quote`、`test_deadline_era_must_match_the_quote`、`test_week_and_weekday_are_matched_as_a_pair`、`test_english_week_phrases_are_not_matched_as_fragments`、`test_slash_date_keeps_the_separator_before_a_time` |
 | 段 3a (4) は語彙の重なりで含意は見ない（quote と矛盾する claim も通る既知の制限） | `test_claim_contradicting_its_quote_passes_as_known_limitation` |
 | AI 再生成 / Manual Notes 保護 | `test_regenerate_creates_new_version_and_keeps_notes` |
 | Ollama 停止中に transcript まで完了 | `test_ollama_outage_leaves_transcribed_then_completes`、`test_summary_runs_once_ollama_is_started_after_the_server`、`test_ollama_without_models_is_model_missing` |
