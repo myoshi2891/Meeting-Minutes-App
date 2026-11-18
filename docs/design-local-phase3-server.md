@@ -129,7 +129,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * 圧縮の原子性：メモリ上で符号化 → 復元して `build_wav(pcm)` の sha256 が `audio_chunks.sha256`（WAV 値、不変）と一致することを確かめる → `write_atomic` で `.flac` を書く → `local_path` / `codec='flac'` / `sha256_flac` 更新 → WAV 削除。不一致は `.flac` を書かずに `INVALID_AUDIO`（non-retryable）。WAV は残る
 * 圧縮と他の処理の競合：(a) 切り替えの更新は lease の現行の所有者だけが行い、Chunk の `local_path` / `sha256` が読んだ時のままであることも確かめる。STT の再実行（ジョブを行ごと消す）や再 PUT の修復（WAV に書き戻す）が先に起きていたら、WAV のまま残して作った `.flac` を消す。圧縮ファイルは試行ごとに別の一時ファイル（`*.staging`）に書き、lease の確認と同じ書き込みロックの下で最終パスへ置き換える。後始末で消すのはその試行の一時ファイルだけなので、lease を失った旧い試行が、別の試行の確定した圧縮ファイルを上書き・削除することはない。(b) 音声を読む側（VAD・STT・話者分離）は、読み取りに失敗したら Chunk の行を読み直し、パスが変わっていれば新しいパスから読む（`read_chunk_pcm()`。存在確認の後に消えて OSError になった場合も同じ）。読み直さないと、置き換わった直後の読み取りが「ファイルなし」になり、正常な Chunk を `missing` にしてしまう。(c) WAV を消すのは、更新のコミットの後の通常の経路も、コミット後・WAV の削除前に落ちた回のやり直しのジョブも、書き込みロックの下で lease が現行で、Chunk がまだ圧縮済み（通常の経路は切り替えた先のパス、やり直しは読んだときと同じパス）のときだけ（`_unlink_wav_if_still_compressed`）。コミットの後・読んだ後に再 PUT の修復が WAV に書き戻していれば、その WAV が正なので残す
 * `read_pcm` は拡張子で分岐し、FLAC の場合も WAV sha256 で照合する（`sha256` 列の意味を変えない）
-* バックアップ：`VACUUM INTO {dataDir}/backups/minutes-{世代番号}-{epoch ms}.sqlite`。**直近のバックアップから 24 時間たっていたら作る**（起動時と 1 時間ごとに判定。基準はファイル名の時刻で、プロセスの起動からの経過ではない）。世代数 `backup_generations`（既定 7）。起動のたびに作ると、短時間に再起動を 7 回くり返しただけで古い世代がすべて押し出される。使うたびにサーバーを起動する使い方でも 1 日 1 世代になる。世代管理・復元元の選択・期日の判定の「新しい順」は名前の時刻ではなく世代番号（既存の最大 + 1、ファイル名に残る）で決める。時刻で並べると、時計が戻った後に作った世代が前の世代より古い扱いになり、時計が追いつくと元の順に戻って、どちらでも新しい世代を消す・古い世代から復元する。最新の世代の時刻が現在より未来なら（作った後に時計が戻った）期日として作る（戻った後に作った世代は番号が最大なので、作った直後に消さず、毎周作り直さない）。`completed` 遷移ごとのバックアップは行わない（DB 全体の複製なので会議 1 件ごとには重く、世代もその分早く回る。失われるのは最長 24 時間分の要約とノートで、録音と transcript は録音ファイルから作り直せる）
+* バックアップ：`VACUUM INTO {dataDir}/backups/minutes-{世代番号}-{epoch ms}.sqlite`。**直近のバックアップから 24 時間たっていたら作る**（起動時と 1 時間ごとに判定。基準はファイル名の時刻で、プロセスの起動からの経過ではない）。世代数 `backup_generations`（既定 7）。起動のたびに作ると、短時間に再起動を 7 回くり返しただけで古い世代がすべて押し出される。使うたびにサーバーを起動する使い方でも 1 日 1 世代になる。世代管理・復元元の選択・期日の判定の「新しい順」は名前の時刻ではなく世代番号（既存の最大 + 1、ファイル名に残る）で決める。時刻で並べると、時計が戻った後に作った世代が前の世代より古い扱いになり、時計が追いつくと元の順に戻って、どちらでも新しい世代を消す・古い世代から復元する。最新の世代の時刻が現在より未来なら（作った後に時計が戻った）期日として作る（戻った後に作った世代は番号が最大なので、作った直後に消さず、毎周作り直さない）。`completed` 遷移ごとのバックアップは行わない（DB 全体の複製なので会議 1 件ごとには重く、世代もその分早く回る。判定は 1 時間ごとなので、バックアップの間隔は 24 時間を超えて最長でほぼ 25 時間になり、作成が失敗すれば次の成功までさらに延びる。その間の要約とノートは失われうる。録音と transcript は録音ファイルから作り直せる）
 * バックアップは `.part` に書いてから名前を付け替える。書きかけ・失敗したファイルは正規の名前では残らず、復元元にも世代管理の対象にもならない
 * 起動時 `PRAGMA integrity_check`。`ok` 以外なら、壊れたファイルを `minutes.sqlite.corrupt-{epoch}` に退避し、**検査に通る最も新しいバックアップ**を復元して開く（最新が壊れていれば 1 つ古いものへ下がる）。使えるバックアップが 1 つもなければ**空の DB で起動する**（起動を止めない。サーバーが動いていなければブラウザは Chunk を送れない）
 * 復元の直後に、録音ファイルから DB にない会議と Chunk を作り直す（下の rebuild と同じ処理を `build_context` が自動で行う）。バックアップより後に録音した会議は DB にないが、ファイルは残っているためである。作り直した会議は transcript から処理し直す。バックアップより後の要約とノートは失われる。バックアップより後に行った手動の文字起こし（無音と判定した Chunk の手動 STT。`POST .../chunks/{source}/{sequenceNo}/transcribe`）も失われ、その Chunk は `skipped` のまま残る（バックアップの時点で STT の前なら、処理し直しで再び `skipped` になる）。手動の STT はもう一度実行する。起動時に、復元元と作り直した件数を標準エラーに警告として出す（黙って古い状態に戻さない）
@@ -2746,10 +2746,23 @@ def _chunk_from_bytes(path: Path, data: bytes, codec: AudioCodec | None) -> tupl
 # 控えは利用者のディスク上のファイルで、壊れている・手で書き換えられている・別の版が書いたものでありうる。
 # 項目ごとに型と範囲を確かめ、合わなければ既定値に置き換える。1 つの会議の壊れた控えで rebuild 全体（1 トランザクション）を止めない
 
+# meeting.json の上限（バイト）。書くのは会議 1 件の項目と Chunk の一覧で、最長の会議（4 時間・2 source・30 秒の Chunk で 960 件、
+# 1 件 300 バイト前後）でも 300 KB ほど。超えるものは控えとして読まない（壊れた・手で置いた巨大なファイルで起動時の復旧がメモリを使い切らない）
+MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
+
+
 def _load_snapshot(path: Path) -> dict[str, Any]:
-    """meeting.json を読む。ない・読めない・最上位がオブジェクトでないときは空（控えなしとして復元する）。"""
+    """meeting.json を読む。ない・読めない・上限（MAX_SNAPSHOT_BYTES）を超える・最上位がオブジェクトでないときは空（控えなしとして復元する）。
+
+    大きさを stat で確かめてから読むと、その間に置き換わったファイルを全量読む。読む量そのものを上限 + 1 バイトで止める（_read_chunk_file と同じ）
+    """
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        with path.open("rb") as f:
+            raw = f.read(MAX_SNAPSHOT_BYTES + 1)
+        if len(raw) > MAX_SNAPSHOT_BYTES:
+            return {}
+        # UnicodeDecodeError は ValueError のサブクラス
+        loaded = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, RecursionError):
         # 入れ子の深すぎる JSON は ValueError ではなく RecursionError になる。1 つの会議の控えで rebuild・起動時の復旧を止めない
         return {}
@@ -4347,7 +4360,9 @@ def _load_and_diarize(ctx: AppContext, provider: DiarizationProvider, meeting_id
             pcm = read_chunk_pcm(ctx, c, max_samples=(limit - loaded.get(c.source, 0)) // 2)
         except PcmTooLongError as e:
             raise InvalidAudioError(f"diarization input too large: {c.source}") from e
-        except InvalidWavError:
+        except (InvalidWavError, OSError):
+            # 壊れた Chunk も、読めない Chunk（権限・I/O エラー。read_chunk_pcm は読み直しても変わらなければ元の OSError を返す）も飛ばし、
+            # 読める Chunk で分離を続ける。OSError を通すと、1 つの Chunk で会議全体の話者分離が失敗する
             continue
         # 読んだ後にも確かめる（二重の守り。読む前の上限と同じ値）
         loaded[c.source] = loaded.get(c.source, 0) + len(pcm)
@@ -5795,6 +5810,42 @@ async def test_diarize_reads_each_chunk_within_remaining_timeline_budget(client3
     # Assert: 1 つ目は上限全体、2 つ目は 1 つ目（30 秒 = 480000 サンプル）を引いた残り
     full = MAX_TIMELINE_MS * 16
     assert budgets == {"mic": [full, full - 480000], "system": [full, full - 480000]}
+
+
+async def test_diarize_skips_chunk_that_raises_oserror(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                       diarization_provider: FakeDiarizationProvider,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    """分離の中で Chunk の読み取りが OSError（権限・I/O エラー）になっても、その Chunk を飛ばし、読める Chunk で分離を続ける（壊れた Chunk と同じ）。"""
+    # Arrange: 分離の中の読み取りだけ、mic の 1 つ目の Chunk で OSError を投げる
+    await _two_source_meeting(client3)
+    in_diarize = False
+    real_read = handlers_module.read_chunk_pcm
+
+    def failing(c: AppContext, chunk: Any, max_samples: int | None = None) -> bytes:
+        if in_diarize and chunk.source == "mic" and chunk.sequence_no == 0:
+            raise PermissionError("denied")
+        return real_read(c, chunk, max_samples)
+
+    real_diarize = runner3.handlers["diarize_meeting"]
+
+    async def diarize_flagged(c: AppContext, job: Any) -> str | None:
+        nonlocal in_diarize
+        in_diarize = True
+        try:
+            return await real_diarize(c, job)
+        finally:
+            in_diarize = False
+
+    monkeypatch.setattr(handlers_module, "read_chunk_pcm", failing)
+    monkeypatch.setitem(runner3.handlers, "diarize_meeting", diarize_flagged)
+    # Act
+    await runner3.run_until_idle()
+    # Assert: 分離は完了し、読めた Chunk（mic 1 つ・system 2 つ）だけを渡した
+    with ctx3.db.read() as conn:
+        status = next(j.status for j in repo.list_jobs(conn, "m-1") if j.job_type == "diarize_meeting")
+    assert status == "completed"
+    assert len(diarization_provider.calls) == 1
+    assert {s: len(v) for s, v in diarization_provider.calls[0].pcm_by_source.items()} == {"mic": 1, "system": 2}
 
 
 async def test_diarize_model_missing_does_not_wait(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
@@ -7454,6 +7505,41 @@ async def test_rebuild_tolerates_deeply_nested_snapshot(client3: httpx.AsyncClie
     # Assert
     assert report.meetings_created == 1 and report.chunks_created == 2
     assert m is not None and m.title == "復元された会議"
+
+
+async def test_rebuild_treats_oversized_snapshot_as_unreadable(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """上限を超える meeting.json は全量を読まずに読めない控えとして扱い、控えなしとして復元する（rebuild を止めない）。"""
+    # Arrange: 正しい JSON だが上限を 1 バイト超える（中身が読まれていればタイトルが復元される）
+    await _completed_meeting(client3, runner3, ctx3)
+    head = '{"title": "大きすぎる控え", "pad": "'
+    body = head + "x" * (rebuild_module.MAX_SNAPSHOT_BYTES - len(head.encode("utf-8")) - 2) + '"}'
+    path = ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json"
+    path.write_text(body + " ", encoding="utf-8")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert len(body.encode("utf-8")) == rebuild_module.MAX_SNAPSHOT_BYTES
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert m is not None and m.title == "復元された会議"
+
+
+async def test_rebuild_reads_snapshot_at_the_size_limit(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """上限ちょうどの meeting.json は読む（境界）。"""
+    # Arrange
+    await _completed_meeting(client3, runner3, ctx3)
+    head = '{"title": "上限ちょうど", "pad": "'
+    body = head + "x" * (rebuild_module.MAX_SNAPSHOT_BYTES - len(head.encode("utf-8")) - 2) + '"}'
+    (ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json").write_text(body, encoding="utf-8")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert m is not None and m.title == "上限ちょうど"
 
 
 async def test_rebuild_replaces_title_that_cannot_be_encoded(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
