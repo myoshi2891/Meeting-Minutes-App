@@ -3798,13 +3798,17 @@ _MONTH_DAY_JA = r"(?:再来月|今月|来月)の?\d{1,2}日"
 _MONTH_PERIOD_JA = r"(?:再来月|今月|来月)の?(?:末|上旬|中旬|下旬)"
 # 週末（「来週末」「来週の末」「週末」）も同じ。後ろの時刻（「来週末午後5時」）と 1 つの表現にする
 _WEEK_END_JA = r"(?:(?:再来週|今週|来週)の?末|週末)"
+# 相対の日（「明日」「明後日」）も同じ。後ろの時刻（「明日午後5時」）と 1 つの表現にする。別々に切り出すと、quote の「明日確認し、
+# 明後日午後5時に提出」の別の句の「明日」と時刻を寄せ集めて deadline の「明日午後5時」を裏付けてしまう
+_REL_DAY_JA = r"(?:明後日|明日)"
 _DEADLINE_HINTS = re.compile(
     rf"({_DATE}{_DATE_WEEKDAY_JA}{_TIME_SUFFIX}|{_TIME_EN}|{_TIME}|"
     rf"{_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_PERIOD_JA}{_TIME_SUFFIX}|"
     rf"{_WEEK_END_JA}{_TIME_SUFFIX}|"
-    r"今週|来週|再来週|今月|再来月|来月|月末|明日|明後日|年内|上旬|中旬|下旬|"
+    rf"{_REL_DAY_JA}{_TIME_SUFFIX}|"
+    r"今週|来週|再来週|今月|再来月|来月|月末|年内|上旬|中旬|下旬|"
     rf"{_EN_DEADLINE_ALTS})",
     re.IGNORECASE,
 )
@@ -3819,11 +3823,11 @@ _EN_DEADLINE_HINTS = re.compile(
 # 日付の後ろの英語の時刻（「11月20日5pm」の「5pm」）。_quote_hints が、日本語・数字の表現から英字を含むものを捨てるときに、
 # これだけは英字として数えない（日付と 1 つの表現なので、捨てると同じ日付・時刻の quote でも通らない）
 _TRAILING_TIME_EN = re.compile(rf"{_TIME_EN}$")
-# 正規化前の quote（_spaced）で、日付・日本語の曜日・相対の月と日・相対の月の時期・週末の後ろに付いた英語の時刻（「11/20 5pm」「金曜日の 5pm」）。
+# 正規化前の quote（_spaced）で、日付・日本語の曜日・相対の月と日・相対の月の時期・週末・相対の日の後ろに付いた英語の時刻（「11/20 5pm」「金曜日の 5pm」「明日 5pm」）。
 # 正規化した quote では区切りが落ちて日付と 1 つの表現（「11/205pm」）になるので、_quote_hints は英語の表現を切り出す前にこの時刻を
 # 落とす。落とさないと、同じ時刻が時刻だけの表現（「5pm」）としても数えられ、quote の「11/20 5pm」が deadline の「5pm」を裏付けてしまう。
 # 区切りは _spaced で空白 1 つになり、「の」は挟んでよい（_TIME_SUFFIX と同じ）。「at」を挟んだもの（「11/20 at 5pm」）は日付に付かない
-_ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}|{_MONTH_PERIOD_JA}|{_WEEK_END_JA}) ?(?:の ?)?){_TIME_EN}")
+_ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}|{_MONTH_PERIOD_JA}|{_WEEK_END_JA}|{_REL_DAY_JA}) ?(?:の ?)?){_TIME_EN}")
 # 期限の表現を切り出した残りの、組にならなかった英語の修飾（normalize 済みで空白が無い。_deadline_supported）。
 # 週・月・年（「next month 5pm」「this year」）と時間帯（「friday afternoon」の「afternoon」）は表現として切り出さないので、
 # 残っていれば deadline 全体を句として求める（時間帯を落とすと、quote の「friday morning」が「friday afternoon」を裏付ける）。
@@ -3930,7 +3934,8 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     英数字で始まる・終わる deadline は、quote の中でも英数字に挟まれない句全体として現れることを求める（_phrase_in）。
     期限の表現と、組にならない週・月・年・時間帯の修飾（「next week 5pm」「5pm next week」「next month 5pm」「friday afternoon」）を併せ持つ deadline は、表現のすべてに加えて
     deadline 全体が句として quote に現れることを求める（時刻だけで比べると修飾が落ち、quote の「this week 5pm」「this month 5pm」が通る）。
-    相対の月の時期・週末と時刻（「来月上旬午後5時」「来週末午後5時」）も 1 つの表現で、quote の「今月上旬午後5時」の時刻と別の句の「来月上旬」では通らない。
+    相対の月の時期・週末・相対の日と時刻（「来月上旬午後5時」「来週末午後5時」「明日午後5時」）も 1 つの表現で、quote の「今月上旬午後5時」の時刻と別の句の「来月上旬」、
+    「明日確認し、明後日午後5時に提出」の「明日」と時刻では通らない。
     部分文字列で比べると、「next week」が「next weekend」の、「end of month」が「end of monthly」の先頭に当たる。
     quote は正規化前のもの（正規化は空白を落とし、語の境目が分からなくなる）。
 
@@ -5952,8 +5957,17 @@ def _imported_modules(path: Path) -> set[str]:
 
 
 def _network_calls(path: Path) -> set[str]:
+    """接続・子プロセスの起動。属性の呼び出し（「asyncio.open_connection」「os.system」）と、名前で import したもの
+    （「from asyncio import open_connection as oc」「from os import system」。別名を問わず元の名前で数える）の両方を拾う。"""
     found: set[str] = set()
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.ImportFrom) and node.level == 0:
+            for a in node.names:
+                if a.name in NETWORK_CALLS:
+                    found.add(a.name)
+                elif node.module == "os" and OS_PROCESS_CALLS.fullmatch(a.name):
+                    found.add(f"os.{a.name}")
+            continue
         if not isinstance(node, ast.Attribute):
             continue
         if node.attr in NETWORK_CALLS:
@@ -5973,6 +5987,18 @@ def test_network_modules_only_in_allowed_modules() -> None:
                     offenders.append(f"{rel}: {name}")
         offenders.extend(f"{rel}: {call}" for call in sorted(_network_calls(p)))
     assert offenders == []
+
+
+def test_network_calls_detects_from_imports(tmp_path: Path) -> None:
+    """名前で import した接続・子プロセスの関数（別名を付けたものを含む）も拾う。属性の呼び出しは従来どおり拾う。"""
+    # Arrange
+    src = tmp_path / "m.py"
+    src.write_text("from asyncio import open_connection as oc\nfrom os import system, path\nimport os\n"
+                   "from os import spawnv as sp\nos.popen('x')\n", encoding="utf-8")
+    # Act
+    found = _network_calls(src)
+    # Assert: 関係の無い名前（os.path）は拾わない
+    assert found == {"open_connection", "os.system", "os.spawnv", "os.popen"}
 
 
 def test_stt_worker_does_not_import_db() -> None:
@@ -7989,6 +8015,31 @@ def test_week_end_and_time_are_one_expression() -> None:
     assert reasons_for("来週末", "鈴木さんが来週の末に見積もりを出します") == []
     # 日本語の助詞・語（「中に」）は修飾として扱わない（「来週中に11月20日」は「来週」と「11月20日」の両方で比べる）
     assert reasons_for("来週中に11月20日", "鈴木さんが来週、11月20日までに見積もりを出します") == []
+
+
+def test_relative_day_and_time_are_one_expression() -> None:
+    """「明日午後5時」は相対の日と時刻で 1 つの表現。quote の別の句の「明日」と「午後5時」を寄せ集めても裏付けない（段 5）。"""
+    # Arrange
+    sid = "dfdfdfdf-4747-4000-8000-000000000047"
+
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        index = SegmentIndex({sid: quote})
+        item = {"task": "見積もりを出す", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]],
+                "quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ組（「の」の有無・英語の時刻を問わない）なら通る
+    assert reasons_for("明日午後5時", "鈴木さんが明日の午後5時までに見積もりを出します") == []
+    assert reasons_for("明後日17時", "鈴木さんが明後日17時に見積もりを出します") == []
+    assert reasons_for("明日5pm", "鈴木さんが明日 5pm に見積もりを出します") == []
+    # 別の句の「明日」と時刻、時刻の違う「明日」、別の相対の日に付いた時刻は通さない
+    assert reasons_for("明日午後5時", "鈴木さんが明日確認し、明後日午後5時に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("明日午後5時", "午後5時に会議があり、鈴木さんが明日見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("明日午後5時", "鈴木さんが明日午前9時に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 「明日」に付いた英語の時刻は、時刻だけの deadline を裏付けない（日付に付いた時刻と同じ）
+    assert reasons_for("5pm", "鈴木さんが明日 5pm に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 時刻の付かない相対の日は従来どおり
+    assert reasons_for("明日", "鈴木さんが明日までに見積もりを出します") == []
 
 
 def test_deadline_year_must_match_the_quote() -> None:
