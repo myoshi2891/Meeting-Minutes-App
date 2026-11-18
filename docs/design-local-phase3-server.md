@@ -679,6 +679,15 @@ def job_owner(conn: sqlite3.Connection, job_id: str) -> str | None:
 
 # ---- 公平 lease（§2.5） ----
 
+def has_ready_job(conn: sqlite3.Connection, job_type: str, now: int) -> bool:
+    """job_type のジョブが lease できる状態で待っているか（pending / retrying で next_run_at が過ぎた。lease_job_fair と同じ条件）。"""
+    row = conn.execute(
+        "SELECT 1 FROM processing_jobs WHERE job_type = ? AND status IN ('pending','retrying') AND next_run_at <= ? LIMIT 1",
+        (job_type, now),
+    ).fetchone()
+    return row is not None
+
+
 def lease_job_fair(conn: sqlite3.Connection, owner: str, allowed_types: list[str], now: int,
                    lease_ms: int = 300_000) -> Job | None:
     """利用者ごとの実行中ジョブ数が少ない利用者を優先する。単一利用者では Phase 2 の lease_job と同じ順序になる。"""
@@ -1019,21 +1028,44 @@ def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
 def on_job_failed(conn: sqlite3.Connection, job: Job) -> str | None:
     """ジョブが failed で確定した後の後続処理。Runner（ハンドラの失敗）と Sweeper（lease 切れで回数切れ）が同じ規則を使う。
 
-    戻り値は後続処理で作ったジョブの id（diarize_meeting の失敗で作った merge。作らなければ None）。Runner と Sweeper が
-    コミット後に流す（完了時の後続ジョブと同じ。流さないと lease されるまで pending の行がイベントに出ない）。
+    戻り値は後続処理で作ったジョブの id（diarize_meeting の失敗で作った merge と、入れ替え待ちの撮り直しを公開する merge。
+    作らなければ None）。Runner と Sweeper がコミット後に流す（完了時の後続ジョブと同じ。流さないと lease されるまで pending の行がイベントに出ない）。
     """
     if job.job_type == "transcribe_chunk":
         on_transcribe_failed(conn, job_of_chunk(conn, job))
     elif job.job_type == "synthesize_minutes":
         on_summary_failed(conn, job.meeting_id)
-    elif job.job_type in ("vad_chunk", "merge_transcript"):
+    elif job.job_type == "vad_chunk":
         # Chunk も会議も変えず、失敗したジョブの再試行を待つ（Phase 2 §12・§14 の表）
         return None
+    elif job.job_type == "merge_transcript":
+        return rerun_merge_for_staged(conn, job)
     elif job.job_type == "diarize_meeting":
         # 話者分離の失敗は transcript を止めない（§2.2）
         return on_diarize_finished(conn, job.meeting_id)
     # live_transcribe_chunk / compress_chunk の失敗は後続に影響しない
     return None
+
+
+def rerun_merge_for_staged(conn: sqlite3.Connection, job: Job) -> str | None:
+    """failed で確定した merge の後に、入れ替え待ちの撮り直しを公開する merge を作る（Phase 2 §12 rerun_merge_for_staged と同じ規則）。
+
+    この merge の行より後に置いた撮り直しがあるときだけ作る（書き込みの前に落ち続ける merge を際限なく作り直さない）。
+    作るのは merge で、分離はやり直さない（Runner が merge の完了で作り直す merge と同じ。分離は終端なので ensure_merge_job も merge を作る）。
+    分離の有効・無効（Runner の diarization_active）はここでは持たない（Sweeper からも呼ばれる）ので、on_diarize_finished と同じく
+    全 Chunk が終端のときだけ merge を直接作る。分離が終わっていなければ（作り直した分離が待っている・実行中）作らない
+    （その分離の完了が on_diarize_finished で merge を作る。先に merge を作ると話者の無い segments を公開する）。
+    既知の差：Runner の完了処理（ensure_merge_job）は、分離の行が無く分離が有効なら分離から作るが、ここは merge を作る
+    （merge の後に分離を有効にした会議で、撮り直しの公開に分離を挟まない）
+    """
+    if not repo.has_replacements_since(conn, job.meeting_id, job.created_at):
+        return None
+    repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
+    if not _all_chunks_terminal(conn, job.meeting_id):
+        return None
+    if repo.count_jobs(conn, job.meeting_id, "diarize_meeting", ["pending", "leased", "processing", "retrying"]) > 0:
+        return None
+    return repo.insert_job(conn, job.meeting_id, "merge_transcript")
 
 
 def _all_chunks_terminal(conn: sqlite3.Connection, meeting_id: str) -> bool:
@@ -1151,7 +1183,7 @@ def job_of_chunk(conn: sqlite3.Connection, job: Job) -> AudioChunk:
 
 # 9. Runner `jobs/runner.py`（変更）
 
-変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` と STT は GPU で重ねない（双方向の排他。分離は STT の実行中に lease せず、STT（ライブを含む）は分離の実行中に lease しない。合算の VRAM を実測していないため。§3）。分離の実行中は、行（`leased` / `processing`）に加えて実行枠（`ctx.diarize_slots`）が埋まっていることでも判定する（pending に戻した分離の旧い試行のスレッドは行に出ない。行がある間も枠が埋まっている間も、次の分離を lease しない。lease した分離が枠を取る前に、別の Runner が次の分離を lease して枠を待たないため）。STT の実行中は、行に加えて実行中のハンドラの数（`ctx.stt_in_flight`。`_run_handler` が数える）でも判定する（STT の再実行 `request_rerun_stt` が行を消しても、旧い試行の推論はハンドラが抜けるまで GPU を使う）、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す。
+変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` と STT は GPU で重ねない（双方向の排他。分離は STT の実行中に lease せず、STT（ライブを含む）は分離の実行中に lease しない。合算の VRAM を実測していないため。§3）。分離の実行中は、行（`leased` / `processing`）に加えて実行枠（`ctx.diarize_slots`）が埋まっていることでも判定する（pending に戻した分離の旧い試行のスレッドは行に出ない。行がある間も枠が埋まっている間も、次の分離を lease しない。lease した分離が枠を取る前に、別の Runner が次の分離を lease して枠を待たないため）。STT の実行中は、行に加えて実行中のハンドラの数（`ctx.stt_in_flight`。`_run_handler` が数える）でも判定する（STT の再実行 `request_rerun_stt` が行を消しても、旧い試行の推論はハンドラが抜けるまで GPU を使う）、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す、(6) lease できる分離が待っている間は新しい STT（ライブを含む）を lease せず、実行中の STT が抜けたら分離を lease する（`repo_phase3.has_ready_job`。STT は分離より優先度が高く、ライブ STT が絶えず届くと実行中の STT が 0 にならず分離が飢える。待つ分離が無くなれば優先度の順に戻る。再試行の待ち時間中の分離は数えない）。
 
 ```python
 # minutes_local/jobs/runner.py
@@ -1196,6 +1228,8 @@ class JobRunner:
         with self.ctx.db.read() as conn:
             stt_rows = sum(repo.count_jobs(conn, None, t, ["leased", "processing"]) for t in STT_TYPES)
             diarize_rows = repo.count_jobs(conn, None, "diarize_meeting", ["leased", "processing"])
+            # lease できる状態で待っている分離。再試行の待ち時間中（next_run_at が先）は数えない（待つ間に STT を止めない）
+            diarize_ready = repo_phase3.has_ready_job(conn, "diarize_meeting", now_ms())
         # 行に加えて実行中のハンドラ（ctx.stt_in_flight）も数える。STT の再実行（request_rerun_stt）が行を消した旧い試行は
         # 行に出ないが、推論が終わってハンドラが抜けるまで GPU を使う。行だけで判定すると、その推論と並んで分離を lease する
         stt_running = stt_rows + self.ctx.stt_in_flight
@@ -1206,7 +1240,10 @@ class JobRunner:
         # STT と分離は GPU で重ねない（双方向の排他）。STT と分離を合わせた VRAM の最大値は実測しておらず、予算を決められないため。
         # 分離の実行中（行または枠）は STT（ライブを含む）を lease しない。引き換えに、ライブ文字起こしと他の会議の STT は
         # 分離が終わるまで待つ（実測して合算の予算を決めれば重ねてよい。§3 の表）。実行中の STT は止めない（lease 済みは走りきる）
-        if not diarize_running:
+        # 分離が待っていれば、新しい STT も lease しない（次の 1 件を分離に充てる）。STT は優先度が分離より高く、ライブ STT が
+        # 絶えず届くと（複数の Runner なら lease が重なって）実行中の STT が 0 にならず、分離が永久に lease されない。
+        # 実行中の STT は走りきり、抜けたら下の条件で分離を lease する。待つ分離が無くなれば従来の優先度の順に戻る
+        if not diarize_running and not diarize_ready:
             types[1:1] = ["live_transcribe_chunk", "transcribe_chunk"]
         # diarize は STT 実行中には lease しない（GPU 排他）。
         # 分離の実行中（行または枠）も lease しない（lease しても枠を待つだけで、Runner の 1 枠を何時間も塞ぐ）。
@@ -2141,8 +2178,9 @@ class AudioCodec(Protocol):
     @property
     def extension(self) -> str: ...
     def encode(self, pcm: bytes) -> bytes: ...
-    # 壊れた入力は ValueError で返す（read_pcm が InvalidWavError に包む）
-    def decode(self, data: bytes) -> bytes: ...
+    # 壊れた入力は ValueError で返す（read_pcm が InvalidWavError に包む）。max_samples を渡したら、それを超える分は復号しない
+    # （返すのは最大 max_samples + 1 サンプル。超えたかどうかは read_pcm が長さで判定する。全量を PCM にしてから比べない）
+    def decode(self, data: bytes, max_samples: int | None = None) -> bytes: ...
 
 
 class FakeCodec:
@@ -2157,10 +2195,12 @@ class FakeCodec:
     def encode(self, pcm: bytes) -> bytes:
         return self.MAGIC + struct.pack("<I", len(pcm)) + pcm
 
-    def decode(self, data: bytes) -> bytes:
+    def decode(self, data: bytes, max_samples: int | None = None) -> bytes:
         if len(data) < 8 or data[:4] != self.MAGIC:
             raise ValueError("not a fake container")
         n, = struct.unpack_from("<I", data, 4)
+        if max_samples is not None:
+            n = min(n, (max_samples + 1) * 2)
         pcm = data[8:8 + n]
         if self.corrupt and pcm:
             return pcm[:-2] + b"\x00\x00"
@@ -2178,11 +2218,13 @@ class FlacCodec:
         sf.write(buf, np.frombuffer(pcm, dtype=np.int16), 16000, format="FLAC", subtype="PCM_16")
         return buf.getvalue()
 
-    def decode(self, data: bytes) -> bytes:
+    def decode(self, data: bytes, max_samples: int | None = None) -> bytes:
         import numpy as np  # type: ignore[import-not-found]
         import soundfile as sf  # type: ignore[import-not-found]
+        # 読むフレーム数を上限 + 1 で止める（ヘッダのフレーム数は壊れていると信じられない。-1 は全量）
+        frames = -1 if max_samples is None else max_samples + 1
         try:
-            audio, sr = sf.read(io.BytesIO(data), dtype="int16")
+            audio, sr = sf.read(io.BytesIO(data), frames=frames, dtype="int16")
         except RuntimeError as e:
             # 壊れたファイルの libsndfile の例外（RuntimeError 系）を、AudioCodec.decode の約束どおり ValueError にそろえる。
             # read_pcm はこれを InvalidWavError に変えるので、呼び出し側（修復判定・STT）は 1 種類の例外だけを扱えばよい
@@ -2224,6 +2266,10 @@ WAV_BITS = 16
 
 class InvalidWavError(ValueError):
     pass
+
+
+class PcmTooLongError(ValueError):
+    """read_pcm の max_samples を超える音声。壊れた音声（InvalidWavError）とは分ける（呼び出し側は Chunk を飛ばさずに断る）。"""
 
 
 @dataclass(frozen=True)
@@ -2304,11 +2350,18 @@ def write_atomic(data_dir: Path, relative_path: str, data: bytes) -> Path:
     return final
 
 
-def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = None, codec: AudioCodec | None = None) -> bytes:
-    """WAV または圧縮ファイルを読み、PCM を返す。expected_sha256 は常に WAV 形式での値（§2.4）。"""
+def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = None, codec: AudioCodec | None = None,
+             max_samples: int | None = None) -> bytes:
+    """WAV または圧縮ファイルを読み、PCM を返す。expected_sha256 は常に WAV 形式での値（§2.4）。
+
+    max_samples を渡すと、それより長い音声は全量を PCM にする前に PcmTooLongError で断る。WAV はファイルの大きさ（ヘッダ + PCM）で、
+    圧縮ファイルは上限 + 1 サンプルで止めた復号の長さで判定する（ヘッダの長さは壊れていると信じられない）
+    """
     path = data_dir / relative_path
     if not path.exists():
         raise InvalidWavError(f"file missing: {relative_path}")
+    if max_samples is not None and path.suffix == ".wav" and path.stat().st_size > WAV_HEADER_BYTES + max_samples * 2:
+        raise PcmTooLongError(f"longer than {max_samples} samples: {relative_path}")
     data = path.read_bytes()
     if path.suffix == ".wav":
         if expected_sha256 is not None and sha256_hex(data) != expected_sha256:
@@ -2318,9 +2371,11 @@ def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = N
     if codec is None or codec.extension != path.suffix:
         raise InvalidWavError(f"no codec for {path.suffix}: {relative_path}")
     try:
-        pcm = codec.decode(data)
+        pcm = codec.decode(data, max_samples)
     except ValueError as e:
         raise InvalidWavError(f"decode failed: {relative_path}: {e}") from e
+    if max_samples is not None and len(pcm) > max_samples * 2:
+        raise PcmTooLongError(f"longer than {max_samples} samples: {relative_path}")
     if expected_sha256 is not None and sha256_hex(build_wav(pcm)) != expected_sha256:
         raise InvalidWavError(f"sha256 mismatch after decode: {relative_path}")
     return pcm
@@ -2853,11 +2908,18 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
                     report.skipped_files.append(str(f.relative_to(data_dir)))
                     continue
                 start, end = offsets
+                try:
+                    size_bytes = f.stat().st_size
+                except OSError:
+                    # 読んだ後に消えた・読めなくなった（取り外し・別プロセスの削除）。このファイルだけ飛ばし、rebuild 全体
+                    # （1 トランザクション。起動時の復元）を止めない
+                    report.skipped_files.append(str(f.relative_to(data_dir)))
+                    continue
                 has_voice = mc.get("hasVoice")
                 repo.upsert_chunk(conn, AudioChunk(
                     id=repo.new_id(), meeting_id=meeting_id, source=source, sequence_no=seq,  # type: ignore[arg-type]
                     start_offset_ms=start, end_offset_ms=end, duration_ms=duration,
-                    sample_count=sample_count, local_path=str(f.relative_to(data_dir)), size_bytes=f.stat().st_size, sha256=wav_sha,
+                    sample_count=sample_count, local_path=str(f.relative_to(data_dir)), size_bytes=size_bytes, sha256=wav_sha,
                     # 有音かどうかが分からなければ有音として扱う（無音と決めつけて STT を省かない。Invariant 7）
                     vad_score=_vad_score(mc.get("vadScore")), has_voice=has_voice if isinstance(has_voice, bool) else True,
                     save_status="verified", created_at=t,
@@ -3861,7 +3923,7 @@ from ..stt.confidence import confidence
 from ..stt.language import LanguageGuess, resolve_chunk_language
 from ..stt.overlap import build_input, to_absolute
 from ..stt.provider import STTRequest, STTResult
-from ..storage.files import InvalidWavError, build_wav, read_pcm, sha256_hex, write_atomic
+from ..storage.files import InvalidWavError, PcmTooLongError, build_wav, read_pcm, sha256_hex, write_atomic
 from . import pipeline
 from .context import AppContext
 from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError, normalize_exception
@@ -3872,21 +3934,22 @@ log = logging.getLogger(__name__)
 DEFAULT_LLM_CTX_TOKENS = 8192
 
 
-def read_chunk_pcm(ctx: AppContext, chunk: AudioChunk) -> bytes:
+def read_chunk_pcm(ctx: AppContext, chunk: AudioChunk, max_samples: int | None = None) -> bytes:
     """Chunk の PCM を読む。行を読んでからファイルを開くまでの間に圧縮（§2.4）がファイルを置き換えていたら、行を読み直して読む。
 
     読み直さないと、置き換わった直後の読み取りが「ファイルなし」で失敗し、呼び出し側が正常な Chunk を missing にする。
     read_pcm の存在確認の後・読み取りの前に置き換わると OSError（FileNotFoundError）になるので、それも読み直しの対象にする。
     パスが変わっていなければ本当の欠損・破損なので、元の例外をそのまま返す。
+    max_samples は read_pcm に渡す（超えれば PcmTooLongError。読み直しの対象ではない）。
     """
     try:
-        return read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec)
+        return read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec, max_samples)
     except (InvalidWavError, OSError):
         with ctx.db.read() as conn:
             fresh = repo.get_chunk(conn, chunk.id)
         if fresh is None or fresh.local_path == chunk.local_path:
             raise
-        return read_pcm(ctx.settings.data_dir, fresh.local_path, fresh.sha256, ctx.codec)
+        return read_pcm(ctx.settings.data_dir, fresh.local_path, fresh.sha256, ctx.codec, max_samples)
 
 
 def _read_stored_pcm(ctx: AppContext, chunk: AudioChunk) -> bytes | None:
@@ -4213,14 +4276,20 @@ def _load_and_diarize(ctx: AppContext, provider: DiarizationProvider, meeting_id
     """
     pcm_by_source: dict[str, list[tuple[int, bytes]]] = {}
     loaded: dict[str, int] = {}
+    limit = MAX_TIMELINE_MS * 32   # 1 source あたりの上限（16 kHz・PCM16 で 1 ms = 32 バイト）
     for c in targets:
+        # 読む前に、この source の残りの量（サンプル数）を上限として渡す。壊れた・差し替えられた圧縮ファイルが行の時刻よりはるかに
+        # 長く復号されても、全量を PCM にする前に断る（Chunk ごとに上限全体を渡すと、1 つで約 461 MB を確保しうる）。
+        # 長さの検査は sha256 の照合より前なので、壊れていて上限も超えるファイルは、飛ばす（InvalidWavError）のではなく分離ごと断る
         try:
-            pcm = read_chunk_pcm(ctx, c)
+            pcm = read_chunk_pcm(ctx, c, max_samples=(limit - loaded.get(c.source, 0)) // 2)
+        except PcmTooLongError as e:
+            raise InvalidAudioError(f"diarization input too large: {c.source}") from e
         except InvalidWavError:
             continue
-        # 行の時刻より長く復号される Chunk があっても、読んだ量が上限（16 kHz・PCM16 で 1 ms = 32 バイト）を超えた時点でやめる
+        # 読んだ後にも確かめる（二重の守り。読む前の上限と同じ値）
         loaded[c.source] = loaded.get(c.source, 0) + len(pcm)
-        if loaded[c.source] > MAX_TIMELINE_MS * 32:
+        if loaded[c.source] > limit:
             raise InvalidAudioError(f"diarization input too large: {c.source} {loaded[c.source]} bytes")
         pcm_by_source.setdefault(c.source, []).append((c.start_offset_ms, pcm))
     req = DiarizationRequest(meeting_id=meeting_id, pcm_by_source=pcm_by_source, models_dir=str(ctx.settings.models_dir),
@@ -5562,10 +5631,10 @@ async def test_diarize_rejects_too_long_timeline_before_reading_pcm(client3: htt
     in_diarize = False
     real_read = handlers_module.read_chunk_pcm
 
-    def spy(c: AppContext, chunk: Any) -> bytes:
+    def spy(c: AppContext, chunk: Any, max_samples: int | None = None) -> bytes:
         if in_diarize:
             reads_in_diarize.append(chunk.id)
-        return real_read(c, chunk)
+        return real_read(c, chunk, max_samples)
 
     real_diarize = runner3.handlers["diarize_meeting"]
 
@@ -5599,14 +5668,14 @@ async def test_diarize_reads_chunk_pcm_off_the_event_loop(client3: httpx.AsyncCl
     in_diarize = False
     real_read = handlers_module.read_chunk_pcm
 
-    def spy(c: AppContext, chunk: Any) -> bytes:
+    def spy(c: AppContext, chunk: Any, max_samples: int | None = None) -> bytes:
         if in_diarize:
             try:
                 asyncio.get_running_loop()
                 on_loop.append(True)
             except RuntimeError:
                 on_loop.append(False)
-        return real_read(c, chunk)
+        return real_read(c, chunk, max_samples)
 
     real_diarize = runner3.handlers["diarize_meeting"]
 
@@ -5625,6 +5694,40 @@ async def test_diarize_reads_chunk_pcm_off_the_event_loop(client3: httpx.AsyncCl
     # Assert: 4 Chunk をすべてイベントループの外で読み、分離も 1 回走った
     assert on_loop == [False] * 4
     assert len(diarization_provider.calls) == 1
+
+
+async def test_diarize_reads_each_chunk_within_remaining_timeline_budget(client3: httpx.AsyncClient, runner3: JobRunner,
+                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """分離は Chunk ごとに、その source の残りの上限（サンプル数）を read_chunk_pcm に渡す。上限全体を毎回渡すと、
+    長く復号される Chunk 1 つで上限分の PCM を確保しうる（§11 _load_and_diarize。読んだ後の検査は二重の守りとして残す）。"""
+    # Arrange: 分離の中の読み取りに渡した上限を source ごとに記録する
+    await _two_source_meeting(client3)
+    budgets: dict[str, list[int | None]] = {}
+    in_diarize = False
+    real_read = handlers_module.read_chunk_pcm
+
+    def spy(c: AppContext, chunk: Any, max_samples: int | None = None) -> bytes:
+        if in_diarize:
+            budgets.setdefault(chunk.source, []).append(max_samples)
+        return real_read(c, chunk, max_samples)
+
+    real_diarize = runner3.handlers["diarize_meeting"]
+
+    async def diarize_flagged(c: AppContext, job: Any) -> str | None:
+        nonlocal in_diarize
+        in_diarize = True
+        try:
+            return await real_diarize(c, job)
+        finally:
+            in_diarize = False
+
+    monkeypatch.setattr(handlers_module, "read_chunk_pcm", spy)
+    monkeypatch.setitem(runner3.handlers, "diarize_meeting", diarize_flagged)
+    # Act
+    await runner3.run_until_idle()
+    # Assert: 1 つ目は上限全体、2 つ目は 1 つ目（30 秒 = 480000 サンプル）を引いた残り
+    full = MAX_TIMELINE_MS * 16
+    assert budgets == {"mic": [full, full - 480000], "system": [full, full - 480000]}
 
 
 async def test_diarize_model_missing_does_not_wait(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
@@ -6060,6 +6163,55 @@ async def test_stt_is_not_leased_while_diarization_runs(client3: httpx.AsyncClie
     assert stt <= set(runner3.allowed_types())
 
 
+async def test_pending_diarize_is_admitted_despite_a_replenished_live_queue(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                            runner3: JobRunner) -> None:
+    """ライブ STT が絶えず届いても、待っている分離を飢えさせない（§9 allowed_types）。分離が lease できる状態で待っていれば
+    新しい STT を lease せず、実行中の STT が抜けたら次の 1 件を分離に充てる。"""
+    # Arrange: 分離が待っている。ライブ STT が 1 件実行中で、次のライブ STT も届いている
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE meeting_id = 'm-1'")
+        chunks = repo.list_chunks(conn, "m-1")
+        diarize_id = repo.insert_job(conn, "m-1", "diarize_meeting")
+        for c in chunks[:2]:
+            repo.insert_job(conn, "m-1", "live_transcribe_chunk", chunk_id=c.id)
+        running = repo_phase3.lease_job_fair(conn, "w-live", ["live_transcribe_chunk"], now_ms())
+        assert running is not None
+    stt = {"transcribe_chunk", "live_transcribe_chunk"}
+    # Act / Assert: STT の実行中は、次の STT も分離も lease しない（実行中の STT が抜けるのを待つ）
+    types = set(runner3.allowed_types())
+    assert not (stt & types) and "diarize_meeting" not in types
+    # Act: 実行中の STT が終わり、その間にもライブ STT が届き続ける
+    async with ctx3.db.write() as conn:
+        assert repo.finish_job(conn, running.id, "w-live", running.attempts, "completed")
+        repo.insert_job(conn, "m-1", "live_transcribe_chunk", chunk_id=chunks[2].id)
+    # allowed_types はコミット済みの状態を読む（run_once と同じく、lease の書き込みの前に決める）
+    types = set(runner3.allowed_types())
+    async with ctx3.db.write() as conn:
+        leased = repo_phase3.lease_job_fair(conn, runner3.owner, list(types), now_ms())
+    # Assert: 届いているライブ STT より先に、分離を lease する
+    assert leased is not None and leased.id == diarize_id
+
+
+async def test_stt_keeps_priority_when_no_diarize_is_ready(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """分離が待っていない（無い、または再試行の待ち時間中）なら、従来どおり STT を lease し、優先度の順（ライブ STT が先）に戻る（§9）。"""
+    # Arrange: ライブ STT が届いている。分離は再試行の待ち時間中（next_run_at が先）
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE meeting_id = 'm-1'")
+        chunk = repo.list_chunks(conn, "m-1")[0]
+        live_id = repo.insert_job(conn, "m-1", "live_transcribe_chunk", chunk_id=chunk.id)
+        diarize_id = repo.insert_job(conn, "m-1", "diarize_meeting")
+        conn.execute("UPDATE processing_jobs SET status = 'retrying', next_run_at = ? WHERE id = ?", (now_ms() + 600_000, diarize_id))
+    # Act
+    types = runner3.allowed_types()
+    async with ctx3.db.write() as conn:
+        leased = repo_phase3.lease_job_fair(conn, runner3.owner, types, now_ms())
+    # Assert: STT を lease でき、ライブ STT が先に選ばれる
+    assert {"transcribe_chunk", "live_transcribe_chunk"} <= set(types)
+    assert leased is not None and leased.id == live_id
+
+
 async def test_leased_diarize_blocks_next_diarize_before_taking_the_slot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
     """lease した分離が実行枠を取る前（handle_diarize の acquire の前）でも、次の分離を lease しない（§9 allowed_types）。
 
@@ -6381,7 +6533,8 @@ from minutes_local.jobs.sweeper import resume_finalized
 from minutes_local.llm.fake_provider import FakeSummaryProvider
 from minutes_local.storage import backup
 from minutes_local.storage.codec import FakeCodec
-from minutes_local.storage.files import read_pcm
+from minutes_local.storage.files import PcmTooLongError, build_wav, read_pcm
+from minutes_local.storage import rebuild as rebuild_module
 from minutes_local.storage.rebuild import RebuildReport, rebuild
 from minutes_local.stt.fake_provider import FakeSTTProvider
 from tests.conftest import GPU_HW, create_meeting, finalize, put_chunk, sine_pcm
@@ -6682,6 +6835,31 @@ def test_flac_codec_roundtrip_is_bit_exact() -> None:
     for broken in (b"", b"xx", encoded[: len(encoded) // 2]):
         with pytest.raises(ValueError):
             codec.decode(broken)
+
+
+@pytest.mark.parametrize("kind", ["wav", "fake", "flac"])
+def test_read_pcm_rejects_audio_longer_than_limit_before_decoding_all(tmp_path: Path, kind: str) -> None:
+    """max_samples を超える音声は、全量を PCM にする前に PcmTooLongError で断る（話者分離のタイムラインの上限。§11 _load_and_diarize）。
+    上限以内なら従来どおり読む。圧縮ファイルの復号は上限 + 1 サンプルで止める（ヘッダの長さを信じない）"""
+    codec: object = None
+    if kind == "flac":
+        pytest.importorskip("soundfile")
+        from minutes_local.storage.codec import FlacCodec
+        codec = FlacCodec()
+    elif kind == "fake":
+        codec = FakeCodec()
+    # Arrange: 1 秒（16000 サンプル）の音声
+    pcm = sine_pcm(1)
+    data = build_wav(pcm) if codec is None else codec.encode(pcm)  # type: ignore[attr-defined]
+    name = "a.wav" if codec is None else f"a{codec.extension}"  # type: ignore[attr-defined]
+    (tmp_path / name).write_bytes(data)
+    # Act / Assert: 上限が長さちょうどなら読める。1 サンプル足りなければ断る
+    assert read_pcm(tmp_path, name, None, codec, max_samples=16000) == pcm  # type: ignore[arg-type]
+    with pytest.raises(PcmTooLongError):
+        read_pcm(tmp_path, name, None, codec, max_samples=15999)  # type: ignore[arg-type]
+    if codec is not None:
+        # 復号そのものも上限 + 1 サンプルで止まる（全量を確保しない）
+        assert len(codec.decode(data, max_samples=100)) == 101 * 2  # type: ignore[attr-defined]
 
 
 # ---- 圧縮と読み取りの競合 ----
@@ -7224,6 +7402,34 @@ async def test_rebuild_skips_relink_when_alternate_becomes_unreadable(client3: h
     assert second is not None and second.local_path.endswith(".fake") and second.save_status == "verified"
 
 
+async def test_rebuild_skips_recording_that_disappears_after_reading(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                     runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """録音を読んだ後に消えても（取り外し・別プロセスの削除）、rebuild を止めずにそのファイルだけ飛ばし、残りを復元する。"""
+    # Arrange: 会議の行を消す。1 つ目の録音は、中身を読んだ直後に消えるようにする
+    await _completed_meeting(client3, runner3, ctx3)
+    data_dir = ctx3.settings.data_dir
+    mic = data_dir / "recordings" / "local" / "m-1" / "mic"
+    vanishing = sorted(mic.glob("*.wav"))[0]
+    original = rebuild_module._chunk_from_file
+
+    def read_then_vanish(path: Path, codec: object) -> object:
+        restored = original(path, codec)  # type: ignore[arg-type]
+        if path == vanishing:
+            path.unlink()
+        return restored
+
+    monkeypatch.setattr(rebuild_module, "_chunk_from_file", read_then_vanish)
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, data_dir, ctx3.codec)
+        chunks = repo.list_chunks(conn, "m-1")
+    # Assert: 消えた録音は飛ばした一覧に載り、もう一方は復元する
+    assert report.meetings_created == 1 and report.chunks_created == 1
+    assert report.skipped_files == [str(vanishing.relative_to(data_dir))]
+    assert [c.sequence_no for c in chunks] == [1]
+
+
 async def test_rebuild_skips_recording_named_with_non_ascii_digits(client3: httpx.AsyncClient, ctx3: AppContext,
                                                                    runner3: JobRunner) -> None:
     """連番の名前に ASCII 以外の数字（「²」は str.isdigit() が真で int() が投げる）があっても、そのファイルだけ除いて復元する。"""
@@ -7407,6 +7613,9 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | lease 済みの merge が書く前に手動 STT の Chunk が初めて完了すると、その merge の行を消して書かせず（話者の無い segments を公開しない）、作り直した分離の完了後の merge が話者付きで入れる（§8 `on_transcribe_completed`・`repo_phase3.discard_meeting_job`） | `test_manual_stt_committed_before_leased_merge_writes_discards_that_merge` |
 | 同時に走らせる話者分離は `MAX_CONCURRENT_DIARIZE` 本まで。pending に戻した分離の次の試行は、旧い試行のスレッドが抜けるまで分離を始めず、その間 Runner は分離と（STT と並べない設定なら）要約を lease しない。lease した分離の行がある間も（枠を取る前でも）次の分離を lease しない。分離を待つハンドラがキャンセルされても、スレッドが抜けるまで枠を返さない（§7 `diarize_slots`・§9 `allowed_types`・§21 `handle_diarize`） | `test_requeued_diarize_waits_for_the_running_attempt`、`test_cancelled_diarize_keeps_the_slot_until_its_thread_exits`、`test_leased_diarize_blocks_next_diarize_before_taking_the_slot` |
 | 分離が failed で確定して作った merge ジョブ（`on_job_failed` の戻り値）は、Runner の失敗時も Sweeper の回数切れも、コミット後に流す（完了時の後続ジョブと同じ。§8 `on_job_failed`・§9 `_on_failure`・Phase 2 §14 `sweep_once`） | `test_failed_diarize_publishes_the_merge_job_it_creates`、`test_exhausted_diarize_publishes_the_merge_job_it_creates` |
+| lease できる分離が待っていれば、ライブ STT が絶えず届いても新しい STT を lease せず、実行中の STT が抜けたら分離を lease する。待つ分離が無い（再試行の待ち時間中を含む）なら従来の優先度の順（§9 `allowed_types`・`repo_phase3.has_ready_job`） | `test_pending_diarize_is_admitted_despite_a_replenished_live_queue`、`test_stt_keeps_priority_when_no_diarize_is_ready` |
+| 分離の読み込みは、Chunk ごとにその source の残りの上限を渡し、上限を超える音声は全量を PCM にする前に断る（WAV は大きさ、圧縮ファイルは上限 + 1 サンプルで止めた復号。§16 `read_pcm`・§21 `_load_and_diarize`） | `test_read_pcm_rejects_audio_longer_than_limit_before_decoding_all`、`test_diarize_reads_each_chunk_within_remaining_timeline_budget` |
+| merge が書き込みをコミットした後に回数切れで failed になっても、その行より後に置いた撮り直しは作り直した merge が公開する。落ち続ける merge は際限なく作り直さない（§8 `rerun_merge_for_staged`。Phase 2 のテストを Phase 3 の pipeline で実行） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly`（Phase 2 §23） |
 | 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
 | 実 Provider：無音 Chunk を挟んでも話者区間の時刻がずれない、上限は `max_speakers`、一時ファイルはデータディレクトリの中 | `test_assemble_timeline_pads_gaps_with_silence`、`test_pyannote_provider_keeps_absolute_time_across_skipped_chunk`、`test_speaker_after_silent_chunk_is_not_shifted` |
 | エコー除去 | `test_echo_from_system_is_dropped_on_mic` |
@@ -7417,6 +7626,7 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | バックアップの原子性・壊れたバックアップを復元元にしない | `test_backup_failure_leaves_no_partial_file`、`test_restore_skips_broken_backup` |
 | バックアップは 24 時間に 1 回・定期処理のループが失敗で終わらない | `test_scheduler_backs_up_only_when_a_day_has_passed`、`test_scheduler_loop_survives_failed_iteration` |
 | 圧縮後の古い行を検証した圧縮ファイルへ向け直す。行が指すファイルが壊れていれば向け直し、健全なら向け直さない。代わりがなければ `missing` | `test_rebuild_relinks_chunk_compressed_after_backup`、`test_rebuild_relinks_only_when_existing_recording_is_corrupt` |
+| rebuild は、読んだ後に消えた・読めなくなった録音をそのファイルだけ飛ばし、残りを復元する（§18 `rebuild`） | `test_rebuild_skips_recording_that_disappears_after_reading` |
 | 起動時の復旧（バックアップあり / なし）で録音ファイルから作り直す。復元の途中で止まっても次の起動がやり直す | `test_startup_recovery_rebuilds_meetings_missing_from_database`、`test_interrupted_restore_resumes_on_next_start` |
 | 壊れた `meeting.json` で rebuild を止めない・確定前の会議は `recording` に戻す | `test_rebuild_drops_malformed_stop_pair`、`test_rebuild_drops_malformed_end_time`、`test_rebuild_tolerates_malformed_snapshot_fields`、`test_rebuild_tolerates_snapshot_that_is_not_an_object`、`test_rebuild_restores_unfinalized_meeting_as_recording` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
@@ -7475,7 +7685,7 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 
 Step の順序で気を付ける点：
 
-* Phase 2 のファイルのうち `jobs/sweeper.py` と `db/repo.py` は Phase 3 で変更しないが、Phase 2 側の `pipeline.on_job_failed()`（Phase 2 §12）は Phase 3 の `jobs/pipeline.py` で `diarize_meeting` の分岐を足した版に置き換わる（§8）。この版は分離の失敗で作った merge ジョブの id を返し、Phase 2 の Sweeper（`sweep_once`）はその行をトランザクションの中で読んでコミット後に流す（Phase 2 の版は常に `None` を返す）。3-b で `pipeline.py` を差し替えるときに落とさない
+* Phase 2 のファイルのうち `jobs/sweeper.py` と `db/repo.py` は Phase 3 で変更しないが、Phase 2 側の `pipeline.on_job_failed()`（Phase 2 §12）は Phase 3 の `jobs/pipeline.py` で `diarize_meeting` の分岐を足した版に置き換わる（§8）。この版は分離の失敗で作った merge ジョブと、入れ替え待ちの撮り直しを公開する merge（`rerun_merge_for_staged`）の id を返し、Phase 2 の Sweeper（`sweep_once`）はその行をトランザクションの中で読んでコミット後に流す（Phase 2 の版が返すのは後者だけ）。3-b で `pipeline.py` を差し替えるときに落とさない
 * 3-d の話者分離のテストは pyannote を入れずに通る（Pipeline の差し替え。§12）。`diarization` extras を入れるのは 3-h
 * 3-f の `test_flac_codec_roundtrip_is_bit_exact` は `soundfile` がなければ skip になる。`dev` extras（§1.1）を入れて、skip ではなく通過になっていることを確かめる
 
