@@ -230,7 +230,8 @@ CREATE TABLE processing_jobs_new (
   last_error    TEXT,
   duration_ms   INTEGER,
   created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  updated_at    INTEGER NOT NULL,
+  input_transcript_version INTEGER  -- 要約の試行が合成に使う transcript の版。handle_summary が控え、lease で消す（sweeper が比べる）
 );
 INSERT INTO processing_jobs_new SELECT * FROM processing_jobs;
 DROP TABLE processing_jobs;
@@ -696,7 +697,8 @@ def lease_job_fair(conn: sqlite3.Connection, owner: str, allowed_types: list[str
     ph = ",".join("?" for _ in allowed_types)
     row = conn.execute(
         f"""UPDATE processing_jobs
-            SET status = 'leased', lease_until = ?, lease_owner = ?, attempts = attempts + 1, updated_at = ?
+            SET status = 'leased', lease_until = ?, lease_owner = ?, attempts = attempts + 1, updated_at = ?,
+                input_transcript_version = NULL
             WHERE id = (
               SELECT j.id FROM processing_jobs j
               JOIN meetings m ON m.id = j.meeting_id
@@ -2684,29 +2686,57 @@ def write_meeting_json(data_dir: Path, meeting: Meeting, chunks: list[AudioChunk
     return write_atomic(data_dir, rel, json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8"))
 
 
-def _chunk_from_file(path: Path, codec: AudioCodec | None) -> tuple[int, str, bytes] | None:
-    """(sample_count, wav_sha256, pcm) をファイルから復元。読めなければ None。"""
+# 録音ファイル 1 つの音声の上限（サンプル数）。録音の Chunk は 30 秒（480,000 サンプル。Phase 1 §8）で、その 10 倍を見込む。
+# rebuild は利用者のディスク上のファイルを読む（壊れた・別の版が書いた・手で置いたものでありうる）。超えるファイルは全量を読まずに
+# 飛ばし（skipped_files）、残りの復元を続ける。上限なしに読むと、1 つの巨大なファイルで起動時の復元がメモリを使い切って止まる
+REBUILD_MAX_CHUNK_SAMPLES = 480_000 * 10
+
+
+def _read_chunk_file(path: Path, codec: AudioCodec | None) -> bytes | None:
+    """録音ファイルを上限（REBUILD_MAX_CHUNK_SAMPLES を符号化した最悪の大きさ）まで読む。超える・読めないときは None。
+
+    大きさを stat で確かめてから読むと、その間に置き換わったファイルを全量読む。読む量そのものを上限 + 1 バイトで止める（read_pcm と同じ）
+    """
+    max_samples = REBUILD_MAX_CHUNK_SAMPLES
+    limit = (codec.max_encoded_bytes(max_samples) if codec is not None and codec.extension == path.suffix
+             else WAV_HEADER_BYTES + max_samples * 2)
     try:
-        data = path.read_bytes()
+        with path.open("rb") as fh:
+            data = fh.read(limit + 1)
     except OSError:
+        return None
+    return data if len(data) <= limit else None
+
+
+def _chunk_from_file(path: Path, codec: AudioCodec | None) -> tuple[int, str, bytes] | None:
+    """(sample_count, wav_sha256, pcm) をファイルから復元。読めない・上限を超えるときは None。"""
+    data = _read_chunk_file(path, codec)
+    if data is None:
         return None
     return _chunk_from_bytes(path, data, codec)
 
 
 def _chunk_from_bytes(path: Path, data: bytes, codec: AudioCodec | None) -> tuple[int, str, bytes] | None:
-    """読んだ内容 data（path の拡張子で形式を決める）から (sample_count, wav_sha256, pcm) を復元。形式が合わなければ None。"""
+    """読んだ内容 data（path の拡張子で形式を決める）から (sample_count, wav_sha256, pcm) を復元。形式が合わない・上限を超えるときは None。
+
+    圧縮ファイルの復号は上限 + 1 サンプルで止める（codec.decode の max_samples）。ファイルの大きさが上限に収まっても、
+    符号化の形式によっては復号した PCM がはるかに大きくなりうる
+    """
+    max_samples = REBUILD_MAX_CHUNK_SAMPLES
     if path.suffix == ".wav":
         try:
             h = parse_wav_header(data)
         except ValueError:
             return None
+        if h.sample_count > max_samples:
+            return None
         return h.sample_count, sha256_hex(data), data[WAV_HEADER_BYTES:]
     if codec is not None and codec.extension == path.suffix:
         try:
-            pcm = codec.decode(data)
+            pcm = codec.decode(data, max_samples)
         except ValueError:
             return None
-        if not pcm:
+        if not pcm or len(pcm) > max_samples * 2:
             return None
         return len(pcm) // 2, sha256_hex(build_wav(pcm)), pcm
     return None
@@ -2818,10 +2848,8 @@ def _file_matches_chunk(path: Path, chunk: AudioChunk, codec: AudioCodec | None)
     """
     if path.suffix != ".wav" and chunk.sha256_flac is not None:
         # 圧縮ファイルは行に控えたファイルの sha256 と比べる（codec がなくても確かめられる）
-        try:
-            return sha256_hex(path.read_bytes()) == chunk.sha256_flac
-        except OSError:
-            return False
+        data = _read_chunk_file(path, codec)   # 上限を超える・読めないときは None（壊れた扱い）
+        return data is not None and sha256_hex(data) == chunk.sha256_flac
     if path.suffix != ".wav" and (codec is None or codec.extension != path.suffix):
         return None if path.exists() else False
     restored = _chunk_from_file(path, codec)
@@ -2841,9 +2869,8 @@ def _relink_chunk(conn: sqlite3.Connection, data_dir: Path, chunk: AudioChunk, f
         return False
     # f は 1 回だけ読み、検証したそのバイト列から大きさと sha256_flac を記録する。読み直すと、その間に置き換わった
     # 検証していない内容を記録してしまう。読めなければ（権限・取り外し）この Chunk だけ向け直さず、rebuild と起動時の復元を止めない
-    try:
-        encoded = f.read_bytes()
-    except OSError:
+    encoded = _read_chunk_file(f, codec)   # 上限を超える・読めないときは None（_chunk_from_file と同じ）
+    if encoded is None:
         return False
     restored = _chunk_from_bytes(f, encoded, codec)
     if restored is None or restored[1] != chunk.sha256:
@@ -4039,7 +4066,9 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
         return None
     try:
         pcm = read_chunk_pcm(ctx, chunk)
-    except InvalidWavError as e:
+    except (InvalidWavError, OSError) as e:
+        # 読めないファイル（権限・取り外し。read_chunk_pcm は読み直しても読めなければ OSError のまま返す）も、壊れた WAV と同じく
+        # 修復を確かめ直し、無事でなければ missing にする。OSError のまま投げると INTERNAL で再試行を回数切れまで繰り返し、Chunk も missing にならない
         repaired: bytes | None = None
         async with ctx.db.write() as conn:
             # 成功時と同じく、失効した旧ワーカーは Chunk を書かない（Phase 2 §12 handle_vad）。例外はそのまま投げる。
@@ -4426,6 +4455,11 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
             raise InvalidAudioError("meeting missing")
         lines, gaps = render_lines(conn, job.meeting_id, meeting.transcript_version)
         seg_texts = {ln.segment_id: ln.text for ln in lines}
+    # 合成に使う版をジョブの行へ控える（lease の現行の所有者だけ）。合成の途中でワーカーが落ちて lease が切れたとき、Sweeper が
+    # この版と今の版を比べ、進んでいれば古い版に対する試行として回数に数えずに同じ行を戻す（§14 sweeper.sweep_once。§12.7）。
+    # ハンドラの失敗は JobError.input_transcript_version で同じ比較をする（Runner._on_failure）
+    async with ctx.db.write() as conn:
+        repo.record_input_transcript_version(conn, job.id, job.lease_owner or "", job.attempts, meeting.transcript_version)
     ratio = json.loads(meeting.language_ratio_json) if meeting.language_ratio_json else {}
     language, mixed = _summary_language(ctx, ratio)
     text = format_for_llm(lines, gaps)
@@ -6545,10 +6579,12 @@ async def test_dominant_language_selects_prompt(client3: httpx.AsyncClient, ctx3
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import threading
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -6975,6 +7011,42 @@ async def test_reader_follows_chunk_replaced_between_exists_and_read(client3: ht
     pcm = read_chunk_pcm(ctx3, stale)
     # Assert
     assert len(pcm) == 960000
+
+
+@pytest.mark.parametrize("readable_on_recheck", [True, False])
+async def test_vad_rechecks_chunk_when_read_raises_os_error(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                            monkeypatch: pytest.MonkeyPatch, readable_on_recheck: bool) -> None:
+    """VAD の読み取りが OSError（権限・取り外し）でも、読めない WAV と同じく修復を確かめ直す。読めれば VAD を続け、読めなければ
+    missing にして INVALID_AUDIO で止める（OSError のまま投げると missing にならず、再試行を回数切れまで繰り返す）。"""
+    # Arrange: vad ジョブを lease し、その Chunk の 1 回目の読み取りを PermissionError にする
+    from minutes_local.jobs import handlers as handlers_module
+    from minutes_local.jobs.retry import InvalidAudioError
+    await create_meeting(client3)
+    await put_chunk(client3, "m-1", 0, sine_pcm(30))
+    assert (await finalize(client3, "m-1", mic=1)).status_code == 200
+    async with ctx3.db.write() as conn:
+        vad = repo_phase3.lease_job_fair(conn, "w-1", ["vad_chunk"], now_ms())
+        assert vad is not None
+
+    def unreadable(*_args: object, **_kwargs: object) -> bytes:
+        raise PermissionError("denied")
+    monkeypatch.setattr(handlers_module, "read_chunk_pcm", unreadable)
+    if not readable_on_recheck:
+        monkeypatch.setattr(handlers_module, "read_pcm", unreadable)
+    # Act
+    if readable_on_recheck:
+        await handlers_module.handle_vad(ctx3, vad)
+    else:
+        with pytest.raises(InvalidAudioError):
+            await handlers_module.handle_vad(ctx3, vad)
+    # Assert
+    with ctx3.db.read() as conn:
+        chunk = repo.get_chunk(conn, vad.chunk_id or "")
+    assert chunk is not None
+    if readable_on_recheck:
+        assert chunk.save_status != "missing" and chunk.stt_status != "pending"
+    else:
+        assert chunk.save_status == "missing"
 
 
 async def test_compress_does_not_switch_after_job_was_withdrawn(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
@@ -7448,15 +7520,15 @@ async def test_rebuild_skips_relink_when_alternate_becomes_unreadable(client3: h
             repo.update_chunk(conn, c.id, local_path=c.local_path, codec="wav", sha256_flac=None, size_bytes=c.size_bytes)
     flaky = (data_dir / old_rows[0].local_path).with_suffix(".fake")
     reads = {"n": 0}
-    original = Path.read_bytes
+    original = Path.open
 
-    def read_bytes_failing(self: Path) -> bytes:
+    def open_failing(self: Path, *args: Any, **kwargs: Any) -> Any:
         if self == flaky:
             reads["n"] += 1
             raise PermissionError("unreadable")
-        return original(self)
+        return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", read_bytes_failing)
+    monkeypatch.setattr(Path, "open", open_failing)
     # Act
     with ctx3.db.write_sync() as conn:
         report = rebuild(conn, data_dir, ctx3.codec)
@@ -7486,15 +7558,15 @@ async def test_rebuild_relink_records_the_bytes_it_validated(client3: httpx.Asyn
     changing = (data_dir / old_rows[0].local_path).with_suffix(".fake")
     validated = changing.read_bytes()
     reads = {"n": 0}
-    original = Path.read_bytes
+    original = Path.open
 
-    def read_bytes_changing(self: Path) -> bytes:
+    def open_changing(self: Path, *args: Any, **kwargs: Any) -> Any:
         if self == changing:
             reads["n"] += 1
-            return validated if reads["n"] == 1 else validated + b"\x00\x00"
-        return original(self)
+            return io.BytesIO(validated if reads["n"] == 1 else validated + b"\x00\x00")
+        return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", read_bytes_changing)
+    monkeypatch.setattr(Path, "open", open_changing)
     # Act
     with ctx3.db.write_sync() as conn:
         rebuild(conn, data_dir, ctx3.codec)
@@ -7530,6 +7602,34 @@ async def test_rebuild_skips_recording_that_disappears_after_reading(client3: ht
     assert report.meetings_created == 1 and report.chunks_created == 1
     assert report.skipped_files == [str(vanishing.relative_to(data_dir))]
     assert [c.sequence_no for c in chunks] == [1]
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+async def test_rebuild_skips_recording_larger_than_chunk_limit(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                               monkeypatch: pytest.MonkeyPatch, compressed: bool) -> None:
+    """上限（REBUILD_MAX_CHUNK_SAMPLES）を超える録音は全量を読まずに飛ばし、残りを復元する（壊れた・巨大なファイルで起動時の復元がメモリを使い切らない）。"""
+    # Arrange: 会議の行と控え（meeting.json）を消し、2 つ目の録音だけ上限（30 秒の Chunk がちょうど収まる大きさ）を超える長さにする
+    await _completed_meeting(client3, runner3, ctx3)
+    data_dir = ctx3.settings.data_dir
+    mic = data_dir / "recordings" / "local" / "m-1" / "mic"
+    files = sorted(mic.glob("*.wav"))
+    big = files[1]
+    if compressed:
+        big.unlink()
+        big = big.with_suffix(".fake")
+        big.write_bytes(FakeCodec().encode(sine_pcm(31)))
+    else:
+        big.write_bytes(build_wav(sine_pcm(31)))
+    (mic.parent / "meeting.json").unlink(missing_ok=True)
+    monkeypatch.setattr(rebuild_module, "REBUILD_MAX_CHUNK_SAMPLES", 480000, raising=False)
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, data_dir, ctx3.codec)
+        chunks = repo.list_chunks(conn, "m-1")
+    # Assert: 上限を超えた録音は飛ばした一覧に載り、上限に収まる 30 秒の録音は復元する
+    assert report.skipped_files == [str(big.relative_to(data_dir))]
+    assert [c.sequence_no for c in chunks] == [0]
 
 
 async def test_rebuild_skips_recording_named_with_non_ascii_digits(client3: httpx.AsyncClient, ctx3: AppContext,
@@ -7729,6 +7829,8 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | バックアップは 24 時間に 1 回・定期処理のループが失敗で終わらない | `test_scheduler_backs_up_only_when_a_day_has_passed`、`test_scheduler_loop_survives_failed_iteration` |
 | 圧縮後の古い行を検証した圧縮ファイルへ向け直す。行が指すファイルが壊れていれば向け直し、健全なら向け直さない。代わりがなければ `missing` | `test_rebuild_relinks_chunk_compressed_after_backup`、`test_rebuild_relinks_only_when_existing_recording_is_corrupt`、`test_rebuild_relink_records_the_bytes_it_validated` |
 | rebuild は、読んだ後に消えた・読めなくなった録音をそのファイルだけ飛ばし、残りを復元する（§18 `rebuild`） | `test_rebuild_skips_recording_that_disappears_after_reading` |
+| rebuild は、上限（`REBUILD_MAX_CHUNK_SAMPLES`）を超える録音を全量を読まずに飛ばし、残りを復元する。読む量を上限 + 1 バイトで止め、圧縮ファイルの復号も上限で止める（§18 `_read_chunk_file`） | `test_rebuild_skips_recording_larger_than_chunk_limit` |
+| VAD の読み取りが OSError（権限・取り外し）でも、壊れた WAV と同じく修復を確かめ直し、読めなければ missing にして INVALID_AUDIO で止める（§21 `handle_vad`） | `test_vad_rechecks_chunk_when_read_raises_os_error` |
 | 起動時の復旧（バックアップあり / なし）で録音ファイルから作り直す。復元の途中で止まっても次の起動がやり直す | `test_startup_recovery_rebuilds_meetings_missing_from_database`、`test_interrupted_restore_resumes_on_next_start` |
 | 壊れた `meeting.json` で rebuild を止めない・確定前の会議は `recording` に戻す | `test_rebuild_drops_malformed_stop_pair`、`test_rebuild_drops_malformed_end_time`、`test_rebuild_tolerates_malformed_snapshot_fields`、`test_rebuild_tolerates_snapshot_that_is_not_an_object`、`test_rebuild_restores_unfinalized_meeting_as_recording` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
