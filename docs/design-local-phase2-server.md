@@ -1823,6 +1823,8 @@ class JobError(Exception):
     error_class: ErrorClass = "INTERNAL"
     retryable: bool = True
     counts_attempt: bool = True   # False = attempts を消費しない（無期限 retry）
+    # ハンドラが入力にした transcript の版（handle_summary が付ける）。Runner の _on_failure が記録と同じトランザクションで今の版と比べる
+    input_transcript_version: int | None = None
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
@@ -2415,21 +2417,34 @@ class JobRunner:
         now = now_ms()
         d = decide(err, job.attempts, job.max_attempts, now)
         async with self.ctx.db.write() as conn:
-            ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
-                                 last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
-            if not ok:
-                return  # 旧ワーカーの報告は無視（基本設計 §9.3）
-            if not d.consume_attempt:
-                conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
-            if err.error_class == "OOM" and job.job_type == "transcribe_chunk":
-                self._downgrade_stt(conn, job.meeting_id, job.model_name)
-            if d.next_status == "failed":
-                pipeline.on_job_failed(conn, job)
-            elif job.job_type == "synthesize_minutes":
-                # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
-                pipeline.on_summary_deferred(conn, job.meeting_id)
-            repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
+            # 要約の失敗は、合成に使った版（handle_summary が付ける）と今の版を、この記録と同じトランザクションで比べる。
+            # 進んでいれば古い版に対する失敗なので記録せず、同じ行を pending に戻す（requeue_job。試行回数は戻す。§12.7）。
+            # lease を失っていれば requeue_job も finish_job も 0 行で、何も書かない
+            requeued = self._input_advanced(conn, job, err) and repo.requeue_job(conn, job.id, self.owner, job.attempts)
+            if not requeued:
+                ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
+                                     last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
+                if not ok:
+                    return  # 旧ワーカーの報告は無視（基本設計 §9.3）
+                if not d.consume_attempt:
+                    conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
+                if err.error_class == "OOM" and job.job_type == "transcribe_chunk":
+                    self._downgrade_stt(conn, job.meeting_id, job.model_name)
+                if d.next_status == "failed":
+                    pipeline.on_job_failed(conn, job)
+                elif job.job_type == "synthesize_minutes":
+                    # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
+                    pipeline.on_summary_deferred(conn, job.meeting_id)
+                repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
         self._publish_job(job.id)
+
+    @staticmethod
+    def _input_advanced(conn, job: Job, err: JobError) -> bool:  # type: ignore[no-untyped-def]
+        """ハンドラが失敗に付けた入力の transcript の版（handle_summary）が、今の会議の版と違うか。付いていなければ False。"""
+        if err.input_transcript_version is None:
+            return False
+        current = repo.get_meeting(conn, job.meeting_id)
+        return current is not None and current.transcript_version != err.input_transcript_version
 
     def _downgrade_stt(self, conn, meeting_id: str, ran_with: str | None) -> None:  # type: ignore[no-untyped-def]
         """会議単位でモデルを 1 段落とす（基本設計 §7.3）。ran_with は失敗したジョブが使ったモデル（lease 時点の model_name）。
@@ -2635,7 +2650,7 @@ stateDiagram-v2
     retrying --> pending : lease_job の next_run_at <= now 条件で再取得（状態列は retrying のまま lease される）
     leased --> pending : sweeper.sweep_once（attempts < max_attempts）
     processing --> pending : sweeper.sweep_once（attempts < max_attempts）
-    processing --> pending : handlers.handle_summary → repo.requeue_job（合成の間に transcript の版が進んだ。合成・検証が失敗したときも）
+    processing --> pending : handlers.handle_summary → repo.requeue_job（合成の間に transcript の版が進んだ）。合成・検証の失敗で版が進んでいれば runner._on_failure → repo.requeue_job
     leased --> failed : sweeper.sweep_once（attempts >= max_attempts）
     processing --> failed : sweeper.sweep_once（attempts >= max_attempts）
     pending --> cancelled : pipeline.exclude_failed / request_rerun_stt
@@ -2660,7 +2675,7 @@ stateDiagram-v2
 | lease 切れ後の transcribe の再実行 | `handle_transcribe` は lease の検査の後、Chunk の segments を置き換える。Chunk が既に `completed` なら、新しい結果を `staged_segments` に置いて完了済みの merge ジョブを消し、作り直す merge が版を上げるのと同じトランザクションで入れ替える。`completed` でなければ同じトランザクションで消してから入れる | 前の attempt の segments に新しい結果が混ざる。前の結果で merge が終わっていると、置き換えた区間がその版から消えたまま merge が作り直されない。その場で消すと、merge のコミットまで（失敗すればその後も）公開中の版から区間が抜ける |
 | 旧ワーカーの merge 書き込み | `handlers.handle_merge` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議の `transcribed`・要約ジョブのどれも書かない | 回数切れで `failed` になった merge ジョブを残したまま transcript の版が進み、要約ジョブが作られて会議が `completed` まで進む。lease を取り直した新しいワーカーと二重に merge すると版が 2 回進む |
 | 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、要約の結果を誰も確かめないまま会議が `completed` に戻る。`finish_job` の条件はジョブ行しか守らない |
-| 合成の間に transcript の版が進んだ要約 | `handlers.handle_summary` が書き込みトランザクションで会議の `transcript_version` を読み直し、合成に使った版と違えば要約を保存せず、会議も `completed` にしない。`repo.requeue_job` で同じ行を `pending` に戻す（試行回数は戻す。lease を外すので Runner の `finish_job` は 0 行）。合成・検証が失敗したときも、版が進んでいれば失敗として記録せずに同じく戻す（古い版に対する失敗。版が同じなら従来どおり `_on_failure`） | 撮り直しの入れ替え・手動 STT の後の merge が合成中に版を進めると、merge の `on_merge_completed` は要約ジョブを一意制約で作れない。そのまま保存すると、新しい版の transcript に古い版の要約が組になり、会議は `completed` になる |
+| 合成の間に transcript の版が進んだ要約 | `handlers.handle_summary` が書き込みトランザクションで会議の `transcript_version` を読み直し、合成に使った版と違えば要約を保存せず、会議も `completed` にしない。`repo.requeue_job` で同じ行を `pending` に戻す（試行回数は戻す。lease を外すので Runner の `finish_job` は 0 行）。合成・検証が失敗したときは、`handle_summary` が合成に使った版を `JobError.input_transcript_version` に付けて投げ、Runner の `_on_failure` が失敗を記録する書き込みトランザクションの中で今の版と比べる。進んでいれば失敗として記録せずに同じく戻す（古い版に対する失敗。版が同じなら従来どおり失敗として記録する）。比較と記録を別のトランザクションにすると、その間に merge が版を進めたとき `failed` になる | 撮り直しの入れ替え・手動 STT の後の merge が合成中に版を進めると、merge の `on_merge_completed` は要約ジョブを一意制約で作れない。そのまま保存すると、新しい版の transcript に古い版の要約が組になり、会議は `completed` になる |
 | lease 切れ後の要約回収 | `pipeline.on_summary_failed` は `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れて回数切れで回収されると、要約があるのに会議が `failed` になる。この場合はジョブ `failed`・会議 `completed` の組を意図して残す |
 | 回収の配信 | `sweeper._publish`（コミット後） | §14 |
 
@@ -4274,7 +4289,7 @@ from ..stt.provider import STTRequest
 from ..storage.files import InvalidWavError, read_pcm
 from . import pipeline
 from .context import AppContext
-from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError
+from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError, normalize_exception
 from .selection import refresh_llm, refresh_stt
 
 log = logging.getLogger(__name__)
@@ -4476,17 +4491,17 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
         synth = await synthesize(ctx.llm, llm_model, ctx.settings.language, text, DEFAULT_LLM_CTX_TOKENS, th.llm_ctx_fill_ratio)
         index = SegmentIndex(seg_texts)
         accepted, rejected, unresolved = validate(synth.draft, index)
-    except Exception:
-        # 合成・検証の失敗が、合成の間に merge が版を進めた後なら、それは古い版の transcript に対する失敗。failed にすると
-        # 会議も failed になり、新しい版の要約ジョブは実行中のこの行が一意制約で先にあるので作られていない。成功時と同じく
-        # 同じ行を pending に戻して新しい版でやり直す（requeue_job。lease の現行の所有者だけ。試行回数は戻す）。
-        # 版が同じ・lease を失っていれば、そのまま投げて Runner の _on_failure が従来どおり記録する。CancelledError は捕まえない
-        async with ctx.db.write() as conn:
-            current = repo.get_meeting(conn, job.meeting_id)
-            if (current is not None and current.transcript_version != meeting.transcript_version
-                    and repo.requeue_job(conn, job.id, job.lease_owner or "", job.attempts)):
-                return llm_model
-        raise
+    except Exception as exc:
+        # 合成・検証の失敗に、合成に使った transcript の版を付けて投げる。Runner の _on_failure が、失敗を記録する書き込み
+        # トランザクションの中で今の版と比べ、進んでいれば failed にせず同じ行を pending に戻す（古い版に対する失敗。failed に
+        # すると会議も failed になり、新しい版の要約ジョブは実行中のこの行が一意制約で先にあるので作られていない）。
+        # 比較をここで別のトランザクションで行うと、比較の後・失敗の記録の前に merge が版を進めたとき failed になる。
+        # CancelledError は捕まえない
+        err = normalize_exception(exc)
+        err.input_transcript_version = meeting.transcript_version
+        if err is exc:
+            raise
+        raise err from exc
     total = len(synth.draft.topics) + len(synth.draft.decisions) + len(synth.draft.actionItems)
     t = now_ms()
     summary = MeetingSummary(
@@ -5958,9 +5973,14 @@ def _imported_modules(path: Path) -> set[str]:
 
 def _network_calls(path: Path) -> set[str]:
     """接続・子プロセスの起動。属性の呼び出し（「asyncio.open_connection」「os.system」）と、名前で import したもの
-    （「from asyncio import open_connection as oc」「from os import system」。別名を問わず元の名前で数える）の両方を拾う。"""
+    （「from asyncio import open_connection as oc」「from os import system」。別名を問わず元の名前で数える）の両方を拾う。
+    os を別名で import したもの（「import os as o」→「o.system」）も os として数える。"""
     found: set[str] = set()
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    # 先に os を指す名前を集める（import が呼び出しより後ろにあっても拾う）
+    os_names = {a.asname or a.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+                for a in node.names if a.name == "os"}
+    for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.level == 0:
             for a in node.names:
                 if a.name in NETWORK_CALLS:
@@ -5972,7 +5992,7 @@ def _network_calls(path: Path) -> set[str]:
             continue
         if node.attr in NETWORK_CALLS:
             found.add(node.attr)
-        elif isinstance(node.value, ast.Name) and node.value.id == "os" and OS_PROCESS_CALLS.fullmatch(node.attr):
+        elif isinstance(node.value, ast.Name) and node.value.id in os_names and OS_PROCESS_CALLS.fullmatch(node.attr):
             found.add(f"os.{node.attr}")
     return found
 
@@ -5994,11 +6014,11 @@ def test_network_calls_detects_from_imports(tmp_path: Path) -> None:
     # Arrange
     src = tmp_path / "m.py"
     src.write_text("from asyncio import open_connection as oc\nfrom os import system, path\nimport os\n"
-                   "from os import spawnv as sp\nos.popen('x')\n", encoding="utf-8")
+                   "from os import spawnv as sp\nos.popen('x')\nimport os as o\no.execv('x', [])\n", encoding="utf-8")
     # Act
     found = _network_calls(src)
     # Assert: 関係の無い名前（os.path）は拾わない
-    assert found == {"open_connection", "os.system", "os.spawnv", "os.popen"}
+    assert found == {"open_connection", "os.system", "os.spawnv", "os.popen", "os.execv"}
 
 
 def test_stt_worker_does_not_import_db() -> None:
@@ -6996,6 +7016,41 @@ async def test_summary_failure_after_merge_advances_transcript_requeues_instead_
     assert requeued is not None and (requeued.status, requeued.lease_owner, requeued.attempts) == ("pending", None, before.attempts)
     assert meeting is not None and meeting.status != "failed"
     assert failed is not None and failed.status == "failed"
+
+
+async def test_summary_failure_requeues_when_merge_advances_after_handler_raises(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ハンドラが失敗を投げた後・Runner が失敗を記録する前に merge が版を進めても、failed にせず pending に戻す（§12.7）。
+
+    版の比較と失敗の記録が別のトランザクションだと、その間の merge を見落として failed になる。
+    """
+    # Arrange: 合成は版を進めずに失敗し、Runner の _on_failure に入る直前に merge が版を進める
+    from minutes_local.jobs.retry import BusinessValidationError, JobError
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+
+    async def failing(*_args: Any, **_kwargs: Any) -> Any:
+        raise BusinessValidationError("empty summary")
+    monkeypatch.setattr(handlers, "synthesize", failing)
+    original = runner._on_failure
+
+    async def advance_then_fail(job: Job, err: JobError, duration_ms: int) -> None:
+        async with ctx.db.write() as conn:
+            m = repo.get_meeting(conn, "m-1")
+            assert m is not None
+            repo.update_meeting(conn, "m-1", transcript_version=m.transcript_version + 1)
+        await original(job, err, duration_ms)
+    monkeypatch.setattr(runner, "_on_failure", advance_then_fail)
+    with ctx.db.read() as conn:
+        before = next(j for j in repo.list_jobs(conn, "m-1") if j.job_type == "synthesize_minutes")
+    # Act
+    assert await runner.run_once() is True
+    # Assert
+    with ctx.db.read() as conn:
+        job = repo.get_job(conn, before.id)
+        meeting = repo.get_meeting(conn, "m-1")
+    assert job is not None and (job.status, job.lease_owner, job.attempts) == ("pending", None, before.attempts)
+    assert meeting is not None and meeting.status != "failed"
 
 
 async def test_publish_created_job_logs_instead_of_raising_after_commit(
