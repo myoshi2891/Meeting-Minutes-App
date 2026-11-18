@@ -424,7 +424,8 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
   last_error    TEXT,
   duration_ms   INTEGER,
   created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  updated_at    INTEGER NOT NULL,
+  input_transcript_version INTEGER  -- 要約の試行が合成に使う transcript の版。handle_summary が控え、lease で消す（sweeper が比べる）
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_transcribe_job
   ON processing_jobs(meeting_id, chunk_id) WHERE job_type = 'transcribe_chunk';
@@ -933,7 +934,8 @@ def lease_job(conn: sqlite3.Connection, owner: str, allowed_types: list[str], no
     placeholders = ",".join("?" for _ in allowed_types)
     row = conn.execute(
         f"""UPDATE processing_jobs
-            SET status = 'leased', lease_until = ?, lease_owner = ?, attempts = attempts + 1, updated_at = ?
+            SET status = 'leased', lease_until = ?, lease_owner = ?, attempts = attempts + 1, updated_at = ?,
+                input_transcript_version = NULL
             WHERE id = (
               SELECT id FROM processing_jobs
               WHERE status IN ('pending','retrying') AND next_run_at <= ? AND job_type IN ({placeholders})
@@ -1053,10 +1055,37 @@ def delete_finished_job(conn: sqlite3.Connection, meeting_id: str, job_type: Job
     )
 
 
+def record_input_transcript_version(conn: sqlite3.Connection, job_id: str, owner: str, attempts: int, version: int) -> bool:
+    """要約の試行が合成に使う transcript の版を控える（lease の現行の所有者だけ）。
+
+    ワーカーが合成の途中で落ちると失敗は報告されず、Sweeper は lease 切れでしか知らない。控えた版を今の版と比べ、
+    進んでいれば古い版に対する試行として回数に数えずに戻す（list_expired_stale_summaries）。lease_job が消すので、
+    控える前に落ちた試行は前の試行の版で比べられない（比べると、落ち続ける試行を回数を戻して際限なく繰り返す）
+    """
+    cur = conn.execute(
+        "UPDATE processing_jobs SET input_transcript_version = ? WHERE id = ? AND lease_owner = ? AND attempts = ?",
+        (version, job_id, owner, attempts),
+    )
+    return cur.rowcount == 1
+
+
+def list_expired_stale_summaries(conn: sqlite3.Connection, now: int) -> list[Job]:
+    """lease が切れた要約ジョブのうち、控えた版（record_input_transcript_version）が今の会議の版と違うもの。控えていなければ含めない。"""
+    rows = conn.execute(
+        """SELECT j.* FROM processing_jobs j JOIN meetings m ON m.id = j.meeting_id
+           WHERE j.job_type = 'synthesize_minutes' AND j.status IN ('leased','processing')
+             AND j.lease_until IS NOT NULL AND j.lease_until < ?
+             AND j.input_transcript_version IS NOT NULL AND j.input_transcript_version != m.transcript_version""",
+        (now,),
+    ).fetchall()
+    return [_row(Job, r) for r in rows]
+
+
 def requeue_job(conn: sqlite3.Connection, job_id: str, owner: str, attempts: int) -> bool:
     """実行中の試行を取り消し、同じ行を pending に戻す（lease の現行の所有者だけ。試行回数は戻す）。
 
-    ハンドラが結果を捨ててやり直すときに使う（handle_summary：合成の間に transcript の版が進んだ）。lease を外すので、
+    ハンドラが結果を捨ててやり直すときに使う（handle_summary：合成の間に transcript の版が進んだ）。Sweeper も、合成の途中で
+    落ちた要約の試行の版が古いときに使う（sweeper.sweep_once。lease を外す前に呼ぶ）。lease を外すので、
     戻った後の Runner の finish_job（lease_owner と attempts の条件）は 0 行になり、この試行を completed にしない。
     """
     cur = conn.execute(
@@ -2546,10 +2575,11 @@ class JobRunner:
 
 # 14. Sweeper `jobs/sweeper.py`
 
-lease が切れたジョブの扱いは 2 通りある（基本設計 §9.3）。
+lease が切れたジョブの扱いは 3 通りある（基本設計 §9.3）。
 
 | 条件 | 扱い | 理由 |
 | --- | --- | --- |
+| 要約（`synthesize_minutes`）で、試行が控えた版（`input_transcript_version`）が今の会議の `transcript_version` と違う | 回数を問わず `pending` に戻し、試行回数も戻す（`repo.list_expired_stale_summaries` → `repo.requeue_job`。下の 2 つより先に、lease を外す前に行う） | 合成の途中でワーカーが落ちた間に merge が版を進めていれば、古い版に対する試行である（§12.7。Runner `_on_failure` の版の比較と同じ）。回数切れで `failed` にすると会議も `failed` になり、新しい版の要約は利用者が再試行するまで作られない。版は `handle_summary` が合成の前に控え、`lease_job` が消す。控える前に落ちた試行（`NULL`）は比べず、下の規則で回数を数える（前の試行の版で比べると、落ち続ける試行を回数を戻して際限なく繰り返す） |
 | `attempts < max_attempts` | `pending` に戻す（`repo.sweep_expired`） | ワーカーが落ちた・固まった。別のワーカーがやり直す |
 | `attempts >= max_attempts` | `failed`（`error_class = INTERNAL`）にし、`pipeline.on_job_failed()` を呼ぶ（`repo.fail_exhausted_expired`） | lease 切れは Runner の失敗処理（`retry.decide` の回数判定）を通らない。回数を見ずに戻すと、実行するたびにプロセスごと落とすジョブが、サーバーを起動し直すたびに永久に実行される。`attempts` は lease のたびに進むので、上限と比べられる |
 
@@ -2635,6 +2665,16 @@ async def sweep_once(db: Database, events: EventBroker) -> int:
     """lease が切れたジョブを回収する。戻り値は回収した件数（pending に戻した数 + 回数切れで failed にした数）。"""
     async with db.write() as conn:
         now = now_ms()
+        # 要約は、合成に使った版（handle_summary が控える）から transcript が進んでいれば古い版に対する試行なので、回数切れでも
+        # failed にせず、同じ行を pending に戻す（requeue_job。試行回数は戻す。§12.7。Runner._on_failure の版の比較と同じ）。
+        # failed にすると会議も failed になり、新しい版の要約は利用者が再試行するまで作られない。lease を外す前（下の 2 つより先）に
+        # 戻す（requeue_job は lease の所有者と attempts で行を選ぶ）。版が同じなら下の規則どおり回数を数える
+        stale: list[Job] = []
+        for job in repo.list_expired_stale_summaries(conn, now):
+            if repo.requeue_job(conn, job.id, job.lease_owner or "", job.attempts):
+                requeued_job = repo.get_job(conn, job.id)
+                if requeued_job is not None:
+                    stale.append(requeued_job)
         # 回数を使い切ったものは pending に戻さず failed にする（落ち続けるジョブを永久に実行しない。§8 fail_exhausted_expired）
         exhausted = repo.fail_exhausted_expired(conn, now)
         followups: list[Job] = []   # on_job_failed が作ったジョブ（Phase 3 の分離の失敗で作る merge）。行はトランザクションの中で読む
@@ -2643,7 +2683,7 @@ async def sweep_once(db: Database, events: EventBroker) -> int:
             followup = repo.get_job(conn, followup_id) if followup_id is not None else None
             if followup is not None:
                 followups.append(followup)
-        requeued = repo.sweep_expired(conn, now)
+        requeued = stale + repo.sweep_expired(conn, now)
         if requeued or exhausted:
             repo.record_metric(conn, "lease_expired", len(requeued) + len(exhausted))
         if exhausted:
@@ -2722,7 +2762,7 @@ stateDiagram-v2
 | lease 切れ後の transcribe の再実行 | `handle_transcribe` は lease の検査の後、Chunk の segments を置き換える。Chunk が既に `completed` なら、新しい結果を `staged_segments` に置いて完了済みの merge ジョブを消し、作り直す merge が版を上げるのと同じトランザクションで入れ替える。`completed` でなければ同じトランザクションで消してから入れる | 前の attempt の segments に新しい結果が混ざる。前の結果で merge が終わっていると、置き換えた区間がその版から消えたまま merge が作り直されない。その場で消すと、merge のコミットまで（失敗すればその後も）公開中の版から区間が抜ける |
 | 旧ワーカーの merge 書き込み | `handlers.handle_merge` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議の `transcribed`・要約ジョブのどれも書かない | 回数切れで `failed` になった merge ジョブを残したまま transcript の版が進み、要約ジョブが作られて会議が `completed` まで進む。lease を取り直した新しいワーカーと二重に merge すると版が 2 回進む |
 | 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、要約の結果を誰も確かめないまま会議が `completed` に戻る。`finish_job` の条件はジョブ行しか守らない |
-| 合成の間に transcript の版が進んだ要約 | `handlers.handle_summary` が書き込みトランザクションで会議の `transcript_version` を読み直し、合成に使った版と違えば要約を保存せず、会議も `completed` にしない。`repo.requeue_job` で同じ行を `pending` に戻す（試行回数は戻す。lease を外すので Runner の `finish_job` は 0 行）。合成・検証が失敗したときは、`handle_summary` が合成に使った版を `JobError.input_transcript_version` に付けて投げ、Runner の `_on_failure` が失敗を記録する書き込みトランザクションの中で今の版と比べる。進んでいれば失敗として記録せずに同じく戻す（古い版に対する失敗。版が同じなら従来どおり失敗として記録する）。比較と記録を別のトランザクションにすると、その間に merge が版を進めたとき `failed` になる | 撮り直しの入れ替え・手動 STT の後の merge が合成中に版を進めると、merge の `on_merge_completed` は要約ジョブを一意制約で作れない。そのまま保存すると、新しい版の transcript に古い版の要約が組になり、会議は `completed` になる |
+| 合成の間に transcript の版が進んだ要約 | `handlers.handle_summary` が書き込みトランザクションで会議の `transcript_version` を読み直し、合成に使った版と違えば要約を保存せず、会議も `completed` にしない。`repo.requeue_job` で同じ行を `pending` に戻す（試行回数は戻す。lease を外すので Runner の `finish_job` は 0 行）。合成・検証が失敗したときは、`handle_summary` が合成に使った版を `JobError.input_transcript_version` に付けて投げ、Runner の `_on_failure` が失敗を記録する書き込みトランザクションの中で今の版と比べる。進んでいれば失敗として記録せずに同じく戻す（古い版に対する失敗。版が同じなら従来どおり失敗として記録する）。比較と記録を別のトランザクションにすると、その間に merge が版を進めたとき `failed` になる。合成の途中でワーカーが落ちたとき（失敗の報告が無い）は、`handle_summary` が合成の前にジョブの行へ控えた版（`repo.record_input_transcript_version`。`lease_job` が消す）を Sweeper が回収のトランザクションで今の版と比べ、進んでいれば回数切れでも同じく戻す（§14） | 撮り直しの入れ替え・手動 STT の後の merge が合成中に版を進めると、merge の `on_merge_completed` は要約ジョブを一意制約で作れない。そのまま保存すると、新しい版の transcript に古い版の要約が組になり、会議は `completed` になる |
 | lease 切れ後の要約回収 | `pipeline.on_summary_failed` は `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れて回数切れで回収されると、要約があるのに会議が `failed` になる。この場合はジョブ `failed`・会議 `completed` の組を意図して残す |
 | 回収の配信 | `sweeper._publish`（コミット後） | §14 |
 
@@ -3865,8 +3905,17 @@ _WEEK_END_JA = r"(?:(?:再来週|今週|来週)の?末|週末)"
 # 相対の日（「明日」「明後日」）も同じ。後ろの時刻（「明日午後5時」）と 1 つの表現にする。別々に切り出すと、quote の「明日確認し、
 # 明後日午後5時に提出」の別の句の「明日」と時刻を寄せ集めて deadline の「明日午後5時」を裏付けてしまう
 _REL_DAY_JA = r"(?:明後日|明日)"
+# 月日の付かない相対の年（「来年」「来年11月」「来年の末」「来年度末」「来年春」「来年度上期」）。後ろの月・年度・時期（季節・半期を含む）も
+# 1 つの表現にする（相対の月の時期と同じ）。
+# 表現として切り出さないと _phrase_in の部分一致になり、deadline の「来年」が quote の「再来年」の中に当たる。年だけを切り出すと、
+# deadline の「来年11月」が「来年」に縮み、quote の「来年3月」が裏付けてしまう。月日の付いたもの（「来年11月20日」）は _DATE が先に取る
+_REL_YEAR_JA = (
+    r"(?:再来年|来年|今年|去年)(?:の?(?:\d{1,2}月|度))?"
+    r"(?:の?(?:末|上旬|中旬|下旬|上半期|下半期|上期|下期|前半|後半|春|夏|秋|冬|初め|早々|明け))?"
+)
 _DEADLINE_HINTS = re.compile(
     rf"({_DATE}{_DATE_WEEKDAY_JA}{_TIME_SUFFIX}|{_TIME_EN}|{_TIME}|"
+    rf"{_REL_YEAR_JA}|"
     rf"{_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_DAY_JA}{_TIME_SUFFIX}|"
     rf"{_MONTH_PERIOD_JA}{_TIME_SUFFIX}|"
@@ -3995,7 +4044,8 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     相対の月と日（「来月20日」）も同じで、quote の別の句の曜日と時刻や、「来月21日」の「来月」では通らない。英語の時刻も同じで、
     曜日・日付と時刻（「next friday 5pm」「11/20 5pm」。「at」の有無は問わない）を 1 つの表現として比べ、quote の「next Friday 9am」は通らない。
     表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たるのは
-    「再」で始まる候補（「再来週」「再来週末」「再来月」「再来月末」「再来年11月20日」）だけなので、それぞれ 1 つの表現になる）。
+    「再」で始まる候補（「再来週」「再来週末」「再来月」「再来月末」「再来年」「再来年11月20日」）だけなので、それぞれ 1 つの表現になる）。
+    月日の付かない相対の年（「来年」「来年末」「来年11月」「来年春」）も 1 つの表現で、quote の「再来年」「来年3月」「来年秋」では通らない。
     quote の英語の表現は、正規化前の quote で語として現れるものだけを数える（_quote_hints。正規化すると語の境目が消え、
     「Simon day」が「monday」に当たる）。
     相対表現を日付に換算した deadline（quote は「来週」、deadline は「11月20日」）は通さない。換算の基準
@@ -4555,6 +4605,11 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
             raise InvalidAudioError("meeting missing")
         lines, gaps = render_lines(conn, job.meeting_id, meeting.transcript_version)
         seg_texts = {ln.segment_id: ln.text for ln in lines}
+    # 合成に使う版をジョブの行へ控える（lease の現行の所有者だけ）。合成の途中でワーカーが落ちて lease が切れたとき、Sweeper が
+    # この版と今の版を比べ、進んでいれば古い版に対する試行として回数に数えずに同じ行を戻す（§14 sweeper.sweep_once。§12.7）。
+    # ハンドラの失敗は JobError.input_transcript_version で同じ比較をする（Runner._on_failure）
+    async with ctx.db.write() as conn:
+        repo.record_input_transcript_version(conn, job.id, job.lease_owner or "", job.attempts, meeting.transcript_version)
     text = format_for_llm(lines, gaps)
     th = ctx.settings.thresholds
     try:
@@ -7147,6 +7202,66 @@ async def test_summary_failure_requeues_when_merge_advances_after_handler_raises
     assert meeting is not None and meeting.status != "failed"
 
 
+@pytest.mark.parametrize("advanced", [True, False])
+async def test_sweep_requeues_expired_summary_only_when_transcript_advanced(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, monkeypatch: pytest.MonkeyPatch, advanced: bool) -> None:
+    """要約を抱えたワーカーが合成の途中で落ち、その間に merge が版を進めていたら、Sweeper は回数切れでも failed にせず同じ行を
+    pending に戻す（試行回数は戻す。§12.7）。版が同じなら従来どおり回数切れで failed にする。
+
+    落ちたワーカーは失敗を報告しないので、合成に使った版は handle_summary が合成の前にジョブの行へ控える。
+    """
+    # Arrange: 回数を使い切った最後の試行が合成の途中で止まる（落ちたワーカー）。その間に merge が版を進め、lease が切れる
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    started, never = asyncio.Event(), asyncio.Event()
+
+    async def stuck(*_args: Any, **_kwargs: Any) -> Any:
+        started.set()
+        await never.wait()
+    monkeypatch.setattr(handlers, "synthesize", stuck)
+    async with ctx.db.write() as conn:
+        leased = repo.lease_job(conn, "w-dead", ["synthesize_minutes"], now_ms())
+        assert leased is not None
+        conn.execute("UPDATE processing_jobs SET attempts = max_attempts WHERE id = ?", (leased.id,))
+        job = repo.get_job(conn, leased.id)
+    assert job is not None
+    task = asyncio.create_task(handlers.handle_summary(ctx, job))
+    await started.wait()
+    async with ctx.db.write() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        assert m is not None
+        if advanced:
+            repo.update_meeting(conn, "m-1", transcript_version=m.transcript_version + 1)
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
+    # Act
+    try:
+        swept = await sweep_once(ctx.db, ctx.events)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    with ctx.db.read() as conn:
+        after = repo.get_job(conn, job.id)
+        meeting = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert swept == 1
+    assert after is not None and meeting is not None
+    if not advanced:
+        assert (after.status, after.error_class) == ("failed", "INTERNAL")
+        assert meeting.status == "failed"
+        return
+    assert (after.status, after.lease_owner, after.attempts) == ("pending", None, job.attempts - 1)
+    assert meeting.status != "failed"
+    # 次の試行が版を控える前に落ちたら、前の試行が控えた古い版で比べない（lease で消す）。回数切れで failed になる
+    again = await _expire_exhausted(ctx, "synthesize_minutes")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    with ctx.db.read() as conn:
+        last = repo.get_job(conn, again.id)
+    assert last is not None and last.status == "failed"
+
+
 async def test_publish_created_job_logs_instead_of_raising_after_commit(
         client: httpx.AsyncClient, ctx: AppContext, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     """コミット後の配信で例外が出ても Runner へ伝えない。伝えると、書き込みを終えた試行が失敗として記録・再試行される（§13）。"""
@@ -8319,6 +8434,30 @@ def test_deadline_relative_year_must_match_the_quote() -> None:
     assert not _deadline_supported("11月20日", "来年11月20日までに提出")
 
 
+def test_deadline_standalone_relative_year_must_match_the_quote() -> None:
+    """相対の年だけの期限（「来年」「来年末」「来年11月」「来年度」）も 1 つの表現。quote の「再来年」は deadline の「来年」を裏付けない（段 5）。
+
+    期限の表現として切り出さないと _phrase_in の部分一致になり、「来年」が「再来年」の中に当たる。
+    """
+    # Act / Assert: 同じ相対の年なら通る（「の」を挟んでもよい）
+    assert _deadline_supported("来年", "来年までに提出")
+    assert _deadline_supported("再来年", "再来年に提出")
+    assert _deadline_supported("来年末", "来年の末までに提出")
+    assert _deadline_supported("来年11月", "来年の11月に提出")
+    assert _deadline_supported("来年度末", "来年度末までに提出")
+    assert _deadline_supported("来年春", "来年の春に提出")
+    # 年が違えば落ちる（「来年」は「再来年」の中にも現れる）
+    assert not _deadline_supported("来年", "再来年までに提出")
+    assert not _deadline_supported("今年", "去年までに提出")
+    # 後ろの月・時期・年度も年と 1 つの表現。違えば落ち、付いた quote は付いていない deadline を裏付けない
+    assert not _deadline_supported("来年11月", "来年3月に提出")
+    assert not _deadline_supported("来年末", "来年に提出")
+    assert not _deadline_supported("来年度末", "来年度に提出")
+    assert not _deadline_supported("来年春", "来年秋に提出")
+    assert not _deadline_supported("来年度上期", "来年度下期に提出")
+    assert not _deadline_supported("来年", "来年11月20日までに提出")
+
+
 def test_deadline_era_must_match_the_quote() -> None:
     """元号の付いた日付は元号まで 1 つの表現。quote の令和 8 年は deadline の平成 8 年の同じ月日を裏付けない（段 5）。"""
     # Arrange
@@ -9422,13 +9561,14 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | GPU OOM retry + ダウングレード | `test_oom_downgrades_model_per_meeting`、`test_two_jobs_failing_with_oom_on_the_same_model_downgrade_once`、`test_downgrade_skips_models_that_are_not_installed`、`test_provider_loads_on_the_requested_device_and_keeps_one_model` |
 | ワーカークラッシュ → Sweeper → 再 lease | `test_sweeper_recovers_expired_lease_and_ignores_stale_owner`、`test_pool_is_rebuilt_after_a_worker_crash`、`test_pool_is_rebuilt_after_a_timeout` |
 | 落ち続けるジョブを永久に実行しない（lease 切れの回数上限） | `test_sweeper_fails_job_whose_lease_keeps_expiring` |
+| 合成の途中で落ちた要約は、控えた版から transcript が進んでいれば回数切れでも failed にせず戻す。版が同じ・控える前に落ちたときは回数を数える（§14・§12.7） | `test_sweep_requeues_expired_summary_only_when_transcript_advanced` |
 | merge が書き込みをコミットした後に回数切れで failed になっても、その merge が終わる前に置いた撮り直しは作り直した merge が公開する（同じミリ秒でも）。書き込みの前に落ち続ける merge は際限なく作り直さない（§12 `rerun_merge_for_staged`） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly` |
 | 常駐ループが 1 周の失敗で終わらない | `test_runner_loop_survives_failed_iteration`、`test_sweeper_loop_survives_failed_iteration` |
 | invalid audio no-retry | `test_failed_chunk_blocks_until_excluded`、`test_retry_decisions` |
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
 | DLQ = failed + 再試行 | `test_retry_failed_job_via_api`、`test_failed_chunk_blocks_until_excluded` |
 | Structured Output / sourceSegmentIds / assignee 検出 | `test_validate_stage3_to_7`、`test_synthesize_single_window_retries_schema_once` |
-| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算・別の日付の部品の寄せ集め・年や元号の違う同じ月日・別の週の同じ曜日では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote`、`test_compound_deadline_is_not_matched_by_its_part`、`test_deadline_is_not_assembled_from_parts_of_other_dates`、`test_deadline_year_must_match_the_quote`、`test_deadline_relative_year_must_match_the_quote`、`test_deadline_era_must_match_the_quote`、`test_week_and_weekday_are_matched_as_a_pair`、`test_english_week_phrases_are_not_matched_as_fragments`、`test_slash_date_keeps_the_separator_before_a_time` |
+| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算・別の日付の部品の寄せ集め・年や元号の違う同じ月日・別の週の同じ曜日では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote`、`test_compound_deadline_is_not_matched_by_its_part`、`test_deadline_is_not_assembled_from_parts_of_other_dates`、`test_deadline_year_must_match_the_quote`、`test_deadline_relative_year_must_match_the_quote`、`test_deadline_standalone_relative_year_must_match_the_quote`、`test_deadline_era_must_match_the_quote`、`test_week_and_weekday_are_matched_as_a_pair`、`test_english_week_phrases_are_not_matched_as_fragments`、`test_slash_date_keeps_the_separator_before_a_time` |
 | 段 3a (4) は語彙の重なりで含意は見ない（quote と矛盾する claim も通る既知の制限） | `test_claim_contradicting_its_quote_passes_as_known_limitation` |
 | AI 再生成 / Manual Notes 保護 | `test_regenerate_creates_new_version_and_keeps_notes` |
 | Ollama 停止中に transcript まで完了 | `test_ollama_outage_leaves_transcribed_then_completes`、`test_summary_runs_once_ollama_is_started_after_the_server`、`test_ollama_without_models_is_model_missing` |
