@@ -1050,7 +1050,7 @@ def on_job_failed(conn: sqlite3.Connection, job: Job) -> str | None:
 def rerun_merge_for_staged(conn: sqlite3.Connection, job: Job) -> str | None:
     """failed で確定した merge の後に、入れ替え待ちの撮り直しを公開する merge を作る（Phase 2 §12 rerun_merge_for_staged と同じ規則）。
 
-    この merge の行より後に置いた撮り直しがあるときだけ作る（書き込みの前に落ち続ける merge を際限なく作り直さない）。
+    この merge が終わる前に置いた撮り直し（stage_replacement が控えた merge の id）があるときだけ作る（書き込みの前に落ち続ける merge を際限なく作り直さない）。
     作るのは merge で、分離はやり直さない（Runner が merge の完了で作り直す merge と同じ。分離は終端なので ensure_merge_job も merge を作る）。
     分離の有効・無効（Runner の diarization_active）はここでは持たない（Sweeper からも呼ばれる）ので、on_diarize_finished と同じく
     全 Chunk が終端のときだけ merge を直接作る。分離が終わっていなければ（作り直した分離が待っている・実行中）作らない
@@ -1058,7 +1058,7 @@ def rerun_merge_for_staged(conn: sqlite3.Connection, job: Job) -> str | None:
     既知の差：Runner の完了処理（ensure_merge_job）は、分離の行が無く分離が有効なら分離から作るが、ここは merge を作る
     （merge の後に分離を有効にした会議で、撮り直しの公開に分離を挟まない）
     """
-    if not repo.has_replacements_since(conn, job.meeting_id, job.created_at):
+    if not repo.has_replacements_staged_during(conn, job.meeting_id, job.id):
         return None
     repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
     if not _all_chunks_terminal(conn, job.meeting_id):
@@ -2181,6 +2181,8 @@ class AudioCodec(Protocol):
     # 壊れた入力は ValueError で返す（read_pcm が InvalidWavError に包む）。max_samples を渡したら、それを超える分は復号しない
     # （返すのは最大 max_samples + 1 サンプル。超えたかどうかは read_pcm が長さで判定する。全量を PCM にしてから比べない）
     def decode(self, data: bytes, max_samples: int | None = None) -> bytes: ...
+    # max_samples サンプルの音声を符号化したファイルの最悪の大きさ。read_pcm はこれを超えて読まない（全量を読み込む前に断る）
+    def max_encoded_bytes(self, max_samples: int) -> int: ...
 
 
 class FakeCodec:
@@ -2194,6 +2196,9 @@ class FakeCodec:
 
     def encode(self, pcm: bytes) -> bytes:
         return self.MAGIC + struct.pack("<I", len(pcm)) + pcm
+
+    def max_encoded_bytes(self, max_samples: int) -> int:
+        return 8 + max_samples * 2
 
     def decode(self, data: bytes, max_samples: int | None = None) -> bytes:
         if len(data) < 8 or data[:4] != self.MAGIC:
@@ -2217,6 +2222,13 @@ class FlacCodec:
         buf = io.BytesIO()
         sf.write(buf, np.frombuffer(pcm, dtype=np.int16), 16000, format="FLAC", subtype="PCM_16")
         return buf.getvalue()
+
+    def max_encoded_bytes(self, max_samples: int) -> int:
+        """最悪の符号化の大きさ。圧縮の効かない音声は verbatim になり、PCM（16 bit・モノラルで 2 バイト/サンプル）に、フレームごとの
+        見出し・CRC と subframe の見出し（合わせて 20 バイト以下）が付く。FLAC のブロックは最小 16 サンプルなので 16 サンプルごとに
+        20 バイトを見込む（libsndfile の既定のブロックは 4096 サンプルで、実際の余分ははるかに小さい）。メタデータ（STREAMINFO・
+        padding・コメント・シークテーブル）に 1 MiB を見込む。ファイルのヘッダの長さは使わない（壊れていると信じられない）"""
+        return max_samples * 2 + (max_samples // 16 + 1) * 20 + (1 << 20)
 
     def decode(self, data: bytes, max_samples: int | None = None) -> bytes:
         import numpy as np  # type: ignore[import-not-found]
@@ -2350,26 +2362,41 @@ def write_atomic(data_dir: Path, relative_path: str, data: bytes) -> Path:
     return final
 
 
+def _read_at_most(path: Path, limit: int, relative_path: str) -> bytes:
+    """path を limit バイトまで読む。超えるファイルは limit + 1 バイトで読むのをやめ、PcmTooLongError で断る（全量を読み込まない）。"""
+    with path.open("rb") as fh:
+        data = fh.read(limit + 1)
+    if len(data) > limit:
+        raise PcmTooLongError(f"file larger than {limit} bytes: {relative_path}")
+    return data
+
+
 def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = None, codec: AudioCodec | None = None,
              max_samples: int | None = None) -> bytes:
     """WAV または圧縮ファイルを読み、PCM を返す。expected_sha256 は常に WAV 形式での値（§2.4）。
 
-    max_samples を渡すと、それより長い音声は全量を PCM にする前に PcmTooLongError で断る。WAV はファイルの大きさ（ヘッダ + PCM）で、
-    圧縮ファイルは上限 + 1 サンプルで止めた復号の長さで判定する（ヘッダの長さは壊れていると信じられない）
+    max_samples を渡すと、それより長い音声は全量を PCM にする前に PcmTooLongError で断る。読む量そのものを上限で止める
+    （WAV はヘッダ + PCM の大きさ、圧縮ファイルは codec.max_encoded_bytes。超えれば全量を読まずに断る）。圧縮ファイルはさらに、
+    上限 + 1 サンプルで止めた復号の長さで判定する（ヘッダの長さは壊れていると信じられない）
     """
     path = data_dir / relative_path
     if not path.exists():
         raise InvalidWavError(f"file missing: {relative_path}")
-    if max_samples is not None and path.suffix == ".wav" and path.stat().st_size > WAV_HEADER_BYTES + max_samples * 2:
-        raise PcmTooLongError(f"longer than {max_samples} samples: {relative_path}")
-    data = path.read_bytes()
+    if path.suffix != ".wav" and (codec is None or codec.extension != path.suffix):
+        raise InvalidWavError(f"no codec for {path.suffix}: {relative_path}")
+    if max_samples is None:
+        data = path.read_bytes()
+    else:
+        limit = (codec.max_encoded_bytes(max_samples) if path.suffix != ".wav" and codec is not None
+                 else WAV_HEADER_BYTES + max_samples * 2)
+        data = _read_at_most(path, limit, relative_path)
     if path.suffix == ".wav":
         if expected_sha256 is not None and sha256_hex(data) != expected_sha256:
             raise InvalidWavError(f"sha256 mismatch: {relative_path}")
         parse_wav_header(data)
         return data[WAV_HEADER_BYTES:]
-    if codec is None or codec.extension != path.suffix:
-        raise InvalidWavError(f"no codec for {path.suffix}: {relative_path}")
+    if codec is None:
+        raise InvalidWavError(f"no codec for {path.suffix}: {relative_path}")   # 上で確かめ済み（型を絞る）
     try:
         pcm = codec.decode(data, max_samples)
     except ValueError as e:
@@ -2663,6 +2690,11 @@ def _chunk_from_file(path: Path, codec: AudioCodec | None) -> tuple[int, str, by
         data = path.read_bytes()
     except OSError:
         return None
+    return _chunk_from_bytes(path, data, codec)
+
+
+def _chunk_from_bytes(path: Path, data: bytes, codec: AudioCodec | None) -> tuple[int, str, bytes] | None:
+    """読んだ内容 data（path の拡張子で形式を決める）から (sample_count, wav_sha256, pcm) を復元。形式が合わなければ None。"""
     if path.suffix == ".wav":
         try:
             h = parse_wav_header(data)
@@ -2807,13 +2839,14 @@ def _relink_chunk(conn: sqlite3.Connection, data_dir: Path, chunk: AudioChunk, f
     rel = str(f.relative_to(data_dir))
     if rel == chunk.local_path or _file_matches_chunk(data_dir / chunk.local_path, chunk, codec) is not False:
         return False
-    restored = _chunk_from_file(f, codec)
-    if restored is None or restored[1] != chunk.sha256:
-        return False
+    # f は 1 回だけ読み、検証したそのバイト列から大きさと sha256_flac を記録する。読み直すと、その間に置き換わった
+    # 検証していない内容を記録してしまう。読めなければ（権限・取り外し）この Chunk だけ向け直さず、rebuild と起動時の復元を止めない
     try:
         encoded = f.read_bytes()
     except OSError:
-        # 検証の後に読めなくなった（権限・取り外し）。この Chunk だけ向け直さず、rebuild と起動時の復元を止めない
+        return False
+    restored = _chunk_from_bytes(f, encoded, codec)
+    if restored is None or restored[1] != chunk.sha256:
         return False
     repo.update_chunk(conn, chunk.id, local_path=rel, codec=_codec_of(f), size_bytes=len(encoded), save_status="verified",
                       sha256_flac=None if f.suffix == ".wav" else sha256_hex(encoded))
@@ -6533,7 +6566,7 @@ from minutes_local.jobs.sweeper import resume_finalized
 from minutes_local.llm.fake_provider import FakeSummaryProvider
 from minutes_local.storage import backup
 from minutes_local.storage.codec import FakeCodec
-from minutes_local.storage.files import PcmTooLongError, build_wav, read_pcm
+from minutes_local.storage.files import PcmTooLongError, build_wav, read_pcm, sha256_hex
 from minutes_local.storage import rebuild as rebuild_module
 from minutes_local.storage.rebuild import RebuildReport, rebuild
 from minutes_local.stt.fake_provider import FakeSTTProvider
@@ -6860,6 +6893,41 @@ def test_read_pcm_rejects_audio_longer_than_limit_before_decoding_all(tmp_path: 
     if codec is not None:
         # 復号そのものも上限 + 1 サンプルで止まる（全量を確保しない）
         assert len(codec.decode(data, max_samples=100)) == 101 * 2  # type: ignore[attr-defined]
+
+
+def test_read_pcm_bounds_compressed_file_read_before_decoding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """圧縮ファイルは、上限に対する最悪の符号化の大きさ（codec.max_encoded_bytes）を超えて読まず、復号の前に PcmTooLongError で断る。
+    ヘッダの長さ（FakeCodec の n）は見ない。全量を読み込まない（Path.read_bytes を使わない）"""
+    # Arrange: ヘッダは 1 秒と書いてあるが、後ろに大きなごみが続くファイル
+    codec = FakeCodec()
+    name = "a.fake"
+    (tmp_path / name).write_bytes(codec.encode(sine_pcm(1)) + b"\x00" * 1_000_000)
+
+    def no_full_read(self: Path) -> bytes:
+        raise AssertionError("read_pcm must not read the whole file")
+
+    def no_decode(self: FakeCodec, data: bytes, max_samples: int | None = None) -> bytes:
+        raise AssertionError("decode must not run on an oversized file")
+
+    monkeypatch.setattr(Path, "read_bytes", no_full_read)
+    monkeypatch.setattr(FakeCodec, "decode", no_decode)
+    # Act / Assert
+    with pytest.raises(PcmTooLongError):
+        read_pcm(tmp_path, name, None, codec, max_samples=16000)
+
+
+def test_flac_worst_case_bound_admits_incompressible_audio(tmp_path: Path) -> None:
+    """圧縮の効かない音声（白色雑音）の FLAC も、長さちょうどの上限なら読める（通常の符号化の余分を見込んだ上限。§16 max_encoded_bytes）。"""
+    pytest.importorskip("soundfile")
+    from minutes_local.storage.codec import FlacCodec
+    # Arrange
+    codec = FlacCodec()
+    pcm = os.urandom(32000)
+    data = codec.encode(pcm)
+    (tmp_path / "a.flac").write_bytes(data)
+    # Act / Assert: 符号化した大きさは上限の中にあり、読める
+    assert len(data) <= codec.max_encoded_bytes(16000)
+    assert read_pcm(tmp_path, "a.flac", None, codec, max_samples=16000) == pcm
 
 
 # ---- 圧縮と読み取りの競合 ----
@@ -7367,8 +7435,8 @@ async def test_rebuild_reverifies_missing_chunk_whose_file_was_restored(client3:
 
 async def test_rebuild_skips_relink_when_alternate_becomes_unreadable(client3: httpx.AsyncClient, ctx3: AppContext,
                                                                        runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
-    """向け直す先のファイルが検証の後に読めなくなっても、rebuild を止めずにその Chunk だけ向け直さない。"""
-    # Arrange: 圧縮後に行だけを圧縮前（WAV）に戻す。1 つ目の圧縮ファイルは 2 回目の読み取り（向け直しの直前）で失敗させる
+    """向け直す先のファイルが読めなくても（権限・取り外し）、rebuild を止めずにその Chunk だけ向け直さない。"""
+    # Arrange: 圧縮後に行だけを圧縮前（WAV）に戻す。1 つ目の圧縮ファイルは読み取り（検証と記録に使う 1 回）で失敗させる
     data_dir = ctx3.settings.data_dir
     await _completed_meeting(client3, runner3, ctx3)
     with ctx3.db.read() as conn:
@@ -7382,24 +7450,58 @@ async def test_rebuild_skips_relink_when_alternate_becomes_unreadable(client3: h
     reads = {"n": 0}
     original = Path.read_bytes
 
-    def read_bytes_failing_second_time(self: Path) -> bytes:
+    def read_bytes_failing(self: Path) -> bytes:
         if self == flaky:
             reads["n"] += 1
-            if reads["n"] == 2:
-                raise PermissionError("unreadable")
+            raise PermissionError("unreadable")
         return original(self)
 
-    monkeypatch.setattr(Path, "read_bytes", read_bytes_failing_second_time)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_failing)
     # Act
     with ctx3.db.write_sync() as conn:
         report = rebuild(conn, data_dir, ctx3.codec)
         first = repo.get_chunk(conn, old_rows[0].id)
         second = repo.get_chunk(conn, old_rows[1].id)
     # Assert: 読めなかった方は向け直さず（行が指す WAV はないので missing）、もう一方は向け直す
-    assert reads["n"] == 2
+    assert reads["n"] == 1
     assert (report.chunks_relinked, report.chunks_marked_missing) == (1, 1)
     assert first is not None and first.local_path == old_rows[0].local_path and first.save_status == "missing"
     assert second is not None and second.local_path.endswith(".fake") and second.save_status == "verified"
+
+
+async def test_rebuild_relink_records_the_bytes_it_validated(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                              runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """向け直しは向け直す先を 1 回だけ読み、検証したそのバイト列から大きさと sha256_flac を記録する。
+    読み直すと、その間に置き換わった別の内容を、検証していないまま行に記録してしまう。"""
+    # Arrange: 圧縮後に行だけを圧縮前（WAV）に戻す。1 つ目の圧縮ファイルは、2 回目以降の読み取りで別の内容を返す
+    data_dir = ctx3.settings.data_dir
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        old_rows = sorted(repo.list_chunks(conn, "m-1"), key=lambda c: c.sequence_no)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        for c in old_rows:
+            repo.update_chunk(conn, c.id, local_path=c.local_path, codec="wav", sha256_flac=None, size_bytes=c.size_bytes)
+    changing = (data_dir / old_rows[0].local_path).with_suffix(".fake")
+    validated = changing.read_bytes()
+    reads = {"n": 0}
+    original = Path.read_bytes
+
+    def read_bytes_changing(self: Path) -> bytes:
+        if self == changing:
+            reads["n"] += 1
+            return validated if reads["n"] == 1 else validated + b"\x00\x00"
+        return original(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_changing)
+    # Act
+    with ctx3.db.write_sync() as conn:
+        rebuild(conn, data_dir, ctx3.codec)
+        first = repo.get_chunk(conn, old_rows[0].id)
+    # Assert: 記録した大きさと sha256 は、検証した 1 回目の内容のもの
+    assert first is not None and first.local_path.endswith(".fake")
+    assert first.size_bytes == len(validated) and first.sha256_flac == sha256_hex(validated)
 
 
 async def test_rebuild_skips_recording_that_disappears_after_reading(client3: httpx.AsyncClient, ctx3: AppContext,
@@ -7614,8 +7716,8 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | 同時に走らせる話者分離は `MAX_CONCURRENT_DIARIZE` 本まで。pending に戻した分離の次の試行は、旧い試行のスレッドが抜けるまで分離を始めず、その間 Runner は分離と（STT と並べない設定なら）要約を lease しない。lease した分離の行がある間も（枠を取る前でも）次の分離を lease しない。分離を待つハンドラがキャンセルされても、スレッドが抜けるまで枠を返さない（§7 `diarize_slots`・§9 `allowed_types`・§21 `handle_diarize`） | `test_requeued_diarize_waits_for_the_running_attempt`、`test_cancelled_diarize_keeps_the_slot_until_its_thread_exits`、`test_leased_diarize_blocks_next_diarize_before_taking_the_slot` |
 | 分離が failed で確定して作った merge ジョブ（`on_job_failed` の戻り値）は、Runner の失敗時も Sweeper の回数切れも、コミット後に流す（完了時の後続ジョブと同じ。§8 `on_job_failed`・§9 `_on_failure`・Phase 2 §14 `sweep_once`） | `test_failed_diarize_publishes_the_merge_job_it_creates`、`test_exhausted_diarize_publishes_the_merge_job_it_creates` |
 | lease できる分離が待っていれば、ライブ STT が絶えず届いても新しい STT を lease せず、実行中の STT が抜けたら分離を lease する。待つ分離が無い（再試行の待ち時間中を含む）なら従来の優先度の順（§9 `allowed_types`・`repo_phase3.has_ready_job`） | `test_pending_diarize_is_admitted_despite_a_replenished_live_queue`、`test_stt_keeps_priority_when_no_diarize_is_ready` |
-| 分離の読み込みは、Chunk ごとにその source の残りの上限を渡し、上限を超える音声は全量を PCM にする前に断る（WAV は大きさ、圧縮ファイルは上限 + 1 サンプルで止めた復号。§16 `read_pcm`・§21 `_load_and_diarize`） | `test_read_pcm_rejects_audio_longer_than_limit_before_decoding_all`、`test_diarize_reads_each_chunk_within_remaining_timeline_budget` |
-| merge が書き込みをコミットした後に回数切れで failed になっても、その行より後に置いた撮り直しは作り直した merge が公開する。落ち続ける merge は際限なく作り直さない（§8 `rerun_merge_for_staged`。Phase 2 のテストを Phase 3 の pipeline で実行） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly`（Phase 2 §23） |
+| 分離の読み込みは、Chunk ごとにその source の残りの上限を渡し、上限を超える音声は全量を PCM にする前に断る（読む量を WAV はヘッダ + PCM、圧縮ファイルは最悪の符号化の大きさ `max_encoded_bytes` で止め、圧縮ファイルはさらに上限 + 1 サンプルで止めた復号で判定。§16 `read_pcm`・§21 `_load_and_diarize`） | `test_read_pcm_rejects_audio_longer_than_limit_before_decoding_all`、`test_read_pcm_bounds_compressed_file_read_before_decoding`、`test_flac_worst_case_bound_admits_incompressible_audio`、`test_diarize_reads_each_chunk_within_remaining_timeline_budget` |
+| merge が書き込みをコミットした後に回数切れで failed になっても、その merge が終わる前に置いた撮り直しは作り直した merge が公開する（同じミリ秒でも）。落ち続ける merge は際限なく作り直さない（§8 `rerun_merge_for_staged`。Phase 2 のテストを Phase 3 の pipeline で実行） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly`（Phase 2 §23） |
 | 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
 | 実 Provider：無音 Chunk を挟んでも話者区間の時刻がずれない、上限は `max_speakers`、一時ファイルはデータディレクトリの中 | `test_assemble_timeline_pads_gaps_with_silence`、`test_pyannote_provider_keeps_absolute_time_across_skipped_chunk`、`test_speaker_after_silent_chunk_is_not_shifted` |
 | エコー除去 | `test_echo_from_system_is_dropped_on_mic` |
@@ -7625,7 +7727,7 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
 | バックアップの原子性・壊れたバックアップを復元元にしない | `test_backup_failure_leaves_no_partial_file`、`test_restore_skips_broken_backup` |
 | バックアップは 24 時間に 1 回・定期処理のループが失敗で終わらない | `test_scheduler_backs_up_only_when_a_day_has_passed`、`test_scheduler_loop_survives_failed_iteration` |
-| 圧縮後の古い行を検証した圧縮ファイルへ向け直す。行が指すファイルが壊れていれば向け直し、健全なら向け直さない。代わりがなければ `missing` | `test_rebuild_relinks_chunk_compressed_after_backup`、`test_rebuild_relinks_only_when_existing_recording_is_corrupt` |
+| 圧縮後の古い行を検証した圧縮ファイルへ向け直す。行が指すファイルが壊れていれば向け直し、健全なら向け直さない。代わりがなければ `missing` | `test_rebuild_relinks_chunk_compressed_after_backup`、`test_rebuild_relinks_only_when_existing_recording_is_corrupt`、`test_rebuild_relink_records_the_bytes_it_validated` |
 | rebuild は、読んだ後に消えた・読めなくなった録音をそのファイルだけ飛ばし、残りを復元する（§18 `rebuild`） | `test_rebuild_skips_recording_that_disappears_after_reading` |
 | 起動時の復旧（バックアップあり / なし）で録音ファイルから作り直す。復元の途中で止まっても次の起動がやり直す | `test_startup_recovery_rebuilds_meetings_missing_from_database`、`test_interrupted_restore_resumes_on_next_start` |
 | 壊れた `meeting.json` で rebuild を止めない・確定前の会議は `recording` に戻す | `test_rebuild_drops_malformed_stop_pair`、`test_rebuild_drops_malformed_end_time`、`test_rebuild_tolerates_malformed_snapshot_fields`、`test_rebuild_tolerates_snapshot_that_is_not_an_object`、`test_rebuild_restores_unfinalized_meeting_as_recording` |
