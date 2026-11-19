@@ -2410,6 +2410,11 @@ export interface DraftStore {
    * 読み取り・判定・書き込みは 1 つの readwrite トランザクション（別タブの退避が間に入らない）。消したら true
    */
   consumeHeld(holdKey: string, holdId: string, matches: (current: unknown) => boolean): Promise<boolean>;
+  /**
+   * 退避先（holdKey のオブジェクト）へ value を戻す。項目は place が今の退避先を見て選ぶ（他の項目には触らない）。
+   * 読み取り・選択・書き込みは 1 つの readwrite トランザクション（別タブの退避が間に入らない）。戻した項目の id を返す
+   */
+  restoreHeld(holdKey: string, value: unknown, place: (held: Readonly<Record<string, unknown>>) => string): Promise<string>;
 }
 
 export interface NotesStoreDeps {
@@ -2891,7 +2896,8 @@ export class NotesStore {
    * 内容のことがあるので、取り込んだ内容が IndexedDB にある根拠にならない。取り込みの書き込みが成功しても、書き込みを待つ間に
    * 後の編集が内容か要約の版を置き換えていれば（今の内容が sameContent で取り込んだ内容と違うか、lastAppliedSummaryVersion が
    * 取り込んだ下書きの版と違えば）消さない。下書きは後の編集で上書きされている。consumeHeld のトランザクションを待つ間の編集も
-   * 同じく見る（消す判定 matches の中で確かめ直す。holdsImported）。
+   * 同じく見る（消す判定 matches の中で確かめ直す。holdsImported）。判定の後・トランザクションの完了までに入った編集は判定で
+   * 止められないので、完了の後にもう一度確かめ、取り込んだ内容がもう今の内容でなければ項目を退避先へ戻す（restoreHeld）。
    * 要約の版（lastAppliedSummaryVersion）は、取り込んだ下書きが持つ版を引き継ぐ（その内容が反映した版）。
    * 今の内容に未送信の編集（hasUnsentEdits）があれば、replaceUnsent を付けない呼び出しは何も変えずに "unsent" を返す。
    * 取り込みはエディタの内容を置き換え、このタブの下書きも上書きする（自分のタブの下書きは退避先へ移さない。evictionHoldId）ので、
@@ -2933,8 +2939,32 @@ export class NotesStore {
       this.reportError(error);
       return "kept";
     }
-    if (removed) this.set({ heldDrafts: this.state.heldDrafts.filter((h) => h.tabId !== entry.tabId) });
-    return removed ? "removed" : "kept";
+    if (!removed) return "kept";
+    // 消す判定（matches）の後・トランザクションの完了の通知までの間にも編集は入る。その編集の書き込みは消した後に並び、
+    // このタブの下書きを上書きするので、取り込んだ内容は下書きにも退避先にも無くなる。今の内容が取り込んだ内容でなければ項目を戻す
+    if (!this.holdsImported(entry.draft)) {
+      await this.restoreHeld(entry);
+      return "kept";
+    }
+    this.set({ heldDrafts: this.state.heldDrafts.filter((h) => h.tabId !== entry.tabId) });
+    return "removed";
+  }
+
+  /**
+   * importHeldDraft が消した項目を退避先へ戻す。置くのは元の項目が空いていればそこ、別タブが後から書き直していれば
+   * 空いている別の項目（vacantHoldId。後から書いた内容を上書きしない）。別の項目へ置いたら、一覧（heldDrafts）の元の項目を
+   * その項目へ移す（元の項目の今の内容は別タブが書いたもので、次の load() の一覧に出る）。
+   * 戻せなかったときは onError に知らせる（取り込んだ内容は、このインスタンスのメモリか dispose() の戻り値にしか無い）
+   */
+  private async restoreHeld(entry: { readonly tabId: string; readonly draft: Draft }): Promise<void> {
+    try {
+      const placed = await this.deps.drafts.restoreHeld(this.heldKey(), entry.draft, (held) => vacantHoldId(entry.tabId, entry.draft, held));
+      if (placed === entry.tabId) return;
+      const others = this.state.heldDrafts.filter((h) => h.tabId !== entry.tabId);
+      this.set({ heldDrafts: withHeld(others, { tabId: placed, draft: entry.draft }) });
+    } catch (error) {
+      this.reportError(error);
+    }
   }
 
   /**
@@ -3328,6 +3358,36 @@ export class IdbDraftStore implements DraftStore {
         const record: SettingsRecord = { key: holdKey, value: held };
         store.put(record);
         removed = true;
+      };
+    });
+  }
+
+  restoreHeld(holdKey: string, value: unknown, place: (held: Readonly<Record<string, unknown>>) => string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction(STORE_SETTINGS, "readwrite");
+      const store = tx.objectStore(STORE_SETTINGS);
+      let placed: string | null = null;
+      let failure: unknown = null;
+      tx.oncomplete = () => (placed === null ? reject(new Error("held draft restore did not write")) : resolve(placed));
+      tx.onerror = () => reject(tx.error ?? new Error("held draft restore failed"));
+      // place が投げたときは abort して、その例外で reject する（握りつぶさない）
+      tx.onabort = () => reject(failure ?? tx.error ?? new Error("held draft restore aborted"));
+      const req = store.get(holdKey);
+      req.onsuccess = () => {
+        const current = valueOf(req.result);
+        const held: Record<string, unknown> = typeof current === "object" && current !== null ? { ...(current as Record<string, unknown>) } : {};
+        let id: string;
+        try {
+          id = place(held);
+        } catch (error) {
+          failure = error;
+          tx.abort();
+          return;
+        }
+        held[id] = value;
+        const record: SettingsRecord = { key: holdKey, value: held };
+        store.put(record);
+        placed = id;
       };
     });
   }
@@ -4799,6 +4859,14 @@ function build(opts: { serverRevision?: number; offline?: boolean } = {}) {
         drafts.set(holdKey, held);
         return true;
       },
+      restoreHeld: async (holdKey, value, place) => {
+        const current = drafts.get(holdKey);
+        const held: Record<string, unknown> = typeof current === "object" && current !== null ? { ...(current as Record<string, unknown>) } : {};
+        const id = place(held);
+        held[id] = value;
+        drafts.set(holdKey, held);
+        return id;
+      },
     },
     tabId: "tab-A",
     debounceMs: 1000,
@@ -5567,6 +5635,51 @@ describe("NotesStore", () => {
     expect(b.drafts.get("notes:m:held")).toEqual({ "tab-B": fromB });
   });
 
+  it("消す判定の後・トランザクションの完了までに編集が内容を置き換えたら、消した項目を戻す", async () => {
+    // Arrange: 消す判定（matches）が true を返した直後、完了の通知の前に別の編集が入る
+    const b = build();
+    const fromB = { json: ["b"], revision: 0, lastAppliedSummaryVersion: null, savedAt: 5, writer: "tab-B", writeId: "tab-B:1", saved: false };
+    await b.drafts.set("notes:m:held", { "tab-B": fromB });
+    const store: NotesStore = new NotesStore({ ...b.deps, drafts: { ...b.deps.drafts, consumeHeld: (k, id, matches) =>
+      b.deps.drafts.consumeHeld(k, id, (current) => {
+        const ok = matches(current);
+        if (ok) store.setDraft(["edited after the check"]);
+        return ok;
+      }) } }, "m");
+    await store.load();
+    // Act
+    const result = await store.importHeldDraft({ tabId: "tab-B", draft: fromB });
+    // Assert: 取り込んだ内容は今の内容にも下書きにも無いので、項目を元の場所へ戻し、一覧にも残す
+    expect(result).toBe("kept");
+    expect(store.current.json).toEqual(["edited after the check"]);
+    expect(b.drafts.get("notes:m:held")).toEqual({ "tab-B": fromB });
+    expect(store.current.heldDrafts).toEqual([{ tabId: "tab-B", draft: fromB }]);
+  });
+
+  it("戻す前に別タブが同じ項目を書き直していれば、上書きせずに空いている項目へ戻し、一覧の項目もそこへ移す", async () => {
+    // Arrange: 判定の後に編集が入り、消した後・戻す前に別タブが同じ項目へ新しい下書きを退避する
+    const b = build();
+    const fromB = { json: ["b"], revision: 0, lastAppliedSummaryVersion: null, savedAt: 5, writer: "tab-B", writeId: "tab-B:1", saved: false };
+    const newerB = { json: ["b newer"], revision: 0, lastAppliedSummaryVersion: null, savedAt: 6, writer: "tab-B", writeId: "tab-B:2", saved: false };
+    await b.drafts.set("notes:m:held", { "tab-B": fromB });
+    const store: NotesStore = new NotesStore({ ...b.deps, drafts: { ...b.deps.drafts, consumeHeld: async (k, id, matches) => {
+      const removed = await b.deps.drafts.consumeHeld(k, id, (current) => {
+        const ok = matches(current);
+        if (ok) store.setDraft(["edited after the check"]);
+        return ok;
+      });
+      await b.drafts.set("notes:m:held", { ...(b.drafts.get("notes:m:held") as Record<string, unknown>), "tab-B": newerB });
+      return removed;
+    } } }, "m");
+    await store.load();
+    // Act
+    const result = await store.importHeldDraft({ tabId: "tab-B", draft: fromB });
+    // Assert: 別タブの新しい下書きは残し、取り込んだ下書きは別の項目に戻る
+    expect(result).toBe("kept");
+    expect(b.drafts.get("notes:m:held")).toEqual({ "tab-B": newerB, "tab-B:1": fromB });
+    expect(store.current.heldDrafts).toEqual([{ tabId: "tab-B:1", draft: fromB }]);
+  });
+
   it("取り込んだ後の編集が要約の版だけを置き換えたら、内容が同じでも項目を消さない", async () => {
     // Arrange: 取り込みを知らせた onChange の中で、エディタが同じ内容を別の要約の版で一度だけ書き直す
     const b = build();
@@ -6326,6 +6439,22 @@ describe("IdbDraftStore", () => {
     expect(await store.get("notes:m:held")).toEqual({ "tab-C": { json: ["c"] } });
   });
 
+  it("restoreHeld は place が選んだ項目へ値を置き、他の項目は残す。place が投げれば何も書かずに reject する", async () => {
+    // Arrange
+    const db = await openDatabase(new IDBFactory());
+    const store = new IdbDraftStore(db);
+    await store.set("notes:m:held", { "tab-B": { json: ["newer"] }, "tab-C": { json: ["c"] } });
+    const seen: unknown[] = [];
+    // Act
+    const placed = await store.restoreHeld("notes:m:held", { json: ["b"] }, (held) => { seen.push({ ...held }); return "tab-B:1"; });
+    const failed = store.restoreHeld("notes:m:held", { json: ["x"] }, () => { throw new Error("place failed"); });
+    // Assert
+    expect(placed).toBe("tab-B:1");
+    expect(seen).toEqual([{ "tab-B": { json: ["newer"] }, "tab-C": { json: ["c"] } }]);
+    await expect(failed).rejects.toThrow("place failed");
+    expect(await store.get("notes:m:held")).toEqual({ "tab-B": { json: ["newer"] }, "tab-C": { json: ["c"] }, "tab-B:1": { json: ["b"] } });
+  });
+
   it("holdIfKept が false なら、書かなかった内容を退避せず、前の退避分を消す", async () => {
     // Arrange
     const db = await openDatabase(new IDBFactory());
@@ -6636,7 +6765,7 @@ describe("UI reducer", () => {
 | W10 | System Audio の取得ボタンと、取得できなかったとき（拒否・音声トラックなし）の Mic のみへの切り替え表示 | `main.ts`・`index.html` | §5、基本設計 §16.1 | `DegradedReason` の 2 値（§2）ごとの文言 |
 | W11 | 確定待ちの内訳（`main.ts` の `listByMeeting(id, "mic")` → `pendingCountsText`）に System の Chunk も含める | `main.ts`・`recording-view.ts` | Phase 1 §31.4 | System の未送信が残る会議で件数に出る。欠番・末尾の判定は source ごと |
 | W12 | 要約欄の描画で `citationNotice(state)`（§11。中で `unresolvedCitations` を呼ぶ）を使う。`pending` が true（表示中の transcript が要約より古い・まだ無い）の間は、どの項目にも根拠リンクを出さない（照合できず、飛び先が要約の版の行か分からない）。transcript を取り直して `pending` が false になってから、下の規則でリンクを出す。`banner` が null でなければ要約欄の先頭に出す。項目ごとに `kind`・`index` で `items` を引き、該当する項目は根拠リンク（transcript へ飛ぶ）の代わりに `text` を出す（決定事項・アクションは保存した `quote`、話題は「根拠の行は作り直されました」）。該当しない項目は従来どおりリンクを出す | `main.ts` | 基本設計 §12.7、§11 | 文言は `ui-state.test.ts`（§12.6）で確かめる。描画は、transcript が要約と同じ版か進んだ版で引用先が消えた状態を `reduce` で作り、`main.ts` の要約欄の描画関数の出力に案内・`quote`・話題の文言が出て、該当項目に根拠リンクが無いことを `app.test.ts` で確かめる。transcript が要約より古い状態（`pending`）では、どの項目にも根拠リンクが無いことも確かめる |
-| W13 | ノート欄に `NotesState.heldDrafts`（別タブが退避した未送信の下書き。閉じた・落ちたタブの分を含む。このタブの書き込みが別タブの下書きを上書きして退避先へ移した分も、書けた時点で `NotesStore` が足すので、読み込み直さずに一覧に出る。`load()` が下書きのキーを読めなかった（1 回読み直しても失敗した）ときは、サーバーの内容で開き、最初の書き込みが上書きする未送信の下書きを自分のタブのものも `{tabId}:unread` の項目へ移して一覧に出す。この扱いは最初の読み込みの失敗を `onError` に知らせる前から始め（`onError` の中の編集の書き込みも移す）、読み直しが成功しても下書きのキーへ書けるまで続ける。`load()` が読んだ自分のタブの下書き（前のインスタンスが書いたもの）を、読み込み中に編集が入って採用しなかったときも、その下書きを上書きする最初の書き込みが同じ `{tabId}:unread` の項目へ移す（作り直したインスタンスは空で始まり、採用するまでその内容を持たない）。別タブが上書きして自分のタブの項目（`{tabId}`）へ移した、同じ `tabId` の前のインスタンスの下書きも、作り直したインスタンスの書き込みはその項目を置き換える・消す前に `{tabId}:unread` の項目へ移して一覧に出す（`DraftGuard.relocateOwn`。`load()` は自分のタブの項目を一覧に出さないので、消すとどこにも残らない。このインスタンスが書いた・引き継いだ・採用した下書きは内容を持っているので移さずに消す）。writer の無い旧ビルドの下書きはどのタブのものか分からないので、時刻で比べずに下書きごとに別の項目（`legacy`・`legacy:1`…）へ移す（同じ項目に重ねるのは、書き込みの識別・内容・要約の版 `lastAppliedSummaryVersion` がすべて同じ下書きだけ。版が違えば別の項目に残し、取り込みで引き継ぐ版を失わない）。同じタブの下書きの前後は `writeId` の通し番号で決め（`savedAt` は時計の巻き戻しで逆転しうるので使わない）、後の書き込みでも内容か要約の版が前の退避分と違えば上書きせずに別の項目（`{tabId}:1`…）へ移して両方を残し（同じ `tabId` で作り直したインスタンスは採用するまで前の内容を持たないので、後の書き込みが前の内容を含むとは限らない）、`writeId` が無いなど前後が分からなければ、どちらも捨てずに別の項目（`{tabId}:1`…）へ移す）を一覧で出す。項目ごとに書いたタブ・時刻・内容を見せ、利用者が選んだ内容をエディタへ取り込む（`NotesStore.importHeldDraft`。`setDraft` と同じ経路で取り込み、取り込んだ編集そのものの下書きを書けてから、その項目を退避先から消す。後の編集の書き込みの成功では消さない。書き込みを待つ間に後の編集が内容を置き換えたとき（今の内容が取り込んだ内容と違うとき。キーの順序だけの違いはエディタのエコーとして同じとみなす。それ以外の違いは残す側に倒す）も消さない。`consumeHeld` のトランザクションを待つ間の編集も、消す判定の中で確かめ直して同じく扱う。要約の版 `lastAppliedSummaryVersion` は取り込んだ下書きのものを引き継ぐ）。取り込みはエディタの内容とこのタブの下書きを置き換えるので、今の内容に未送信の編集（`hasUnsentEdits()`。サーバーにあるノートを空にした編集も含む。サーバーにノートが無く内容も空なら失うものが無いので含めない）があれば、`importHeldDraft` は何も変えずに `"unsent"` を返す。UI は置き換えてよいかを利用者に確かめ、了承されたら `{ replaceUnsent: true }` で呼び直す（確かめずに付けない）。消すのは `DraftStore.consumeHeld` の 1 つのトランザクションで、項目が選んだ時点と同じ書き込み（`writeId` まで比べる。`writeId` の無い旧ビルドの項目は識別が重なりうるので、内容と要約の版も比べる）のときだけ。選んだ後に書き直された項目は残し、他の項目には触らない。`setDraft` だけで取り込むと項目が消えず、取り込み済みの内容が以後の一覧に出続ける。自動では採用しない | `main.ts` | §10 `guardFor`・`DraftGuard`・`importHeldDraft`・`consumeHeld` | `notes-store.test.ts`（退避した carry が別のタブの `load()` で `heldDrafts` に出る。このタブの書き込みが退避した分は読み込み直さずに出て、`load(carry)` の書き込みが読み込み中に退避しても carry を採用する。取り込むと選んだ項目だけ消え、書き直された項目は残る。取り込みの書き込みが失敗すれば後の書き込みが成功しても残る。後の編集が内容を置き換えれば残り（`consumeHeld` を待つ間の編集も同じ）、キーの順序だけ違うエコーなら消える。同じタブの退避分の前後は `writeId` で決まり、`savedAt` が逆転しても後の書き込みを捨てない。後の書き込みでも内容が違えば前の退避分を上書きせずに両方を残す。旧ビルドの項目が選んだ後に同じ識別の別の内容へ置き換わっていれば消さない。`writeId` が無ければ両方を残す。旧ビルドの下書きは内容と識別が同じでも要約の版が違えば別の項目に残す。取り込んだ下書きの要約の版を引き継ぐ。未送信の編集があれば `replaceUnsent` なしでは断る。ノートを空にした編集も断り、サーバーにも内容にも何も無ければ断らない。`load()` が読んだ自分のタブの下書きは、採用前に入った編集が上書きしても `{tabId}:unread` へ移り、採用した下書きとこのインスタンスの書き込みは移さない。別タブが自分のタブの項目へ移した前のインスタンスの下書きは、作り直したインスタンスの読み込み中の編集とその後の書き込みで消えずに `{tabId}:unread` へ移り、このインスタンスが書いた下書きなら消える）。描画は空のとき何も出さず、1 件以上で一覧が出ることを `app.test.ts` で確かめる。`"unsent"` が返ったら確認を出し、了承したときだけ `{ replaceUnsent: true }` で呼び直し、断れば内容が変わらないことも `app.test.ts` で確かめる |
+| W13 | ノート欄に `NotesState.heldDrafts`（別タブが退避した未送信の下書き。閉じた・落ちたタブの分を含む。このタブの書き込みが別タブの下書きを上書きして退避先へ移した分も、書けた時点で `NotesStore` が足すので、読み込み直さずに一覧に出る。`load()` が下書きのキーを読めなかった（1 回読み直しても失敗した）ときは、サーバーの内容で開き、最初の書き込みが上書きする未送信の下書きを自分のタブのものも `{tabId}:unread` の項目へ移して一覧に出す。この扱いは最初の読み込みの失敗を `onError` に知らせる前から始め（`onError` の中の編集の書き込みも移す）、読み直しが成功しても下書きのキーへ書けるまで続ける。`load()` が読んだ自分のタブの下書き（前のインスタンスが書いたもの）を、読み込み中に編集が入って採用しなかったときも、その下書きを上書きする最初の書き込みが同じ `{tabId}:unread` の項目へ移す（作り直したインスタンスは空で始まり、採用するまでその内容を持たない）。別タブが上書きして自分のタブの項目（`{tabId}`）へ移した、同じ `tabId` の前のインスタンスの下書きも、作り直したインスタンスの書き込みはその項目を置き換える・消す前に `{tabId}:unread` の項目へ移して一覧に出す（`DraftGuard.relocateOwn`。`load()` は自分のタブの項目を一覧に出さないので、消すとどこにも残らない。このインスタンスが書いた・引き継いだ・採用した下書きは内容を持っているので移さずに消す）。writer の無い旧ビルドの下書きはどのタブのものか分からないので、時刻で比べずに下書きごとに別の項目（`legacy`・`legacy:1`…）へ移す（同じ項目に重ねるのは、書き込みの識別・内容・要約の版 `lastAppliedSummaryVersion` がすべて同じ下書きだけ。版が違えば別の項目に残し、取り込みで引き継ぐ版を失わない）。同じタブの下書きの前後は `writeId` の通し番号で決め（`savedAt` は時計の巻き戻しで逆転しうるので使わない）、後の書き込みでも内容か要約の版が前の退避分と違えば上書きせずに別の項目（`{tabId}:1`…）へ移して両方を残し（同じ `tabId` で作り直したインスタンスは採用するまで前の内容を持たないので、後の書き込みが前の内容を含むとは限らない）、`writeId` が無いなど前後が分からなければ、どちらも捨てずに別の項目（`{tabId}:1`…）へ移す）を一覧で出す。項目ごとに書いたタブ・時刻・内容を見せ、利用者が選んだ内容をエディタへ取り込む（`NotesStore.importHeldDraft`。`setDraft` と同じ経路で取り込み、取り込んだ編集そのものの下書きを書けてから、その項目を退避先から消す。後の編集の書き込みの成功では消さない。書き込みを待つ間に後の編集が内容を置き換えたとき（今の内容が取り込んだ内容と違うとき。キーの順序だけの違いはエディタのエコーとして同じとみなす。それ以外の違いは残す側に倒す）も消さない。`consumeHeld` のトランザクションを待つ間の編集も、消す判定の中で確かめ直して同じく扱う。判定の後・トランザクションの完了までに入った編集は判定では止められないので、完了の後に確かめ直し、消した項目を退避先へ戻す（`DraftStore.restoreHeld`。別タブがその間に同じ項目を書き直していれば上書きせず、空いている項目へ戻し、一覧の項目もそこへ移す）。要約の版 `lastAppliedSummaryVersion` は取り込んだ下書きのものを引き継ぐ）。取り込みはエディタの内容とこのタブの下書きを置き換えるので、今の内容に未送信の編集（`hasUnsentEdits()`。サーバーにあるノートを空にした編集も含む。サーバーにノートが無く内容も空なら失うものが無いので含めない）があれば、`importHeldDraft` は何も変えずに `"unsent"` を返す。UI は置き換えてよいかを利用者に確かめ、了承されたら `{ replaceUnsent: true }` で呼び直す（確かめずに付けない）。消すのは `DraftStore.consumeHeld` の 1 つのトランザクションで、項目が選んだ時点と同じ書き込み（`writeId` まで比べる。`writeId` の無い旧ビルドの項目は識別が重なりうるので、内容と要約の版も比べる）のときだけ。選んだ後に書き直された項目は残し、他の項目には触らない。`setDraft` だけで取り込むと項目が消えず、取り込み済みの内容が以後の一覧に出続ける。自動では採用しない | `main.ts` | §10 `guardFor`・`DraftGuard`・`importHeldDraft`・`consumeHeld`・`restoreHeld` | `notes-store.test.ts`（退避した carry が別のタブの `load()` で `heldDrafts` に出る。このタブの書き込みが退避した分は読み込み直さずに出て、`load(carry)` の書き込みが読み込み中に退避しても carry を採用する。取り込むと選んだ項目だけ消え、書き直された項目は残る。取り込みの書き込みが失敗すれば後の書き込みが成功しても残る。後の編集が内容を置き換えれば残り（`consumeHeld` を待つ間の編集も同じ。消す判定の後・完了までの編集なら項目を戻し、別タブが同じ項目を書き直していれば空いている項目へ戻す）、キーの順序だけ違うエコーなら消える。同じタブの退避分の前後は `writeId` で決まり、`savedAt` が逆転しても後の書き込みを捨てない。後の書き込みでも内容が違えば前の退避分を上書きせずに両方を残す。旧ビルドの項目が選んだ後に同じ識別の別の内容へ置き換わっていれば消さない。`writeId` が無ければ両方を残す。旧ビルドの下書きは内容と識別が同じでも要約の版が違えば別の項目に残す。取り込んだ下書きの要約の版を引き継ぐ。未送信の編集があれば `replaceUnsent` なしでは断る。ノートを空にした編集も断り、サーバーにも内容にも何も無ければ断らない。`load()` が読んだ自分のタブの下書きは、採用前に入った編集が上書きしても `{tabId}:unread` へ移り、採用した下書きとこのインスタンスの書き込みは移さない。別タブが自分のタブの項目へ移した前のインスタンスの下書きは、作り直したインスタンスの読み込み中の編集とその後の書き込みで消えずに `{tabId}:unread` へ移り、このインスタンスが書いた下書きなら消える）。描画は空のとき何も出さず、1 件以上で一覧が出ることを `app.test.ts` で確かめる。`"unsent"` が返ったら確認を出し、了承したときだけ `{ replaceUnsent: true }` で呼び直し、断れば内容が変わらないことも `app.test.ts` で確かめる |
 
 Phase 1 のソースで source を `"mic"` に固定している箇所は、`recording-controller.ts` のメタデータ（§4 で引数化）、`finalizer.ts`（§7）、`recovery.ts`（W6。変更不要）、`main.ts`（W11）の 4 つである。実装の最後に `grep -rn '"mic"' src` で、これ以外に増えていないことを確かめる。
 

@@ -1069,8 +1069,27 @@ def record_input_transcript_version(conn: sqlite3.Connection, job_id: str, owner
     return cur.rowcount == 1
 
 
+def mark_job_committed(conn: sqlite3.Connection, job_id: str, owner: str, attempts: int) -> bool:
+    """ハンドラが結果をコミットするトランザクションの中で、実行中の試行を completed にする（lease の現行の所有者だけ）。
+
+    lease は外さない。続く Runner の finish_job（lease_owner と attempts の条件）がそのまま当たり、所要時間とモデル名を記録して
+    lease を外す。finish_job の前にワーカーが落ちても、Sweeper（leased / processing だけを見る）はこの行を拾わないので、
+    コミット済みの結果を作り直さず、failed にもしない。要約（handle_summary）では、その後に transcript の版が進んでも
+    list_expired_stale_summaries が戻さない（戻すと、§12.7 で利用者の操作に限る「進んだ後の再生成」が自動で走る）
+    """
+    cur = conn.execute(
+        "UPDATE processing_jobs SET status = 'completed', updated_at = ? WHERE id = ? AND lease_owner = ? AND attempts = ?",
+        (now_ms(), job_id, owner, attempts),
+    )
+    return cur.rowcount == 1
+
+
 def list_expired_stale_summaries(conn: sqlite3.Connection, now: int) -> list[Job]:
-    """lease が切れた要約ジョブのうち、控えた版（record_input_transcript_version）が今の会議の版と違うもの。控えていなければ含めない。"""
+    """lease が切れた要約ジョブのうち、控えた版（record_input_transcript_version）が今の会議の版と違うもの。控えていなければ含めない。
+
+    要約をコミットした試行は含めない。handle_summary は要約と同じトランザクションでジョブを completed にする（mark_job_committed）ので、
+    leased / processing だけを見るこの条件に当たらない。版の比較は、まだ要約をコミットしていない試行だけに掛かる
+    """
     rows = conn.execute(
         """SELECT j.* FROM processing_jobs j JOIN meetings m ON m.id = j.meeting_id
            WHERE j.job_type = 'synthesize_minutes' AND j.status IN ('leased','processing')
@@ -2144,9 +2163,9 @@ def on_summary_deferred(conn: sqlite3.Connection, meeting_id: str) -> None:
 def on_summary_failed(conn: sqlite3.Connection, meeting_id: str) -> None:
     """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。
 
-    completed の会議は変えない。ハンドラが要約と completed をコミットした後、finish_job の前に lease が切れて Sweeper が
-    回数切れで回収すると、ここに来る。ハンドラの失敗（Runner）では、mark_processing の時点で on_summary_started が
-    summarizing にしているので completed は来ない（§14）。
+    completed の会議は変えない（要約をコミット済み）。ハンドラは要約と同じトランザクションでジョブも completed にする
+    （repo.mark_job_committed）ので、finish_job の前に lease が切れても Sweeper は回収せず、ここには来ない。ハンドラの失敗（Runner）
+    では、mark_processing の時点で on_summary_started が summarizing にしているので completed は来ない（§14）。念のため残す
     """
     current = repo.get_meeting(conn, meeting_id)
     if current is not None and current.status == "completed":
@@ -2489,6 +2508,7 @@ class JobRunner:
         now = now_ms()
         d = decide(err, job.attempts, job.max_attempts, now)
         followup: str | None = None  # 失敗の後続処理で作ったジョブの id（入れ替え待ちの撮り直しを公開する merge）
+        removed: Job | None = None   # 後続処理が消した failed の行の控え（消した後は読み直せない）
         async with self.ctx.db.write() as conn:
             # 要約の失敗は、合成に使った版（handle_summary が付ける）と今の版を、この記録と同じトランザクションで比べる。
             # 進んでいれば古い版に対する失敗なので記録せず、同じ行を pending に戻す（requeue_job。試行回数は戻す。§12.7）。
@@ -2504,13 +2524,18 @@ class JobRunner:
                 if err.error_class == "OOM" and job.job_type == "transcribe_chunk":
                     self._downgrade_stt(conn, job.meeting_id, job.model_name)
                 if d.next_status == "failed":
+                    # merge の失敗では、後続処理が failed の行を消して作り直すことがある（rerun_merge_for_staged）。消す前に控え、
+                    # 消えていれば控えを流す。消した後の _publish_job は行を引けず、失敗のイベントが流れない（完了時と同じ）
+                    failed_row = repo.get_job(conn, job.id)
                     followup = pipeline.on_job_failed(conn, job)
+                    if repo.get_job(conn, job.id) is None:
+                        removed = failed_row
                 elif job.job_type == "synthesize_minutes":
                     # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
                     pipeline.on_summary_deferred(conn, job.meeting_id)
                 repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
         # 完了時と同じく、どちらもコミットの後に流す
-        self._publish_job(job.id)
+        self._publish_job(job.id, removed=removed)
         if followup is not None:
             self._publish_job(followup)
 
@@ -2579,7 +2604,7 @@ lease が切れたジョブの扱いは 3 通りある（基本設計 §9.3）�
 
 | 条件 | 扱い | 理由 |
 | --- | --- | --- |
-| 要約（`synthesize_minutes`）で、試行が控えた版（`input_transcript_version`）が今の会議の `transcript_version` と違う | 回数を問わず `pending` に戻し、試行回数も戻す（`repo.list_expired_stale_summaries` → `repo.requeue_job`。下の 2 つより先に、lease を外す前に行う） | 合成の途中でワーカーが落ちた間に merge が版を進めていれば、古い版に対する試行である（§12.7。Runner `_on_failure` の版の比較と同じ）。回数切れで `failed` にすると会議も `failed` になり、新しい版の要約は利用者が再試行するまで作られない。版は `handle_summary` が合成の前に控え、`lease_job` が消す。控える前に落ちた試行（`NULL`）は比べず、下の規則で回数を数える（前の試行の版で比べると、落ち続ける試行を回数を戻して際限なく繰り返す） |
+| 要約（`synthesize_minutes`）で、試行が控えた版（`input_transcript_version`）が今の会議の `transcript_version` と違う | 回数を問わず `pending` に戻し、試行回数も戻す（`repo.list_expired_stale_summaries` → `repo.requeue_job`。下の 2 つより先に、lease を外す前に行う） | 合成の途中でワーカーが落ちた間に merge が版を進めていれば、古い版に対する試行である（§12.7。Runner `_on_failure` の版の比較と同じ）。回数切れで `failed` にすると会議も `failed` になり、新しい版の要約は利用者が再試行するまで作られない。版は `handle_summary` が合成の前に控え、`lease_job` が消す。控える前に落ちた試行（`NULL`）は比べず、下の規則で回数を数える（前の試行の版で比べると、落ち続ける試行を回数を戻して際限なく繰り返す）。要約をコミットした試行は対象外：`handle_summary` は要約と同じトランザクションでジョブを `completed` にする（`repo.mark_job_committed`。lease は Runner の `finish_job` が外す）ので、`finish_job` の前に落ちても、この行と下の 2 つのどれにも当たらない（戻すと要約を作り直し、版が進んでいれば §12.7 で利用者の操作に限る「進んだ後の再生成」が自動で走る） |
 | `attempts < max_attempts` | `pending` に戻す（`repo.sweep_expired`） | ワーカーが落ちた・固まった。別のワーカーがやり直す |
 | `attempts >= max_attempts` | `failed`（`error_class = INTERNAL`）にし、`pipeline.on_job_failed()` を呼ぶ（`repo.fail_exhausted_expired`） | lease 切れは Runner の失敗処理（`retry.decide` の回数判定）を通らない。回数を見ずに戻すと、実行するたびにプロセスごと落とすジョブが、サーバーを起動し直すたびに永久に実行される。`attempts` は lease のたびに進むので、上限と比べられる |
 
@@ -2592,11 +2617,11 @@ lease が切れたジョブの扱いは 3 通りある（基本設計 §9.3）�
 | `merge_transcript` | 変えない | 変えない（`transcribing`。ただし書き込みをコミット済みなら進んだまま。下記） | 要約ジョブを作らない。この merge が終わる前に置いた入れ替え待ちの撮り直し（控えた merge の id で判定）があれば、merge を作り直す（`rerun_merge_for_staged`。下記） | 失敗したジョブの再試行。除外の対象ではない |
 | `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2）。ただし既に `completed` なら変えない（下記） | なし | 再試行、または要約の再生成 |
 
-transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、その Chunk の segments を新しい結果で置き換える。Chunk がまだ `completed` でなければ、同じ書き込みトランザクションで segments を消してから入れる。`completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments`（Chunk ごとの印は `segment_replacements`）に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（`repo.promote_replacements`）。その場で消すと、作り直す merge がコミットするまで transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにその merge が入れ替えてから新しい segments を読む。merge が実行中（`processing`）なら、その merge が入れ替えを書いた後に撮り直しがコミットされていることがある。`delete_finished_job` は実行中の行を消さず、`ensure_merge_job` も一意制約で作れないので、Runner が merge の完了を記録するときに入れ替え待ち（`repo.has_replacements`）を見て、残っていれば merge を作り直す。merge が書き込みをコミットした後・`finish_job` の前に lease が切れて回数切れで回収されると、完了は記録されず、`failed` の行が一意制約で `ensure_merge_job` を止める。この場合は `on_job_failed` が、その merge が終わる前に置いた入れ替え待ち（`stage_replacement` が控えた merge の id。`repo.has_replacements_staged_during`。時刻では同じミリ秒の前後が分からない）を見て、残っていれば完了済みの行を消して `ensure_merge_job` で作り直す（`rerun_merge_for_staged`。必要な Chunk が `pending` のまま・vad が残る・未承認の `failed` transcribe があれば作らない）。書き込みの前に落ち続けた merge も 1 度は作り直すが、撮り直しが控えたのは前の行の id なので、作り直した行も回数切れになれば作らない（落ち続ける merge を際限なく作り直さない）。初めて完了する Chunk（手動 STT の無音 Chunk）も、実行中（`leased` / `processing`）の merge があれば同じく `staged_segments` に置く。その merge の書き込みの後にコミットすると版に入らず、入れ替え待ちが無いので作り直されもしない。`handle_transcribe` は初めての完了でも完了済みの merge を消す。手動 STT を受け付けた時点で実行中だった merge（`transcribe_silent_chunk` は消せない）が先に終わっていると、残った行が一意制約で作り直しを止める。ハンドラの中の `on_transcribe_completed` が作った merge（最後の Chunk の完了）は、`handle_transcribe` がコミットの後に流す（Runner の完了処理の `ensure_merge_job` は既存で `None` を返す）。vad の完了で Runner が作った merge も Runner が流す。手動 STT（§12 `request_rerun_stt`）は、まだ入れ替えていない撮り直しの結果も捨てる。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
+transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、その Chunk の segments を新しい結果で置き換える。Chunk がまだ `completed` でなければ、同じ書き込みトランザクションで segments を消してから入れる。`completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments`（Chunk ごとの印は `segment_replacements`）に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（`repo.promote_replacements`）。その場で消すと、作り直す merge がコミットするまで transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにその merge が入れ替えてから新しい segments を読む。merge が実行中（`processing`）なら、その merge が入れ替えを書いた後に撮り直しがコミットされていることがある。`delete_finished_job` は実行中の行を消さず、`ensure_merge_job` も一意制約で作れないので、Runner が merge の完了を記録するときに入れ替え待ち（`repo.has_replacements`）を見て、残っていれば merge を作り直す。merge が書き込みをコミットした後・`finish_job` の前に lease が切れて回数切れで回収されると、完了は記録されず、`failed` の行が一意制約で `ensure_merge_job` を止める。この場合は `on_job_failed` が、その merge が終わる前に置いた入れ替え待ち（`stage_replacement` が控えた merge の id。`repo.has_replacements_staged_during`。時刻では同じミリ秒の前後が分からない）を見て、残っていれば完了済みの行を消して `ensure_merge_job` で作り直す（`rerun_merge_for_staged`。必要な Chunk が `pending` のまま・vad が残る・未承認の `failed` transcribe があれば作らない）。書き込みの前に落ち続けた merge も 1 度は作り直すが、撮り直しが控えたのは前の行の id なので、作り直した行も回数切れになれば作らない（落ち続ける merge を際限なく作り直さない）。消した `failed` の行は読み直せないので、Runner の `_on_failure` は消す前に控えた行を流す（完了時の作り直しと同じ。Sweeper は `RETURNING` の行を流す）。初めて完了する Chunk（手動 STT の無音 Chunk）も、実行中（`leased` / `processing`）の merge があれば同じく `staged_segments` に置く。その merge の書き込みの後にコミットすると版に入らず、入れ替え待ちが無いので作り直されもしない。`handle_transcribe` は初めての完了でも完了済みの merge を消す。手動 STT を受け付けた時点で実行中だった merge（`transcribe_silent_chunk` は消せない）が先に終わっていると、残った行が一意制約で作り直しを止める。ハンドラの中の `on_transcribe_completed` が作った merge（最後の Chunk の完了）は、`handle_transcribe` がコミットの後に流す（Runner の完了処理の `ensure_merge_job` は既存で `None` を返す）。vad の完了で Runner が作った merge も Runner が流す。手動 STT（§12 `request_rerun_stt`）は、まだ入れ替えていない撮り直しの結果も捨てる。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
 
-要約・VAD も同じ隙間（ハンドラのコミットと `finish_job` の間）で回収されうる。どれもハンドラの結果とジョブの完了を 1 トランザクションにはせず（Runner とハンドラの契約が変わる）、後続処理の側で書き込み済みの結果を認める。
+VAD も同じ隙間（ハンドラのコミットと `finish_job` の間）で回収されうる。ハンドラの結果とジョブの完了を 1 トランザクションにはせず（Runner とハンドラの契約が変わる）、後続処理の側で書き込み済みの結果を認める。要約だけは結果と同じトランザクションでジョブを `completed` にする（`repo.mark_job_committed`）。回収して戻すと要約を作り直し、版が進んでいれば §12.7 で利用者の操作に限る「進んだ後の再生成」が自動で走るためである。
 
-* 要約：`on_summary_failed` は `completed` の会議を変えない。ジョブは `failed`、会議は `completed`（要約あり）のまま残る。ハンドラの失敗（Runner の `_on_failure`）では、`mark_processing` の時点で `on_summary_started` が会議を `summarizing` にしているので、ここに `completed` は来ない。
+* 要約：コミット済みの試行は `completed` なので回収されない。`on_summary_failed` は念のため `completed` の会議を変えない。ハンドラの失敗（Runner の `_on_failure`）では、`mark_processing` の時点で `on_summary_started` が会議を `summarizing` にしているので、ここに `completed` は来ない。
 * VAD：`on_vad_completed` は Chunk が `pending` のときだけ結果を適用し、それ以外（既に `queued` / `completed` / `skipped` / `failed`）では `ensure_merge_job` だけを呼ぶ（`handle_vad` は VAD の値も書き換えない）。合わせて `POST /jobs/{id}/retry` は、`queued` に戻す対象を `transcribe_chunk` に限る。どちらかが欠けると、`failed` の vad ジョブの再試行が完了済みの Chunk を `queued` に戻し、transcribe ジョブは既存（一意制約）で作り直されないので、Chunk が `queued` のまま merge を止める。再試行した vad の完了後は Runner が `ensure_merge_job` を呼ぶので merge へ進む。
 
 再試行（`retry_job`）は `attempts` を 0 に戻す。vad / merge の失敗で会議を `failed` にしないのは、会議の `failed` が「merge が 1 回は終わった」を意味するためである（§21.1 `MERGED_STATUSES`。無音 Chunk の手動 STT などがこれで判定する）。vad の失敗で Chunk を `failed` にしないのは、`failed` が `BLOCKING_STT` に含まれず、他の Chunk の完了を契機にその Chunk を欠いたまま merge が作られるためである。
@@ -2763,7 +2788,7 @@ stateDiagram-v2
 | 旧ワーカーの merge 書き込み | `handlers.handle_merge` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議の `transcribed`・要約ジョブのどれも書かない | 回数切れで `failed` になった merge ジョブを残したまま transcript の版が進み、要約ジョブが作られて会議が `completed` まで進む。lease を取り直した新しいワーカーと二重に merge すると版が 2 回進む |
 | 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、要約の結果を誰も確かめないまま会議が `completed` に戻る。`finish_job` の条件はジョブ行しか守らない |
 | 合成の間に transcript の版が進んだ要約 | `handlers.handle_summary` が書き込みトランザクションで会議の `transcript_version` を読み直し、合成に使った版と違えば要約を保存せず、会議も `completed` にしない。`repo.requeue_job` で同じ行を `pending` に戻す（試行回数は戻す。lease を外すので Runner の `finish_job` は 0 行）。合成・検証が失敗したときは、`handle_summary` が合成に使った版を `JobError.input_transcript_version` に付けて投げ、Runner の `_on_failure` が失敗を記録する書き込みトランザクションの中で今の版と比べる。進んでいれば失敗として記録せずに同じく戻す（古い版に対する失敗。版が同じなら従来どおり失敗として記録する）。比較と記録を別のトランザクションにすると、その間に merge が版を進めたとき `failed` になる。合成の途中でワーカーが落ちたとき（失敗の報告が無い）は、`handle_summary` が合成の前にジョブの行へ控えた版（`repo.record_input_transcript_version`。`lease_job` が消す）を Sweeper が回収のトランザクションで今の版と比べ、進んでいれば回数切れでも同じく戻す（§14） | 撮り直しの入れ替え・手動 STT の後の merge が合成中に版を進めると、merge の `on_merge_completed` は要約ジョブを一意制約で作れない。そのまま保存すると、新しい版の transcript に古い版の要約が組になり、会議は `completed` になる |
-| lease 切れ後の要約回収 | `pipeline.on_summary_failed` は `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れて回数切れで回収されると、要約があるのに会議が `failed` になる。この場合はジョブ `failed`・会議 `completed` の組を意図して残す |
+| lease 切れ後の要約回収 | `handlers.handle_summary` が要約と同じトランザクションでジョブを `completed` にする（`repo.mark_job_committed`。lease は Runner の `finish_job` が外す）。`pipeline.on_summary_failed` も念のため `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れると、回収すれば要約を作り直し（版が進んでいれば自動の再生成）、回数切れなら要約があるのに会議が `failed` になる。コミット済みの試行は Sweeper の対象（`leased` / `processing`）から外れるので、どちらも起きない |
 | 回収の配信 | `sweeper._publish`（コミット後） | §14 |
 
 ---
@@ -3879,7 +3904,10 @@ _EN_DAY = (
     rf"(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|(?:next|this) ?(?:{_WEEKDAYS_EN})|"
     rf"{_WEEKDAYS_EN}|day ?after ?tomorrow|tomorrow"
 )
-_EN_DAY_TIME = rf"(?:{_EN_DAY})(?: ?(?:at ?)?{_TIME_EN})?"
+# 英語の日の後ろの時刻は、12 時間制（_TIME_EN）と 24 時間制（「17:00」）の両方を 1 つの表現にする（_TIME_EN を先に試す）。
+# 24 時間制を外すと「friday 17:00」が「friday」と「17:00」に分かれ、quote の「friday 9:00 … monday 17:00」の別の句の曜日と時刻を
+# 寄せ集めて deadline の「friday 17:00」を裏付けてしまう
+_EN_DAY_TIME = rf"(?:{_EN_DAY})(?: ?(?:at ?)?(?:{_TIME_EN}|\d{{1,2}}:\d{{2}}))?"
 _EN_DEADLINE_ALTS = rf"{_EN_DAY_TIME}|next week|this week|end of|eod|eow"
 # 3 つ組のスラッシュの日付の終わり。後ろに数字が続くなら、それが時刻の始まり（区切りを書かずに続けた「26/11/205pm」）の
 # ときだけ止まる。数字だけで止めると「11/20/2026」が「11/20/20」に縮んで「11/20/2027」と同じ表現になる。
@@ -4045,7 +4073,8 @@ def _deadline_supported(deadline: str, quote: str) -> bool:
     日付と時刻（「11月20日午後5時」）も 1 つの表現で、quote の「11月20日午前9時」は通らない。日付と曜日（「11月20日金曜」）も同じで、
     quote の「11月20日に確認し、金曜に提出」の寄せ集めでは通らず、曜日の付いた quote は曜日の無い deadline「11月20日」も裏付けない。曜日と時刻（「来週金曜9時」）・
     相対の月と日（「来月20日」）も同じで、quote の別の句の曜日と時刻や、「来月21日」の「来月」では通らない。英語の時刻も同じで、
-    曜日・日付と時刻（「next friday 5pm」「11/20 5pm」。「at」の有無は問わない）を 1 つの表現として比べ、quote の「next Friday 9am」は通らない。
+    曜日・日付と時刻（「next friday 5pm」「friday 17:00」「11/20 5pm」。「at」の有無は問わない）を 1 つの表現として比べ、quote の「next Friday 9am」や
+    「friday 9:00 … monday 17:00」の寄せ集めは通らない。
     表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たるのは
     「再」で始まる候補（「再来週」「再来週末」「再来月」「再来月末」「再来年」「再来年11月20日」）だけなので、それぞれ 1 つの表現になる）。
     月日の付かない相対の年（「来年」「来年末」「来年11月」「来年春」）も 1 つの表現で、quote の「再来年」「来年3月」「来年秋」では通らない。
@@ -4661,6 +4690,10 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
         repo.update_meeting(conn, job.meeting_id, llm_model_used=llm_model)
         repo.record_metric(conn, "llm_schema_fail", synth.schema_retries, model_name=llm_model, meeting_id=job.meeting_id)
         pipeline.on_summary_completed(conn, job.meeting_id)
+        # ジョブも同じトランザクションで completed にする（lease は Runner の finish_job が外す）。finish_job の前にワーカーが落ちても、
+        # Sweeper はコミット済みの試行を回収しない。回収すると要約を作り直し（版が進んでいれば §12.7 の自動の再生成になる）、
+        # 回数切れなら failed にする
+        repo.mark_job_committed(conn, job.id, job.lease_owner or "", job.attempts)
     ctx.events.publish(job.meeting_id, {"type": "summary_version", "version": version})
     return llm_model
 
@@ -6894,7 +6927,7 @@ from minutes_local.db.connection import now_ms
 from minutes_local.db.models import Job
 from minutes_local.jobs import handlers, sweeper
 from minutes_local.jobs.context import AppContext
-from minutes_local.jobs.retry import OOMError, decide, InvalidAudioError, ModelMissingError, normalize_exception
+from minutes_local.jobs.retry import JobError, OOMError, decide, InvalidAudioError, ModelMissingError, normalize_exception
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.jobs.sweeper import resume_finalized, sweep_once
 from minutes_local.stt.fake_provider import FakeSTTProvider
@@ -7306,6 +7339,41 @@ async def test_sweep_requeues_expired_summary_only_when_transcript_advanced(
         last = repo.get_job(conn, again.id)
     assert last is not None and last.status == "failed"
 
+
+
+async def test_committed_summary_is_not_requeued_when_transcript_advanced_before_lease_expired(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
+    """要約をコミットした後、Runner の finish_job の前にワーカーが落ち、その後に transcript の版が進んでも、Sweeper は
+    古い版に対する試行として戻さない（§14・§12.7。戻すと利用者の操作に限る「進んだ後の再生成」が自動で走る）。
+    要約と同じトランザクションでジョブを completed にしている（repo.mark_job_committed）。版が同じときは
+    test_sweeper_keeps_meeting_completed_by_summary_before_lease_expired。
+    """
+    # Arrange: 回数を使い切った最後の試行が要約をコミットし、finish_job の前に落ちる
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    async with ctx.db.write() as conn:
+        leased = repo.lease_job(conn, "w-dead", ["synthesize_minutes"], now_ms())
+        assert leased is not None
+        conn.execute("UPDATE processing_jobs SET attempts = max_attempts WHERE id = ?", (leased.id,))
+        job = repo.get_job(conn, leased.id)
+        assert job is not None and repo.mark_processing(conn, job.id, "w-dead", job.model_name)
+    await handlers.handle_summary(ctx, job)
+    async with ctx.db.write() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        assert m is not None
+        repo.update_meeting(conn, "m-1", transcript_version=m.transcript_version + 1)
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
+    # Act
+    swept = await sweep_once(ctx.db, ctx.events)
+    # Assert: 回収せず、ジョブは completed・会議は completed のまま。要約は 1 版だけ
+    with ctx.db.read() as conn:
+        after = repo.get_job(conn, job.id)
+        meeting = repo.get_meeting(conn, "m-1")
+        n = conn.execute("SELECT COUNT(*) AS n FROM meeting_summary_versions WHERE meeting_id = 'm-1'").fetchone()["n"]
+    assert swept == 0
+    assert after is not None and after.status == "completed"
+    assert meeting is not None and meeting.status == "completed"
+    assert n == 1
 
 async def test_publish_created_job_logs_instead_of_raising_after_commit(
         client: httpx.AsyncClient, ctx: AppContext, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
@@ -7727,6 +7795,30 @@ async def test_merge_failing_without_commit_is_not_recreated_endlessly(
         assert repo.has_replacements(conn, "m-1") is False
 
 
+async def test_failed_merge_replaced_for_staged_retry_still_publishes_its_failure(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, stt_provider: FakeSTTProvider,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """ハンドラの失敗で merge が failed になり、入れ替え待ちの撮り直しのために後続処理がその行を消して作り直しても、
+    失敗のイベントを流す（§12 rerun_merge_for_staged。消した後は行を引けないので、消す前に控えた行を流す）。"""
+    # Arrange: merge の間に撮り直しを置き、merge のワーカー（Runner）が回数を使い切った最後の試行で失敗する
+    leased = await _stage_retry_while_merge_runs(client, ctx, runner, stt_provider, commit_merge=True)
+    with ctx.db.read() as conn:
+        merge = repo.get_job(conn, leased.id)   # 回数を使い切った max_attempts を持たせる（lease 時点の Job は前の上限のまま）
+    assert merge is not None
+    runner.owner = "w-merge"
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(ctx.events, "publish", lambda _meeting_id, event: published.append(event))
+    # Act
+    await runner._on_failure(merge, JobError("merge crashed"), 0)
+    # Assert: failed の行は消えて作り直した merge が pending で残り、イベントは failed → 作り直した merge の順に流れる
+    with ctx.db.read() as conn:
+        merges = [(j.id, j.status) for j in repo.list_jobs(conn, "m-1") if j.job_type == "merge_transcript"]
+    assert len(merges) == 1 and merges[0][0] != merge.id and merges[0][1] == "pending"
+    jobs = [(e["job"]["id"], e["job"]["status"]) for e in published if e["type"] == "job"]
+    assert jobs == [(merge.id, "failed"), merges[0]]
+    assert any(e["type"] == "meeting_status" for e in published)
+
+
 async def test_vad_from_expired_lease_does_not_advance_chunk(client: httpx.AsyncClient, ctx: AppContext) -> None:
     """lease を失った旧ワーカーの VAD 結果は書かない。書くと failed の vad ジョブを残したまま Chunk が進む（基本設計 §9.3）。"""
     # Arrange: vad ジョブを抱えたワーカーが落ち、回数切れで回収される
@@ -7810,7 +7902,8 @@ async def test_merge_from_expired_lease_does_not_write_transcript(client: httpx.
 
 async def test_sweeper_keeps_meeting_completed_by_summary_before_lease_expired(client: httpx.AsyncClient, ctx: AppContext,
                                                                               runner: JobRunner) -> None:
-    """要約をコミットした後、finish_job の前に lease が切れて回数切れで回収されても、会議を failed に戻さない（§14）。"""
+    """要約をコミットした後、finish_job の前に lease が切れて回数も使い切っていても、回収せず会議を failed に戻さない（§14）。
+    要約と同じトランザクションでジョブを completed にしている（repo.mark_job_committed）。"""
     # Arrange: 要約と会議の completed は書けたが、完了報告の前に lease が切れて回数も使い切った
     await _seed(client, 1)
     await _run_until_job(ctx, runner, "synthesize_minutes")
@@ -7821,13 +7914,13 @@ async def test_sweeper_keeps_meeting_completed_by_summary_before_lease_expired(c
     async with ctx.db.write() as conn:
         conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
     # Act
-    assert await sweep_once(ctx.db, ctx.events) == 1
-    # Assert: ジョブは failed だが、書き込み済みの要約と会議の completed は残る
+    assert await sweep_once(ctx.db, ctx.events) == 0
+    # Assert: ジョブは completed のままで、書き込み済みの要約と会議の completed も残る
     with ctx.db.read() as conn:
         meeting = repo.get_meeting(conn, "m-1")
         swept = repo.get_job(conn, job.id)
         n = conn.execute("SELECT COUNT(*) AS n FROM meeting_summary_versions WHERE meeting_id = 'm-1'").fetchone()["n"]
-    assert swept is not None and swept.status == "failed"
+    assert swept is not None and swept.status == "completed"
     assert meeting is not None and meeting.status == "completed"
     assert n == 1
 
@@ -8823,6 +8916,11 @@ def test_english_time_must_match_the_quote() -> None:
     assert reasons_for("11/20 5pm", "鈴木さんが11/20 5pmまでに提出") == []
     assert reasons_for("11月20日 5:30pm", "鈴木さんが11月20日5:30pmまでに提出") == []
     assert reasons_for("5pm", "Suzuki will submit it by 5 pm") == []
+    # 24 時間制の時刻も英語の曜日と 1 つの表現。同じ曜日と時刻なら通り、時刻が違えば通らず、別の句の曜日と時刻を寄せ集めても通らない
+    assert reasons_for("Friday 17:00", "Suzuki will submit it Friday 17:00") == []
+    assert reasons_for("next Friday 17:00", "Suzuki will submit it next friday at 17:00.") == []
+    assert reasons_for("Friday 17:00", "Suzuki will submit it Friday 9:00") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("Friday 17:00", "Suzuki submits Friday 9:00 and reviews Monday 17:00") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
 
 
 def test_english_deadline_hints_need_word_boundaries_in_the_quote() -> None:
@@ -9613,7 +9711,8 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | ワーカークラッシュ → Sweeper → 再 lease | `test_sweeper_recovers_expired_lease_and_ignores_stale_owner`、`test_pool_is_rebuilt_after_a_worker_crash`、`test_pool_is_rebuilt_after_a_timeout` |
 | 落ち続けるジョブを永久に実行しない（lease 切れの回数上限） | `test_sweeper_fails_job_whose_lease_keeps_expiring` |
 | 合成の途中で落ちた要約は、控えた版から transcript が進んでいれば回数切れでも failed にせず戻す。版が同じ・控える前に落ちたときは回数を数える（§14・§12.7） | `test_sweep_requeues_expired_summary_only_when_transcript_advanced` |
-| merge が書き込みをコミットした後に回数切れで failed になっても、その merge が終わる前に置いた撮り直しは作り直した merge が公開する（同じミリ秒でも）。書き込みの前に落ち続ける merge は際限なく作り直さない（§12 `rerun_merge_for_staged`） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly` |
+| 要約をコミットした後・`finish_job` の前に落ちた試行は、版が進んでいても回数切れでも回収しない（作り直さず、failed にもしない。§14・§12.7 `repo.mark_job_committed`） | `test_committed_summary_is_not_requeued_when_transcript_advanced_before_lease_expired`、`test_sweeper_keeps_meeting_completed_by_summary_before_lease_expired` |
+| merge が書き込みをコミットした後に回数切れで failed になっても、その merge が終わる前に置いた撮り直しは作り直した merge が公開する（同じミリ秒でも）。書き込みの前に落ち続ける merge は際限なく作り直さない（§12 `rerun_merge_for_staged`） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly`、`test_failed_merge_replaced_for_staged_retry_still_publishes_its_failure`（Runner の失敗で消した failed の行も流す） |
 | 常駐ループが 1 周の失敗で終わらない | `test_runner_loop_survives_failed_iteration`、`test_sweeper_loop_survives_failed_iteration` |
 | invalid audio no-retry | `test_failed_chunk_blocks_until_excluded`、`test_retry_decisions` |
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
