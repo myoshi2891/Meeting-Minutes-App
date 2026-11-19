@@ -134,7 +134,7 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * 起動時 `PRAGMA integrity_check`。`ok` 以外なら、壊れたファイルを `minutes.sqlite.corrupt-{epoch}` に退避し、**検査に通る最も新しいバックアップ**を復元して開く（最新が壊れていれば 1 つ古いものへ下がる）。使えるバックアップが 1 つもなければ**空の DB で起動する**（起動を止めない。サーバーが動いていなければブラウザは Chunk を送れない）
 * 復元の直後に、録音ファイルから DB にない会議と Chunk を作り直す（下の rebuild と同じ処理を `build_context` が自動で行う）。バックアップより後に録音した会議は DB にないが、ファイルは残っているためである。作り直した会議は transcript から処理し直す。バックアップより後の要約とノートは失われる。バックアップより後に行った手動の文字起こし（無音と判定した Chunk の手動 STT。`POST .../chunks/{source}/{sequenceNo}/transcribe`）も失われ、その Chunk は `skipped` のまま残る（バックアップの時点で STT の前なら、処理し直しで再び `skipped` になる）。手動の STT はもう一度実行する。起動時に、復元元と作り直した件数を標準エラーに警告として出す（黙って古い状態に戻さない）
 * `doctor --rebuild`：`recordings/` を走査し、`meeting.json`（finalize 時に書く。Phase 1 §13 の規約を Phase 3 で実装）と WAV/FLAC ヘッダから `meetings` / `audio_chunks` の欠損行を再構築する。既存行は上書きしない。**serve が動いているデータディレクトリには実行しない**（ロックが取れなければ終了コード 1。同じ Chunk の行を 2 つのプロセスが作り合う）
-* 再構築した会議の状態：`meeting.json` に終了時刻（`endedAtEpochMs`）があれば `finalized`（確定済み。serve の起動時にジョブを作る）、作成時の控えのまま（終了時刻なし）なら **`recording`** に戻す。確定前の会議を `finalized` にすると、ブラウザが持っている未送信の Chunk の PUT を 409 で断ってしまう（Recording-First）。`recording` に戻せば、Phase 1 の Recovery が残りを送って確定する。`meeting.json` が読めない会議は `finalized` にする。確定前に取ったバックアップから戻した会議は、行が `recording` などの確定前の状態で残る。確定時の控えがあれば、既存の行も `finalized` に進め、欠けている終了時刻などを控えから補う（ブラウザは確定を終えて再送しないので、そのままでは `resume_finalized` が拾わない）
+* 再構築した会議の状態：`meeting.json` に終了時刻（`endedAtEpochMs`）があれば `finalized`（確定済み。serve の起動時にジョブを作る）、作成時の控えのまま（終了時刻なし）なら **`recording`** に戻す。確定前の会議を `finalized` にすると、ブラウザが持っている未送信の Chunk の PUT を 409 で断ってしまう（Recording-First）。`recording` に戻せば、Phase 1 の Recovery が残りを送って確定する。`meeting.json` が読めない（無い・壊れている）会議も `recording` にする。確定したかが分からず、`finalized` にすると、まだ送信中のブラウザの Chunk を断る（録音を失う側に倒さない）。ブラウザが確定を終えていた会議は `recording` のまま止まり、文字起こしされない（既知の制限。サーバー側に確定を進める経路は無く、利用者の判断を待つ。PROGRESS「次の作業」）。確定前に取ったバックアップから戻した会議は、行が `recording` などの確定前の状態で残る。確定時の控えがあれば、既存の行も `finalized` に進め、欠けている終了時刻などを控えから補う（ブラウザは確定を終えて再送しないので、そのままでは `resume_finalized` が拾わない）
 * 逆同期：`GET /chunks` は `save_status='missing'` の Chunk を `registered=false` で返す（Phase 1 契約の `registered` フィールドの意味の範囲内）。ブラウザ側が IndexedDB の Blob から再 PUT する（client 文書 §6）
 
 ## 2.5 LAN 共有
@@ -1142,7 +1142,8 @@ def on_summary_deferred(conn: sqlite3.Connection, meeting_id: str) -> None:
 def on_summary_failed(conn: sqlite3.Connection, meeting_id: str) -> None:
     """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。
 
-    completed の会議は変えない。要約をコミットした後、finish_job の前に lease が切れて回数切れで回収されると来る（Phase 2 §14）。
+    completed の会議は変えない（要約をコミット済み）。handle_summary は要約と同じトランザクションでジョブも completed にする
+    （repo.mark_job_committed）ので、finish_job の前に lease が切れても Sweeper は回収せず、ここには来ない。念のため残す（Phase 2 §14）。
     """
     current = repo.get_meeting(conn, meeting_id)
     if current is not None and current.status == "completed":
@@ -1370,6 +1371,7 @@ class JobRunner:
             # モデル未配置等の無期限 retry では待たず failed にし、merge へ進める（§2.2）
             d = RetryDecision("failed", None, True)
         followup: str | None = None  # 失敗の後続処理で作ったジョブの id（分離の失敗で作った merge）
+        removed: Job | None = None   # 後続処理が消した failed の行の控え（消した後は読み直せない）
         async with self.ctx.db.write() as conn:
             # 要約の失敗は、合成に使った版（handle_summary が付ける）と今の版を、この記録と同じトランザクションで比べる。
             # 進んでいれば古い版に対する失敗なので記録せず、同じ行を pending に戻す（requeue_job。試行回数は戻す。§12.7）。
@@ -1385,13 +1387,18 @@ class JobRunner:
                 if err.error_class == "OOM" and job.job_type in GPU_HEAVY and job.job_type != "diarize_meeting":
                     self._downgrade_stt(conn, job.meeting_id, job.model_name)
                 if d.next_status == "failed":
+                    # merge の失敗では、後続処理が failed の行を消して作り直すことがある（rerun_merge_for_staged）。消す前に控え、
+                    # 消えていれば控えを流す。消した後の _publish_job は行を引けず、失敗のイベントが流れない（完了時と同じ）
+                    failed_row = repo.get_job(conn, job.id)
                     followup = pipeline.on_job_failed(conn, job)
+                    if repo.get_job(conn, job.id) is None:
+                        removed = failed_row
                 elif job.job_type == "synthesize_minutes":
                     # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
                     pipeline.on_summary_deferred(conn, job.meeting_id)
                 repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
         # 完了時と同じく、どちらもコミットの後に流す
-        self._publish_job(job.id)
+        self._publish_job(job.id, removed=removed)
         if followup is not None:
             self._publish_job(followup)
 
@@ -2629,7 +2636,7 @@ finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` 
 
 利用者（`local_user_id`）は控えの `localUserId` ではなく**ディレクトリの階層**（`recordings/{userId}/…`）で決める。ファイルの置き場所と所有者が食い違うと、以後の Chunk が別の階層に書かれる。
 
-復元する会議の状態は `_restored_status()` が決める（§2.4）。確定時の控えには終了時刻が入るので、終了時刻があれば（値が不正でも）`finalized`、作成時の控えのままなら `recording`、控えが読めなければ `finalized`。
+復元する会議の状態は `_restored_status()` が決める（§2.4）。確定時の控えには終了時刻が入るので、終了時刻があれば（値が不正でも）`finalized`、作成時の控えのままなら `recording`、控えが読めなければ `recording`（確定したかが分からない。§2.4 の既知の制限）。
 
 rebuild を呼ぶのは 2 か所だけである。`doctor --rebuild`（データディレクトリのロックを取ってから。§22）と、`build_context` の起動時の復旧（壊れた DB を復元した直後。§22）。動いているサーバーと並行して呼ばない。
 
@@ -2821,11 +2828,11 @@ def _restored_status(meta: dict[str, Any]) -> str:
 
     控えが作成時のまま（終了時刻なし）なら recording に戻す。ブラウザは未送信の Chunk と確定の要求をまだ持っていて、
     finalized にすると Chunk の PUT を 409 で断ってしまう（Recording-First）。確定は Phase 1 の Recovery がやり直す。
-    控えそのものが読めない会議は、止まったままにしないよう finalized にする（serve が起動時にジョブを作る。Phase 2 §14）。
+    控えそのものが読めない会議も recording にする。確定したかが分からない（_snapshot_finalized と同じく、読めない控えを確定の
+    根拠にしない）。finalized にすると、まだ送信中のブラウザの Chunk を断り、録音を失う。ブラウザが確定を終えていた会議は
+    recording のまま止まり、文字起こしされない（既知の制限。§2.4）。
     """
-    if meta and meta.get("endedAtEpochMs") is None:
-        return "recording"
-    return "finalized"
+    return "finalized" if _snapshot_finalized(meta) else "recording"
 
 
 PRE_FINALIZE_STATUSES = ("created", "recording", "finalizing")
@@ -4527,6 +4534,10 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
         repo.update_meeting(conn, job.meeting_id, llm_model_used=llm_model, summary_language=language)
         repo.record_metric(conn, "llm_schema_fail", synth.schema_retries, model_name=llm_model, meeting_id=job.meeting_id)
         pipeline.on_summary_completed(conn, job.meeting_id)
+        # ジョブも同じトランザクションで completed にする（lease は Runner の finish_job が外す）。finish_job の前にワーカーが落ちても、
+        # Sweeper はコミット済みの試行を回収しない。回収すると要約を作り直し（版が進んでいれば §12.7 の自動の再生成になる）、
+        # 回数切れなら failed にする
+        repo.mark_job_committed(conn, job.id, job.lease_owner or "", job.attempts)
     ctx.events.publish(job.meeting_id, {"type": "summary_version", "version": version})
     return llm_model
 
@@ -7736,7 +7747,8 @@ async def test_rebuild_skips_recording_named_with_non_ascii_digits(client3: http
 
 
 async def test_rebuild_tolerates_snapshot_that_is_not_an_object(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
-    """meeting.json の最上位がオブジェクトでなくても、控えなしとして復元する。"""
+    """meeting.json の最上位がオブジェクトでなくても、控えなしとして復元する。確定したかが分からないので recording にする
+    （finalized にすると、まだ送信中のブラウザの Chunk の PUT を断る。§2.4）。"""
     # Arrange
     await _completed_meeting(client3, runner3, ctx3)
     (ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json").write_text("[1, 2]", encoding="utf-8")
@@ -7747,7 +7759,7 @@ async def test_rebuild_tolerates_snapshot_that_is_not_an_object(client3: httpx.A
         m = repo.get_meeting(conn, "m-1")
     # Assert
     assert report.meetings_created == 1 and report.chunks_created == 2
-    assert m is not None and m.title == "復元された会議" and m.status == "finalized"
+    assert m is not None and m.title == "復元された会議" and m.status == "recording"
 ```
 
 ## 23.7 LAN 共有
@@ -7918,7 +7930,7 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | rebuild は、上限（`REBUILD_MAX_CHUNK_SAMPLES`）を超える録音を全量を読まずに飛ばし、残りを復元する。読む量を上限 + 1 バイトで止め、圧縮ファイルの復号も上限で止める（§18 `_read_chunk_file`） | `test_rebuild_skips_recording_larger_than_chunk_limit` |
 | VAD の読み取りが OSError（権限・取り外し）でも、壊れた WAV と同じく修復を確かめ直し、読めなければ missing にして INVALID_AUDIO で止める（§21 `handle_vad`） | `test_vad_rechecks_chunk_when_read_raises_os_error` |
 | 起動時の復旧（バックアップあり / なし）で録音ファイルから作り直す。復元の途中で止まっても次の起動がやり直す | `test_startup_recovery_rebuilds_meetings_missing_from_database`、`test_interrupted_restore_resumes_on_next_start` |
-| 壊れた `meeting.json` で rebuild を止めない・確定前の会議は `recording` に戻す | `test_rebuild_drops_malformed_stop_pair`、`test_rebuild_drops_malformed_end_time`、`test_rebuild_tolerates_malformed_snapshot_fields`、`test_rebuild_tolerates_snapshot_that_is_not_an_object`、`test_rebuild_restores_unfinalized_meeting_as_recording` |
+| 壊れた `meeting.json` で rebuild を止めない・確定前の会議と、読めない控えの会議（確定したかが分からない）は `recording` に戻す | `test_rebuild_drops_malformed_stop_pair`、`test_rebuild_drops_malformed_end_time`、`test_rebuild_tolerates_malformed_snapshot_fields`、`test_rebuild_tolerates_snapshot_that_is_not_an_object`、`test_rebuild_restores_unfinalized_meeting_as_recording` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
 | CLI：同名の利用者の拒否と削除、serve の動作中は `doctor --rebuild` を断る | `test_user_cli_rejects_duplicate_name_and_removes_user`、`test_doctor_rebuild_refuses_while_server_is_running` |
 | マイグレーション 009〜012 | `test_apply_phase3_moves_files_and_extends_job_types`、`test_apply_phase3_keeps_other_recordings_when_meeting_id_equals_user_id` |
