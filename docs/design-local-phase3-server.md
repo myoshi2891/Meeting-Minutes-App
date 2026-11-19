@@ -95,7 +95,7 @@ testpaths = ["tests"]
 * ジョブ種別 `diarize_meeting`（`priority=150`：全 `transcribe_chunk` 完了後、`merge_transcript`(200) の前）。依存関係は `transcribe 完了 → diarize → merge → summary` に変わる
 * `DiarizationProvider` 抽象 + pyannote 実 Provider（遅延 import）+ Fake。モデルは利用者が `{dataDir}/models/diarization/` に配置する。Phase 2 §7.4 のような取得の経路は用意しない（配置の規約と理由は §12）
 * 実 Provider に渡す音声は、source ごとに Chunk を絶対時刻の位置へ置いて連続させる（`assemble_timeline()`）。話者分離に渡すのは STT が完了した Chunk だけなので、無音で STT を省いた Chunk の区間は無音で埋める。単純に連結すると、省いた Chunk 1 つにつき後ろの話者区間が 30 秒ずつ前へずれ、別の人の発言にラベルが付く
-* 話者分離はサーバーのプロセス内（`asyncio.to_thread`）で走らせる。STT のようなプロセスプールには入れない（1 会議 1 回で、ワーカーにモデルを持たせておく利点がない）。その代わり、メモリ不足で OS に止められるとサーバーごと落ちる。この場合も、lease 切れの回数上限（Phase 2 §14）で `failed` になり、話者分離なしで merge へ進む（落ち続けて会議が止まったままにはならない）。同時に走らせる分離は `MAX_CONCURRENT_DIARIZE`（1）本までに絞る（`AppContext.diarize_slots`。§7）。1 本分のピーク（全 Chunk の PCM とモデル。§3 の表）しか見積もっておらず、2 本分が載ることは確かめていないため。上げるのは §24 の実機確認で最大メモリを測ってから。`requeue_running_job` で `pending` に戻した分離の次の試行も、旧い試行のスレッド（`asyncio.to_thread` は止められない）が抜けて枠を返すまで分離を始めない。分離を待つハンドラがキャンセルされたとき（サーバーの終了など）も、枠はスレッドが抜けるまで返さない（§21 `handle_diarize` の `_release_when_done`）。
+* 話者分離はサーバーのプロセス内（デーモンスレッド。§21 `_start_diarize_thread`）で走らせる。STT のようなプロセスプールには入れない（1 会議 1 回で、ワーカーにモデルを持たせておく利点がない）。その代わり、メモリ不足で OS に止められるとサーバーごと落ちる。この場合も、lease 切れの回数上限（Phase 2 §14）で `failed` になり、話者分離なしで merge へ進む（落ち続けて会議が止まったままにはならない）。同時に走らせる分離は `MAX_CONCURRENT_DIARIZE`（1）本までに絞る（`AppContext.diarize_slots`。§7）。1 本分のピーク（全 Chunk の PCM とモデル。§3 の表）しか見積もっておらず、2 本分が載ることは確かめていないため。上げるのは §24 の実機確認で最大メモリを測ってから。`requeue_running_job` で `pending` に戻した分離の次の試行も、旧い試行のスレッド（スレッドは止められない）が抜けて枠を返すまで分離を始めない。分離を待つハンドラがキャンセルされたとき（サーバーの終了など）も、枠はスレッドが抜けるまで返さない（§21 `handle_diarize` の `_release_when_done`）。分離を待つ間も Runner の heartbeat が lease を延ばすので、生きたまま固まった分離は lease 切れでは見つからない。待つ時間に上限（全 Chunk の長さ × 係数、下限 600 秒。`Thresholds.diarize_timeout_*`）を設け、超えたらスレッドを見放す：ジョブは再試行せず `failed`（`TIMEOUT`）にして話者分離なしで merge へ進み、枠はスレッドが抜けるまで持つ（次の分離は始めない）。見放したスレッドは STT と要約の排他では数えない（`AppContext.diarize_abandoned`。固まったまま STT・要約まで止め続けない。VRAM を抱えていれば STT は OOM の扱いに任せる）。スレッドは結果を返せば捨てられて枠を返し、返さなければプロセスの終了で止まる（分離は既定の executor ではなくデーモンスレッドで走らせる。既定の executor のスレッドはインタープリタの終了時に join され、固まっているとサーバーを止められない）。抜けないまま枠が空かなければ、分離はサーバーを再起動するまで始まらない（ログに出す）。
 * mic と system は**別々に**ダイアライズし、ラベルに source 接頭辞を付けない代わりに `meeting_speakers` で `(label → 名前)` を利用者が割り当てる。mic 側は通常 1 話者（利用者本人）だが、会議室のマイクで複数人が話す場合もあるため固定しない
 * ラベルは `S1..Sn`。名前は AI に推定させない（v4.0 §63、Invariant 9）
 * 分離失敗（モデル未配置・OOM 上限到達・プロセスごと落ちる失敗の繰り返し）は `merge` を止めない。`speaker_id=NULL` のまま続行し、UI に「話者分離なし」を表示
@@ -131,10 +131,10 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 * `read_pcm` は拡張子で分岐し、FLAC の場合も WAV sha256 で照合する（`sha256` 列の意味を変えない）
 * バックアップ：`VACUUM INTO {dataDir}/backups/minutes-{世代番号}-{epoch ms}.sqlite`。**直近のバックアップから 24 時間たっていたら作る**（起動時と 1 時間ごとに判定。基準はファイル名の時刻で、プロセスの起動からの経過ではない）。世代数 `backup_generations`（既定 7）。起動のたびに作ると、短時間に再起動を 7 回くり返しただけで古い世代がすべて押し出される。使うたびにサーバーを起動する使い方でも 1 日 1 世代になる。世代管理・復元元の選択・期日の判定の「新しい順」は名前の時刻ではなく世代番号（既存の最大 + 1、ファイル名に残る）で決める。時刻で並べると、時計が戻った後に作った世代が前の世代より古い扱いになり、時計が追いつくと元の順に戻って、どちらでも新しい世代を消す・古い世代から復元する。最新の世代の時刻が現在より未来なら（作った後に時計が戻った）期日として作る（戻った後に作った世代は番号が最大なので、作った直後に消さず、毎周作り直さない）。`completed` 遷移ごとのバックアップは行わない（DB 全体の複製なので会議 1 件ごとには重く、世代もその分早く回る。判定は 1 時間ごとなので、バックアップの間隔は 24 時間を超えて最長でほぼ 25 時間になり、作成が失敗すれば次の成功までさらに延びる。その間の要約とノートは失われうる。録音と transcript は録音ファイルから作り直せる）
 * バックアップは `.part` に書いてから名前を付け替える。書きかけ・失敗したファイルは正規の名前では残らず、復元元にも世代管理の対象にもならない
-* 起動時 `PRAGMA integrity_check`。`ok` 以外なら、壊れたファイルを `minutes.sqlite.corrupt-{epoch}` に退避し、**検査に通る最も新しいバックアップ**を復元して開く（最新が壊れていれば 1 つ古いものへ下がる）。使えるバックアップが 1 つもなければ**空の DB で起動する**（起動を止めない。サーバーが動いていなければブラウザは Chunk を送れない）
+* 起動時 `PRAGMA integrity_check`。`ok` 以外なら、壊れたファイルを `minutes.sqlite.corrupt-{epoch}` に退避し、**検査に通る最も新しいバックアップ**を復元して開く（最新が壊れている・このアプリのスキーマ（`schema_version`）を持たなければ 1 つ古いものへ下がる）。使えるバックアップが 1 つもなければ**空の DB で起動する**（起動を止めない。サーバーが動いていなければブラウザは Chunk を送れない）
 * 復元の直後に、録音ファイルから DB にない会議と Chunk を作り直す（下の rebuild と同じ処理を `build_context` が自動で行う）。バックアップより後に録音した会議は DB にないが、ファイルは残っているためである。作り直した会議は transcript から処理し直す。バックアップより後の要約とノートは失われる。バックアップより後に行った手動の文字起こし（無音と判定した Chunk の手動 STT。`POST .../chunks/{source}/{sequenceNo}/transcribe`）も失われ、その Chunk は `skipped` のまま残る（バックアップの時点で STT の前なら、処理し直しで再び `skipped` になる）。手動の STT はもう一度実行する。起動時に、復元元と作り直した件数を標準エラーに警告として出す（黙って古い状態に戻さない）
 * `doctor --rebuild`：`recordings/` を走査し、`meeting.json`（finalize 時に書く。Phase 1 §13 の規約を Phase 3 で実装）と WAV/FLAC ヘッダから `meetings` / `audio_chunks` の欠損行を再構築する。既存行は上書きしない。**serve が動いているデータディレクトリには実行しない**（ロックが取れなければ終了コード 1。同じ Chunk の行を 2 つのプロセスが作り合う）
-* 再構築した会議の状態：`meeting.json` に終了時刻（`endedAtEpochMs`）があれば `finalized`（確定済み。serve の起動時にジョブを作る）、作成時の控えのまま（終了時刻なし）なら **`recording`** に戻す。確定前の会議を `finalized` にすると、ブラウザが持っている未送信の Chunk の PUT を 409 で断ってしまう（Recording-First）。`recording` に戻せば、Phase 1 の Recovery が残りを送って確定する。`meeting.json` が読めない（無い・壊れている）会議も `recording` にする。確定したかが分からず、`finalized` にすると、まだ送信中のブラウザの Chunk を断る（録音を失う側に倒さない）。ブラウザが確定を終えていた会議は `recording` のまま止まり、文字起こしされない（既知の制限。サーバー側に確定を進める経路は無く、利用者の判断を待つ。PROGRESS「次の作業」）。確定前に取ったバックアップから戻した会議は、行が `recording` などの確定前の状態で残る。確定時の控えがあれば、既存の行も `finalized` に進め、欠けている終了時刻などを控えから補う（ブラウザは確定を終えて再送しないので、そのままでは `resume_finalized` が拾わない）
+* 再構築した会議の状態：`meeting.json` に有効な終了時刻（`endedAtEpochMs`。SQLite INTEGER に収まる 0 以上の整数）があれば `finalized`（確定済み。serve の起動時にジョブを作る）、作成時の控えのまま（終了時刻なし）なら **`recording`** に戻す。確定前の会議を `finalized` にすると、ブラウザが持っている未送信の Chunk の PUT を 409 で断ってしまう（Recording-First）。`recording` に戻せば、Phase 1 の Recovery が残りを送って確定する。`meeting.json` が読めない（無い・壊れている）会議と、終了時刻が不正な値（範囲外・整数でない。控えが壊れた印）の会議も `recording` にする。確定したかが分からず、`finalized` にすると、まだ送信中のブラウザの Chunk を断る（録音を失う側に倒さない）。ブラウザが確定を終えていた会議は `recording` のまま止まり、文字起こしされない（既知の制限。サーバー側に確定を進める経路は無く、利用者の判断を待つ。PROGRESS「次の作業」）。確定前に取ったバックアップから戻した会議は、行が `recording` などの確定前の状態で残る。確定時の控えがあれば、既存の行も `finalized` に進め、欠けている終了時刻などを控えから補う（ブラウザは確定を終えて再送しないので、そのままでは `resume_finalized` が拾わない）
 * 逆同期：`GET /chunks` は `save_status='missing'` の Chunk を `registered=false` で返す（Phase 1 契約の `registered` フィールドの意味の範囲内）。ブラウザ側が IndexedDB の Blob から再 PUT する（client 文書 §6）
 
 ## 2.5 LAN 共有
@@ -267,6 +267,9 @@ CREATE INDEX IF NOT EXISTS idx_meetings_user ON meetings(local_user_id, created_
 """
 
 PHASE3_SQL: list[tuple[int, str]] = [(9, M009), (10, M010), (11, M011)]
+# このビルドが知る最新の schema_version（012 はファイル移動を伴うので PHASE3_SQL の外で記録する）。
+# 復元元のバックアップの検証（storage/backup.usable_backup）が、これより新しい版を断る
+LATEST_SCHEMA_VERSION = 12
 
 
 MIGRATE_012_STAGING = ".migrate-012"
@@ -394,6 +397,11 @@ class Thresholds:
     llm_connect_timeout_s: float = 10.0
     llm_read_timeout_s: float = 600.0
     llm_ctx_fill_ratio: float = 0.6
+    # Phase 3：話者分離の待ち時間の上限（handle_diarize）。全 Chunk の長さ × 係数、下限 diarize_timeout_min_s。
+    # 係数は §24 の実機確認で 60 分・2 source の所要時間を測って見直す（それまでは大きめに取り、正常な分離を断たない）
+    diarize_timeout_factor_gpu: float = 1.0
+    diarize_timeout_factor_cpu: float = 5.0
+    diarize_timeout_min_s: float = 600.0
     # Phase 3
     language_min_prob: float = 0.6          # これ未満は会議の主言語にフォールバック
     language_dominant_ratio: float = 0.6    # これ以上なら主言語で要約
@@ -909,6 +917,9 @@ class AppContext:
     # 実行中の STT（ライブを含む）のハンドラの数（JobRunner._run_handler が数える）。STT の再実行（request_rerun_stt）が
     # ジョブの行を消しても推論は止まらないので、行が無くても抜けるまで分離を lease しない（JobRunner.allowed_types）
     stt_in_flight: int = 0
+    # 時間切れで見放した分離のスレッドの数（handle_diarize の _abandon_until_done）。スレッドは止められないので枠（diarize_slots）は
+    # 抜けるまで持ち続ける（次の分離は始めない）が、固まったスレッドが STT と要約まで止めないよう、その排他では走っていない扱いにする
+    diarize_abandoned: int = 0
 
     @property
     def diarization_active(self) -> bool:
@@ -1186,7 +1197,7 @@ def job_of_chunk(conn: sqlite3.Connection, job: Job) -> AudioChunk:
 
 # 9. Runner `jobs/runner.py`（変更）
 
-変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` と STT は GPU で重ねない（双方向の排他。分離は STT の実行中に lease せず、STT（ライブを含む）は分離の実行中に lease しない。合算の VRAM を実測していないため。§3）。分離の実行中は、行（`leased` / `processing`）に加えて実行枠（`ctx.diarize_slots`）が埋まっていることでも判定する（pending に戻した分離の旧い試行のスレッドは行に出ない。行がある間も枠が埋まっている間も、次の分離を lease しない。lease した分離が枠を取る前に、別の Runner が次の分離を lease して枠を待たないため）。STT の実行中は、行に加えて実行中のハンドラの数（`ctx.stt_in_flight`。`_run_handler` が数える）でも判定する（STT の再実行 `request_rerun_stt` が行を消しても、旧い試行の推論はハンドラが抜けるまで GPU を使う）、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す、(6) lease できる分離が待っている間は新しい STT（ライブを含む）を lease せず、実行中の STT が抜けたら分離を lease する（`repo_phase3.has_ready_job`。STT は分離より優先度が高く、ライブ STT が絶えず届くと実行中の STT が 0 にならず分離が飢える。待つ分離が無くなれば優先度の順に戻る。再試行の待ち時間中の分離は数えない）。
+変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` と STT は GPU で重ねない（双方向の排他。分離は STT の実行中に lease せず、STT（ライブを含む）は分離の実行中に lease しない。合算の VRAM を実測していないため。§3）。分離の実行中は、行（`leased` / `processing`）に加えて実行枠（`ctx.diarize_slots`）が埋まっていることでも判定する（pending に戻した分離の旧い試行のスレッドは行に出ない。行がある間も枠が埋まっている間も、次の分離を lease しない。lease した分離が枠を取る前に、別の Runner が次の分離を lease して枠を待たないため）。STT の実行中は、行に加えて実行中のハンドラの数（`ctx.stt_in_flight`。`_run_handler` が数える）でも判定する（STT の再実行 `request_rerun_stt` が行を消しても、旧い試行の推論はハンドラが抜けるまで GPU を使う）、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す、(6) lease できる分離が待っている間は新しい STT（ライブを含む）を lease せず、実行中の STT が抜けたら次の 1 件を分離だけに予約する（`repo_phase3.has_ready_job`。STT は分離より優先度が高く、ライブ STT が絶えず届くと実行中の STT が 0 にならず分離が飢える。予約しないと、優先度の高い `vad_chunk`（50）が絶えず届く間（公平 lease で別の利用者のジョブが先に来る場合も）分離（150）が lease されない。待つ分離が無くなれば優先度の順に戻る。再試行の待ち時間中の分離と、枠が埋まっていて始められない分離は数えない）。分離の待ちの上限は実行中の STT が抜けるまで（STT の時間切れ）と空いた Runner の次の lease、STT の待ちの上限は待っている分離ごとに分離の時間切れ（§21 `_diarize_timeout_s`。時間切れの後は見放したスレッドを STT の排他で数えない）。
 
 ```python
 # minutes_local/jobs/runner.py
@@ -1203,7 +1214,7 @@ from ..db import repo, repo_phase3
 from ..db.connection import now_ms
 from ..db.models import Job
 from . import pipeline
-from .context import AppContext
+from .context import MAX_CONCURRENT_DIARIZE, AppContext
 from .retry import JobError, RetryDecision, decide, normalize_exception
 
 log = logging.getLogger(__name__)
@@ -1240,20 +1251,33 @@ class JobRunner:
         # 行を見ても分からないが、スレッドが抜けるまで枠を持つ。行だけで判定すると、そのスレッドと並んで次の分離や要約を lease する
         diarize_slots_full = self.ctx.diarize_slots.locked()
         diarize_running = diarize_rows > 0 or diarize_slots_full
+        # GPU を使っている分離。時間切れで見放したスレッド（ctx.diarize_abandoned。handle_diarize）だけが枠を埋めているなら数えない。
+        # 枠は抜けるまで返さない（次の分離は始めない）が、固まったスレッドで STT と要約まで止め続けない（止まる上限を時間切れで切る）。
+        # 固まったスレッドが VRAM を抱えていれば STT は OOM になりうる。そのときは STT の OOM の扱い（再試行とモデルの格下げ）に任せる
+        diarize_live = diarize_rows > 0 or (diarize_slots_full and self.ctx.diarize_abandoned < MAX_CONCURRENT_DIARIZE)
+        # lease できる分離が待っていても、枠が埋まっていれば（見放したスレッドを含む）始められない。そのときは STT を止めない
+        diarize_waiting = diarize_ready and not diarize_running
         # STT と分離は GPU で重ねない（双方向の排他）。STT と分離を合わせた VRAM の最大値は実測しておらず、予算を決められないため。
         # 分離の実行中（行または枠）は STT（ライブを含む）を lease しない。引き換えに、ライブ文字起こしと他の会議の STT は
         # 分離が終わるまで待つ（実測して合算の予算を決めれば重ねてよい。§3 の表）。実行中の STT は止めない（lease 済みは走りきる）
         # 分離が待っていれば、新しい STT も lease しない（次の 1 件を分離に充てる）。STT は優先度が分離より高く、ライブ STT が
         # 絶えず届くと（複数の Runner なら lease が重なって）実行中の STT が 0 にならず、分離が永久に lease されない。
-        # 実行中の STT は走りきり、抜けたら下の条件で分離を lease する。待つ分離が無くなれば従来の優先度の順に戻る
-        if not diarize_running and not diarize_ready:
+        # 実行中の STT は走りきり、抜けたら下の予約で分離を lease する。待つ分離が無くなれば従来の優先度の順に戻る
+        # 予約：STT が抜けていて分離を始められるなら、次の 1 件は分離だけにする。vad_chunk（優先度 50）は分離（150）より先に
+        # lease されるので、録音中の会議の vad_chunk が絶えず届くと（利用者ごとの公平 lease で別の利用者のジョブが先に来る場合も）
+        # 分離が lease されない。分離の待ちの上限は、実行中の STT が抜けるまで（STT の時間切れ）と、空いた Runner の次の lease。
+        # STT の待ちの上限は、待っている分離ごとに分離の時間切れ（handle_diarize の _diarize_timeout_s）。時間切れの後は見放した
+        # スレッドを STT の排他で数えない（diarize_live）ので、分離が固まっても STT は止まり続けない
+        if stt_running == 0 and diarize_waiting:
+            return ["diarize_meeting"]
+        if not diarize_live and not diarize_waiting:
             types[1:1] = ["live_transcribe_chunk", "transcribe_chunk"]
         # diarize は STT 実行中には lease しない（GPU 排他）。
         # 分離の実行中（行または枠）も lease しない（lease しても枠を待つだけで、Runner の 1 枠を何時間も塞ぐ）。
         # 枠だけで判定すると、lease した分離が枠を取る前（handle_diarize の acquire の前）に別の Runner が次の分離を lease する
         if stt_running == 0 and not diarize_running:
             types.append("diarize_meeting")
-        if (stt_running == 0 and not diarize_running) or self.ctx.models.allow_concurrent_stt_and_llm:
+        if (stt_running == 0 and not diarize_live) or self.ctx.models.allow_concurrent_stt_and_llm:
             types.append("synthesize_minutes")
         return types
 
@@ -1367,8 +1391,9 @@ class JobRunner:
     async def _on_failure(self, job: Job, err: JobError, duration_ms: int) -> None:
         now = now_ms()
         d = decide(err, job.attempts, job.max_attempts, now)
-        if job.job_type == "diarize_meeting" and not err.counts_attempt:
-            # モデル未配置等の無期限 retry では待たず failed にし、merge へ進める（§2.2）
+        if job.job_type == "diarize_meeting" and (not err.counts_attempt or err.error_class == "TIMEOUT"):
+            # モデル未配置等の無期限 retry では待たず failed にし、merge へ進める（§2.2）。時間切れ（handle_diarize）も再試行しない。
+            # 固まったスレッドが抜けるまで枠が空かず、再試行は lease されないまま待ち続け、その間 merge も要約も進まない
             d = RetryDecision("failed", None, True)
         followup: str | None = None  # 失敗の後続処理で作ったジョブの id（分離の失敗で作った merge）
         removed: Job | None = None   # 後続処理が消した failed の行の控え（消した後は読み直せない）
@@ -1457,7 +1482,7 @@ class JobRunner:
             self.ctx.events.publish(job.meeting_id, {"type": "meeting_status", "status": meeting.status})
 ```
 
-`diarize_meeting` が `MODEL_MISSING` / `PROVIDER_UNREACHABLE` で無期限 retry になる場合、Phase 2 の規則では 5 分ごとに待ち続け、その間 merge も summary も進まない。話者分離はプレビュー性の機能なので、`_on_failure` の冒頭で `RetryDecision("failed")` に置き換え、merge へ進める（§2.2「分離失敗は merge を止めない」の具体化）。
+`diarize_meeting` が `MODEL_MISSING` / `PROVIDER_UNREACHABLE` で無期限 retry になる場合、Phase 2 の規則では 5 分ごとに待ち続け、その間 merge も summary も進まない。話者分離はプレビュー性の機能なので、`_on_failure` の冒頭で `RetryDecision("failed")` に置き換え、merge へ進める（§2.2「分離失敗は merge を止めない」の具体化）。時間切れ（`TIMEOUT`。§21 `handle_diarize` が固まった分離を見放したとき）も同じく再試行せず `failed` にする。見放したスレッドが枠を持ったままなので、再試行は lease されずに待ち続ける。
 
 ---
 
@@ -2426,7 +2451,7 @@ def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = N
 | `create_backup` | `VACUUM INTO` で `minutes-{世代番号}-{epoch ms}.sqlite` を作る | `.part` に書いてから名前を付け替える。書きかけを正規の名前で残さない。世代番号は既存の最大 + 1（同じミリ秒の 2 回目も前の世代を上書きしない） |
 | `list_backups` | 完成したバックアップを古い順に返す | ファイル名の世代番号で並べる（時刻で並べると時計の巻き戻りと追いつきで順が入れ替わる）。`.part` と規約外の名前は含めない |
 | `prune_backups` | 新しい方から `keep` 世代を残す | 中断で残った `.part` も消す |
-| `restore_latest` | 壊れた DB を退避し、復元元にできる最も新しいバックアップを置く | DB に触る前に復旧中の控え（`minutes.sqlite.recovering`）を置き、`build_context` が `rebuild` を終えてから消す（`finish_recovery`）。途中で止まれば次の起動が控えを見て、DB が無くても初回起動とみなさずにやり直す。コピーは別名に書いてから付け替える。候補ごとに `integrity_check` をかけ、壊れていれば 1 つ古いものへ下がる。空のファイルは検査に通るので、大きさも見る。使えるものがなければ DB を置かない（空で起動し、§18 が作り直す）。`users` もバックアップの時点に戻るので、その後に失効させた利用者のトークンがまた通る。運用者は復元の後に、失効させたままにすべき利用者をもう一度消す（§2.5） |
+| `restore_latest` | 壊れた DB を退避し、復元元にできる最も新しいバックアップを置く | DB に触る前に復旧中の控え（`minutes.sqlite.recovering`）を置き、`build_context` が `rebuild` を終えてから消す（`finish_recovery`）。途中で止まれば次の起動が控えを見て、DB が無くても初回起動とみなさずにやり直す。コピーは別名に書いてから付け替える。候補ごとに `integrity_check` をかけ、壊れていれば 1 つ古いものへ下がる。空のファイルは検査に通るので、大きさも見る。`integrity_check` は表の無い DB や別のアプリの DB も通すので、`schema_version` が 1 以上・このビルドの最新（`LATEST_SCHEMA_VERSION`）以下であることも確かめ、満たさなければ 1 つ古いものへ下がる（`usable_backup`）。使えるものがなければ DB を置かない（空で起動し、§18 が作り直す）。`users` もバックアップの時点に戻るので、その後に失効させた利用者のトークンがまた通る。運用者は復元の後に、失効させたままにすべき利用者をもう一度消す（§2.5） |
 | `Recovery` | 起動時に DB を作り直した記録（復元元・作り直した件数） | `AppContext.recovery` に載せ、`serve` / `doctor` が警告として出す（§22） |
 
 ```python
@@ -2443,6 +2468,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..db.connection import Database
+from ..db.migrations_phase3 import LATEST_SCHEMA_VERSION
 from .rebuild import RebuildReport
 
 PREFIX = "minutes-"
@@ -2551,12 +2577,39 @@ def integrity_ok(db_path: Path) -> bool:
         return False
 
 
-def usable_backup(path: Path) -> bool:
-    """復元元にできるか。空のファイルは integrity_check には通るが、会議が 1 件も入っていない。"""
+def backup_schema_version(path: Path) -> int | None:
+    """バックアップの schema_version（適用済みのマイグレーションの最大番号）。表が無い・読めない・整数でなければ None。
+
+    読み取り専用で開く（検査で復元元のファイルを書き換えない・無いファイルを作らない）。
+    """
     try:
-        return path.stat().st_size > 0 and integrity_ok(path)
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.DatabaseError, OSError, ValueError):
+        # 表が無い（sqlite3.OperationalError は DatabaseError）・SQLite のファイルでない・パスを URI にできない
+        return None
+    version = row[0] if row is not None else None
+    return version if isinstance(version, int) and not isinstance(version, bool) else None
+
+
+def usable_backup(path: Path) -> bool:
+    """復元元にできるか。空でなく、integrity_check に通り、このアプリのスキーマ（schema_version が 1 以上、このビルドの最新以下）を持つ。
+
+    空のファイルは integrity_check には通るが、会議が 1 件も入っていない。integrity_check は SQLite のファイルとしての健全さしか
+    見ないので、表の無い DB や別のアプリの DB も通る。それを復元すると、起動時の migrate が空の DB と同じく表を作り、
+    会議の無い DB で始まる（より古い正しいバックアップがあっても使わない）。古い版は復元の後に migrate・apply_phase3 が上げるので通す。
+    このビルドより新しい版は、このビルドが知らない列・表を持つので断る。
+    """
+    try:
+        if path.stat().st_size == 0 or not integrity_ok(path):
+            return False
     except OSError:
         return False
+    version = backup_schema_version(path)
+    return version is not None and 1 <= version <= LATEST_SCHEMA_VERSION
 
 
 def recovery_marker(db_path: Path) -> Path:
@@ -2636,7 +2689,7 @@ finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` 
 
 利用者（`local_user_id`）は控えの `localUserId` ではなく**ディレクトリの階層**（`recordings/{userId}/…`）で決める。ファイルの置き場所と所有者が食い違うと、以後の Chunk が別の階層に書かれる。
 
-復元する会議の状態は `_restored_status()` が決める（§2.4）。確定時の控えには終了時刻が入るので、終了時刻があれば（値が不正でも）`finalized`、作成時の控えのままなら `recording`、控えが読めなければ `recording`（確定したかが分からない。§2.4 の既知の制限）。
+復元する会議の状態は `_restored_status()` が決める（§2.4）。確定時の控えには終了時刻が入るので、有効な終了時刻（SQLite INTEGER に収まる 0 以上の整数）があれば `finalized`、作成時の控えのままなら `recording`、控えが読めない・終了時刻が不正な値なら `recording`（確定したかが分からない。確定 API は終了時刻を検証してから控えを書くので、不正な値は控えが壊れた印。§2.4 の既知の制限）。
 
 rebuild を呼ぶのは 2 か所だけである。`doctor --rebuild`（データディレクトリのロックを取ってから。§22）と、`build_context` の起動時の復旧（壊れた DB を復元した直後。§22）。動いているサーバーと並行して呼ばない。
 
@@ -2824,7 +2877,10 @@ def _stop_metadata(meta: dict[str, Any]) -> tuple[str | None, int | None]:
 
 
 def _restored_status(meta: dict[str, Any]) -> str:
-    """復元する会議の状態。確定時の控えには終了時刻が入る（値が不正でも、確定したことは分かる）。
+    """復元する会議の状態。確定時の控えには有効な終了時刻（SQLite INTEGER に収まる 0 以上の整数）が入る。
+
+    終了時刻が不正な値（範囲外・整数でない）の控えは、確定したかが分からないものとして recording にする。確定 API は終了時刻を
+    検証してから控えを書くので、不正な値は控えが壊れた・書き換えられた印で、確定の根拠にしない（finalized にすると録音を失う側に倒れる）。
 
     控えが作成時のまま（終了時刻なし）なら recording に戻す。ブラウザは未送信の Chunk と確定の要求をまだ持っていて、
     finalized にすると Chunk の PUT を 409 で断ってしまう（Recording-First）。確定は Phase 1 の Recovery がやり直す。
@@ -2839,8 +2895,9 @@ PRE_FINALIZE_STATUSES = ("created", "recording", "finalizing")
 
 
 def _snapshot_finalized(meta: dict[str, Any]) -> bool:
-    """控えが確定時のもの（終了時刻のキーに値がある）か。読めない控え（空）は確定とみなさない（既存の行を動かす根拠にしない）。"""
-    return bool(meta) and meta.get("endedAtEpochMs") is not None
+    """控えが確定時のもの（終了時刻が有効な SQLite の epoch 値）か。読めない控え（空）も、終了時刻が不正な控えも確定とみなさない
+    （確定したかが分からない。既存の行を動かす根拠にも、新しい行を finalized にする根拠にもしない）。"""
+    return _is_sqlite_epoch_ms(meta.get("endedAtEpochMs"))
 
 
 def _snapshot_chunks(meta: dict[str, Any]) -> dict[tuple[str, int], dict[str, Any]]:
@@ -3983,9 +4040,12 @@ async def me(request: Request) -> Any:
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from ..db import repo, repo_phase3
@@ -4336,17 +4396,68 @@ def _align_labels(segments: list[Segment], turns: tuple[SpeakerTurn, ...], taken
     return tuple(SpeakerTurn(t.source, t.start_ms, t.end_ms, mapping[t.label], t.confidence) for t in turns)
 
 
-def _release_when_done(slots: asyncio.Semaphore, worker: asyncio.Task[DiarizationResult]) -> None:
-    """分離のスレッドが抜けたら実行枠を返す（handle_diarize がキャンセルで先に抜けたとき）。
+def _release_when_done(slots: asyncio.Semaphore, worker: asyncio.Future[DiarizationResult]) -> None:
+    """分離のスレッドが抜けたら実行枠を返す（handle_diarize がキャンセル・時間切れで先に抜けたとき）。
 
-    返すのはタスクの完了の通知（イベントループの上で呼ばれる）。スレッドの関数の finally で返すと、スレッドを始める前に
-    取り消されたときに返らず、枠が埋まったままになる。結果は捨てる（呼び出し元は抜けている）。例外は取り出して、未取得の警告を出さない
+    返すのは Future の完了の通知（イベントループの上で呼ばれる）。スレッドの関数の finally で返すと、ループの外から Semaphore に
+    触ることになる。結果は捨てる（呼び出し元は抜けている）。例外は取り出して、未取得の警告を出さない
     """
-    def done(task: asyncio.Task[DiarizationResult]) -> None:
+    def done(task: asyncio.Future[DiarizationResult]) -> None:
         if not task.cancelled() and task.exception() is not None:
-            log.warning("diarization finished after its handler was cancelled: %s", task.exception())
+            log.warning("diarization finished after its handler left: %s", task.exception())
         slots.release()
     worker.add_done_callback(done)
+
+
+def _abandon_until_done(ctx: AppContext, worker: asyncio.Future[DiarizationResult]) -> None:
+    """時間切れで見放したスレッドを、抜けるまで ctx.diarize_abandoned に数える（JobRunner.allowed_types が STT と要約の排他で除く）。"""
+    ctx.diarize_abandoned += 1
+
+    def done(_: asyncio.Future[DiarizationResult]) -> None:
+        ctx.diarize_abandoned -= 1
+        log.warning("abandoned diarization thread exited; the diarization slot is free again")
+    worker.add_done_callback(done)
+
+
+def _start_diarize_thread(fn: Callable[[], DiarizationResult]) -> asyncio.Future[DiarizationResult]:
+    """fn をデーモンスレッドで走らせ、結果をイベントループの Future で返す。
+
+    asyncio.to_thread（既定の executor）は使わない。既定の executor のスレッドはインタープリタの終了時に join されるので、
+    固まった分離が残っていると、サーバーを止めてもプロセスが抜けず、再起動で回復できない。デーモンスレッドはプロセスの終了で止まる。
+    結果はループのスレッドで Future に渡す（call_soon_threadsafe）。ループが閉じた後（サーバーの終了）に届いた結果は捨てる
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[DiarizationResult] = loop.create_future()
+
+    def deliver(outcome: Callable[[], None]) -> None:
+        try:
+            loop.call_soon_threadsafe(lambda: None if future.done() else outcome())
+        except RuntimeError:
+            log.info("diarization finished after the event loop closed; the result is discarded")
+
+    def run() -> None:
+        try:
+            result = fn()
+        except Exception as e:  # noqa: BLE001  ハンドラ側（normalize_exception）で分類する
+            error = e   # except を抜けると e は消える。後でループのスレッドが呼ぶ lambda には別の名前で渡す
+            deliver(lambda: future.set_exception(error))
+            return
+        deliver(lambda: future.set_result(result))
+
+    threading.Thread(target=run, name="diarize", daemon=True).start()
+    return future
+
+
+def _diarize_timeout_s(ctx: AppContext, targets: list[AudioChunk]) -> float:
+    """分離を待つ時間の上限（秒）。全 Chunk の長さ × 段（GPU / CPU）の係数、下限 diarize_timeout_min_s。
+
+    分離を待つ間も Runner の heartbeat が lease を延ばすので、生きたまま固まった分離（返らない provider.diarize）は lease 切れでは
+    見つからない。この上限で見つける（STT の stt_timeout_factor と同じ考え方）
+    """
+    th = ctx.settings.thresholds
+    factor = th.diarize_timeout_factor_cpu if ctx.models.tier == "cpu_only" else th.diarize_timeout_factor_gpu
+    audio_s = sum(c.duration_ms for c in targets) / 1000
+    return max(th.diarize_timeout_min_s, audio_s * factor)
 
 
 def _load_and_diarize(ctx: AppContext, provider: DiarizationProvider, meeting_id: str, targets: list[AudioChunk]) -> DiarizationResult:
@@ -4390,8 +4501,9 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
     # 待つ間も Runner の heartbeat が lease を延ばす（待っている試行は Runner の 1 枠を占める）
     # 枠は async with で持たない。分離を待つハンドラがキャンセルされる（サーバーの終了など）と、async with はスレッドが走ったまま
     # 枠を返し、次の試行が並んで分離を始める。スレッドを待つ間に抜けたときは、スレッドが抜けた時点で枠を返す（_release_when_done）
+    provider = ctx.diarization
     await ctx.diarize_slots.acquire()
-    worker: asyncio.Task[DiarizationResult] | None = None
+    worker: asyncio.Future[DiarizationResult] | None = None
     try:
         with ctx.db.read() as conn:
             chunks = repo.list_chunks(conn, job.meeting_id)
@@ -4399,10 +4511,22 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
         # PCM を読む前に、行の時刻で 1 source のタイムラインの長さを確かめる（assemble_timeline と同じ上限。§9 の表）。
         # 超えれば InvalidAudioError（再試行しない）で、話者分離なしで merge へ進む（§2.2）
         check_timeline_span([(c.source, c.start_offset_ms, c.end_offset_ms) for c in targets])
-        # PCM の読み込み・復号（読んだ量の上限の確認を含む）と分離を 1 つのスレッドで行う（_load_and_diarize）。
-        # スレッドを別のタスクで待ち、shield で包む。このハンドラがキャンセルされてもタスクは残り、スレッドの終わりを知らせる
-        worker = asyncio.create_task(asyncio.to_thread(_load_and_diarize, ctx, ctx.diarization, job.meeting_id, targets))
-        result = await asyncio.shield(worker)
+        # PCM の読み込み・復号（読んだ量の上限の確認を含む）と分離を 1 つのデーモンスレッドで行う（_load_and_diarize）。
+        # スレッドの終わりは Future で受け、shield で包んで待つ。このハンドラがキャンセル・時間切れで抜けても Future は残り、
+        # スレッドの終わりを知らせる（枠はそこで返す。下の finally）
+        worker = _start_diarize_thread(functools.partial(_load_and_diarize, ctx, provider, job.meeting_id, targets))
+        timeout_s = _diarize_timeout_s(ctx, targets)
+        try:
+            result = await asyncio.wait_for(asyncio.shield(worker), timeout_s)
+        except asyncio.TimeoutError as e:
+            # 生きたまま固まった分離。スレッドは止められないので見放す：枠は抜けるまで持ち（finally の _release_when_done。次の分離は
+            # 始めない）、STT と要約の排他では数えない（_abandon_until_done）。ジョブは再試行せず failed にし、話者分離なしで
+            # merge へ進む（Runner._on_failure）。スレッドが後で抜ければ結果は捨て（ハンドラは抜けている）、枠を返す。
+            # 抜けなければ、プロセスの終了（サーバーの再起動）で止まる（デーモンスレッド。_start_diarize_thread）
+            _abandon_until_done(ctx, worker)
+            log.error("diarization of meeting %s did not finish in %.0fs; abandoning its thread (restart the server to free the slot "
+                      "if it never exits)", job.meeting_id, timeout_s)
+            raise JobTimeoutError(f"diarization timeout after {timeout_s:.0f}s") from e
         async with ctx.db.write() as conn:
             # lease が失効していれば何も書かない（Phase 2 基本設計 §9.3）。分離は長く走るので、失効した旧ワーカーが
             # merge の後でラベルを上書きしたり、新しい attempt の結果を古い結果で置き換えたりする
@@ -4433,7 +4557,7 @@ async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
         if worker is None or worker.done():
             ctx.diarize_slots.release()   # スレッドを始める前に抜けた（タイムラインの上限など）か、スレッドが抜けている
         else:
-            _release_when_done(ctx.diarize_slots, worker)   # スレッドがまだ走っている（キャンセルで抜けた）
+            _release_when_done(ctx.diarize_slots, worker)   # スレッドがまだ走っている（キャンセル・時間切れで抜けた）
 
 
 # ---- merge / summary ----
@@ -6322,6 +6446,62 @@ async def test_pending_diarize_is_admitted_despite_a_replenished_live_queue(clie
     assert leased is not None and leased.id == diarize_id
 
 
+async def test_ready_diarize_is_leased_before_a_replenished_vad_queue(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """vad_chunk（優先度 50）が絶えず届いても、始められる分離（150）を飢えさせない（§9 allowed_types の予約）。
+    STT が抜けていて分離が待っていれば、次の 1 件は分離だけにする。"""
+    # Arrange: 分離が待っている。録音中の会議の vad_chunk も届いている（分離より優先度が高い）
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE meeting_id = 'm-1'")
+        chunks = repo.list_chunks(conn, "m-1")
+        diarize_id = repo.insert_job(conn, "m-1", "diarize_meeting")
+        for c in chunks[:2]:
+            repo.insert_job(conn, "m-1", "vad_chunk", chunk_id=c.id)
+    # Act
+    types = runner3.allowed_types()
+    async with ctx3.db.write() as conn:
+        leased = repo_phase3.lease_job_fair(conn, runner3.owner, types, now_ms())
+    # Assert: 届いている vad_chunk より先に分離を lease する
+    assert types == ["diarize_meeting"]
+    assert leased is not None and leased.id == diarize_id
+
+
+async def test_hung_diarize_times_out_and_keeps_the_slot_until_its_thread_exits(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                               runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """生きたまま固まった分離（heartbeat が lease を延ばすので lease 切れでは見つからない）は時間切れで見放す（§21 handle_diarize）。
+    ジョブは再試行せず failed にして話者分離なしで merge・要約へ進む。枠はスレッドが抜けるまで返さず（次の分離は始めない）、
+    見放したスレッドは STT と要約の排他では数えない。スレッドが抜ければ枠を返す。"""
+    # Arrange: 分離が gate まで返らない。時間切れを短くする
+    provider = _BlockingDiarization()
+    ctx3.diarization = provider
+    monkeypatch.setattr(handlers_module, "_diarize_timeout_s", lambda ctx, targets: 0.05)
+    await _two_source_meeting(client3)
+    try:
+        # Act
+        await runner3.run_until_idle()
+        # Assert: 分離は時間切れで failed（再試行しない）、merge と要約は進む
+        with ctx3.db.read() as conn:
+            m = repo.get_meeting(conn, "m-1")
+            jobs = {j.job_type: (j.status, j.error_class) for j in repo.list_jobs(conn, "m-1")
+                    if j.job_type in ("diarize_meeting", "merge_transcript")}
+        assert provider.calls == 1
+        assert jobs == {"diarize_meeting": ("failed", "TIMEOUT"), "merge_transcript": ("completed", None)}
+        assert m is not None and m.status == "completed"
+        # Assert: スレッドが走っている間は枠を持つ。見放したスレッドは STT の排他では数えない
+        assert ctx3.diarize_slots.locked() and ctx3.diarize_abandoned == 1
+        types = set(runner3.allowed_types())
+        assert "diarize_meeting" not in types and {"transcribe_chunk", "live_transcribe_chunk"} <= types
+    finally:
+        provider.gate.set()
+    # Act: スレッドが抜ける
+    for _ in range(500):
+        if not ctx3.diarize_slots.locked():
+            break
+        await asyncio.sleep(0.01)
+    # Assert: 枠を返し、見放した数も戻る
+    assert not ctx3.diarize_slots.locked() and ctx3.diarize_abandoned == 0
+
+
 async def test_stt_keeps_priority_when_no_diarize_is_ready(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
     """分離が待っていない（無い、または再試行の待ち時間中）なら、従来どおり STT を lease し、優先度の順（ライブ STT が先）に戻る（§9）。"""
     # Arrange: ライブ STT が届いている。分離は再試行の待ち時間中（next_run_at が先）
@@ -6644,7 +6824,10 @@ import asyncio
 import io
 import json
 import os
+import shutil
+import sqlite3
 import threading
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -6654,6 +6837,7 @@ import pytest
 from minutes_local.bootstrap import build_context, open_database_with_recovery
 from minutes_local.config import Settings
 from minutes_local.db import repo, repo_phase3
+from minutes_local.db.migrations_phase3 import LATEST_SCHEMA_VERSION
 from minutes_local.db.models import Meeting
 from minutes_local.db.connection import Database, now_ms
 from minutes_local.jobs import scheduler
@@ -6927,13 +7111,14 @@ async def test_rebuild_drops_malformed_stop_pair(client3: httpx.AsyncClient, ctx
 
 @pytest.mark.parametrize("ended", [-1, 2**63, True, "1700000000000", 1.5])
 async def test_rebuild_drops_malformed_end_time(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner, ended: object) -> None:
-    """SQLite INTEGER に入らない・整数でない終了時刻は None にし、rebuild 全体を止めない（会議と Chunk は復元する）。"""
+    """SQLite INTEGER に入らない・整数でない終了時刻は None にし、rebuild 全体を止めない（会議と Chunk は復元する）。
+    確定したかが分からないので、会議は recording に戻す（不正な終了時刻を確定の根拠にしない。§20 _restored_status）。"""
     # Arrange / Act
     await _completed_meeting(client3, runner3, ctx3)
     report, m = _rewrite_snapshot_and_rebuild(ctx3, endedAtEpochMs=ended)
     # Assert
     assert report.meetings_created == 1 and report.chunks_created == 2
-    assert m is not None and m.status == "finalized" and m.ended_at is None
+    assert m is not None and m.status == "recording" and m.ended_at is None
 
 
 async def test_missing_chunk_is_reported_for_resync(client3: httpx.AsyncClient, ctx3: AppContext) -> None:
@@ -7266,7 +7451,8 @@ async def test_backup_failure_leaves_no_partial_file(ctx3: AppContext, monkeypat
 
 
 async def test_restore_skips_broken_backup(ctx3: AppContext) -> None:
-    """最新のバックアップが壊れていても、検査に通る最も新しいものから復元する。"""
+    """最新のバックアップが壊れていても、検査に通る最も新しいものから復元する。integrity_check に通っても、このアプリの
+    スキーマ（schema_version が 1 以上・このビルドの最新以下）を持たないものは飛ばし、1 つ古いものへ下がる。"""
     # Arrange
     s = ctx3.settings
     good = backup.create_backup(ctx3.db, s.backups_dir)
@@ -7278,7 +7464,19 @@ async def test_restore_skips_broken_backup(ctx3: AppContext) -> None:
     corrupt = s.backups_dir / f"minutes-{gen + 2}-{stamp}.sqlite"
     empty.write_bytes(b"")                                                               # 空のファイルは integrity_check に通るが中身がない
     corrupt.write_bytes(b"partial")
-    assert backup.list_backups(s.backups_dir) == [good, empty, corrupt]                 # 新しい順に corrupt → empty → good を試す
+    # integrity_check には通るが、このアプリのスキーマを持たない DB（表が無い・別のアプリ・このビルドより新しい版）
+    foreign = s.backups_dir / f"minutes-{gen + 3}-{stamp}.sqlite"
+    newer = s.backups_dir / f"minutes-{gen + 4}-{stamp}.sqlite"
+    with closing(sqlite3.connect(foreign)) as conn:
+        conn.execute("CREATE TABLE other (x INTEGER)")
+        conn.commit()
+    shutil.copyfile(good, newer)
+    with closing(sqlite3.connect(newer)) as conn:
+        conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (?, 0)", (LATEST_SCHEMA_VERSION + 1,))
+        conn.commit()
+    assert backup.integrity_ok(foreign) and backup.integrity_ok(newer)
+    # 新しい順に newer → foreign → corrupt → empty → good を試す
+    assert backup.list_backups(s.backups_dir) == [good, empty, corrupt, foreign, newer]
     ctx3.db.close()
     s.db_path.write_bytes(b"garbage" * 100)
     # Act
@@ -7913,7 +8111,8 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | lease 済みの merge が書く前に手動 STT の Chunk が初めて完了すると、その merge の行を消して書かせず（話者の無い segments を公開しない）、作り直した分離の完了後の merge が話者付きで入れる（§8 `on_transcribe_completed`・`repo_phase3.discard_meeting_job`） | `test_manual_stt_committed_before_leased_merge_writes_discards_that_merge` |
 | 同時に走らせる話者分離は `MAX_CONCURRENT_DIARIZE` 本まで。pending に戻した分離の次の試行は、旧い試行のスレッドが抜けるまで分離を始めず、その間 Runner は分離と（STT と並べない設定なら）要約を lease しない。lease した分離の行がある間も（枠を取る前でも）次の分離を lease しない。分離を待つハンドラがキャンセルされても、スレッドが抜けるまで枠を返さない（§7 `diarize_slots`・§9 `allowed_types`・§21 `handle_diarize`） | `test_requeued_diarize_waits_for_the_running_attempt`、`test_cancelled_diarize_keeps_the_slot_until_its_thread_exits`、`test_leased_diarize_blocks_next_diarize_before_taking_the_slot` |
 | 分離が failed で確定して作った merge ジョブ（`on_job_failed` の戻り値）は、Runner の失敗時も Sweeper の回数切れも、コミット後に流す（完了時の後続ジョブと同じ。§8 `on_job_failed`・§9 `_on_failure`・Phase 2 §14 `sweep_once`） | `test_failed_diarize_publishes_the_merge_job_it_creates`、`test_exhausted_diarize_publishes_the_merge_job_it_creates` |
-| lease できる分離が待っていれば、ライブ STT が絶えず届いても新しい STT を lease せず、実行中の STT が抜けたら分離を lease する。待つ分離が無い（再試行の待ち時間中を含む）なら従来の優先度の順（§9 `allowed_types`・`repo_phase3.has_ready_job`） | `test_pending_diarize_is_admitted_despite_a_replenished_live_queue`、`test_stt_keeps_priority_when_no_diarize_is_ready` |
+| lease できる分離が待っていれば、ライブ STT が絶えず届いても新しい STT を lease せず、実行中の STT が抜けたら次の 1 件を分離に予約する（vad_chunk が絶えず届いても分離が先）。待つ分離が無い（再試行の待ち時間中を含む）なら従来の優先度の順（§9 `allowed_types`・`repo_phase3.has_ready_job`） | `test_pending_diarize_is_admitted_despite_a_replenished_live_queue`、`test_stt_keeps_priority_when_no_diarize_is_ready`、`test_ready_diarize_is_leased_before_a_replenished_vad_queue` |
+| 固まった分離は時間切れで見放し、ジョブは再試行せず failed にして話者分離なしで merge・要約へ進む。枠はスレッドが抜けるまで返さず、見放したスレッドは STT と要約の排他で数えない（§21 `handle_diarize`・§9 `_on_failure`・`allowed_types`） | `test_hung_diarize_times_out_and_keeps_the_slot_until_its_thread_exits` |
 | 分離の読み込みは、Chunk ごとにその source の残りの上限を渡し、上限を超える音声は全量を PCM にする前に断る（読む量を WAV はヘッダ + PCM、圧縮ファイルは最悪の符号化の大きさ `max_encoded_bytes` で止め、圧縮ファイルはさらに上限 + 1 サンプルで止めた復号で判定。§16 `read_pcm`・§21 `_load_and_diarize`） | `test_read_pcm_rejects_audio_longer_than_limit_before_decoding_all`、`test_read_pcm_bounds_compressed_file_read_before_decoding`、`test_flac_worst_case_bound_admits_incompressible_audio`、`test_diarize_reads_each_chunk_within_remaining_timeline_budget` |
 | merge が書き込みをコミットした後に回数切れで failed になっても、その merge が終わる前に置いた撮り直しは作り直した merge が公開する（同じミリ秒でも）。落ち続ける merge は際限なく作り直さない（§8 `rerun_merge_for_staged`。Phase 2 のテストを Phase 3 の pipeline で実行） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly`（Phase 2 §23） |
 | 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
@@ -7923,7 +8122,7 @@ def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureF
 | 圧縮の往復検証・不一致時の保持 | `test_compress_replaces_wav_after_roundtrip`、`test_compress_keeps_wav_when_roundtrip_mismatches`、`test_flac_codec_roundtrip_is_bit_exact`（実コーデック。`soundfile` がなければ skip） |
 | 圧縮と他の処理の競合（読み取りの読み直し・再実行後は切り替えない・残った WAV の掃除） | `test_reader_follows_chunk_replaced_by_compression`、`test_compress_does_not_switch_after_job_was_withdrawn`、`test_compress_retry_removes_wav_left_by_crash` |
 | バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
-| バックアップの原子性・壊れたバックアップを復元元にしない | `test_backup_failure_leaves_no_partial_file`、`test_restore_skips_broken_backup` |
+| バックアップの原子性・壊れたバックアップと、このアプリのスキーマを持たない（`schema_version` が無い・新しすぎる）バックアップを復元元にしない | `test_backup_failure_leaves_no_partial_file`、`test_restore_skips_broken_backup` |
 | バックアップは 24 時間に 1 回・定期処理のループが失敗で終わらない | `test_scheduler_backs_up_only_when_a_day_has_passed`、`test_scheduler_loop_survives_failed_iteration` |
 | 圧縮後の古い行を検証した圧縮ファイルへ向け直す。行が指すファイルが壊れていれば向け直し、健全なら向け直さない。代わりがなければ `missing` | `test_rebuild_relinks_chunk_compressed_after_backup`、`test_rebuild_relinks_only_when_existing_recording_is_corrupt`、`test_rebuild_relink_records_the_bytes_it_validated` |
 | rebuild は、読んだ後に消えた・読めなくなった録音をそのファイルだけ飛ばし、残りを復元する（§18 `rebuild`） | `test_rebuild_skips_recording_that_disappears_after_reading` |
