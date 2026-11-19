@@ -6117,12 +6117,14 @@ NETWORK_ALLOWED: dict[str, set[str]] = {
     "requests": set(), "aiohttp": set(), "urllib3": set(), "websockets": set(),
 }
 # import を見るだけでは拾えない、どのモジュールからでも呼べる接続・子プロセスの起動（asyncio と os の関数）と、
-# 別の経路で得たソケットの低水準の接続（connect_ex、イベントループの sock_connect・sock_sendto）。
+# 別の経路で得たソケットの低水準の接続（connect_ex、イベントループの sock_connect・sock_sendto）と、接続せずに宛先を付けて送る
+# データグラムの送信（sendto・sendmsg）。待ち受けのために socket を許した bootstrap でも、UDP のソケットを作れば connect を通らずに
+# 外へ送れる（socket.socket(AF_INET, SOCK_DGRAM).sendto）。待ち受けのソケット（TCP）は sendto・sendmsg を使わない。
 # 「connect」は socket・_socket を import したモジュール（許可した bootstrap を含む）でだけ数える（_network_calls）。どこでも数えると
 # sqlite3.connect と区別できない。import の許可だけでは、待ち受けのために socket を許したモジュールの socket.socket().connect を塞げない
 NETWORK_CALLS = {"open_connection", "open_unix_connection", "create_connection", "create_datagram_endpoint",
                  "create_subprocess_exec", "create_subprocess_shell", "urlopen",
-                 "connect_ex", "sock_connect", "sock_sendto"}
+                 "connect_ex", "sock_connect", "sock_sendto", "sendto", "sendmsg"}
 OS_PROCESS_CALLS = re.compile(r"system|popen|exec\w*|spawn\w*|posix_spawn\w*")
 
 
@@ -6246,6 +6248,19 @@ def test_network_calls_detects_socket_connect(tmp_path: Path) -> None:
     assert _network_calls(aliased) == {"connect"}
     assert _network_calls(db_only) == set()
     assert _network_calls(no_socket) == set()
+
+
+def test_network_calls_detects_datagram_send_in_allowed_socket_module(tmp_path: Path) -> None:
+    """socket の import を許した bootstrap.py でも、宛先を付けたデータグラムの送信（sendto・sendmsg）は違反。
+    UDP のソケットは connect を通らずに外へ送れるので、「.connect」だけを数えるとすり抜ける。"""
+    # Arrange
+    src = tmp_path / "bootstrap.py"
+    src.write_text("import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.sendto(b'x', ('203.0.113.1', 53))\n"
+                   "s.sendmsg([b'x'], [], 0, ('203.0.113.1', 53))\n", encoding="utf-8")
+    # Act
+    offenders = _network_offenders("bootstrap.py", src)
+    # Assert: socket の import そのものは許可のまま（違反に出ない）
+    assert sorted(offenders) == ["bootstrap.py: sendmsg", "bootstrap.py: sendto"]
 
 
 def test_stt_worker_does_not_import_db() -> None:
