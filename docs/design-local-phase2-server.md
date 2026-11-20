@@ -5,7 +5,7 @@
 **対となる文書:** Phase 2 詳細設計書 ── ブラウザ側（`docs/design-local-phase2-client.md`）。
 **配置:** `docs/design-local-phase2-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。
-**検証状態:** 本書のコードブロック（61 ファイル：`pyproject.toml`・実装 47・テスト 13）はパッケージとして抽出でき、Fake Provider による pytest 13 ファイル 128 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-13、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。Fake Provider のテストが通らない経路（実行デバイスの選定、faster-whisper の呼び出し、プロセスプールの作り直し、起動後のモデルの選び直し、モデルの取得、SSE の keepalive）は §23.8.2 がスタブと実プロセスで確かめる。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
+**検証状態:** 本書のコードブロック（61 ファイル：`pyproject.toml`・実装 47・テスト 13）はパッケージとして抽出でき、Fake Provider による pytest 13 ファイル 131 件が Python 3.12 + FastAPI + pydantic v2 で全件通過し、pyflakes の指摘もないことを確認している（2026-11-13、§23）。再現は `scripts/verify-design-docs.sh server`。実モデル（faster-whisper / Silero / Ollama）は実行していない。Fake Provider のテストが通らない経路（実行デバイスの選定、faster-whisper の呼び出し、プロセスプールの作り直し、起動後のモデルの選び直し、モデルの取得、SSE の keepalive）は §23.8.2 がスタブと実プロセスで確かめる。本書のコードを変えたら同じスクリプトを通す。Phase 3 サーバー設計書は本書のファイルを全文で差し替えているので、**本書を変えたら Phase 3 側の同じファイルにも同じ変更を当てる**（スクリプトが Phase 3 も続けて検証する）。
 
 ---
 
@@ -114,7 +114,7 @@ testpaths = ["tests"]
 | SQLite 書き込みは 1 接続 | `Database.write()` のみが `BEGIN IMMEDIATE` を発行。`asyncio.Lock` で直列化 | `grep -r "BEGIN" minutes_local/` が `db/connection.py` のみ |
 | ワーカーは DB を触らない | `stt/worker.py` は `minutes_local.db` を import しない。結果は dataclass で返す | import 検査テスト（§23.1） |
 | Provider 抽象 + Fake | STT / VAD / LLM は `Protocol` で定義し、実 Provider と Fake Provider を差し替え可能にする | テストは Fake のみ使う |
-| 外部通信は 2 モジュールのみ | `httpx` の import は `llm/ollama_provider.py` と `storage/models_dir.py` に限定 | import 検査テスト（§23.1） |
+| 外部通信は 2 モジュールのみ | `httpx` の import は `llm/ollama_provider.py` と `storage/models_dir.py` に限定。ほかの通信手段（`urllib.request`・`http.client`・`socket`・`subprocess`・asyncio の接続と子プロセス・`os.system` など）も許可したモジュールだけ（`socket` は待ち受けの `bootstrap.py`、`subprocess` は `bootstrap.py`・`hw/detect.py`。どちらも外へ接続しない） | import 検査テスト（§23.2） |
 | 例外を握りつぶさない | ジョブハンドラの例外は `JobError` 階層に正規化して `processing_jobs.error_class` に記録。`except Exception: pass` を書かない | コードレビュー |
 | 早期リターン | 判定の入れ子を避ける | — |
 
@@ -424,7 +424,8 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
   last_error    TEXT,
   duration_ms   INTEGER,
   created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  updated_at    INTEGER NOT NULL,
+  input_transcript_version INTEGER  -- 要約の試行が合成に使う transcript の版。handle_summary が控え、lease で消す（sweeper が比べる）
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_transcribe_job
   ON processing_jobs(meeting_id, chunk_id) WHERE job_type = 'transcribe_chunk';
@@ -461,6 +462,37 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_segments_meeting_time ON transcript_segments(meeting_id, start_ms);
 CREATE INDEX IF NOT EXISTS idx_segments_merged ON transcript_segments(meeting_id, merged_version);
+-- 完了済みの Chunk を撮り直した結果の置き場（§12 handle_transcribe）。次の merge が版を上げるのと同じトランザクションで
+-- transcript_segments と入れ替える（repo.promote_replacements）。それまで公開中の版の行には触れない。
+-- 撮り直しの結果が 0 件（無音）でも入れ替えるので、Chunk ごとの印（segment_replacements）と行（staged_segments）を分ける。
+-- staged_during_merge は置いた時点で終わっていなかった merge ジョブの id（無ければ NULL）。その merge が書き込みの後に回数切れで
+-- failed になったとき、作り直すかを決める（pipeline.rerun_merge_for_staged。時刻では同じミリ秒の前後が分からない）
+CREATE TABLE IF NOT EXISTS segment_replacements (
+  chunk_id            TEXT PRIMARY KEY REFERENCES audio_chunks(id) ON DELETE CASCADE,
+  meeting_id          TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  created_at          INTEGER NOT NULL,
+  staged_during_merge TEXT
+);
+CREATE TABLE IF NOT EXISTS staged_segments (
+  id              TEXT PRIMARY KEY,
+  meeting_id      TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  chunk_id        TEXT NOT NULL REFERENCES segment_replacements(chunk_id) ON DELETE CASCADE,
+  source          TEXT NOT NULL CHECK (source IN ('mic','system')),
+  segment_index   INTEGER NOT NULL,
+  start_ms        INTEGER NOT NULL,
+  end_ms          INTEGER NOT NULL,
+  text            TEXT NOT NULL,
+  normalized_text TEXT,
+  language        TEXT,
+  confidence      REAL,
+  no_speech_prob  REAL,
+  merged_version  INTEGER,
+  merge_reason    TEXT,
+  speaker_id         TEXT,
+  speaker_confidence REAL,
+  created_at      INTEGER NOT NULL,
+  UNIQUE (chunk_id, segment_index)
+);
 """),
     (6, """
 CREATE TABLE IF NOT EXISTS meeting_summary_versions (
@@ -902,7 +934,8 @@ def lease_job(conn: sqlite3.Connection, owner: str, allowed_types: list[str], no
     placeholders = ",".join("?" for _ in allowed_types)
     row = conn.execute(
         f"""UPDATE processing_jobs
-            SET status = 'leased', lease_until = ?, lease_owner = ?, attempts = attempts + 1, updated_at = ?
+            SET status = 'leased', lease_until = ?, lease_owner = ?, attempts = attempts + 1, updated_at = ?,
+                input_transcript_version = NULL
             WHERE id = (
               SELECT id FROM processing_jobs
               WHERE status IN ('pending','retrying') AND next_run_at <= ? AND job_type IN ({placeholders})
@@ -957,14 +990,35 @@ def finish_job(conn: sqlite3.Connection, job_id: str, owner: str, attempts: int,
     return cur.rowcount == 1
 
 
-def sweep_expired(conn: sqlite3.Connection, now: int) -> int:
-    cur = conn.execute(
+def fail_exhausted_expired(conn: sqlite3.Connection, now: int) -> list[Job]:
+    """lease が切れたジョブのうち、試行回数を使い切ったものを failed にして返す。sweep_expired() より先に呼ぶ。
+
+    lease 切れは、ワーカーがジョブを抱えたまま落ちた・固まったことを意味し、Runner の失敗処理（回数の判定）を通らない。
+    回数を見ずに pending へ戻すと、実行するたびにプロセスを落とすジョブ（メモリ不足で OS に止められる等）が、
+    サーバーを起動し直すたびに永久に実行される。attempts は lease のたびに進む（lease_job）ので、ここで上限と比べる。
+    後続の処理（Chunk を failed にする等）は呼び出し側が pipeline.on_job_failed() で行う。
+    """
+    rows = conn.execute(
+        """UPDATE processing_jobs
+           SET status = 'failed', error_class = 'INTERNAL', last_error = 'lease expired; attempts exhausted',
+               lease_until = NULL, lease_owner = NULL, updated_at = ?
+           WHERE status IN ('leased','processing') AND lease_until IS NOT NULL AND lease_until < ? AND attempts >= max_attempts
+           RETURNING *""",
+        (now, now),
+    ).fetchall()
+    return [_row(Job, r) for r in rows]
+
+
+def sweep_expired(conn: sqlite3.Connection, now: int) -> list[Job]:
+    """lease が切れたジョブを pending に戻して返す。返したジョブは呼び出し側がコミット後に配信する（§14）。"""
+    rows = conn.execute(
         """UPDATE processing_jobs
            SET status = 'pending', lease_until = NULL, lease_owner = NULL, last_error = 'lease expired', updated_at = ?
-           WHERE status IN ('leased','processing') AND lease_until IS NOT NULL AND lease_until < ?""",
+           WHERE status IN ('leased','processing') AND lease_until IS NOT NULL AND lease_until < ?
+           RETURNING *""",
         (now, now),
-    )
-    return cur.rowcount
+    ).fetchall()
+    return [_row(Job, r) for r in rows]
 
 
 def count_jobs(conn: sqlite3.Connection, meeting_id: str | None, job_type: str, statuses: list[str]) -> int:
@@ -1001,6 +1055,67 @@ def delete_finished_job(conn: sqlite3.Connection, meeting_id: str, job_type: Job
     )
 
 
+def record_input_transcript_version(conn: sqlite3.Connection, job_id: str, owner: str, attempts: int, version: int) -> bool:
+    """要約の試行が合成に使う transcript の版を控える（lease の現行の所有者だけ）。
+
+    ワーカーが合成の途中で落ちると失敗は報告されず、Sweeper は lease 切れでしか知らない。控えた版を今の版と比べ、
+    進んでいれば古い版に対する試行として回数に数えずに戻す（list_expired_stale_summaries）。lease_job が消すので、
+    控える前に落ちた試行は前の試行の版で比べられない（比べると、落ち続ける試行を回数を戻して際限なく繰り返す）
+    """
+    cur = conn.execute(
+        "UPDATE processing_jobs SET input_transcript_version = ? WHERE id = ? AND lease_owner = ? AND attempts = ?",
+        (version, job_id, owner, attempts),
+    )
+    return cur.rowcount == 1
+
+
+def mark_job_committed(conn: sqlite3.Connection, job_id: str, owner: str, attempts: int) -> bool:
+    """ハンドラが結果をコミットするトランザクションの中で、実行中の試行を completed にする（lease の現行の所有者だけ）。
+
+    lease は外さない。続く Runner の finish_job（lease_owner と attempts の条件）がそのまま当たり、所要時間とモデル名を記録して
+    lease を外す。finish_job の前にワーカーが落ちても、Sweeper（leased / processing だけを見る）はこの行を拾わないので、
+    コミット済みの結果を作り直さず、failed にもしない。要約（handle_summary）では、その後に transcript の版が進んでも
+    list_expired_stale_summaries が戻さない（戻すと、§12.7 で利用者の操作に限る「進んだ後の再生成」が自動で走る）
+    """
+    cur = conn.execute(
+        "UPDATE processing_jobs SET status = 'completed', updated_at = ? WHERE id = ? AND lease_owner = ? AND attempts = ?",
+        (now_ms(), job_id, owner, attempts),
+    )
+    return cur.rowcount == 1
+
+
+def list_expired_stale_summaries(conn: sqlite3.Connection, now: int) -> list[Job]:
+    """lease が切れた要約ジョブのうち、控えた版（record_input_transcript_version）が今の会議の版と違うもの。控えていなければ含めない。
+
+    要約をコミットした試行は含めない。handle_summary は要約と同じトランザクションでジョブを completed にする（mark_job_committed）ので、
+    leased / processing だけを見るこの条件に当たらない。版の比較は、まだ要約をコミットしていない試行だけに掛かる
+    """
+    rows = conn.execute(
+        """SELECT j.* FROM processing_jobs j JOIN meetings m ON m.id = j.meeting_id
+           WHERE j.job_type = 'synthesize_minutes' AND j.status IN ('leased','processing')
+             AND j.lease_until IS NOT NULL AND j.lease_until < ?
+             AND j.input_transcript_version IS NOT NULL AND j.input_transcript_version != m.transcript_version""",
+        (now,),
+    ).fetchall()
+    return [_row(Job, r) for r in rows]
+
+
+def requeue_job(conn: sqlite3.Connection, job_id: str, owner: str, attempts: int) -> bool:
+    """実行中の試行を取り消し、同じ行を pending に戻す（lease の現行の所有者だけ。試行回数は戻す）。
+
+    ハンドラが結果を捨ててやり直すときに使う（handle_summary：合成の間に transcript の版が進んだ）。Sweeper も、合成の途中で
+    落ちた要約の試行の版が古いときに使う（sweeper.sweep_once。lease を外す前に呼ぶ）。lease を外すので、
+    戻った後の Runner の finish_job（lease_owner と attempts の条件）は 0 行になり、この試行を completed にしない。
+    """
+    cur = conn.execute(
+        """UPDATE processing_jobs
+           SET status = 'pending', attempts = attempts - 1, lease_owner = NULL, lease_until = NULL, next_run_at = 0, updated_at = ?
+           WHERE id = ? AND lease_owner = ? AND attempts = ?""",
+        (now_ms(), job_id, owner, attempts),
+    )
+    return cur.rowcount == 1
+
+
 def reset_job_for_rerun(conn: sqlite3.Connection, meeting_id: str, job_type: JobType) -> None:
     """merge / summary の再実行：同じ行を pending に戻す（基本設計 §8.5）。"""
     conn.execute(
@@ -1011,23 +1126,26 @@ def reset_job_for_rerun(conn: sqlite3.Connection, meeting_id: str, job_type: Job
 
 # ---- transcript_segments ----
 
+_SEGMENT_COLUMNS = ("id, meeting_id, chunk_id, source, segment_index, start_ms, end_ms, text, normalized_text, "
+                    "language, confidence, no_speech_prob, merged_version, merge_reason, speaker_id, speaker_confidence, created_at")
+
+
 def insert_segments(conn: sqlite3.Connection, segments: list[Segment], *,
-                    job_id: str, owner: str, attempts: int) -> int:
+                    job_id: str, owner: str, attempts: int, staged: bool = False) -> int:
     """UNIQUE (chunk_id, segment_index) + INSERT OR IGNORE（Invariant 5）。
 
     書き込み前に lease を検証する。完了報告を弾くだけでは不十分で、リースが切れた旧ワーカーの
     結果が先に UNIQUE 行を埋めると、正規の再試行の結果が INSERT OR IGNORE で黙って捨てられる。
     検証と INSERT は同じトランザクションで行う（呼び出し側が write() で開いている）。
+    staged=True は撮り直しの結果を staged_segments に書く（先に stage_replacement を呼ぶ）。
     """
     if not lease_is_current(conn, job_id, owner, attempts):
         return 0        # 失効したワーカーの結果は破棄する
+    table = "staged_segments" if staged else "transcript_segments"
     n = 0
     for s in segments:
         cur = conn.execute(
-            """INSERT OR IGNORE INTO transcript_segments
-               (id, meeting_id, chunk_id, source, segment_index, start_ms, end_ms, text, normalized_text,
-                language, confidence, no_speech_prob, merged_version, merge_reason, speaker_id, speaker_confidence, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            f"INSERT OR IGNORE INTO {table} ({_SEGMENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (s.id, s.meeting_id, s.chunk_id, s.source, s.segment_index, s.start_ms, s.end_ms, s.text,
              s.normalized_text, s.language, s.confidence, s.no_speech_prob, s.merged_version, s.merge_reason,
              s.speaker_id, s.speaker_confidence, s.created_at),
@@ -1098,6 +1216,48 @@ def list_segments(conn: sqlite3.Connection, meeting_id: str, merged_version: int
 
 def delete_segments_of_chunk(conn: sqlite3.Connection, chunk_id: str) -> None:
     conn.execute("DELETE FROM transcript_segments WHERE chunk_id = ?", (chunk_id,))
+
+
+def stage_replacement(conn: sqlite3.Connection, meeting_id: str, chunk_id: str) -> None:
+    """完了済みの Chunk の撮り直しを始める。前の撮り直しでまだ merge されていない結果は捨てる（staged_segments は CASCADE）。
+
+    この時点で終わっていない merge ジョブ（一意制約で多くて 1 行）の id を控える（has_replacements_staged_during）
+    """
+    conn.execute("DELETE FROM segment_replacements WHERE chunk_id = ?", (chunk_id,))
+    open_merge = conn.execute(
+        "SELECT id FROM processing_jobs WHERE meeting_id = ? AND job_type = 'merge_transcript' "
+        "AND status IN ('pending','leased','processing','retrying')",
+        (meeting_id,),
+    ).fetchone()
+    conn.execute("INSERT INTO segment_replacements (chunk_id, meeting_id, created_at, staged_during_merge) VALUES (?,?,?,?)",
+                 (chunk_id, meeting_id, now_ms(), open_merge["id"] if open_merge is not None else None))
+
+
+def promote_replacements(conn: sqlite3.Connection, meeting_id: str) -> int:
+    """撮り直した Chunk の segments を staged_segments から transcript_segments へ入れ替える。戻り値は Chunk 数。
+
+    run_merge が版を上げるのと同じトランザクションで呼ぶ。merge が失敗すれば入れ替えごと巻き戻り、公開中の版が残る。
+    消した行を引用している要約は書き換えない。クライアントが表示中の transcript と照合して、生成時の引用として出す（基本設計 §12.7）。
+    """
+    rows = conn.execute("SELECT chunk_id FROM segment_replacements WHERE meeting_id = ? ORDER BY chunk_id", (meeting_id,)).fetchall()
+    for r in rows:
+        conn.execute("DELETE FROM transcript_segments WHERE chunk_id = ?", (r["chunk_id"],))
+        conn.execute(f"INSERT INTO transcript_segments ({_SEGMENT_COLUMNS}) SELECT {_SEGMENT_COLUMNS} FROM staged_segments WHERE chunk_id = ?",
+                     (r["chunk_id"],))
+    conn.execute("DELETE FROM segment_replacements WHERE meeting_id = ?", (meeting_id,))
+    return len(rows)
+
+
+def has_replacements(conn: sqlite3.Connection, meeting_id: str) -> bool:
+    """まだ merge で入れ替えていない撮り直し（segment_replacements）があるか。"""
+    return conn.execute("SELECT 1 FROM segment_replacements WHERE meeting_id = ? LIMIT 1", (meeting_id,)).fetchone() is not None
+
+
+def has_replacements_staged_during(conn: sqlite3.Connection, meeting_id: str, merge_job_id: str) -> bool:
+    """merge_job_id の merge が終わる前に置いた、まだ入れ替えていない撮り直しがあるか（pipeline.on_job_failed の merge の分岐）。"""
+    return conn.execute(
+        "SELECT 1 FROM segment_replacements WHERE meeting_id = ? AND staged_during_merge = ? LIMIT 1", (meeting_id, merge_job_id)
+    ).fetchone() is not None
 
 
 def set_merge_result(conn: sqlite3.Connection, segment_id: str, merged_version: int | None, reason: str) -> None:
@@ -1730,6 +1890,8 @@ class JobError(Exception):
     error_class: ErrorClass = "INTERNAL"
     retryable: bool = True
     counts_attempt: bool = True   # False = attempts を消費しない（無期限 retry）
+    # ハンドラが入力にした transcript の版（handle_summary が付ける）。Runner の _on_failure が記録と同じトランザクションで今の版と比べる
+    input_transcript_version: int | None = None
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
@@ -1869,37 +2031,102 @@ def on_finalized(conn: sqlite3.Connection, meeting_id: str) -> int:
     return created
 
 
-def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: bool, model_name: str | None) -> None:
-    """has_voice なら transcribe_chunk を生成、そうでなければ skipped。"""
+def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: bool, model_name: str | None) -> bool:
+    """has_voice なら transcribe_chunk を生成、そうでなければ skipped。戻り値は結果を適用したか。
+
+    適用するのは Chunk が pending のときだけ。VAD の結果をコミットした後、finish_job の前に lease が切れて回数切れで
+    回収された vad ジョブを再試行すると、既に queued / completed の Chunk に来る。queued に戻すと、transcribe ジョブは
+    既存（一意制約）で作り直されず、Chunk が queued のまま merge を止める（§14）。
+    """
+    current = repo.get_chunk(conn, chunk.id)
+    if current is not None and current.stt_status != "pending":
+        ensure_merge_job(conn, chunk.meeting_id)
+        return False
     if has_voice:
         repo.update_chunk(conn, chunk.id, stt_status="queued")
         repo.insert_job(conn, chunk.meeting_id, "transcribe_chunk", chunk_id=chunk.id, model_name=model_name)
     else:
         repo.update_chunk(conn, chunk.id, stt_status="skipped")
     ensure_merge_job(conn, chunk.meeting_id)
+    return True
 
 
-def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
+def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk) -> str | None:
+    """戻り値は作った merge ジョブの id（ensure_merge_job）。呼び出し側がコミット後にイベントを流す。"""
     repo.update_chunk(conn, chunk.id, stt_status="completed")
-    ensure_merge_job(conn, chunk.meeting_id)
+    return ensure_merge_job(conn, chunk.meeting_id)
 
 
 def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
-    """failed は merge をブロックする。利用者が retry か exclude_failed を選ぶまで待つ（v4.0 §97〜§98）。"""
+    """failed は merge をブロックする。利用者が retry か exclude_failed を選ぶまで待つ（v4.0 §97〜§98）。
+
+    completed の Chunk は変えない。ハンドラが結果を書いた後、finish_job の前に lease が切れて Sweeper が回数切れで
+    回収すると、ここに来る。failed にすると書き込み済みの segments が gap になる（§14）。
+    """
+    current = repo.get_chunk(conn, chunk.id)
+    if current is not None and current.stt_status == "completed":
+        return
     repo.update_chunk(conn, chunk.id, stt_status="failed")
 
 
-def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str) -> bool:
-    """全 Chunk が終端（completed / skipped / 除外承認済み failed）かつ vad が残っていなければ merge を生成。"""
+def on_job_failed(conn: sqlite3.Connection, job: Job) -> str | None:
+    """ジョブが failed で確定した後の後続処理。Runner（ハンドラの失敗）と Sweeper（lease 切れで回数切れ）が同じ規則を使う。
+
+    戻り値は後続処理で作ったジョブの id（作らなければ None）。呼び出し側がコミット後にイベントを流す（完了時の後続ジョブと同じ）。
+    Phase 2 で作るのは、入れ替え待ちの撮り直しを公開する merge だけ（rerun_merge_for_staged）。Phase 3 の差し替え版は
+    diarize_meeting の失敗でも merge を作る。
+    状態の対応は §14 の表。vad_chunk / merge_transcript の失敗では Chunk も会議も変えない（会議の failed は
+    merge 済みを意味する。§21.1 MERGED_STATUSES）。Chunk の pending（vad）と merge の未完了が後続を止めたまま、
+    失敗したジョブの再試行（POST /jobs/{id}/retry）を待つ。exclude_failed の対象ではない。
+    """
+    if job.job_type == "transcribe_chunk":
+        on_transcribe_failed(conn, job_of_chunk(conn, job))
+    elif job.job_type == "synthesize_minutes":
+        on_summary_failed(conn, job.meeting_id)
+    elif job.job_type == "vad_chunk":
+        # Chunk の stt_status を failed にしない。failed は BLOCKING_STT に含まれず、他の Chunk の完了を契機に
+        # その Chunk を欠いたまま merge が作られる。pending のままなら ensure_merge_job が止まる
+        return None
+    elif job.job_type == "merge_transcript":
+        return rerun_merge_for_staged(conn, job)
+    return None
+
+
+def rerun_merge_for_staged(conn: sqlite3.Connection, job: Job) -> str | None:
+    """failed で確定した merge の後に、入れ替え待ちの撮り直しを公開する merge を作る。戻り値は作った merge の id（作らなければ None）。
+
+    merge の書き込み（入れ替えと版）をコミットした後・finish_job の前に lease が切れ、Sweeper が回数切れで failed にすることがある。
+    その間（processing）にコミットした撮り直しは staged に置かれ（handle_transcribe）、Runner が merge の完了を記録するときに
+    作り直す merge が入れ替える前提だが、完了は記録されない。failed の行が一意制約で ensure_merge_job を止めるので、
+    作り直さないと利用者が merge を再試行するまで撮り直しは公開されない。
+    作るのは、この merge が終わる前に置いた撮り直しがあるときだけ（stage_replacement が控えた merge の id。
+    has_replacements_staged_during）。前後は時刻ではなく id で決める（同じミリ秒・時計の巻き戻しでも取り違えない）。
+    書き込みの前に落ち続けて回数切れになった merge もこれに当たり 1 度は作り直すが、撮り直しが控えたのは前の行の id なので、
+    作り直した行も落ちて回数切れになれば作らない（落ち続ける merge を際限なく作り直さない。§8 fail_exhausted_expired の意図）。
+    撮り直しは失敗した行の再試行を待つ。
+    作るのは ensure_merge_job で、必要な Chunk が pending のまま・vad が残る・未承認の failed transcribe があれば作らない
+    （消した行の代わりは、それらが片付いたときの ensure_merge_job が作る）
+    """
+    if not repo.has_replacements_staged_during(conn, job.meeting_id, job.id):
+        return None
+    repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
+    return ensure_merge_job(conn, job.meeting_id)
+
+
+def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str) -> str | None:
+    """全 Chunk が終端（completed / skipped / 除外承認済み failed）かつ vad が残っていなければ merge を生成。
+
+    戻り値は作ったジョブの id（作らなかった・既存なら None）。呼び出し側がコミット後にイベントを流すのに使う。
+    """
     counts = repo.count_chunks_by_stt(conn, meeting_id)
     if any(counts[s] > 0 for s in BLOCKING_STT):
-        return False
+        return None
     if repo.count_jobs(conn, meeting_id, "vad_chunk", ["pending", "leased", "processing", "retrying"]) > 0:
-        return False
+        return None
     # 未承認の failed transcribe ジョブがあれば待つ
     if repo.count_jobs(conn, meeting_id, "transcribe_chunk", ["failed"]) > 0:
-        return False
-    return repo.insert_job(conn, meeting_id, "merge_transcript") is not None
+        return None
+    return repo.insert_job(conn, meeting_id, "merge_transcript")
 
 
 def exclude_failed(conn: sqlite3.Connection, meeting_id: str) -> int:
@@ -1934,7 +2161,15 @@ def on_summary_deferred(conn: sqlite3.Connection, meeting_id: str) -> None:
 
 
 def on_summary_failed(conn: sqlite3.Connection, meeting_id: str) -> None:
-    """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。"""
+    """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。
+
+    completed の会議は変えない（要約をコミット済み）。ハンドラは要約と同じトランザクションでジョブも completed にする
+    （repo.mark_job_committed）ので、finish_job の前に lease が切れても Sweeper は回収せず、ここには来ない。ハンドラの失敗（Runner）
+    では、mark_processing の時点で on_summary_started が summarizing にしているので completed は来ない（§14）。念のため残す
+    """
+    current = repo.get_meeting(conn, meeting_id)
+    if current is not None and current.status == "completed":
+        return
     repo.set_meeting_status(conn, meeting_id, "failed")
 
 
@@ -1944,9 +2179,14 @@ def request_regenerate_summary(conn: sqlite3.Connection, meeting_id: str) -> Non
 
 
 def request_rerun_stt(conn: sqlite3.Connection, meeting_id: str, stt_model: str | None) -> int:
-    """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。"""
+    """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。
+
+    消した segments を引用している要約は書き換えない（基本設計 §12.7「transcript が進んだ後の引用」）。
+    """
     # ジョブは行ごと消す。実行中のハンドラは lease の検査（行がない）で結果を書けなくなる（§8 lease_is_current）
     conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ?", (meeting_id,))
+    # まだ merge されていない撮り直しの結果も捨てる（残すと、やり直した結果を次の merge が古い結果で上書きする）
+    conn.execute("DELETE FROM segment_replacements WHERE meeting_id = ?", (meeting_id,))
     for chunk in repo.list_chunks(conn, meeting_id):
         repo.delete_segments_of_chunk(conn, chunk.id)
         repo.update_chunk(conn, chunk.id, stt_status="pending")
@@ -2136,6 +2376,7 @@ async def refresh_llm(ctx: AppContext) -> None:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -2146,6 +2387,8 @@ from ..db.models import Job
 from . import pipeline
 from .context import AppContext
 from .retry import JobError, decide, normalize_exception
+
+log = logging.getLogger(__name__)
 
 Handler = Callable[[AppContext, Job], Awaitable[str | None]]
 """ハンドラは成功時に None（または使用モデル名）を返し、失敗時に JobError を送出する。"""
@@ -2192,7 +2435,14 @@ class JobRunner:
 
     async def run_forever(self, idle_sleep_s: float = 1.0) -> None:
         while not self._stop.is_set():
-            ran = await self.run_once()
+            try:
+                ran = await self.run_once()
+            except Exception:  # noqa: BLE001
+                # ハンドラの例外は _execute が JobError にして記録する。ここへ来るのは lease や結果の記録そのものの失敗
+                # （DB のロック・ディスク満杯）。ループを終わらせると、サーバーは Chunk を受け取り続けるのに以後のジョブが
+                # 1 件も動かない。lease したままのジョブは Sweeper が期限切れで回収する
+                log.exception("job runner iteration failed; retrying")
+                ran = False
             if not ran:
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=idle_sleep_s)
@@ -2231,37 +2481,71 @@ class JobRunner:
             return
         hb.cancel()
         duration = int((time.monotonic() - started) * 1000)
+        removed: Job | None = None   # 下で消した完了済みの行の控え（消した後は読み直せない）
+        followup: str | None = None  # この完了処理で作った・作り直したジョブの id
         async with self.ctx.db.write() as conn:
             ok = repo.finish_job(conn, job.id, self.owner, job.attempts, "completed", duration_ms=duration)
             if ok and model_used is not None:
                 conn.execute("UPDATE processing_jobs SET model_name = ? WHERE id = ?", (model_used, job.id))
             if ok and job.job_type in ("vad_chunk", "transcribe_chunk"):
-                # 自分自身が processing のままではハンドラ内の ensure_merge_job が成立しないため、完了確定後に再判定する
-                pipeline.ensure_merge_job(conn, job.meeting_id)
-        self._publish_job(job.id)
+                # 自分自身が processing のままではハンドラ内の ensure_merge_job が成立しないため、完了確定後に再判定する。
+                # 作った merge は下で流す（流さないと lease されるまで pending の行がイベントに出ない）
+                followup = pipeline.ensure_merge_job(conn, job.meeting_id)
+            if ok and job.job_type == "merge_transcript" and repo.has_replacements(conn, job.meeting_id):
+                # merge の書き込みのコミット後・この完了の記録の前（processing の間）にコミットした撮り直しは、この merge では
+                # 入れ替わっていない。handle_transcribe の delete_finished_job は processing の行を消さず、ensure_merge_job も
+                # 一意制約で作れないので、完了を記録した今、作り直す（作らないと撮り直しは次の merge まで公開されない）。
+                # 消す前に完了を記録した行を控える。消した後の _publish_job は行を引けず、完了のイベントが流れない
+                removed = repo.get_job(conn, job.id)
+                repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
+                followup = pipeline.ensure_merge_job(conn, job.meeting_id)
+        # どちらもコミットの後に流す（コミット前に流すと、購読側が読み直したときに行がまだない・ロールバックで消える）
+        self._publish_job(job.id, removed=removed)
+        if followup is not None:
+            self._publish_job(followup)
 
     async def _on_failure(self, job: Job, err: JobError, duration_ms: int) -> None:
         now = now_ms()
         d = decide(err, job.attempts, job.max_attempts, now)
+        followup: str | None = None  # 失敗の後続処理で作ったジョブの id（入れ替え待ちの撮り直しを公開する merge）
+        removed: Job | None = None   # 後続処理が消した failed の行の控え（消した後は読み直せない）
         async with self.ctx.db.write() as conn:
-            ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
-                                 last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
-            if not ok:
-                return  # 旧ワーカーの報告は無視（基本設計 §9.3）
-            if not d.consume_attempt:
-                conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
-            if err.error_class == "OOM" and job.job_type == "transcribe_chunk":
-                self._downgrade_stt(conn, job.meeting_id, job.model_name)
-            if d.next_status == "failed":
-                if job.job_type == "transcribe_chunk":
-                    pipeline.on_transcribe_failed(conn, pipeline.job_of_chunk(conn, job))
+            # 要約の失敗は、合成に使った版（handle_summary が付ける）と今の版を、この記録と同じトランザクションで比べる。
+            # 進んでいれば古い版に対する失敗なので記録せず、同じ行を pending に戻す（requeue_job。試行回数は戻す。§12.7）。
+            # lease を失っていれば requeue_job も finish_job も 0 行で、何も書かない
+            requeued = self._input_advanced(conn, job, err) and repo.requeue_job(conn, job.id, self.owner, job.attempts)
+            if not requeued:
+                ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
+                                     last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
+                if not ok:
+                    return  # 旧ワーカーの報告は無視（基本設計 §9.3）
+                if not d.consume_attempt:
+                    conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
+                if err.error_class == "OOM" and job.job_type == "transcribe_chunk":
+                    self._downgrade_stt(conn, job.meeting_id, job.model_name)
+                if d.next_status == "failed":
+                    # merge の失敗では、後続処理が failed の行を消して作り直すことがある（rerun_merge_for_staged）。消す前に控え、
+                    # 消えていれば控えを流す。消した後の _publish_job は行を引けず、失敗のイベントが流れない（完了時と同じ）
+                    failed_row = repo.get_job(conn, job.id)
+                    followup = pipeline.on_job_failed(conn, job)
+                    if repo.get_job(conn, job.id) is None:
+                        removed = failed_row
                 elif job.job_type == "synthesize_minutes":
-                    pipeline.on_summary_failed(conn, job.meeting_id)
-            elif job.job_type == "synthesize_minutes":
-                # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
-                pipeline.on_summary_deferred(conn, job.meeting_id)
-            repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
-        self._publish_job(job.id)
+                    # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
+                    pipeline.on_summary_deferred(conn, job.meeting_id)
+                repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
+        # 完了時と同じく、どちらもコミットの後に流す
+        self._publish_job(job.id, removed=removed)
+        if followup is not None:
+            self._publish_job(followup)
+
+    @staticmethod
+    def _input_advanced(conn, job: Job, err: JobError) -> bool:  # type: ignore[no-untyped-def]
+        """ハンドラが失敗に付けた入力の transcript の版（handle_summary）が、今の会議の版と違うか。付いていなければ False。"""
+        if err.input_transcript_version is None:
+            return False
+        current = repo.get_meeting(conn, job.meeting_id)
+        return current is not None and current.transcript_version != err.input_transcript_version
 
     def _downgrade_stt(self, conn, meeting_id: str, ran_with: str | None) -> None:  # type: ignore[no-untyped-def]
         """会議単位でモデルを 1 段落とす（基本設計 §7.3）。ran_with は失敗したジョブが使ったモデル（lease 時点の model_name）。
@@ -2298,9 +2582,10 @@ class JobRunner:
         except asyncio.CancelledError:
             return
 
-    def _publish_job(self, job_id: str) -> None:
+    def _publish_job(self, job_id: str, *, removed: Job | None = None) -> None:
+        """removed はコミット済みのトランザクションで消した行の控え。消した行は読み直せないので控えを流す。"""
         with self.ctx.db.read() as conn:
-            job = repo.get_job(conn, job_id)
+            job = removed if removed is not None else repo.get_job(conn, job_id)
             meeting = repo.get_meeting(conn, job.meeting_id) if job else None
         if job is None:
             return
@@ -2315,18 +2600,52 @@ class JobRunner:
 
 # 14. Sweeper `jobs/sweeper.py`
 
+lease が切れたジョブの扱いは 3 通りある（基本設計 §9.3）。
+
+| 条件 | 扱い | 理由 |
+| --- | --- | --- |
+| 要約（`synthesize_minutes`）で、試行が控えた版（`input_transcript_version`）が今の会議の `transcript_version` と違う | 回数を問わず `pending` に戻し、試行回数も戻す（`repo.list_expired_stale_summaries` → `repo.requeue_job`。下の 2 つより先に、lease を外す前に行う） | 合成の途中でワーカーが落ちた間に merge が版を進めていれば、古い版に対する試行である（§12.7。Runner `_on_failure` の版の比較と同じ）。回数切れで `failed` にすると会議も `failed` になり、新しい版の要約は利用者が再試行するまで作られない。版は `handle_summary` が合成の前に控え、`lease_job` が消す。控える前に落ちた試行（`NULL`）は比べず、下の規則で回数を数える（前の試行の版で比べると、落ち続ける試行を回数を戻して際限なく繰り返す）。要約をコミットした試行は対象外：`handle_summary` は要約と同じトランザクションでジョブを `completed` にする（`repo.mark_job_committed`。lease は Runner の `finish_job` が外す）ので、`finish_job` の前に落ちても、この行と下の 2 つのどれにも当たらない（戻すと要約を作り直し、版が進んでいれば §12.7 で利用者の操作に限る「進んだ後の再生成」が自動で走る） |
+| `attempts < max_attempts` | `pending` に戻す（`repo.sweep_expired`） | ワーカーが落ちた・固まった。別のワーカーがやり直す |
+| `attempts >= max_attempts` | `failed`（`error_class = INTERNAL`）にし、`pipeline.on_job_failed()` を呼ぶ（`repo.fail_exhausted_expired`） | lease 切れは Runner の失敗処理（`retry.decide` の回数判定）を通らない。回数を見ずに戻すと、実行するたびにプロセスごと落とすジョブが、サーバーを起動し直すたびに永久に実行される。`attempts` は lease のたびに進むので、上限と比べられる |
+
+`failed` になったジョブの後続処理は、ハンドラが失敗した場合（Runner の `_on_failure`）と同じ `pipeline.on_job_failed()` を通る。ジョブ種別ごとの状態は次のとおり。
+
+| 失敗したジョブ | Chunk の `stt_status` | 会議の `status` | 後続 | 復旧 |
+| --- | --- | --- | --- | --- |
+| `vad_chunk` | 変えない（`pending` のまま。ただし結果をコミット済みなら進んだまま。下記） | 変えない（`transcribing`） | `pending` の Chunk が `ensure_merge_job` を止める | 失敗したジョブの再試行（`POST /jobs/{id}/retry`）。再試行は Chunk を変えず（`queued` に戻すのは transcribe の再試行だけ）、VAD の完了で `pending` の Chunk を `queued` / `skipped` に進める。除外（`exclude-failed`）の対象ではない |
+| `transcribe_chunk` | `failed`（ただし既に `completed` なら変えない。下記） | 変えない（`transcribing`） | 未承認の `failed` ジョブが merge を止める | 再試行、または除外（`exclude-failed`。失敗区間は gap になる） |
+| `merge_transcript` | 変えない | 変えない（`transcribing`。ただし書き込みをコミット済みなら進んだまま。下記） | 要約ジョブを作らない。この merge が終わる前に置いた入れ替え待ちの撮り直し（控えた merge の id で判定）があれば、merge を作り直す（`rerun_merge_for_staged`。下記） | 失敗したジョブの再試行。除外の対象ではない |
+| `synthesize_minutes` | 変えない | `failed`（transcript は閲覧できる。Invariant 2）。ただし既に `completed` なら変えない（下記） | なし | 再試行、または要約の再生成 |
+
+transcribe のハンドラが結果（segments と Chunk の `completed`）をコミットした後、Runner の `finish_job` より先に lease が切れて回数切れで回収されると、ジョブは `failed` になるが Chunk は `completed` のまま残す（`on_transcribe_failed`）。この場合も既存の復旧で収束する。再試行（または回数が残っていて `pending` に戻った再実行）が成功すると、`handle_transcribe` は lease の検査の後、その Chunk の segments を新しい結果で置き換える。Chunk がまだ `completed` でなければ、同じ書き込みトランザクションで segments を消してから入れる。`completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments`（Chunk ごとの印は `segment_replacements`）に置き、次の merge が版を上げるのと同じトランザクションで入れ替える（`repo.promote_replacements`）。その場で消すと、作り直す merge がコミットするまで transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。`INSERT OR IGNORE` で足すだけだと、モデルのダウングレードなどで件数や区切りが変わった新しい結果と古い行が混ざる。置き換えた Chunk が既に `completed` だった場合は、完了済み（`completed` / `failed`）の merge ジョブも同じトランザクションで消す。前の結果のコミット時に `on_transcribe_completed` が merge を作り、回収までに merge が終わっていると、その版（`merged_version`）から置き換えた区間が消え、`ensure_merge_job` は一意制約で merge を作り直せないためである。消しておけば `on_transcribe_completed` → `ensure_merge_job` が作り直し、transcript の版が上がる（`transcript_version` イベントも流れる）。会議と要約の扱いは手動 STT（§21 `transcribe_silent_chunk`）と同じで、会議は merge の完了で `transcribed` に戻り、要約は自動では作り直さない。merge が未実行（`pending`）なら、作り直さずにその merge が入れ替えてから新しい segments を読む。merge が実行中（`processing`）なら、その merge が入れ替えを書いた後に撮り直しがコミットされていることがある。`delete_finished_job` は実行中の行を消さず、`ensure_merge_job` も一意制約で作れないので、Runner が merge の完了を記録するときに入れ替え待ち（`repo.has_replacements`）を見て、残っていれば merge を作り直す。merge が書き込みをコミットした後・`finish_job` の前に lease が切れて回数切れで回収されると、完了は記録されず、`failed` の行が一意制約で `ensure_merge_job` を止める。この場合は `on_job_failed` が、その merge が終わる前に置いた入れ替え待ち（`stage_replacement` が控えた merge の id。`repo.has_replacements_staged_during`。時刻では同じミリ秒の前後が分からない）を見て、残っていれば完了済みの行を消して `ensure_merge_job` で作り直す（`rerun_merge_for_staged`。必要な Chunk が `pending` のまま・vad が残る・未承認の `failed` transcribe があれば作らない）。書き込みの前に落ち続けた merge も 1 度は作り直すが、撮り直しが控えたのは前の行の id なので、作り直した行も回数切れになれば作らない（落ち続ける merge を際限なく作り直さない）。消した `failed` の行は読み直せないので、Runner の `_on_failure` は消す前に控えた行を流す（完了時の作り直しと同じ。Sweeper は `RETURNING` の行を流す）。初めて完了する Chunk（手動 STT の無音 Chunk）も、実行中（`leased` / `processing`）の merge があれば同じく `staged_segments` に置く。その merge の書き込みの後にコミットすると版に入らず、入れ替え待ちが無いので作り直されもしない。`handle_transcribe` は初めての完了でも完了済みの merge を消す。手動 STT を受け付けた時点で実行中だった merge（`transcribe_silent_chunk` は消せない）が先に終わっていると、残った行が一意制約で作り直しを止める。ハンドラの中の `on_transcribe_completed` が作った merge（最後の Chunk の完了）は、`handle_transcribe` がコミットの後に流す（Runner の完了処理の `ensure_merge_job` は既存で `None` を返す）。vad の完了で Runner が作った merge も Runner が流す。手動 STT（§12 `request_rerun_stt`）は、まだ入れ替えていない撮り直しの結果も捨てる。除外しても Chunk が `completed` なので gap にならない。再試行（`POST /jobs/{id}/retry`）は `completed` の Chunk を `queued` に戻さない。戻すと、再試行がまた失敗したとき `on_transcribe_failed` が `completed` を見られず `failed`（gap）にする。再試行が成功すれば `on_transcribe_completed` が `completed` を書き直す。
+
+VAD も同じ隙間（ハンドラのコミットと `finish_job` の間）で回収されうる。ハンドラの結果とジョブの完了を 1 トランザクションにはせず（Runner とハンドラの契約が変わる）、後続処理の側で書き込み済みの結果を認める。要約だけは結果と同じトランザクションでジョブを `completed` にする（`repo.mark_job_committed`）。回収して戻すと要約を作り直し、版が進んでいれば §12.7 で利用者の操作に限る「進んだ後の再生成」が自動で走るためである。
+
+* 要約：コミット済みの試行は `completed` なので回収されない。`on_summary_failed` は念のため `completed` の会議を変えない。ハンドラの失敗（Runner の `_on_failure`）では、`mark_processing` の時点で `on_summary_started` が会議を `summarizing` にしているので、ここに `completed` は来ない。
+* VAD：`on_vad_completed` は Chunk が `pending` のときだけ結果を適用し、それ以外（既に `queued` / `completed` / `skipped` / `failed`）では `ensure_merge_job` だけを呼ぶ（`handle_vad` は VAD の値も書き換えない）。合わせて `POST /jobs/{id}/retry` は、`queued` に戻す対象を `transcribe_chunk` に限る。どちらかが欠けると、`failed` の vad ジョブの再試行が完了済みの Chunk を `queued` に戻し、transcribe ジョブは既存（一意制約）で作り直されないので、Chunk が `queued` のまま merge を止める。再試行した vad の完了後は Runner が `ensure_merge_job` を呼ぶので merge へ進む。
+
+再試行（`retry_job`）は `attempts` を 0 に戻す。vad / merge の失敗で会議を `failed` にしないのは、会議の `failed` が「merge が 1 回は終わった」を意味するためである（§21.1 `MERGED_STATUSES`。無音 Chunk の手動 STT などがこれで判定する）。vad の失敗で Chunk を `failed` にしないのは、`failed` が `BLOCKING_STT` に含まれず、他の Chunk の完了を契機にその Chunk を欠いたまま merge が作られるためである。
+
+回収したジョブ（`pending` に戻したもの・`failed` にしたもの）と、その会議の状態は、書き込みトランザクションのコミット後に `events` へ流す（Runner の `_publish_job` と同じ `job` / `meeting_status` の形。会議の状態は会議ごとに 1 回）。流さないと、SSE で見ている画面は `processing` のまま止まる。コミット前に流すと、受け取ったブラウザの `GET /jobs` が回収前の状態を読む。流す内容（ジョブは `UPDATE ... RETURNING` の行と、`on_job_failed` が作ったジョブ（戻り値の id。Phase 2 では作らないが、Phase 3 の差し替え版は分離の失敗で merge を作る）をトランザクションの中で読んだ行、会議は `on_job_failed` の後に読んだ行）はトランザクションの中で確定させ、コミット後に DB を読み直さない。読み直しが失敗すると、次の周は回収済みのジョブを選ばないので、そのイベントは二度と流れない。このため `sweep_once` / `run_forever` は `EventBroker` を受け取り、`repo.sweep_expired` は戻したジョブを返す。
+
+常駐ループ（`sweeper.run_forever`、`JobRunner.run_forever`）は、1 周の失敗（DB のロック、ディスク満杯）を記録して次の周へ進む。例外でループを抜けると、その `asyncio.Task` は誰も待っていないので黙って終わり、サーバーは Chunk を受け取り続けるのにジョブが 1 件も動かない状態になる。記録は標準の `logging`（`minutes_local.jobs.*`）に `ERROR` で出す。ハンドラを設定していなくても標準エラーに出る。
+
 ```python
 # minutes_local/jobs/sweeper.py
 """lease 期限切れジョブの回収。起動時と 30 秒ごと。基本設計 §9.3。起動時には確定済みで止まった会議も回収する。"""
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from ..db import repo
 from ..db.connection import Database, now_ms
-from ..db.models import AudioChunk
+from ..db.models import AudioChunk, Job, Meeting
 from . import pipeline
+from .events import EventBroker
+
+log = logging.getLogger(__name__)
 
 SWEEP_INTERVAL_S = 30.0
 
@@ -2367,17 +2686,59 @@ def _chunks_intact(data_dir: Path, chunks: list[AudioChunk]) -> bool:
     return all(pipeline.chunk_file_intact(data_dir, c) for c in chunks)
 
 
-async def sweep_once(db: Database) -> int:
+async def sweep_once(db: Database, events: EventBroker) -> int:
+    """lease が切れたジョブを回収する。戻り値は回収した件数（pending に戻した数 + 回数切れで failed にした数）。"""
     async with db.write() as conn:
-        n = repo.sweep_expired(conn, now_ms())
-        if n:
-            repo.record_metric(conn, "lease_expired", n)
-    return n
+        now = now_ms()
+        # 要約は、合成に使った版（handle_summary が控える）から transcript が進んでいれば古い版に対する試行なので、回数切れでも
+        # failed にせず、同じ行を pending に戻す（requeue_job。試行回数は戻す。§12.7。Runner._on_failure の版の比較と同じ）。
+        # failed にすると会議も failed になり、新しい版の要約は利用者が再試行するまで作られない。lease を外す前（下の 2 つより先）に
+        # 戻す（requeue_job は lease の所有者と attempts で行を選ぶ）。版が同じなら下の規則どおり回数を数える
+        stale: list[Job] = []
+        for job in repo.list_expired_stale_summaries(conn, now):
+            if repo.requeue_job(conn, job.id, job.lease_owner or "", job.attempts):
+                requeued_job = repo.get_job(conn, job.id)
+                if requeued_job is not None:
+                    stale.append(requeued_job)
+        # 回数を使い切ったものは pending に戻さず failed にする（落ち続けるジョブを永久に実行しない。§8 fail_exhausted_expired）
+        exhausted = repo.fail_exhausted_expired(conn, now)
+        followups: list[Job] = []   # on_job_failed が作ったジョブ（Phase 3 の分離の失敗で作る merge）。行はトランザクションの中で読む
+        for job in exhausted:
+            followup_id = pipeline.on_job_failed(conn, job)
+            followup = repo.get_job(conn, followup_id) if followup_id is not None else None
+            if followup is not None:
+                followups.append(followup)
+        requeued = stale + repo.sweep_expired(conn, now)
+        if requeued or exhausted:
+            repo.record_metric(conn, "lease_expired", len(requeued) + len(exhausted))
+        if exhausted:
+            repo.record_metric(conn, "lease_expired_exhausted", len(exhausted))
+        # 流す内容はトランザクションの中で確定させる。コミット後に読み直すと、読み取りの失敗でイベントが失われ、
+        # 次の周は回収済みのジョブを選ばないので二度と流れない。ジョブは RETURNING の行（on_job_failed は回収したジョブの行を変えない）と、
+        # on_job_failed が作ったジョブ（流さないと lease されるまで pending の行がイベントに出ない）
+        jobs = exhausted + requeued + followups
+        meetings = {j.meeting_id: repo.get_meeting(conn, j.meeting_id) for j in jobs}
+    # 配信はコミットの後。トランザクションの中で流すと、受け取ったブラウザの GET /jobs が回収前の状態を読む
+    _publish(events, jobs, meetings)
+    return len(requeued) + len(exhausted)
 
 
-async def run_forever(db: Database, stop: asyncio.Event, interval_s: float = SWEEP_INTERVAL_S) -> None:
+def _publish(events: EventBroker, jobs: list[Job], meetings: dict[str, Meeting | None]) -> None:
+    """回収したジョブと会議の状態を、Runner._publish_job と同じ形で流す。会議の状態は会議ごとに 1 回。"""
+    for job in jobs:
+        events.publish(job.meeting_id, {"type": "job", "job": job.model_dump()})
+    for meeting_id, meeting in meetings.items():
+        if meeting is not None:
+            events.publish(meeting_id, {"type": "meeting_status", "status": meeting.status})
+
+
+async def run_forever(db: Database, events: EventBroker, stop: asyncio.Event, interval_s: float = SWEEP_INTERVAL_S) -> None:
     while not stop.is_set():
-        await sweep_once(db)
+        try:
+            await sweep_once(db, events)
+        except Exception:  # noqa: BLE001
+            # 1 回の失敗（DB のロックなど）でループを終わらせない。終わると、落ちたワーカーの lease が回収されなくなる
+            log.exception("sweeper iteration failed; retrying")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_s)
         except asyncio.TimeoutError:
@@ -2399,8 +2760,11 @@ stateDiagram-v2
     processing --> retrying : retry.decide → retrying
     processing --> failed : retry.decide → failed
     retrying --> pending : lease_job の next_run_at <= now 条件で再取得（状態列は retrying のまま lease される）
-    leased --> pending : sweeper.sweep_once
-    processing --> pending : sweeper.sweep_once
+    leased --> pending : sweeper.sweep_once（attempts < max_attempts）
+    processing --> pending : sweeper.sweep_once（attempts < max_attempts）
+    processing --> pending : handlers.handle_summary → repo.requeue_job（合成の間に transcript の版が進んだ）。合成・検証の失敗で版が進んでいれば runner._on_failure → repo.requeue_job
+    leased --> failed : sweeper.sweep_once（attempts >= max_attempts）
+    processing --> failed : sweeper.sweep_once（attempts >= max_attempts）
     pending --> cancelled : pipeline.exclude_failed / request_rerun_stt
     retrying --> cancelled : 同上
     failed --> pending : repo.retry_job（API POST /jobs/{id}/retry）
@@ -2415,7 +2779,17 @@ stateDiagram-v2
 | `OOM` 時のダウングレード | `JobRunner._downgrade_stt` | `meetings.stt_model_used` と、未実行 `transcribe_chunk` の `model_name` を一括更新 |
 | `MODEL_MISSING` / `PROVIDER_UNREACHABLE` | `retry.decide` が `consume_attempt=False`。Runner が `attempts` を戻す | 無期限 retry。5 分間隔 |
 | 旧ワーカーの完了報告 | `repo.finish_job` の `lease_owner` + `attempts` 条件が 0 行 | Sweeper で回収後の二重完了を防ぐ |
+| lease 切れで回数切れ | `repo.fail_exhausted_expired` → `pipeline.on_job_failed` | `failed` の後続処理（Chunk を `failed` にする、会議を `failed` にする）は Runner の `_on_failure` と同じ関数を通る（§14） |
 | 旧ワーカーの結果書き込み | `repo.insert_segments` が `lease_is_current` で弾く | 失効した結果が UNIQUE 行を先取りし、正規の再試行の結果が捨てられるのを防ぐ |
+| 旧ワーカーの VAD 書き込み | `handlers.handle_vad` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば Chunk も `on_vad_completed` も書かない（モデル未配置の分岐も同じ） | 回数切れで `failed` になった vad ジョブを残したまま Chunk が進む |
+| lease 切れ後の VAD 再試行 | `pipeline.on_vad_completed` は `pending` の Chunk にだけ適用する。`POST /jobs/{id}/retry` は `transcribe_chunk` のときだけ Chunk を `queued` にする | 結果をコミットした後に lease が切れて回数切れで回収された vad ジョブを再試行すると、完了済みの Chunk が `queued` に戻り、transcribe ジョブは既存なので作り直されず止まる |
+| lease 切れ後の transcribe 回収 | `pipeline.on_transcribe_failed` は `completed` の Chunk を変えない。`POST /jobs/{id}/retry` も `completed` の Chunk を `queued` に戻さない | ハンドラのコミットと `finish_job` の間で lease が切れ、Sweeper が回数切れで回収すると、書き込み済みの segments を持つ Chunk が `failed`（gap）になる |
+| lease 切れ後の transcribe の再実行 | `handle_transcribe` は lease の検査の後、Chunk の segments を置き換える。Chunk が既に `completed` なら、新しい結果を `staged_segments` に置いて完了済みの merge ジョブを消し、作り直す merge が版を上げるのと同じトランザクションで入れ替える。`completed` でなければ同じトランザクションで消してから入れる | 前の attempt の segments に新しい結果が混ざる。前の結果で merge が終わっていると、置き換えた区間がその版から消えたまま merge が作り直されない。その場で消すと、merge のコミットまで（失敗すればその後も）公開中の版から区間が抜ける |
+| 旧ワーカーの merge 書き込み | `handlers.handle_merge` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば transcript・会議の `transcribed`・要約ジョブのどれも書かない | 回数切れで `failed` になった merge ジョブを残したまま transcript の版が進み、要約ジョブが作られて会議が `completed` まで進む。lease を取り直した新しいワーカーと二重に merge すると版が 2 回進む |
+| 旧ワーカーの要約書き込み | `handlers.handle_summary` が書き込みトランザクションの先頭で `lease_is_current` を確かめ、失効していれば要約も会議の `completed` も書かない | Sweeper が回数切れで `failed`（会議も `failed`）にした後に書くと、要約の結果を誰も確かめないまま会議が `completed` に戻る。`finish_job` の条件はジョブ行しか守らない |
+| 合成の間に transcript の版が進んだ要約 | `handlers.handle_summary` が書き込みトランザクションで会議の `transcript_version` を読み直し、合成に使った版と違えば要約を保存せず、会議も `completed` にしない。`repo.requeue_job` で同じ行を `pending` に戻す（試行回数は戻す。lease を外すので Runner の `finish_job` は 0 行）。合成・検証が失敗したときは、`handle_summary` が合成に使った版を `JobError.input_transcript_version` に付けて投げ、Runner の `_on_failure` が失敗を記録する書き込みトランザクションの中で今の版と比べる。進んでいれば失敗として記録せずに同じく戻す（古い版に対する失敗。版が同じなら従来どおり失敗として記録する）。比較と記録を別のトランザクションにすると、その間に merge が版を進めたとき `failed` になる。合成の途中でワーカーが落ちたとき（失敗の報告が無い）は、`handle_summary` が合成の前にジョブの行へ控えた版（`repo.record_input_transcript_version`。`lease_job` が消す）を Sweeper が回収のトランザクションで今の版と比べ、進んでいれば回数切れでも同じく戻す（§14） | 撮り直しの入れ替え・手動 STT の後の merge が合成中に版を進めると、merge の `on_merge_completed` は要約ジョブを一意制約で作れない。そのまま保存すると、新しい版の transcript に古い版の要約が組になり、会議は `completed` になる |
+| lease 切れ後の要約回収 | `handlers.handle_summary` が要約と同じトランザクションでジョブを `completed` にする（`repo.mark_job_committed`。lease は Runner の `finish_job` が外す）。`pipeline.on_summary_failed` も念のため `completed` の会議を変えない | lease が有効なうちに要約をコミットし、`finish_job` の前に lease が切れると、回収すれば要約を作り直し（版が進んでいれば自動の再生成）、回数切れなら要約があるのに会議が `failed` になる。コミット済みの試行は Sweeper の対象（`leased` / `processing`）から外れるので、どちらも起きない |
+| 回収の配信 | `sweeper._publish`（コミット後） | §14 |
 
 ---
 
@@ -3108,6 +3482,8 @@ def run_merge(conn: sqlite3.Connection, meeting_id: str, th: Thresholds) -> Merg
     if meeting is None:
         raise ValueError(f"meeting not found: {meeting_id}")
     new_version = meeting.transcript_version + 1
+    # 撮り直した Chunk の結果を入れ替える。版を上げるのと同じトランザクションなので、失敗すれば公開中の版が残る（§12 handle_transcribe）
+    repo.promote_replacements(conn, meeting_id)
     all_segments = repo.list_segments(conn, meeting_id)
     kept = dropped = 0
     for source in ("mic", "system"):
@@ -3465,6 +3841,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any
 
 from pydantic import ValidationError
@@ -3474,12 +3851,147 @@ from ..merge.normalize import normalize
 from .schema import EvidenceSpan, MeetingSummaryDraft, RejectedItem, RejectionReason, SummaryActionItem, SummaryDecision, SummaryTopic
 
 # 期限らしい表現（日本語・英語）。網羅性は基本設計 §28 の持ち越し事項。
+# 選択（|）は左の候補から試して最初に当たったものを採る（最長一致ではない）。複合形（「来月末」）は、その一部（「来月」）より前に置く。
+# 置かないと「来月末」が「来月」と切り出され、quote の「来月上旬」が deadline の「来月末」を裏付けてしまう（_deadline_supported）。
+# 「再来月」「再来週」も、組（「再来月末」「再来週末」）と単独の両方を持つ。無いと「再」の位置で何も当たらず、次の「来」の位置で
+# 「来月末」が切り出され、quote の「再来月末」が deadline の「来月末」を裏付けてしまう（「再来週末」は「再来週」に縮む）。
+# 月・週と時期（末・上旬・中旬・下旬）の組は 1 つの表現として切り出す。別々に切り出すと、quote の別の日付の部品
+# （「今月上旬に確認し、来月下旬に提出」の「来月」と「上旬」）を寄せ集めて deadline の「来月上旬」を裏付けてしまう。
+# 組にした表現は、その部品だけの deadline（「上旬」）も裏付けない（どの月の上旬かを quote から言えないため。基本設計 §12.5 段 5）。
+# 組の間には「の」を挟んでよい（「来月の末」「来週の末」「今月の上旬」。_hint_key が落とすので「来月末」と同じ表現になる）。
+# 挟めないと「来月の末」が「来月」だけに縮み、quote の「来月に提出」が deadline の「来月の末」を裏付けてしまう。
+# 年の付いた日付（「2026年11月20日」「26年11月20日」「2026/11/20」「26/11/20」）も年まで 1 つの表現にする。月日だけを切り出すと、quote の 2026 年が deadline の
+# 2027 年の同じ月日を裏付けてしまう（「2026/11/20」は「26/11」と切り出され、同じ年月の別の日も通る。2 桁の年の「26/11/20」も
+# 年まで切り出さないと「26/11」に縮み、「26/11/21」と同じ表現になる）。年が後ろの「11/20/2026」も年まで切り出す。スラッシュの日付は
+# 後ろに数字が続く位置で止めない（止めると「11/20/2026」が「11/20/20」に縮み、「11/20/2027」と同じ表現になる）。元号の付いた年（「令和8年」「令和元年」）は
+# 元号まで含める。数字の年だけを切り出すと、令和 8 年と平成 8 年の同じ月日が同じ表現になる（「元年」は数字でないので、月日だけになる）。
+# 相対の年（「再来年」「来年」「今年」「去年」。「の」は挟んでよい）も月日と 1 つの表現にする。月日だけを切り出すと、quote の
+# 「再来年11月20日」が deadline の「来年11月20日」を裏付けてしまう。「再来年」は「来年」より前に置く（「再来月」と同じ理由）。
+# 年の無い月日の deadline は、年の付いた quote では裏付けない（どの年かを deadline から言えない。組にした表現と同じ扱い）。
+# 週と曜日の組（「来週金曜」「来週の金曜」「next week friday」「friday next week」）も 1 つの表現にする。別々に切り出すと、quote の
+# 「今週金曜」の「金曜」と別の「来週」を寄せ集めて deadline の「来週金曜」を裏付けてしまう。
+# 曜日の後に付く時刻（「来週金曜9時」「月曜日の17時」）も曜日と 1 つの表現にする（日付と時刻と同じ）。別々に切り出すと、quote の
+# 「来週金曜9時、月曜17時」の別の句の曜日と時刻を寄せ集めて deadline の「来週金曜17時」を裏付けてしまう。「金曜日」の「日」は
+# 挟んでよく、_hint_key が「金曜」にそろえる（「日」で切れると時刻が曜日から離れる）。
+# 相対の月と日（「来月20日」「再来月の5日」）も 1 つの表現にする。月だけを切り出すと「20日」はどの候補にも当たらずに落ち、quote の
+# 「来月21日」が deadline の「来月20日」を裏付けてしまう。日の付いた quote は日の無い「来月」を裏付けない（年の無い月日と同じ扱い）。
+# 英語の「next friday」「this friday」も 1 つの表現にする。曜日だけを切り出すと、quote の「this friday」が deadline の「next friday」を
+# 裏付けてしまう（週の修飾が落ちる）。「next friday」と「friday next week」は言い方が違うので別の表現として比べる（通さない側に倒す）
+# 照合する文字列は normalize 済みで空白が無い（「next week」は「nextweek」）。英語の週と曜日の組は空白を任意にする。空白を必須にすると
+# 組が切り出されず、「next week friday」が「friday」だけに縮んで「this week friday」に通る。
+# 組でない「next week」「this week」「end of」は空白付きのまま（normalize 済みの文字列には当たらない）にし、文字列そのものが quote に
+# 現れることを求める（期限の表現を含まない deadline と同じ扱い）。部品として切り出すと、「end of month」が「end of the week」の
+# 「end of」に、「next weekend」が「next week」に通り、別々の句の部品を寄せ集めて「end of next week」も通る。
+# 「day after tomorrow」も 1 つの表現にする（「明後日」と同じ）。「tomorrow」だけを切り出すと、quote の「the day after tomorrow」が
+# deadline の「tomorrow」を裏付けてしまう。findall は左から切り出すので、「day」の位置で長い方が当たり、中の「tomorrow」は残らない
+_WEEKDAYS_JA = "月曜|火曜|水曜|木曜|金曜|土曜|日曜"
+# 時刻（「午後5時」「17時30分」「5時半」「17:00」）。日付の後に付けば日付と 1 つの表現にする（「の」は挟んでよい。_hint_key が落とす）。
+# 日付だけを切り出すと、quote の「11月20日午前9時」が deadline の「11月20日午後5時」を裏付けてしまう（時刻が落ちる）。
+# 時刻だけの表現も切り出す（「午後5時」は「午前9時」と別の表現）。「2時間」の「2時」は時刻ではないので当てない
+_TIME = r"(?:(?:午前|午後)?\d{1,2}時(?!間)(?:\d{1,2}分|半)?|\d{1,2}:\d{2})"
+# 英語の時刻（「5pm」「9 am」「5:30pm」）。日付・英語の曜日（「next friday 5pm」「tomorrow at 9am」）の後に付けば 1 つの表現にする
+# （「at」は挟んでよい。_hint_key が落とす）。別々に切り出すと、quote の「next Friday 9am」が deadline の「next Friday 5pm」を裏付け、
+# 別の句の曜日と時刻（「next Friday 9am and Monday 5pm」）を寄せ集めても通ってしまう。_TIME より前に試す（「5:30pm」を「5:30」と
+# 切り出して am / pm を落とさない）。12 時間制と 24 時間制（「5pm」と「17:00」）は換算せず、別の表現として比べる（通さない側に倒す）。
+# 時刻が前に来る言い方（「5pm next friday」）は時刻と曜日を別々に切り出すので、「next friday 5pm」とは別の表現になる（通さない側）
+_TIME_EN = r"\d{1,2}(?::\d{2})? ?(?:am|pm)"
+# 日付・曜日の後ろに付く時刻（「の」は挟んでよい）。日付（「11月20日」「来月20日」）と曜日（「来週金曜」「月曜日」）で共有する。
+# 数字と数字の間の区切りは、照合する文字列（_hint_text）に空白 1 つで残るので、空白も挟んでよい（「2026/12/1 7pm」）
+_TIME_SUFFIX = rf"(?: ?の?(?:{_TIME_EN}|{_TIME}))?"
+_WEEKDAYS_EN = "monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+# 英語の日（曜日・週と曜日の組・tomorrow）。後ろに時刻を付けてよい
+_EN_DAY = (
+    rf"(?:next|this) ?week ?(?:{_WEEKDAYS_EN})|(?:{_WEEKDAYS_EN}) ?(?:of ?)?(?:next|this) ?week|(?:next|this) ?(?:{_WEEKDAYS_EN})|"
+    rf"{_WEEKDAYS_EN}|day ?after ?tomorrow|tomorrow"
+)
+# 英語の日の後ろの時刻は、12 時間制（_TIME_EN）と 24 時間制（「17:00」）の両方を 1 つの表現にする（_TIME_EN を先に試す）。
+# 24 時間制を外すと「friday 17:00」が「friday」と「17:00」に分かれ、quote の「friday 9:00 … monday 17:00」の別の句の曜日と時刻を
+# 寄せ集めて deadline の「friday 17:00」を裏付けてしまう
+_EN_DAY_TIME = rf"(?:{_EN_DAY})(?: ?(?:at ?)?(?:{_TIME_EN}|\d{{1,2}}:\d{{2}}))?"
+_EN_DEADLINE_ALTS = rf"{_EN_DAY_TIME}|next week|this week|end of|eod|eow"
+# 3 つ組のスラッシュの日付の終わり。後ろに数字が続くなら、それが時刻の始まり（区切りを書かずに続けた「26/11/205pm」）の
+# ときだけ止まる。数字だけで止めると「11/20/2026」が「11/20/20」に縮んで「11/20/2027」と同じ表現になる。
+# 区切りのあった「2026/12/1 7pm」は、照合する文字列（_hint_text）に空白が残るので、日と時刻の数字がつながらない
+_SLASH_DATE_END = r"(?:(?!\d)|(?=" + _TIME_EN + "|" + _TIME + "))"
+# 後ろに時刻を付けてよい日本語・数字の表現：日付（年・元号・相対の年を含む）、日本語の曜日（週の修飾・「日」を含む）、相対の月と日、相対の月の時期、
+# 週末、相対の日、月日の付かない相対の年。
+# _DEADLINE_HINTS と _ATTACHED_TIME_EN で共有する
+_DATE = (
+    r"(?:(?:(?:令和|平成|昭和|大正|明治)(?:\d{1,2}|元)年|\d{1,4}年|(?:再来年|来年|今年|去年)の?)?\d{1,2}月\d{1,2}日|"
+    r"(?:\d{4}|\d{2})/\d{1,2}/\d{1,2}" + _SLASH_DATE_END + r"|\d{1,2}/\d{1,2}/\d{4}" + _SLASH_DATE_END +
+    r"|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2})"
+)
+_DAY_JA = rf"(?:(?:再来週|今週|来週)の?)?(?:{_WEEKDAYS_JA})日?"
+# 日付の後ろの曜日（「11月20日金曜」「11月20日の金曜日」）も日付と 1 つの表現にする（時刻と同じ。後ろの時刻もさらに付けてよい）。
+# 別々に切り出すと、quote の「11月20日に確認し、金曜に提出」の別の句の日付と曜日を寄せ集めて deadline の「11月20日金曜」を裏付けてしまう
+_DATE_WEEKDAY_JA = rf"(?:の?(?:{_WEEKDAYS_JA})日?)?"
+_MONTH_DAY_JA = r"(?:再来月|今月|来月)の?\d{1,2}日"
+# 相対の月の時期（「来月上旬」「今月の末」）。後ろの時刻（「来月上旬午後5時」）も 1 つの表現にする（日付と同じ）。別々に切り出すと、quote の
+# 「今月上旬午後5時」の時刻と別の句の「来月上旬」を寄せ集めて deadline の「来月上旬午後5時」を裏付けてしまう
+_MONTH_PERIOD_JA = r"(?:再来月|今月|来月)の?(?:末|上旬|中旬|下旬)"
+# 週末（「来週末」「来週の末」「週末」）も同じ。後ろの時刻（「来週末午後5時」）と 1 つの表現にする
+_WEEK_END_JA = r"(?:(?:再来週|今週|来週)の?末|週末)"
+# 相対の日（「明日」「明後日」）も同じ。後ろの時刻（「明日午後5時」）と 1 つの表現にする。別々に切り出すと、quote の「明日確認し、
+# 明後日午後5時に提出」の別の句の「明日」と時刻を寄せ集めて deadline の「明日午後5時」を裏付けてしまう
+_REL_DAY_JA = r"(?:明後日|明日)"
+# 月日の付かない相対の年（「来年」「来年11月」「来年の末」「来年度末」「来年春」「来年度上期」）。後ろの月・年度・時期（季節・半期を含む）も
+# 1 つの表現にする（相対の月の時期と同じ）。
+# 表現として切り出さないと _phrase_in の部分一致になり、deadline の「来年」が quote の「再来年」の中に当たる。年だけを切り出すと、
+# deadline の「来年11月」が「来年」に縮み、quote の「来年3月」が裏付けてしまう。月日の付いたもの（「来年11月20日」）は _DATE が先に取る
+# 後ろの時刻（「来年度末午後5時」）も 1 つの表現にする（相対の月の時期と同じ）。別々に切り出すと、quote の「今年度末午後5時に確認し、
+# 来年度末に提出」の別の年の時刻と「来年度末」を寄せ集めて deadline の「来年度末午後5時」を裏付けてしまう
+_REL_YEAR_JA = (
+    r"(?:再来年|来年|今年|去年)(?:の?(?:\d{1,2}月|度))?"
+    r"(?:の?(?:末|上旬|中旬|下旬|上半期|下半期|上期|下期|前半|後半|春|夏|秋|冬|初め|早々|明け))?"
+)
 _DEADLINE_HINTS = re.compile(
-    r"(\d{1,2}月\d{1,2}日|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|月曜|火曜|水曜|木曜|金曜|土曜|日曜|"
-    r"今週|来週|再来週|今月|来月|月末|週末|明日|明後日|年内|上旬|中旬|下旬|"
-    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|this week|end of|tomorrow|eod|eow)",
+    rf"({_DATE}{_DATE_WEEKDAY_JA}{_TIME_SUFFIX}|{_TIME_EN}|{_TIME}|"
+    rf"{_REL_YEAR_JA}{_TIME_SUFFIX}|"
+    rf"{_DAY_JA}{_TIME_SUFFIX}|"
+    rf"{_MONTH_DAY_JA}{_TIME_SUFFIX}|"
+    rf"{_MONTH_PERIOD_JA}{_TIME_SUFFIX}|"
+    rf"{_WEEK_END_JA}{_TIME_SUFFIX}|"
+    rf"{_REL_DAY_JA}{_TIME_SUFFIX}|"
+    r"今週|来週|再来週|今月|再来月|来月|月末|年内|上旬|中旬|下旬|"
+    rf"{_EN_DEADLINE_ALTS})",
     re.IGNORECASE,
 )
+# 英語の候補だけを、正規化前の quote から語の境目つきで切り出す（_deadline_supported）。normalize は空白を落とすので、
+# 正規化した文字列では「Simon day」が「simonday」になって「monday」に、「meow」が「eow」に、「deodorant」が「eod」に当たる。
+# 「next week」「this week」「end of」はここでは除く（deadline 側の正規化した文字列には当たらず、quote 側だけに出ても使われないが、
+# 部品として扱わないことをはっきりさせる）
+# 時刻だけの表現（「5pm」）も、時刻の付いた曜日（「next friday 5pm」）もここで切り出す
+_EN_DEADLINE_HINTS = re.compile(
+    rf"(?<![a-z0-9])(?:{_EN_DAY_TIME}|{_TIME_EN}|eod|eow)(?![a-z0-9])",
+)
+# 日付の後ろの英語の時刻（「11月20日5pm」の「5pm」）。_quote_hints が、日本語・数字の表現から英字を含むものを捨てるときに、
+# これだけは英字として数えない（日付と 1 つの表現なので、捨てると同じ日付・時刻の quote でも通らない）
+_TRAILING_TIME_EN = re.compile(rf"{_TIME_EN}$")
+# 正規化前の quote（_spaced）で、日付・日本語の曜日・相対の月と日・相対の月の時期・週末・相対の日の後ろに付いた英語の時刻（「11/20 5pm」「金曜日の 5pm」「明日 5pm」）。
+# 日本語・数字の表現を切り出す文字列（_hint_text）では日付と 1 つの表現（「11/20 5pm」）になるので、_quote_hints は英語の表現を切り出す前にこの時刻を
+# 落とす。落とさないと、同じ時刻が時刻だけの表現（「5pm」）としても数えられ、quote の「11/20 5pm」が deadline の「5pm」を裏付けてしまう。
+# 区切りは _spaced で空白 1 つになり、「の」は挟んでよい（_TIME_SUFFIX と同じ）。「at」を挟んだもの（「11/20 at 5pm」）は日付に付かない
+_ATTACHED_TIME_EN = re.compile(rf"((?:{_DATE}|{_DAY_JA}|{_MONTH_DAY_JA}|{_MONTH_PERIOD_JA}|{_WEEK_END_JA}|{_REL_DAY_JA}|{_REL_YEAR_JA}) ?(?:の ?)?){_TIME_EN}")
+# 期限の表現を切り出した残りの、組にならなかった英語の修飾（normalize 済みで空白が無い。_deadline_supported）。
+# 週・月・年（「next month 5pm」「this year」）と時間帯（「friday afternoon」の「afternoon」）は表現として切り出さないので、
+# 残っていれば deadline 全体を句として求める（時間帯を落とすと、quote の「friday morning」が「friday afternoon」を裏付ける）。
+# 日本語の助詞・語（「来週中に11月20日」の「中に」）は対象にしない（表現の間に挟まる語で、期限を変えない）
+_EN_UNPAIRED_QUALIFIER = re.compile(r"(?:next|this)(?:week|month|year)|morning|afternoon|evening|night|noon")
+# 英語の「曜日 + 週」（「friday next week」。後ろの時刻はそのまま残す）。比べる形を「週 + 曜日」にそろえる（_hint_key）
+_EN_DAY_THEN_WEEK = re.compile(rf"({_WEEKDAYS_EN})(?:of)?(next|this)week(.*)")
+
+
+# 数字と数字の間の区切り（空白・「の」。_hint_text が残した空白）。_hint_key が空白 1 つにそろえる
+_DIGIT_JOINER = re.compile(r"(?<=[0-9])(?:\s*の\s*|\s+)(?=[0-9])")
+
+
+def _hint_key(hint: str) -> str:
+    """切り出した期限の表現を比べる形にする。大文字小文字・空白・「の」（「来週の金曜」）・時刻の前の「at」を落とし、「曜日」を「曜」に、英語の曜日と週の順序をそろえる。
+    数字と数字の間の区切り（「2026/12/1 7pm」「2026/12/1の7pm」）だけは空白 1 つにそろえて残す（落とすと「2026/12/17pm」と同じ形になる）"""
+    joined = _DIGIT_JOINER.sub(" ", hint.lower())
+    key = re.sub(r"at(?=\d)", "", re.sub(r"(?<![0-9])\s+|\s+(?![0-9])|の", "", joined)).replace("曜日", "曜")
+    m = _EN_DAY_THEN_WEEK.fullmatch(key)
+    return f"{m.group(2)}week{m.group(1)}{m.group(3)}" if m else key
 
 
 def parse_draft(content: str) -> MeetingSummaryDraft:
@@ -3538,11 +4050,138 @@ def _supported_by(claim: str, quote_norm: str, threshold: float = 0.5) -> bool:
     検証がLLMの出力に依存して意味を失う。claim の文字バイグラムのうち quote に
     現れる割合を見る。全く別の内容を書いた場合は 0 になり、要約的な言い換えは通る。
     落ちた項目は破棄ではなく「要確認送り」（v4.0 §66.2）なので、閾値は控えめにする。
+
+    測るのは語彙の重なりであって含意ではない。quote を否定・反転した claim（「据え置きで決定」に対する
+    「据え置きを見送り」、「予定です」に対する「予定ではない」）も、文字の多くが重なれば通る。否定・極性の検査は
+    入れない（日本語の否定は語尾・助詞・語彙の言い換えで表れ、決定的な規則では誤検出と見逃しが多い）。
+    逐語の quote と根拠位置は段階2 の前段で保証され、UI は採用した項目ごとに根拠リンク（sourceSegmentIds から
+    Transcript の該当行へスクロール。基本設計 §18）を出すので、矛盾は利用者が元発言と照らして気づく前提とする
+    （基本設計 §12.5 段 3a の既知の制限）
     """
     grams = _bigrams(normalize(claim))
     if not grams:
         return False
     return len(grams & _bigrams(quote_norm)) / len(grams) >= threshold
+
+
+def _deadline_supported(deadline: str, quote: str) -> bool:
+    """deadline が quote に裏付けられているか（段 5）。quote に期限らしい表現があるだけでは通さない。
+
+    deadline に期限の表現（_DEADLINE_HINTS）があれば、そのすべてが quote にも現れることを求める
+    （「来週中に11月20日」は「来週」と「11月20日」の両方。quote の「来週」は deadline の「月末」「11月20日」を裏付けない）。
+    「来週金曜」のような週と曜日の組は 1 つの表現で、比べるのは _hint_key でそろえた形（「来週の金曜」も同じ）。
+    日付と時刻（「11月20日午後5時」）も 1 つの表現で、quote の「11月20日午前9時」は通らない。日付と曜日（「11月20日金曜」）も同じで、
+    quote の「11月20日に確認し、金曜に提出」の寄せ集めでは通らず、曜日の付いた quote は曜日の無い deadline「11月20日」も裏付けない。曜日と時刻（「来週金曜9時」）・
+    相対の月と日（「来月20日」）も同じで、quote の別の句の曜日と時刻や、「来月21日」の「来月」では通らない。英語の時刻も同じで、
+    曜日・日付と時刻（「next friday 5pm」「friday 17:00」「11/20 5pm」。「at」の有無は問わない）を 1 つの表現として比べ、quote の「next Friday 9am」や
+    「friday 9:00 … monday 17:00」の寄せ集めは通らない。
+    表現を部分文字列で比べないのは、「来週」が「再来週」の中に現れるため（findall で切り出すと、「再」の位置で当たるのは
+    「再」で始まる候補（「再来週」「再来週末」「再来月」「再来月末」「再来年」「再来年11月20日」）だけなので、それぞれ 1 つの表現になる）。
+    月日の付かない相対の年（「来年」「来年末」「来年11月」「来年春」）も 1 つの表現で、quote の「再来年」「来年3月」「来年秋」では通らない。
+    quote の英語の表現は、正規化前の quote で語として現れるものだけを数える（_quote_hints。正規化すると語の境目が消え、
+    「Simon day」が「monday」に当たる）。
+    相対表現を日付に換算した deadline（quote は「来週」、deadline は「11月20日」）は通さない。換算の基準
+    （会議の日付・タイムゾーン）をこの検証は持たず、換算の正しさを確かめられない。
+    期限の表現を含まない deadline（「次回の定例まで」）は、正規化した文字列がそのまま quote に現れることを求める。
+    英数字で始まる・終わる deadline は、quote の中でも英数字に挟まれない句全体として現れることを求める（_phrase_in）。
+    期限の表現と、組にならない週・月・年・時間帯の修飾（「next week 5pm」「5pm next week」「next month 5pm」「friday afternoon」）を併せ持つ deadline は、表現のすべてに加えて
+    deadline 全体が句として quote に現れることを求める（時刻だけで比べると修飾が落ち、quote の「this week 5pm」「this month 5pm」が通る）。
+    相対の月の時期・週末・相対の日・相対の年と時刻（「来月上旬午後5時」「来週末午後5時」「明日午後5時」「来年度末午後5時」）も 1 つの表現で、quote の「今月上旬午後5時」の時刻と別の句の「来月上旬」、
+    「明日確認し、明後日午後5時に提出」の「明日」と時刻、「今年度末午後5時に確認し、来年度末に提出」の別の年の時刻では通らない。
+    部分文字列で比べると、「next week」が「next weekend」の、「end of month」が「end of monthly」の先頭に当たる。
+    quote は正規化前のもの（正規化は空白を落とし、語の境目が分からなくなる）。
+
+    確かめるのは期限の表現が quote にあることで、その期限がこの項目のタスクに掛かることではない。1 つの quote に
+    複数のタスクと期限がある（「今月上旬に確認し、来月下旬に提出」）と、別のタスクの期限も通る。担当者（段 4）も同じ。
+    どの期限・人がどのタスクに掛かるかは係り受けの解析が要り、決定的な規則では誤検出と見逃しが多いので、既知の制限とする
+    （基本設計 §12.5 段 4・5。段 3a (4) の否定と同じ扱い。UI の根拠リンクで利用者が元発言と照らす）
+    期限表現の前後の向き・範囲の語（「まで」「以降」「から」「以前」「by」「after」）も比べない。deadline の「11月20日まで」は
+    quote の「11月20日以降」でも通る（同じ「11月20日」を裏付けとみなす）。向きは期限表現の外の助詞・語で表れ、言い換え（「以後」「より後」
+    「を過ぎてから」）も多いので、決定的な規則では誤検出と見逃しが多い。段 3a (4) の否定・極性と同じ理由で既知の制限とする
+    """
+    d = normalize(deadline)
+    wanted = {_hint_key(m) for m in _DEADLINE_HINTS.findall(_hint_text(deadline))}
+    if not wanted:
+        return d != "" and _phrase_in(d, quote)
+    # 組にならない週・月・年・時間帯の修飾（「next week 5pm」の「next week」、「friday afternoon」の「afternoon」）は表現として切り出されないので、
+    # 時刻だけで比べると修飾が落ち、quote の「this week 5pm」「this month 5pm」が通る。残っていれば deadline 全体が句として quote に
+    # 現れることも求める（期限の表現を含まない deadline と同じ扱い）
+    if _EN_UNPAIRED_QUALIFIER.search(_DEADLINE_HINTS.sub("", d)):
+        return wanted <= _quote_hints(quote) and _phrase_in(d, quote)
+    return wanted <= _quote_hints(quote)
+
+
+def _quote_hints(quote: str) -> set[str]:
+    """quote の期限の表現（_hint_key でそろえた形）。
+
+    日本語・数字の表現は正規化した文字列（_hint_text。数字と数字の間の区切りだけは空白で残す）から切り出す（区切りの違い「来週、金曜」を問わない）。英語の表現（英字を含むもの）は
+    そこから捨て、正規化前の quote（_spaced。区切りを空白に置き換える）から語の境目つきで切り出す（_EN_DEADLINE_HINTS）。
+    正規化した文字列では語の境目が分からず、「Simon day」が「monday」に、「meow」が「eow」に当たる。
+    日付・日本語の曜日に付いた英語の時刻（「11/20 5pm」の「5pm」）は日本語の表現（「11/20 5pm」）が使ったので、英語の表現からは除く
+    （_ATTACHED_TIME_EN。除かないと時刻だけの deadline「5pm」を裏付ける）。別の句の時刻だけの表現（「11/20 9am、確認は5pm」の「5pm」）は残す
+    """
+    japanese = {_hint_key(m) for m in _DEADLINE_HINTS.findall(_hint_text(quote)) if _is_japanese_hint(m)}
+    english = {_hint_key(m) for m in _EN_DEADLINE_HINTS.findall(_ATTACHED_TIME_EN.sub(r"\1", _spaced(quote)))}
+    return japanese | english
+
+
+def _is_japanese_hint(hint: str) -> bool:
+    """日本語・数字の表現か。英字を含むものは英語の表現（_EN_DEADLINE_HINTS が語の境目つきで切り出す）。
+    日付の後ろの英語の時刻（「11月20日5pm」）だけは日付と 1 つの表現なので、英字として数えない（時刻だけの「5pm」は英語の表現）。"""
+    rest = _TRAILING_TIME_EN.sub("", hint)
+    return rest != "" and not re.search(r"[a-z]", rest)
+
+
+# normalize（merge/normalize.py の _PUNCT）が落とす文字。_phrase_in は落とさずに空白へ置き換え、語の境目として残す
+_SEPARATORS = re.compile(r"[。、，．,.!?！？「」()（）\[\]【】…・\s　]+")
+
+
+# 数字と数字の間にある区切り（_SEPARATORS と同じ文字の並び）。_hint_text が空白 1 つで残す
+_DIGIT_GAP = re.compile(r"(?<=[0-9])[。、，．,.!?！？「」()（）\[\]【】…・\s　]+(?=[0-9])")
+
+
+def _hint_text(text: str) -> str:
+    """期限の表現を切り出す文字列。normalize と同じ形にし、数字と数字の間の区切りだけを空白 1 つで残す。
+
+    normalize は区切りを落とすので、「2026/12/1 7pm」が「2026/12/17pm」になり、日と時刻の数字がつながって 17 日と読める
+    （quote の「2026/12/17」が裏付けてしまう）。「12/1 17:00」も「12/117:00」になり「12/11」と「7:00」に切れる。
+    deadline と quote の両方をこれで切り出し、_hint_key が区切りの書き方（空白・読点・「の」）を空白 1 つにそろえる
+    """
+    s = unicodedata.normalize("NFKC", text).lower()
+    return " ".join(_SEPARATORS.sub("", part) for part in _DIGIT_GAP.split(s))
+
+
+def _spaced(quote: str) -> str:
+    """normalize と同じ NFKC・小文字にし、normalize が落とす区切りを空白に置き換える（語の境目を残す）。"""
+    return _SEPARATORS.sub(" ", unicodedata.normalize("NFKC", quote).lower())
+
+
+def _is_ascii_alnum(c: str) -> bool:
+    return c.isascii() and c.isalnum()
+
+
+def _phrase_in(phrase_norm: str, quote: str) -> bool:
+    """normalize 済みの phrase が、quote に句全体として現れるか。
+
+    比べるのは normalize と同じ形（NFKC・小文字・区切りの無視）なので、区切りの位置の違い（「next week」と「nextweek」）は問わない。
+    phrase の先頭・末尾が英数字なら、quote の中でその外側が英数字でないことを求める（「next week」は「next weekend」に当たらない）。
+    日本語は語の境目を文字から決められないので、先頭・末尾が英数字でなければ外側を見ない（「次回の定例まで」は「次回の定例までに」に当たる）
+    """
+    spaced = _spaced(quote)
+    body = r"\s*".join(re.escape(c) for c in phrase_norm)
+    before = r"(?<![a-z0-9])" if _is_ascii_alnum(phrase_norm[0]) else ""
+    after = r"(?![a-z0-9])" if _is_ascii_alnum(phrase_norm[-1]) else ""
+    return re.search(before + body + after, spaced) is not None
+
+
+def _resolved_span(span: EvidenceSpan, index: SegmentIndex) -> EvidenceSpan:
+    """保存する根拠位置の segmentId を完全 ID にする（sourceSegmentIds と同じ形。位置はそのまま。§11.5）。
+
+    LLM は短縮 ID で返す。短縮 ID のまま保存すると、「evidenceSpan.segmentId は sourceSegmentIds のどれか」が成り立たない。
+    採用する項目は _check_evidence で解決できることを確かめ済み
+    """
+    full = index.resolve(span.segmentId)
+    return span if full is None else span.model_copy(update={"segmentId": full})
 
 
 def _check_evidence(ids: list[str], quote: str, span: EvidenceSpan, index: SegmentIndex) -> tuple[str, list[RejectionReason]]:
@@ -3620,7 +4259,8 @@ def validate(draft: MeetingSummaryDraft, index: SegmentIndex) -> tuple[MeetingSu
         if reasons:
             rejected.append(RejectedItem(kind="decision", item=d.model_dump(), reasons=reasons))
         else:
-            decisions.append(SummaryDecision(text=d.text, sourceSegmentIds=ids, quote=d.quote, evidenceSpan=d.evidenceSpan))
+            decisions.append(SummaryDecision(text=d.text, sourceSegmentIds=ids, quote=d.quote,
+                                             evidenceSpan=_resolved_span(d.evidenceSpan, index)))
 
     actions: list[SummaryActionItem] = []
     for a in draft.actionItems:
@@ -3633,7 +4273,8 @@ def validate(draft: MeetingSummaryDraft, index: SegmentIndex) -> tuple[MeetingSu
         evidence = quote_norm
         if a.assignee and normalize(a.assignee) not in evidence:
             reasons.append("ASSIGNEE_NOT_IN_TRANSCRIPT")            # 段 4（v4.0 §63）
-        if a.deadline and not (_DEADLINE_HINTS.search(evidence) or normalize(a.deadline) in evidence):
+        # 期限は正規化前の quote で比べる（句の境目を見る。_deadline_supported）。根拠位置で落ちた（evidence が空）なら quote を根拠にしない
+        if a.deadline and not _deadline_supported(a.deadline, a.quote if evidence else ""):
             reasons.append("DEADLINE_NOT_IN_TRANSCRIPT")            # 段 5
         if not quote_reasons and not _supported_by(a.task, quote_norm):
             reasons.append("CLAIM_NOT_SUPPORTED")
@@ -3645,7 +4286,7 @@ def validate(draft: MeetingSummaryDraft, index: SegmentIndex) -> tuple[MeetingSu
             rejected.append(RejectedItem(kind="actionItem", item=a.model_dump(), reasons=reasons))
         else:
             actions.append(SummaryActionItem(task=a.task, assignee=a.assignee, deadline=a.deadline, sourceSegmentIds=ids,
-                                             quote=a.quote, evidenceSpan=a.evidenceSpan))
+                                             quote=a.quote, evidenceSpan=_resolved_span(a.evidenceSpan, index)))
 
     if not draft.summary.strip():                                   # 段 7
         raise BusinessValidationError("summary is empty")
@@ -3782,10 +4423,11 @@ def caveats_for(stt_model: str | None, llm_model: str | None) -> list[str]:
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from ..db import repo
 from ..db.connection import now_ms
-from ..db.models import Job, Segment, SummaryVersion
+from ..db.models import AudioChunk, Job, Segment, SummaryVersion
 from ..llm.caveats import caveats_for
 from ..llm.map_reduce import synthesize
 from ..llm.prompts import PROMPT_VERSION
@@ -3799,8 +4441,10 @@ from ..stt.provider import STTRequest
 from ..storage.files import InvalidWavError, read_pcm
 from . import pipeline
 from .context import AppContext
-from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError
+from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError, normalize_exception
 from .selection import refresh_llm, refresh_stt
+
+log = logging.getLogger(__name__)
 
 DEFAULT_LLM_CTX_TOKENS = 8192
 
@@ -3815,20 +4459,48 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
         # processing_jobs.status には存在しない（基本設計 §13.1）。
         # モデル配置を待って再試行する設定では、ここで ModelMissingError を投げて retrying にする。
         async with ctx.db.write() as conn:
+            # lease が失効していれば書かない（基本設計 §9.3）。検査と書き込みは同じトランザクションで行う
+            if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                return None
             pipeline.on_vad_completed(conn, chunk, chunk.has_voice, _stt_model_for(ctx, job.meeting_id, conn))
         return None
     try:
         pcm = read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256)
     except InvalidWavError as e:
+        repaired: bytes | None = None
         async with ctx.db.write() as conn:
-            repo.update_chunk(conn, chunk.id, save_status="missing")
-        raise InvalidAudioError(str(e)) from e
+            # 成功時と同じく、失効した旧ワーカーは Chunk を書かない（基本設計 §9.3）。例外はそのまま投げる。
+            # 失敗の記録は Runner が行い、旧ワーカーの報告は finish_job の fencing が無視する
+            if repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                # 読めなかった後・このロックを取る前に再 PUT の修復（書き込みロックの下で書き戻す。§21.2）が入っていれば、
+                # ファイルは無事。同じトランザクションで行を読み直して照合し、無事なら missing にせず VAD を続ける。
+                # 確かめずに missing にすると、修復した Chunk を欠損と記録し、再試行しない INVALID_AUDIO で VAD が止まる
+                current = repo.get_chunk(conn, chunk.id)
+                repaired = await asyncio.to_thread(_read_stored_pcm, ctx, current) if current is not None else None
+                if repaired is None:
+                    repo.update_chunk(conn, chunk.id, save_status="missing")
+        if repaired is None:
+            raise InvalidAudioError(str(e)) from e
+        pcm = repaired
     result = await asyncio.to_thread(ctx.vad.detect, pcm)
     async with ctx.db.write() as conn:
-        repo.update_chunk(conn, chunk.id, has_voice=result.has_voice, server_vad_score=result.voiced_ratio,
-                          vad_source="server_silero")
-        pipeline.on_vad_completed(conn, chunk, result.has_voice, _stt_model_for(ctx, job.meeting_id, conn))
+        # 失効した旧ワーカーが書くと、failed の vad ジョブを残したまま Chunk が進む。再試行の VAD は
+        # 完了済みの Chunk を queued に戻し、transcribe ジョブは既存なので作り直されず止まる
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return None
+        # 既に適用済み（再試行で queued / completed の Chunk に来た）なら、VAD の値も書き換えない
+        if pipeline.on_vad_completed(conn, chunk, result.has_voice, _stt_model_for(ctx, job.meeting_id, conn)):
+            repo.update_chunk(conn, chunk.id, has_voice=result.has_voice, server_vad_score=result.voiced_ratio,
+                              vad_source="server_silero")
     return None
+
+
+def _read_stored_pcm(ctx: AppContext, chunk: AudioChunk) -> bytes | None:
+    """保存済みの WAV を読み、sha256 まで照合する。読めなければ None（pipeline.chunk_file_intact と同じ規則：欠損・破損・OSError）。"""
+    try:
+        return read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256)
+    except (InvalidWavError, OSError):
+        return None
 
 
 def _stt_model_for(ctx: AppContext, meeting_id: str, conn) -> str | None:  # type: ignore[no-untyped-def]
@@ -3836,6 +4508,23 @@ def _stt_model_for(ctx: AppContext, meeting_id: str, conn) -> str | None:  # typ
     if m is not None and m.stt_model_used:
         return m.stt_model_used
     return ctx.models.stt.name if ctx.models.stt else None
+
+
+def _publish_created_job(ctx: AppContext, job_id: str) -> None:
+    """ハンドラのトランザクションで作ったジョブを、コミットの後に Runner._publish_job と同じ形で流す（§13）。"""
+    # 書き込みはコミット済み。読み直し・配信の失敗を Runner へ伝えると、終わった試行が失敗として記録され再試行される。
+    # 記録だけして戻る（購読側は再接続時の補完で追いつく。§13）。Exception だけを捕まえ、CancelledError は止めない
+    try:
+        with ctx.db.read() as conn:
+            job = repo.get_job(conn, job_id)
+            meeting = repo.get_meeting(conn, job.meeting_id) if job else None
+        if job is None:
+            return
+        ctx.events.publish(job.meeting_id, {"type": "job", "job": job.model_dump()})
+        if meeting is not None:
+            ctx.events.publish(job.meeting_id, {"type": "meeting_status", "status": meeting.status})
+    except Exception:
+        log.exception("failed to publish created job %s after commit", job_id)
 
 
 async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
@@ -3887,18 +4576,48 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         # 書いた件数では判定しない。無音で segments が空だと失効していても 0 件になり、旧ワーカーが Chunk を完了にしてしまう
         if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return model_name
-        repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
+        # この Chunk の結果を置き換える。結果のコミット後に lease 切れで回収されたジョブの再試行・再実行では、前の attempt の
+        # segments が残っている。INSERT OR IGNORE だけでは、件数や区切りが変わった新しい結果と古い行が混ざる（§14）
+        current = repo.get_chunk(conn, chunk.id)
+        replaced = current is not None and current.stt_status == "completed"
+        # 実行中（leased / processing）の merge があれば、初めての完了（手動 STT。§21 transcribe_silent_chunk）でも staged に置く。
+        # その merge の書き込みの後にコミットすると版に入らず、ensure_merge_job も一意制約で merge を作れない。
+        # staged なら、Runner が merge の完了を記録するときに入れ替え待ち（has_replacements）を見て作り直す
+        merge_running = repo.count_jobs(conn, chunk.meeting_id, "merge_transcript", ["leased", "processing"]) > 0
+        if replaced or merge_running:
+            # 前の結果は公開中の版（merged_version）に載っていることがある。ここで消すと、作り直す merge がコミットするまで
+            # transcript からその区間が抜け、merge が失敗し続ければ抜けたままになる。新しい結果は staged_segments に置き、
+            # 次の merge が版を上げるのと同じトランザクションで入れ替える（repo.promote_replacements）
+            repo.stage_replacement(conn, chunk.meeting_id, chunk.id)
+            repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts, staged=True)
+        else:
+            # 完了前の attempt の行はどの版にも載っていない（merge は全 Chunk の完了後）ので、その場で置き換える
+            repo.delete_segments_of_chunk(conn, chunk.id)
+            repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
+        # 前の結果で merge が終わっていれば、新しい結果は作り直す merge まで入れ替わらない。完了済みの merge ジョブを消し、
+        # 下の on_transcribe_completed → ensure_merge_job で作り直して版を上げる（手動 STT と同じ。要約は自動では作り直さない）。
+        # 初めての完了でも消す：手動 STT を受け付けた時点で実行中だった merge（transcribe_silent_chunk は消せない）が先に終わっていると、
+        # 残した完了済みの行が一意制約で作り直しを止め、この Chunk は transcript に入らない
+        repo.delete_finished_job(conn, chunk.meeting_id, "merge_transcript")
         if meeting.stt_model_used is None:
             repo.update_meeting(conn, chunk.meeting_id, stt_model_used=model_name)
         repo.record_metric(conn, "stt_seconds", chunk.duration_ms / 1000, model_name=model_name, meeting_id=chunk.meeting_id)
         if result.model_load_ms:
             repo.record_metric(conn, "stt_model_load_ms", result.model_load_ms, model_name=model_name)
-        pipeline.on_transcribe_completed(conn, chunk)
+        created = pipeline.on_transcribe_completed(conn, chunk)
+    # 作った merge はコミットの後に流す。Runner の完了処理の ensure_merge_job は既存（一意制約）で None を返すので、
+    # ここで流さないと lease されるまで pending の行がイベントに出ない
+    if created is not None:
+        _publish_created_job(ctx, created)
     return model_name
 
 
 async def handle_merge(ctx: AppContext, job: Job) -> str | None:
     async with ctx.db.write() as conn:
+        # lease が失効していれば transcript も会議の状態も書かず、要約ジョブも作らない（基本設計 §9.3）。
+        # 書くと failed の merge ジョブを残したまま transcript の版が進み、要約まで走る
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return None
         report = run_merge(conn, job.meeting_id, ctx.settings.thresholds)
         pipeline.on_merge_completed(conn, job.meeting_id)
     ctx.events.publish(job.meeting_id, {"type": "transcript_version", "transcriptVersion": report.transcript_version})
@@ -3918,12 +4637,28 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
             raise InvalidAudioError("meeting missing")
         lines, gaps = render_lines(conn, job.meeting_id, meeting.transcript_version)
         seg_texts = {ln.segment_id: ln.text for ln in lines}
+    # 合成に使う版をジョブの行へ控える（lease の現行の所有者だけ）。合成の途中でワーカーが落ちて lease が切れたとき、Sweeper が
+    # この版と今の版を比べ、進んでいれば古い版に対する試行として回数に数えずに同じ行を戻す（§14 sweeper.sweep_once。§12.7）。
+    # ハンドラの失敗は JobError.input_transcript_version で同じ比較をする（Runner._on_failure）
+    async with ctx.db.write() as conn:
+        repo.record_input_transcript_version(conn, job.id, job.lease_owner or "", job.attempts, meeting.transcript_version)
     text = format_for_llm(lines, gaps)
     th = ctx.settings.thresholds
-    synth = await synthesize(ctx.llm, llm_model, ctx.settings.language, text, DEFAULT_LLM_CTX_TOKENS, th.llm_ctx_fill_ratio)
-
-    index = SegmentIndex(seg_texts)
-    accepted, rejected, unresolved = validate(synth.draft, index)
+    try:
+        synth = await synthesize(ctx.llm, llm_model, ctx.settings.language, text, DEFAULT_LLM_CTX_TOKENS, th.llm_ctx_fill_ratio)
+        index = SegmentIndex(seg_texts)
+        accepted, rejected, unresolved = validate(synth.draft, index)
+    except Exception as exc:
+        # 合成・検証の失敗に、合成に使った transcript の版を付けて投げる。Runner の _on_failure が、失敗を記録する書き込み
+        # トランザクションの中で今の版と比べ、進んでいれば failed にせず同じ行を pending に戻す（古い版に対する失敗。failed に
+        # すると会議も failed になり、新しい版の要約ジョブは実行中のこの行が一意制約で先にあるので作られていない）。
+        # 比較をここで別のトランザクションで行うと、比較の後・失敗の記録の前に merge が版を進めたとき failed になる。
+        # CancelledError は捕まえない
+        err = normalize_exception(exc)
+        err.input_transcript_version = meeting.transcript_version
+        if err is exc:
+            raise
+        raise err from exc
     total = len(synth.draft.topics) + len(synth.draft.decisions) + len(synth.draft.actionItems)
     t = now_ms()
     summary = MeetingSummary(
@@ -3934,6 +4669,18 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
     report = SummaryValidationReport(schemaValid=True, schemaRetries=synth.schema_retries, mapWindows=synth.map_windows,
                                      totalItems=total, rejectedItems=len(rejected), unresolvedSegmentIds=unresolved)
     async with ctx.db.write() as conn:
+        # lease が失効していれば要約も会議の completed も書かない（基本設計 §9.3）。Sweeper が回数切れで failed にした後に
+        # 書くと、failed のジョブと completed の会議が組になる。検査と書き込みは同じトランザクションで行う
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return llm_model
+        # 合成の間に merge（撮り直しの入れ替え・手動 STT の後）が transcript の版を進めていれば、古い版の要約を保存せず、
+        # 会議も completed にしない（merge が transcribed にした状態のまま）。merge の on_merge_completed が作ろうとする要約ジョブは、
+        # 実行中のこの行が一意制約（uq_summary_job）で先にあるので作られない。この試行を取り消して同じ行を pending に戻し、
+        # 新しい版で合成し直す（まだ要約を保存していないので、§12.7 の「進んだ後の再生成」ではなく元の要求の続き）
+        current = repo.get_meeting(conn, job.meeting_id)
+        if current is not None and current.transcript_version != meeting.transcript_version:
+            repo.requeue_job(conn, job.id, job.lease_owner or "", job.attempts)
+            return llm_model
         version = repo.next_summary_version(conn, job.meeting_id)
         repo.insert_summary(conn, SummaryVersion(
             id=repo.new_id(), meeting_id=job.meeting_id, version=version, transcript_version=meeting.transcript_version,
@@ -3943,6 +4690,10 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
         repo.update_meeting(conn, job.meeting_id, llm_model_used=llm_model)
         repo.record_metric(conn, "llm_schema_fail", synth.schema_retries, model_name=llm_model, meeting_id=job.meeting_id)
         pipeline.on_summary_completed(conn, job.meeting_id)
+        # ジョブも同じトランザクションで completed にする（lease は Runner の finish_job が外す）。finish_job の前にワーカーが落ちても、
+        # Sweeper はコミット済みの試行を回収しない。回収すると要約を作り直し（版が進んでいれば §12.7 の自動の再生成になる）、
+        # 回数切れなら failed にする
+        repo.mark_job_committed(conn, job.id, job.lease_owner or "", job.attempts)
     ctx.events.publish(job.meeting_id, {"type": "summary_version", "version": version})
     return llm_model
 
@@ -4473,7 +5224,7 @@ async def finalize(meeting_id: str, req: FinalizeRequest, request: Request) -> A
 | エンドポイント | 前提 | 満たさないとき | 理由 |
 | --- | --- | --- | --- |
 | `POST …/transcript/rerun` | 会議が確定後（`transcribing`〜`failed`）。`sttModel` は `null` か配置済みのモデル | 422 `VALIDATION` | 確定前に通すと会議が `transcribing` に進み、以後の Chunk の PUT が 409 になる（録音の保存が止まる）。未配置のモデルは、既存の transcript を消した後で全 Chunk が `MODEL_MISSING` の待機に入る |
-| `POST …/chunks/{source}/{seq}/transcribe` | 会議が merge 済み（`transcribed`〜`failed`）。Chunk の `stt_status` が `skipped` | 422 `VALIDATION`（Chunk がなければ 404） | `skipped` 以外には transcribe ジョブが既にあり（一意制約）、ジョブなしで `queued` にすると merge が永久に止まる。受け付けたら完了済みの merge ジョブを消し、STT の完了後に transcript の版が上がる。要約は自動では作り直さず、会議は `transcribed` に戻る |
+| `POST …/chunks/{source}/{seq}/transcribe` | 会議が merge 済み（`transcribed`〜`failed`）。Chunk の `stt_status` が `skipped` | 422 `VALIDATION`（Chunk がなければ 404） | `skipped` 以外には transcribe ジョブが既にあり（一意制約）、ジョブなしで `queued` にすると merge が永久に止まる。受け付けたら完了済みの merge ジョブを消し、STT の完了後に transcript の版が上がる。実行中の merge は消せないので、STT の完了時に `handle_transcribe` が結果を `staged_segments` に置くか（merge が実行中）、先に終わった merge を消して作り直させる（§14）。要約は自動では作り直さず、会議は `transcribed` に戻る |
 | `PUT /v1/settings` | `language` は `ja` / `en` / `auto`、`sttModel` は Whisper のモデル名、`vadSamplingRatio` は 0〜1（`common.clean_settings`） | 422 `VALIDATION`。1 つも保存しない | `sttModel` / `llmModel` の空文字は「指定を外して自動選定に戻す」。変更したら `refresh_stt` / `refresh_llm` で選定をやり直す（§13.1） |
 | `POST …/jobs/exclude-failed`（§21.4） | 会議が存在する | 404 `NOT_FOUND` | 確かめないと外部キー違反で 500 になる |
 
@@ -4742,8 +5493,15 @@ async def retry(job_id: str, request: Request) -> Any:
     async with ctx.db.write() as conn:
         ok = repo.retry_job(conn, job_id)
         job = repo.get_job(conn, job_id)
-        if ok and job is not None and job.chunk_id is not None:
-            repo.update_chunk(conn, job.chunk_id, stt_status="queued")
+        # queued に戻すのは transcribe だけ。vad の再試行で queued にすると、VAD の結果が適用済みの Chunk
+        # （completed など）を戻してしまい、transcribe ジョブは既存なので作り直されず止まる（§14）
+        # transcribe でも completed の Chunk は戻さない。結果のコミット後に lease 切れで回収されたジョブの再試行で queued にすると、
+        # 再試行が失敗したとき on_transcribe_failed が completed を見られず failed（書き込み済みの segments が gap）にする。
+        # 再試行が成功すれば on_transcribe_completed が completed を書き直す
+        if ok and job is not None and job.chunk_id is not None and job.job_type == "transcribe_chunk":
+            chunk = repo.get_chunk(conn, job.chunk_id)
+            if chunk is not None and chunk.stt_status != "completed":
+                repo.update_chunk(conn, job.chunk_id, stt_status="queued")
     if not ok:
         return JSONResponse(error_body("VALIDATION", "job is not failed"), status_code=422)
     return {"jobId": job_id, "status": "pending"}
@@ -5034,7 +5792,7 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
                 from .vad.silero_provider import SileroVADProvider
                 vad = SileroVADProvider(p, th.vad_threshold, th.vad_min_speech_ms, th.vad_min_voiced_ms)
             except ImportError:
-                # モデルは置いてあるが onnxruntime（extras の vad）が入っていない。起動を止めず、未配置と同じく
+                # モデルは置いてあるが onnxruntime（extras の stt / cuda）が入っていない。起動を止めず、未配置と同じく
                 # ブラウザ側の VAD で進める（doctor の vad 行に NOT INSTALLED と出る）
                 vad = None
 
@@ -5118,11 +5876,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print(f"token: {token}")
         app = create_app(ctx, token)
         stop = asyncio.Event()
-        await sweeper.sweep_once(ctx.db)
+        await sweeper.sweep_once(ctx.db, ctx.events)
         await sweeper.resume_finalized(ctx.db, s.data_dir)  # Phase 1 で確定した会議（移行した DB）のジョブを作る
         runners = [JobRunner(ctx, HANDLERS, i) for i in range(ctx.models.max_concurrent_stt)]
         tasks = [asyncio.create_task(r.run_forever()) for r in runners]
-        tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, stop)))
+        tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, ctx.events, stop)))
         config = uvicorn.Config(app, host=args.bind, port=s.port, log_level="info")
         server = uvicorn.Server(config)
         try:
@@ -5312,10 +6070,11 @@ ChunkFactory = Callable[[float], bytes]
 
 ```python
 # tests/test_imports.py
-"""§4 の規則：httpx は 2 モジュールのみ、STT ワーカー系は DB を import しない。"""
+"""§4 の規則：httpx は 2 モジュールのみ（ほかの通信手段も許可したモジュールだけ）、STT ワーカー系は DB を import しない。"""
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import minutes_local
@@ -5343,6 +6102,165 @@ def test_httpx_only_in_allowed_modules() -> None:
         if "httpx" in _imports(p) and rel not in HTTPX_ALLOWED:
             offenders.append(rel)
     assert offenders == []
+
+
+# httpx 以外の通信手段も、許可したモジュールだけが使う（外へ出る経路を httpx の 2 モジュールに絞る規則を、別の手段ですり抜けない）。
+# socket は待ち受けのソケットを作るだけ（bootstrap.bind_listen_socket）、subprocess は icacls・whoami・GPU の検出で、どちらも外へ接続しない。
+# 足すときは、外へ接続しないことを確かめてからここに書く
+NETWORK_ALLOWED: dict[str, set[str]] = {
+    "httpx": HTTPX_ALLOWED,
+    "socket": {"bootstrap.py"},
+    # socket の実体（C 実装）。socket と同じ接続を作れるので、どのモジュールにも許さない（bootstrap も socket だけを使う）
+    "_socket": set(),
+    "subprocess": {"bootstrap.py", "hw/detect.py"},
+    "urllib.request": set(), "http.client": set(), "ftplib": set(), "smtplib": set(),
+    "requests": set(), "aiohttp": set(), "urllib3": set(), "websockets": set(),
+}
+# import を見るだけでは拾えない、どのモジュールからでも呼べる接続・子プロセスの起動（asyncio と os の関数）と、
+# 別の経路で得たソケットの低水準の接続（connect_ex、イベントループの sock_connect・sock_sendto）と、接続せずに宛先を付けて送る
+# データグラムの送信（sendto・sendmsg）。待ち受けのために socket を許した bootstrap でも、UDP のソケットを作れば connect を通らずに
+# 外へ送れる（socket.socket(AF_INET, SOCK_DGRAM).sendto）。待ち受けのソケット（TCP）は sendto・sendmsg を使わない。
+# 「connect」は socket・_socket を import したモジュール（許可した bootstrap を含む）でだけ数える（_network_calls）。どこでも数えると
+# sqlite3.connect と区別できない。import の許可だけでは、待ち受けのために socket を許したモジュールの socket.socket().connect を塞げない
+NETWORK_CALLS = {"open_connection", "open_unix_connection", "create_connection", "create_datagram_endpoint",
+                 "create_subprocess_exec", "create_subprocess_shell", "urlopen",
+                 "connect_ex", "sock_connect", "sock_sendto", "sendto", "sendmsg"}
+OS_PROCESS_CALLS = re.compile(r"system|popen|exec\w*|spawn\w*|posix_spawn\w*")
+
+
+def _imported_modules(path: Path) -> set[str]:
+    """import したモジュールの完全な名前。「from urllib import request」は「urllib.request」も数える。"""
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
+            names.update(f"{node.module}.{a.name}" for a in node.names)
+    return names
+
+
+def _network_calls(path: Path) -> set[str]:
+    """接続・子プロセスの起動。属性の呼び出し（「asyncio.open_connection」「os.system」）と、名前で import したもの
+    （「from asyncio import open_connection as oc」「from os import system」。別名を問わず元の名前で数える）の両方を拾う。
+    os を別名で import したもの（「import os as o」→「o.system」）も os として数える。
+    socket・_socket を import したモジュールの「.connect」も数える（受け手が socket 以外の import した名前なら数えない）。"""
+    found: set[str] = set()
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    # 先に os を指す名前を集める（import が呼び出しより後ろにあっても拾う）
+    os_names = {a.asname or a.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+                for a in node.names if a.name == "os"}
+    # socket・_socket を import したモジュールでは「.connect」も接続として数える（socket.socket().connect、作ったソケットの s.connect）。
+    # 受け手が socket 以外の import した名前（sqlite3.connect、「from ..db import connection」の connection.connect）なら数えない
+    socket_modules = {"socket", "_socket"}
+    socket_imported = False
+    other_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in socket_modules:
+                    socket_imported = True
+                else:
+                    other_names.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and (node.module or "").split(".")[0] in socket_modules:
+                socket_imported = True
+            else:
+                other_names.update(a.asname or a.name for a in node.names)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0:
+            for a in node.names:
+                if a.name in NETWORK_CALLS:
+                    found.add(a.name)
+                elif node.module == "os" and OS_PROCESS_CALLS.fullmatch(a.name):
+                    found.add(f"os.{a.name}")
+            continue
+        if not isinstance(node, ast.Attribute):
+            continue
+        if node.attr in NETWORK_CALLS:
+            found.add(node.attr)
+        elif node.attr == "connect" and socket_imported and not (isinstance(node.value, ast.Name) and node.value.id in other_names):
+            found.add("connect")
+        elif isinstance(node.value, ast.Name) and node.value.id in os_names and OS_PROCESS_CALLS.fullmatch(node.attr):
+            found.add(f"os.{node.attr}")
+    return found
+
+
+def _network_offenders(rel: str, path: Path) -> list[str]:
+    """rel（ROOT からの相対パス）のモジュールが、許可されていない通信手段を import・呼び出ししていれば列挙する。"""
+    offenders: list[str] = []
+    for name in _imported_modules(path):
+        for module, allowed in NETWORK_ALLOWED.items():
+            if (name == module or name.startswith(module + ".")) and rel not in allowed:
+                offenders.append(f"{rel}: {name}")
+    offenders.extend(f"{rel}: {call}" for call in sorted(_network_calls(path)))
+    return offenders
+
+
+def test_network_modules_only_in_allowed_modules() -> None:
+    offenders = []
+    for p in ROOT.rglob("*.py"):
+        offenders.extend(_network_offenders(p.relative_to(ROOT).as_posix(), p))
+    assert offenders == []
+
+
+def test_low_level_socket_is_rejected_outside_allowed_modules(tmp_path: Path) -> None:
+    """socket の実体の _socket の import と、ソケットの低水準の接続（connect_ex・ループの sock_connect）も、許可していないモジュールでは違反。
+    socket だけを見ると「import _socket」で同じ接続を作れてしまう。"""
+    # Arrange
+    src = tmp_path / "m.py"
+    src.write_text("import _socket\nfrom _socket import socket as raw\ns = _socket.socket()\ns.connect_ex(('h', 1))\n"
+                   "async def f(loop, a):\n    await loop.sock_connect(s, a)\n", encoding="utf-8")
+    # Act
+    offenders = _network_offenders("jobs/m.py", src)
+    # Assert
+    assert {"jobs/m.py: _socket", "jobs/m.py: _socket.socket", "jobs/m.py: connect_ex", "jobs/m.py: sock_connect"} <= set(offenders)
+
+
+def test_network_calls_detects_from_imports(tmp_path: Path) -> None:
+    """名前で import した接続・子プロセスの関数（別名を付けたものを含む）も拾う。属性の呼び出しは従来どおり拾う。"""
+    # Arrange
+    src = tmp_path / "m.py"
+    src.write_text("from asyncio import open_connection as oc\nfrom os import system, path\nimport os\n"
+                   "from os import spawnv as sp\nos.popen('x')\nimport os as o\no.execv('x', [])\n", encoding="utf-8")
+    # Act
+    found = _network_calls(src)
+    # Assert: 関係の無い名前（os.path）は拾わない
+    assert found == {"open_connection", "os.system", "os.spawnv", "os.popen", "os.execv"}
+
+
+def test_network_calls_detects_socket_connect(tmp_path: Path) -> None:
+    """socket を import したモジュール（許可した bootstrap を含む）の「.connect」は、外への接続として拾う（socket.socket().connect、
+    別名で import した socket、作ったソケットを変数に置いたもの）。import したほかのモジュールの connect（sqlite3.connect）は拾わない。"""
+    # Arrange
+    direct = tmp_path / "direct.py"
+    direct.write_text("import socket\nsocket.socket().connect(('h', 1))\n", encoding="utf-8")
+    aliased = tmp_path / "aliased.py"
+    aliased.write_text("import socket as so\nfrom socket import socket as S\ns = so.socket()\ns.connect(('h', 1))\nS().connect(('h', 1))\n",
+                       encoding="utf-8")
+    db_only = tmp_path / "db_only.py"
+    db_only.write_text("import socket\nimport sqlite3\nfrom ..db import connection\nsqlite3.connect(':memory:')\nconnection.connect()\n",
+                       encoding="utf-8")
+    no_socket = tmp_path / "no_socket.py"
+    no_socket.write_text("import sqlite3\nconn = sqlite3.connect(':memory:')\n", encoding="utf-8")
+    # Act / Assert
+    assert _network_calls(direct) == {"connect"}
+    assert _network_calls(aliased) == {"connect"}
+    assert _network_calls(db_only) == set()
+    assert _network_calls(no_socket) == set()
+
+
+def test_network_calls_detects_datagram_send_in_allowed_socket_module(tmp_path: Path) -> None:
+    """socket の import を許した bootstrap.py でも、宛先を付けたデータグラムの送信（sendto・sendmsg）は違反。
+    UDP のソケットは connect を通らずに外へ送れるので、「.connect」だけを数えるとすり抜ける。"""
+    # Arrange
+    src = tmp_path / "bootstrap.py"
+    src.write_text("import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.sendto(b'x', ('203.0.113.1', 53))\n"
+                   "s.sendmsg([b'x'], [], 0, ('203.0.113.1', 53))\n", encoding="utf-8")
+    # Act
+    offenders = _network_offenders("bootstrap.py", src)
+    # Assert: socket の import そのものは許可のまま（違反に出ない）
+    assert sorted(offenders) == ["bootstrap.py: sendmsg", "bootstrap.py: sendto"]
 
 
 def test_stt_worker_does_not_import_db() -> None:
@@ -6011,16 +6929,24 @@ async def test_web_dir_is_served_at_root_without_token_and_does_not_shadow_api(c
 # tests/test_jobs.py
 from __future__ import annotations
 
+import asyncio
+import logging
+import sqlite3
+from typing import Any
+
 import httpx
 import pytest
 
 from minutes_local.db import repo
 from minutes_local.db.connection import now_ms
+from minutes_local.db.models import Job
+from minutes_local.jobs import handlers, sweeper
 from minutes_local.jobs.context import AppContext
-from minutes_local.jobs.retry import OOMError, decide, InvalidAudioError, ModelMissingError, normalize_exception
+from minutes_local.jobs.retry import JobError, OOMError, decide, InvalidAudioError, ModelMissingError, normalize_exception
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.jobs.sweeper import resume_finalized, sweep_once
 from minutes_local.stt.fake_provider import FakeSTTProvider
+from minutes_local.stt.provider import STTRequest, STTSegment
 from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm
 
 
@@ -6046,7 +6972,7 @@ async def test_sweeper_recovers_expired_lease_and_ignores_stale_owner(client: ht
     async with ctx.db.write() as conn:
         job = repo.lease_job(conn, "dead-worker", ["vad_chunk"], now_ms() - 600_000, lease_ms=1)
     assert job is not None
-    assert await sweep_once(ctx.db) == 1
+    assert await sweep_once(ctx.db, ctx.events) == 1
     async with ctx.db.write() as conn:
         assert repo.get_job(conn, job.id).status == "pending"
         # 旧ワーカーの完了報告は無視される（基本設計 §9.3）
@@ -6152,6 +7078,890 @@ async def test_allowed_types_excludes_summary_while_stt_running(ctx: AppContext)
         conn.execute("INSERT INTO meetings (id,title,status,session_start_epoch_ms,native_sample_rate,consent_confirmed_at,created_at,updated_at) VALUES ('m','t','transcribing',0,16000,1,?,?)", (t, t))
         conn.execute("INSERT INTO processing_jobs (id,meeting_id,job_type,status,priority,created_at,updated_at) VALUES ('j','m','transcribe_chunk','processing',100,?,?)", (t, t))
     assert "synthesize_minutes" not in runner.allowed_types()
+
+
+async def test_runner_loop_survives_failed_iteration(ctx: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    """1 回の失敗（DB のロック・ディスク満杯）で常駐ループが終わらない。終わると、以後のジョブが 1 件も動かない。"""
+    # Arrange: 1 回目の run_once だけ失敗させる
+    runner = JobRunner(ctx, {})
+    calls = 0
+
+    async def flaky() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database or disk is full")
+        runner.stop()
+        return False
+
+    monkeypatch.setattr(runner, "run_once", flaky)
+    # Act
+    await asyncio.wait_for(runner.run_forever(idle_sleep_s=0.01), timeout=5)
+    # Assert: 失敗の後も次の周回が回った
+    assert calls == 2
+
+
+async def test_sweeper_loop_survives_failed_iteration(ctx: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    """回収ループも 1 回の失敗で終わらない。終わると、落ちたワーカーの lease が期限切れのまま回収されない。"""
+    # Arrange
+    stop = asyncio.Event()
+    calls = 0
+
+    async def flaky(_db: object, _events: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        stop.set()
+        return 0
+
+    monkeypatch.setattr(sweeper, "sweep_once", flaky)
+    # Act
+    await asyncio.wait_for(sweeper.run_forever(ctx.db, ctx.events, stop, interval_s=0.01), timeout=5)
+    # Assert
+    assert calls == 2
+
+
+async def test_sweeper_fails_job_whose_lease_keeps_expiring(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
+    """実行するたびにワーカーごと落ちるジョブは、試行回数を使い切ったら failed にする（再起動のたびに永久に実行しない）。"""
+    # Arrange: VAD まで進め、transcribe ジョブを待機にする
+    await _seed(client, 1)
+    await finalize(client, "m-1", mic=1)
+    assert await runner.run_once() is True
+    # Act: lease しては結果を報告せずに落ちる、を max_attempts 回くり返す
+    job_id = ""
+    for attempt in range(1, 6):
+        async with ctx.db.write() as conn:
+            job = repo.lease_job(conn, "w-dead", ["transcribe_chunk"], now_ms())
+            assert job is not None and job.attempts == attempt and job.max_attempts == 5
+            conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
+            job_id = job.id
+        assert await sweep_once(ctx.db, ctx.events) == 1
+    # Assert: 6 回目は lease できず、Chunk は failed（利用者が再試行か除外を選ぶ。§12）
+    async with ctx.db.write() as conn:
+        assert repo.lease_job(conn, "w-new", ["transcribe_chunk"], now_ms()) is None
+        failed = repo.get_job(conn, job_id)
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    assert failed is not None and (failed.status, failed.error_class) == ("failed", "INTERNAL")
+    assert chunk is not None and chunk.stt_status == "failed"
+
+
+async def _run_until_job(ctx: AppContext, runner: JobRunner, job_type: str) -> None:
+    """job_type のジョブが作られるまで 1 件ずつ実行する（そのジョブ自体は実行しない）。"""
+    while True:
+        with ctx.db.read() as conn:
+            if any(j.job_type == job_type for j in repo.list_jobs(conn, "m-1")):
+                return
+        assert await runner.run_once() is True
+
+
+async def _expire_exhausted(ctx: AppContext, job_type: str) -> Job:
+    """job_type を旧ワーカーとして lease し、試行回数を使い切った状態で lease を切らす。戻り値は旧ワーカーが持つ Job。"""
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-dead", [job_type], now_ms())
+        assert job is not None
+        conn.execute("UPDATE processing_jobs SET attempts = max_attempts, lease_until = 0 WHERE id = ?", (job.id,))
+        # 保存した attempts（fencing token）を持たせる。lease 時点の Job のままだと、attempts の不一致だけで弾かれる
+        stored = repo.get_job(conn, job.id)
+    assert stored is not None
+    return stored
+
+
+async def test_summary_from_expired_lease_does_not_complete_failed_meeting(client: httpx.AsyncClient, ctx: AppContext,
+                                                                         runner: JobRunner) -> None:
+    """lease を失った旧ワーカーの要約は書かない。書くと failed のジョブと completed の会議の組になる（基本設計 §9.3）。"""
+    # Arrange: 要約ジョブを抱えたワーカーが落ち、回数切れで回収されて会議は failed になる
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    stale = await _expire_exhausted(ctx, "synthesize_minutes")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Act: 旧ワーカーの要約が後から終わる
+    await handlers.handle_summary(ctx, stale)
+    # Assert: 要約は書かれず、会議は failed のまま
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        job = repo.get_job(conn, stale.id)
+        n = conn.execute("SELECT COUNT(*) AS n FROM meeting_summary_versions WHERE meeting_id = 'm-1'").fetchone()["n"]
+    assert meeting is not None and meeting.status == "failed"
+    assert job is not None and job.status == "failed"
+    assert n == 0
+
+
+async def test_summary_is_not_saved_when_merge_advances_transcript_during_synthesis(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """合成の間に merge が transcript の版を進めたら、古い版の要約を保存せず、会議も completed にしない（§12.7）。
+
+    merge の on_merge_completed が作ろうとする要約ジョブは、実行中のこの行が一意制約で先にあるので作られない。
+    同じ行を pending に戻し（試行回数は戻す）、新しい版で合成し直させる。Runner の finish_job はこの試行を completed にしない。
+    """
+    # Arrange: 合成が終わった直後に、撮り直しの merge が版を進める
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    real = handlers.synthesize
+
+    async def advancing(*args: Any, **kwargs: Any) -> Any:
+        out = await real(*args, **kwargs)
+        async with ctx.db.write() as conn:
+            m = repo.get_meeting(conn, "m-1")
+            assert m is not None
+            repo.update_meeting(conn, "m-1", transcript_version=m.transcript_version + 1)
+        return out
+    monkeypatch.setattr(handlers, "synthesize", advancing)
+    with ctx.db.read() as conn:
+        before = next(j for j in repo.list_jobs(conn, "m-1") if j.job_type == "synthesize_minutes")
+    # Act
+    assert await runner.run_once() is True
+    # Assert: 要約は無く、会議は completed でなく、同じ行が pending に戻っている
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        job = repo.get_job(conn, before.id)
+        n = conn.execute("SELECT COUNT(*) AS n FROM meeting_summary_versions WHERE meeting_id = 'm-1'").fetchone()["n"]
+    assert n == 0
+    assert meeting is not None and meeting.status != "completed"
+    assert job is not None and (job.status, job.lease_owner, job.attempts) == ("pending", None, before.attempts)
+
+
+async def test_summary_failure_after_merge_advances_transcript_requeues_instead_of_failing(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """合成の間に merge が版を進めた後に合成が失敗したら、failed にせず同じ行を pending に戻す（試行回数は戻す。§12.7）。
+
+    失敗は古い版に対するもの。failed にすると会議も failed になり、新しい版の要約ジョブは一意制約で作られない。
+    版が進んでいなければ従来どおり失敗として記録する。
+    """
+    # Arrange: 合成の途中で merge が版を進め、その後に再試行しない失敗が起きる
+    from minutes_local.jobs.retry import BusinessValidationError
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    advance = True
+
+    async def failing(*_args: Any, **_kwargs: Any) -> Any:
+        if advance:
+            async with ctx.db.write() as conn:
+                m = repo.get_meeting(conn, "m-1")
+                assert m is not None
+                repo.update_meeting(conn, "m-1", transcript_version=m.transcript_version + 1)
+        raise BusinessValidationError("empty summary")
+    monkeypatch.setattr(handlers, "synthesize", failing)
+    with ctx.db.read() as conn:
+        before = next(j for j in repo.list_jobs(conn, "m-1") if j.job_type == "synthesize_minutes")
+    # Act
+    assert await runner.run_once() is True
+    with ctx.db.read() as conn:
+        requeued = repo.get_job(conn, before.id)
+        meeting = repo.get_meeting(conn, "m-1")
+    # 版が進まなかった次の試行の失敗は、従来どおり failed になる
+    advance = False
+    assert await runner.run_once() is True
+    with ctx.db.read() as conn:
+        failed = repo.get_job(conn, before.id)
+    # Assert
+    assert requeued is not None and (requeued.status, requeued.lease_owner, requeued.attempts) == ("pending", None, before.attempts)
+    assert meeting is not None and meeting.status != "failed"
+    assert failed is not None and failed.status == "failed"
+
+
+async def test_summary_failure_requeues_when_merge_advances_after_handler_raises(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ハンドラが失敗を投げた後・Runner が失敗を記録する前に merge が版を進めても、failed にせず pending に戻す（§12.7）。
+
+    版の比較と失敗の記録が別のトランザクションだと、その間の merge を見落として failed になる。
+    """
+    # Arrange: 合成は版を進めずに失敗し、Runner の _on_failure に入る直前に merge が版を進める
+    from minutes_local.jobs.retry import BusinessValidationError, JobError
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+
+    async def failing(*_args: Any, **_kwargs: Any) -> Any:
+        raise BusinessValidationError("empty summary")
+    monkeypatch.setattr(handlers, "synthesize", failing)
+    original = runner._on_failure
+
+    async def advance_then_fail(job: Job, err: JobError, duration_ms: int) -> None:
+        async with ctx.db.write() as conn:
+            m = repo.get_meeting(conn, "m-1")
+            assert m is not None
+            repo.update_meeting(conn, "m-1", transcript_version=m.transcript_version + 1)
+        await original(job, err, duration_ms)
+    monkeypatch.setattr(runner, "_on_failure", advance_then_fail)
+    with ctx.db.read() as conn:
+        before = next(j for j in repo.list_jobs(conn, "m-1") if j.job_type == "synthesize_minutes")
+    # Act
+    assert await runner.run_once() is True
+    # Assert
+    with ctx.db.read() as conn:
+        job = repo.get_job(conn, before.id)
+        meeting = repo.get_meeting(conn, "m-1")
+    assert job is not None and (job.status, job.lease_owner, job.attempts) == ("pending", None, before.attempts)
+    assert meeting is not None and meeting.status != "failed"
+
+
+@pytest.mark.parametrize("advanced", [True, False])
+async def test_sweep_requeues_expired_summary_only_when_transcript_advanced(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, monkeypatch: pytest.MonkeyPatch, advanced: bool) -> None:
+    """要約を抱えたワーカーが合成の途中で落ち、その間に merge が版を進めていたら、Sweeper は回数切れでも failed にせず同じ行を
+    pending に戻す（試行回数は戻す。§12.7）。版が同じなら従来どおり回数切れで failed にする。
+
+    落ちたワーカーは失敗を報告しないので、合成に使った版は handle_summary が合成の前にジョブの行へ控える。
+    """
+    # Arrange: 回数を使い切った最後の試行が合成の途中で止まる（落ちたワーカー）。その間に merge が版を進め、lease が切れる
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    started, never = asyncio.Event(), asyncio.Event()
+
+    async def stuck(*_args: Any, **_kwargs: Any) -> Any:
+        started.set()
+        await never.wait()
+    monkeypatch.setattr(handlers, "synthesize", stuck)
+    async with ctx.db.write() as conn:
+        leased = repo.lease_job(conn, "w-dead", ["synthesize_minutes"], now_ms())
+        assert leased is not None
+        conn.execute("UPDATE processing_jobs SET attempts = max_attempts WHERE id = ?", (leased.id,))
+        job = repo.get_job(conn, leased.id)
+    assert job is not None
+    task = asyncio.create_task(handlers.handle_summary(ctx, job))
+    await started.wait()
+    async with ctx.db.write() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        assert m is not None
+        if advanced:
+            repo.update_meeting(conn, "m-1", transcript_version=m.transcript_version + 1)
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
+    # Act
+    try:
+        swept = await sweep_once(ctx.db, ctx.events)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    with ctx.db.read() as conn:
+        after = repo.get_job(conn, job.id)
+        meeting = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert swept == 1
+    assert after is not None and meeting is not None
+    if not advanced:
+        assert (after.status, after.error_class) == ("failed", "INTERNAL")
+        assert meeting.status == "failed"
+        return
+    assert (after.status, after.lease_owner, after.attempts) == ("pending", None, job.attempts - 1)
+    assert meeting.status != "failed"
+    # 次の試行が版を控える前に落ちたら、前の試行が控えた古い版で比べない（lease で消す）。回数切れで failed になる
+    again = await _expire_exhausted(ctx, "synthesize_minutes")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    with ctx.db.read() as conn:
+        last = repo.get_job(conn, again.id)
+    assert last is not None and last.status == "failed"
+
+
+
+async def test_committed_summary_is_not_requeued_when_transcript_advanced_before_lease_expired(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
+    """要約をコミットした後、Runner の finish_job の前にワーカーが落ち、その後に transcript の版が進んでも、Sweeper は
+    古い版に対する試行として戻さない（§14・§12.7。戻すと利用者の操作に限る「進んだ後の再生成」が自動で走る）。
+    要約と同じトランザクションでジョブを completed にしている（repo.mark_job_committed）。版が同じときは
+    test_sweeper_keeps_meeting_completed_by_summary_before_lease_expired。
+    """
+    # Arrange: 回数を使い切った最後の試行が要約をコミットし、finish_job の前に落ちる
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    async with ctx.db.write() as conn:
+        leased = repo.lease_job(conn, "w-dead", ["synthesize_minutes"], now_ms())
+        assert leased is not None
+        conn.execute("UPDATE processing_jobs SET attempts = max_attempts WHERE id = ?", (leased.id,))
+        job = repo.get_job(conn, leased.id)
+        assert job is not None and repo.mark_processing(conn, job.id, "w-dead", job.model_name)
+    await handlers.handle_summary(ctx, job)
+    async with ctx.db.write() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        assert m is not None
+        repo.update_meeting(conn, "m-1", transcript_version=m.transcript_version + 1)
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
+    # Act
+    swept = await sweep_once(ctx.db, ctx.events)
+    # Assert: 回収せず、ジョブは completed・会議は completed のまま。要約は 1 版だけ
+    with ctx.db.read() as conn:
+        after = repo.get_job(conn, job.id)
+        meeting = repo.get_meeting(conn, "m-1")
+        n = conn.execute("SELECT COUNT(*) AS n FROM meeting_summary_versions WHERE meeting_id = 'm-1'").fetchone()["n"]
+    assert swept == 0
+    assert after is not None and after.status == "completed"
+    assert meeting is not None and meeting.status == "completed"
+    assert n == 1
+
+async def test_publish_created_job_logs_instead_of_raising_after_commit(
+        client: httpx.AsyncClient, ctx: AppContext, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """コミット後の配信で例外が出ても Runner へ伝えない。伝えると、書き込みを終えた試行が失敗として記録・再試行される（§13）。"""
+    # Arrange
+    await _seed(client, 1)
+    async with ctx.db.write() as conn:
+        job_id = repo.insert_job(conn, "m-1", "merge_transcript")
+    assert job_id is not None
+
+    def boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("publish failed")
+    monkeypatch.setattr(ctx.events, "publish", boom)
+    # Act
+    with caplog.at_level(logging.ERROR):
+        handlers._publish_created_job(ctx, job_id)
+    # Assert: 例外は記録だけされる
+    assert any(r.exc_info is not None and "publish failed" in str(r.exc_info[1]) for r in caplog.records)
+
+
+@pytest.mark.parametrize("job_type", ["vad_chunk", "merge_transcript"])
+async def test_vad_or_merge_failure_keeps_meeting_transcribing_until_retry(client: httpx.AsyncClient, ctx: AppContext,
+                                                                          runner: JobRunner, job_type: str) -> None:
+    """vad / merge の失敗では会議を failed にしない（failed は merge 済みを意味する。§21.1 MERGED_STATUSES）。再試行で進む（§14）。"""
+    # Arrange
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, job_type)
+    failed = await _expire_exhausted(ctx, job_type)
+    # Act
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Assert: 会議は transcribing。vad の失敗では Chunk も pending のまま残り、merge を作らない
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+        types = [j.job_type for j in repo.list_jobs(conn, "m-1")]
+    assert meeting is not None and meeting.status == "transcribing"
+    if job_type == "vad_chunk":
+        assert chunk is not None and chunk.stt_status == "pending"
+        assert "merge_transcript" not in types
+    # 除外の対象ではなく、失敗したジョブの再試行で完了まで進む
+    assert (await client.post("/v1/meetings/m-1/jobs/exclude-failed")).json()["excluded"] == 0
+    assert (await client.post(f"/v1/jobs/{failed.id}/retry")).status_code == 200
+    await runner.run_until_idle()
+    with ctx.db.read() as conn:
+        assert repo.get_meeting(conn, "m-1").status == "completed"
+
+
+async def test_sweeper_publishes_recovered_jobs_after_commit(client: httpx.AsyncClient, ctx: AppContext,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    """回収したジョブと会議の状態を SSE に流す（流さないと画面が processing のまま止まる）。流すのはコミットの後。"""
+    # Arrange: vad ジョブ 2 件を旧ワーカーが抱えたまま落ちる。1 件は回数が残り、1 件は使い切っている
+    await _seed(client, 2)
+    async with ctx.db.write() as conn:
+        requeued = repo.lease_job(conn, "w-dead", ["vad_chunk"], now_ms())
+        exhausted = repo.lease_job(conn, "w-dead", ["vad_chunk"], now_ms())
+        assert requeued is not None and exhausted is not None
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE meeting_id = 'm-1'")
+        conn.execute("UPDATE processing_jobs SET attempts = max_attempts WHERE id = ?", (exhausted.id,))
+    # 配信した時点で、別の接続から読めた（コミット済みの）状態も記録する
+    seen: list[tuple[dict[str, Any], str | None]] = []
+
+    def spy(meeting_id: str, event: dict[str, Any]) -> None:
+        with ctx.db.read() as conn:
+            if event["type"] == "job":
+                job = repo.get_job(conn, event["job"]["id"])
+                seen.append((event, job.status if job else None))
+            else:
+                meeting = repo.get_meeting(conn, meeting_id)
+                seen.append((event, meeting.status if meeting else None))
+
+    monkeypatch.setattr(ctx.events, "publish", spy)
+    # Act
+    assert await sweep_once(ctx.db, ctx.events) == 2
+    # Assert: pending に戻したジョブと failed にしたジョブの両方を、コミット済みの状態で流す。会議の状態は 1 回
+    jobs = {e["job"]["id"]: (e["job"]["status"], committed) for e, committed in seen if e["type"] == "job"}
+    assert jobs == {requeued.id: ("pending", "pending"), exhausted.id: ("failed", "failed")}
+    assert [(e["status"], committed) for e, committed in seen if e["type"] == "meeting_status"] == [("transcribing", "transcribing")]
+
+
+async def test_sweeper_publishes_recovered_jobs_without_reading_after_commit(client: httpx.AsyncClient, ctx: AppContext,
+                                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """コミット後の読み直しが失敗しても回収したジョブを流す。次の周は回収済みのジョブを選ばないので、ここで落とすと二度と流れない。"""
+    # Arrange: vad ジョブを旧ワーカーが抱えたまま落ち、コミット後の読み取りは失敗する
+    await _seed(client, 1)
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-dead", ["vad_chunk"], now_ms(), lease_ms=1)
+        assert job is not None
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(ctx.events, "publish", lambda _meeting_id, event: events.append(event))
+
+    def broken_read() -> Any:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(ctx.db, "read", broken_read)
+    # Act
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Assert
+    assert [(e["type"], e.get("job", {}).get("status", e.get("status"))) for e in events] == [
+        ("job", "pending"), ("meeting_status", "transcribing")]
+
+
+async def test_sweeper_keeps_chunk_completed_by_worker_before_lease_expired(client: httpx.AsyncClient, ctx: AppContext,
+                                                                            runner: JobRunner) -> None:
+    """ハンドラが Chunk を completed にした後、finish_job の前に lease が切れて回数切れで回収されても、Chunk を failed に戻さない。"""
+    # Arrange: transcribe の結果は書けたが、完了報告の前に lease が切れて回数も使い切った
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "transcribe_chunk")
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["transcribe_chunk"], now_ms())
+        assert job is not None
+    await handlers.handle_transcribe(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    # Act
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Assert: ジョブは failed だが、書き込み済みの結果は残る（再試行・除外のどちらでも gap にならない。§14）
+    with ctx.db.read() as conn:
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+        swept = repo.get_job(conn, job.id)
+    assert swept is not None and swept.status == "failed"
+    assert chunk is not None and chunk.stt_status == "completed"
+
+
+async def test_transcribe_retry_after_committed_result_keeps_chunk_completed(client: httpx.AsyncClient, ctx: AppContext,
+                                                                             runner: JobRunner) -> None:
+    """結果のコミット後に回収された transcribe ジョブを再試行しても Chunk を queued に戻さない。再試行が失敗しても completed のまま（§14）。"""
+    # Arrange: transcribe の結果は書けたが、完了報告の前に lease が切れて回数切れで回収された
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "transcribe_chunk")
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["transcribe_chunk"], now_ms())
+        assert job is not None
+    await handlers.handle_transcribe(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Act: 再試行し、その再試行もワーカーが落ちて回数切れで回収される（ハンドラの実装に依らず失敗させる）
+    assert (await client.post(f"/v1/jobs/{job.id}/retry")).status_code == 200
+    with ctx.db.read() as conn:
+        after_retry = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    await _expire_exhausted(ctx, "transcribe_chunk")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Assert: 再試行の受付でも失敗の後でも Chunk は completed。書き込み済みの segments は gap にならない
+    with ctx.db.read() as conn:
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+        retried = repo.get_job(conn, job.id)
+    assert after_retry is not None and after_retry.stt_status == "completed"
+    assert retried is not None and retried.status == "failed"
+    assert chunk is not None and chunk.stt_status == "completed"
+
+
+async def test_transcribe_retry_replaces_segments_and_remerges(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                                               stt_provider: FakeSTTProvider) -> None:
+    """結果のコミット後に回収された transcribe の再試行は、Chunk の segments を置き換え、終わっていた merge を作り直す（§14）。"""
+    # Arrange: 1 回目の結果（3 件）を書いた後、完了報告の前に lease が切れて回数切れで回収される。
+    # 1 回目のコミットで作られた merge と要約は、回収とは関係なく先に終わる
+    def first(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(0.0, 5.0, "旧い一", -0.2, 0.05), STTSegment(10.0, 15.0, "旧い二", -0.2, 0.05),
+                STTSegment(20.0, 25.0, "旧い三", -0.2, 0.05)]
+
+    def second(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(1.0, 8.0, "新しい一", -0.2, 0.05), STTSegment(12.0, 18.0, "新しい二", -0.2, 0.05)]
+
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "transcribe_chunk")
+    stt_provider.script = first
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["transcribe_chunk"], now_ms())
+        assert job is not None
+    await handlers.handle_transcribe(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    await runner.run_until_idle()
+    with ctx.db.read() as conn:
+        merged = repo.get_meeting(conn, "m-1")
+    assert merged is not None and merged.transcript_version == 1
+    # Act: 1 回目と件数・区切りの違う結果を返す再試行
+    stt_provider.script = second
+    assert (await client.post(f"/v1/jobs/{job.id}/retry")).status_code == 200
+    await runner.run_until_idle()
+    # Assert: Chunk には新しい結果だけが残り、merge が作り直されて版が上がり、transcript にも新しい結果だけが載る
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        all_texts = [s.text for s in repo.list_segments(conn, "m-1")]
+        latest = [s.text for s in repo.list_segments(conn, "m-1", merged_version=2)]
+        retried = repo.get_job(conn, job.id)
+    assert all_texts == ["新しい一", "新しい二"]
+    assert meeting is not None and meeting.transcript_version == 2
+    assert latest == ["新しい一", "新しい二"]
+    assert retried is not None and retried.status == "completed"
+    # 要約は自動では作り直さない（手動 STT と同じ。transcribed に戻る）
+    assert meeting.status == "transcribed"
+
+
+async def test_transcribe_retry_keeps_published_transcript_until_remerge_commits(client: httpx.AsyncClient, ctx: AppContext,
+                                                                                runner: JobRunner, stt_provider: FakeSTTProvider,
+                                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    """撮り直した結果は、作り直す merge のコミットまで公開中の版を変えない。merge が失敗しても公開中の版は残る（§12 handle_transcribe）。"""
+    # Arrange: 1 回目の結果で merge まで終え（版 1）、結果のコミット後に回収された transcribe を撮り直す
+    def first(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(0.0, 5.0, "旧い一", -0.2, 0.05), STTSegment(10.0, 15.0, "旧い二", -0.2, 0.05)]
+
+    def second(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(1.0, 8.0, "新しい一", -0.2, 0.05)]
+
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "transcribe_chunk")
+    stt_provider.script = first
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["transcribe_chunk"], now_ms())
+        assert job is not None
+    await handlers.handle_transcribe(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    await runner.run_until_idle()
+    stt_provider.script = second
+    assert (await client.post(f"/v1/jobs/{job.id}/retry")).status_code == 200
+    while True:
+        with ctx.db.read() as conn:
+            retried = repo.get_job(conn, job.id)
+        if retried is not None and retried.status == "completed":
+            break
+        assert await runner.run_once() is True
+    # Assert 1: 撮り直しをコミットしても、merge の前は版 1 がそのまま読める
+    with ctx.db.read() as conn:
+        before = [s.text for s in repo.list_segments(conn, "m-1", merged_version=1)]
+    assert before == ["旧い一", "旧い二"]
+
+    # Act 2: 作り直す merge が、入れ替えと版の更新を書いた後で失敗する
+    real_run_merge = handlers.run_merge
+
+    def crashing_merge(conn: sqlite3.Connection, meeting_id: str, th: Any) -> Any:
+        real_run_merge(conn, meeting_id, th)
+        raise RuntimeError("merge crashed")
+
+    monkeypatch.setattr(handlers, "run_merge", crashing_merge)
+    async with ctx.db.write() as conn:
+        merge_job = repo.lease_job(conn, "w-merge", ["merge_transcript"], now_ms())
+        assert merge_job is not None
+    with pytest.raises(RuntimeError):
+        await handlers.handle_merge(ctx, merge_job)
+    # Assert 2: 入れ替えごと巻き戻り、版 1 が残る
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        after_crash = [s.text for s in repo.list_segments(conn, "m-1", merged_version=1)]
+    assert meeting is not None and meeting.transcript_version == 1
+    assert after_crash == ["旧い一", "旧い二"]
+
+    # Act 3: merge をやり直す
+    monkeypatch.undo()
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (merge_job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    await runner.run_until_idle()
+    # Assert 3: 版 2 は新しい結果だけになり、置き場は空になる
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        latest = [s.text for s in repo.list_segments(conn, "m-1", merged_version=2)]
+        all_texts = [s.text for s in repo.list_segments(conn, "m-1")]
+        staged = conn.execute("SELECT COUNT(*) AS n FROM staged_segments").fetchone()["n"]
+        marks = conn.execute("SELECT COUNT(*) AS n FROM segment_replacements").fetchone()["n"]
+    assert meeting is not None and meeting.transcript_version == 2
+    assert latest == ["新しい一"] and all_texts == ["新しい一"]
+    assert staged == 0 and marks == 0
+
+
+async def test_transcribe_retry_during_merge_schedules_followup_merge(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                                                       stt_provider: FakeSTTProvider,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    """merge の書き込みの後・完了の記録の前にコミットした撮り直しは、その merge の完了後に作り直す merge が入れ替える（§14）。"""
+    # Arrange: 1 回目の結果のコミット後に transcribe が回収され、その結果で merge が作られている
+    def first(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(0.0, 5.0, "旧い一", -0.2, 0.05)]
+
+    def second(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(1.0, 8.0, "新しい一", -0.2, 0.05)]
+
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "transcribe_chunk")
+    stt_provider.script = first
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["transcribe_chunk"], now_ms())
+        assert job is not None
+    await handlers.handle_transcribe(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # merge のハンドラが入れ替えと版 1 をコミットした後（ジョブはまだ processing）に、撮り直しをコミットする
+    real_merge = runner.handlers["merge_transcript"]
+    retried_during_merge = False
+
+    async def merge_then_retry(c: AppContext, merge_job: Job) -> str | None:
+        nonlocal retried_during_merge
+        result = await real_merge(c, merge_job)
+        if not retried_during_merge:
+            retried_during_merge = True
+            stt_provider.script = second
+            assert (await client.post(f"/v1/jobs/{job.id}/retry")).status_code == 200
+            async with c.db.write() as conn:
+                again = repo.lease_job(conn, "w-retry", ["transcribe_chunk"], now_ms())
+                assert again is not None
+            await handlers.handle_transcribe(c, again)
+            async with c.db.write() as conn:
+                assert repo.finish_job(conn, again.id, "w-retry", again.attempts, "completed")
+        return result
+
+    runner.handlers["merge_transcript"] = merge_then_retry
+    published: list[dict] = []
+    monkeypatch.setattr(ctx.events, "publish", lambda _meeting_id, event: published.append(event))
+    # Act
+    await runner.run_until_idle()
+    # Assert: 消した最初の merge の完了と、作り直した merge（pending）のイベントが流れる
+    merges = [e["job"] for e in published if e.get("type") == "job" and e["job"]["job_type"] == "merge_transcript"]
+    completed = [j["id"] for j in merges if j["status"] == "completed"]
+    assert len(set(completed)) == 2
+    assert completed[-1] in {j["id"] for j in merges if j["status"] == "pending"}
+    # Assert: 作り直した merge が撮り直しを入れ替え、版 2 は新しい結果だけになる
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        latest = [s.text for s in repo.list_segments(conn, "m-1", merged_version=2)]
+        pending = repo.has_replacements(conn, "m-1")
+    assert retried_during_merge
+    assert meeting is not None and meeting.transcript_version == 2
+    assert latest == ["新しい一"] and pending is False
+
+
+async def _stage_retry_while_merge_runs(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                        stt_provider: FakeSTTProvider, commit_merge: bool) -> Job:
+    """merge を旧ワーカーとして lease し（commit_merge なら書き込みまでコミットし）、その間に撮り直しを staged に置く。
+
+    その後、merge の lease を回数切れの状態で切らす。戻り値は旧ワーカーが持つ merge の Job
+    """
+    def first(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(0.0, 5.0, "旧い一", -0.2, 0.05)]
+
+    def second(req: STTRequest) -> list[STTSegment]:
+        return [STTSegment(1.0, 8.0, "新しい一", -0.2, 0.05)]
+
+    # 1 回目の結果のコミット後に transcribe が回収され（再試行できる failed）、その結果で merge が作られている
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "transcribe_chunk")
+    stt_provider.script = first
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["transcribe_chunk"], now_ms())
+        assert job is not None
+    await handlers.handle_transcribe(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    async with ctx.db.write() as conn:
+        merge = repo.lease_job(conn, "w-merge", ["merge_transcript"], now_ms())
+        assert merge is not None and repo.mark_processing(conn, merge.id, "w-merge", None)
+    if commit_merge:
+        await handlers.handle_merge(ctx, merge)   # 入れ替えと版 1 をコミットする（finish_job はまだ）
+    # merge が processing の間に撮り直しをコミットする（handle_transcribe は staged に置き、merge の行を消さない）
+    stt_provider.script = second
+    assert (await client.post(f"/v1/jobs/{job.id}/retry")).status_code == 200
+    async with ctx.db.write() as conn:
+        again = repo.lease_job(conn, "w-retry", ["transcribe_chunk"], now_ms())
+        assert again is not None
+    await handlers.handle_transcribe(ctx, again)
+    async with ctx.db.write() as conn:
+        assert repo.finish_job(conn, again.id, "w-retry", again.attempts, "completed")
+        assert repo.has_replacements(conn, "m-1")
+        # merge の行と撮り直しを同じミリ秒にする（時刻の大小では前後が分からない。前後は撮り直しが記録した merge の id で決める）
+        conn.execute("UPDATE processing_jobs SET created_at = (SELECT created_at FROM segment_replacements WHERE meeting_id = 'm-1') "
+                     "WHERE id = ?", (merge.id,))
+        # merge のワーカーが finish_job の前に落ち、回数を使い切っている
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (merge.id,))
+    return merge
+
+
+async def test_committed_merge_expiring_after_staged_retry_schedules_followup_merge(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, stt_provider: FakeSTTProvider) -> None:
+    """merge が書き込みをコミットした後・finish_job の前に撮り直しが staged に置かれ、lease 切れの回数切れで failed になっても、
+    作り直した merge が撮り直しを入れ替える（§14。failed の行が一意制約で ensure_merge_job を止めたままにしない）。"""
+    # Arrange
+    await _stage_retry_while_merge_runs(client, ctx, runner, stt_provider, commit_merge=True)
+    # Act: Sweeper が回数切れの merge を回収し、作り直した merge を実行する
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    with ctx.db.read() as conn:
+        merges = [j.status for j in repo.list_jobs(conn, "m-1") if j.job_type == "merge_transcript"]
+    await runner.run_until_idle()
+    # Assert: 回収の直後に merge が pending で作り直され、版 2 は新しい結果だけになる
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        latest = [s.text for s in repo.list_segments(conn, "m-1", merged_version=2)]
+        pending = repo.has_replacements(conn, "m-1")
+    assert merges == ["pending"]
+    assert meeting is not None and meeting.transcript_version == 2
+    assert latest == ["新しい一"] and pending is False
+
+
+async def test_merge_failing_without_commit_is_not_recreated_endlessly(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, stt_provider: FakeSTTProvider) -> None:
+    """書き込みの前に落ちて回数切れになった merge も 1 度は作り直すが、作り直した merge も落ちて回数切れになれば、それ以上作らない
+    （撮り直しはその行より前に置かれている。落ち続ける merge を際限なく作り直さない。§8 fail_exhausted_expired）。"""
+    # Arrange: 書き込みをコミットしない merge の間に撮り直しを置く。回収で 1 度だけ作り直される
+    await _stage_retry_while_merge_runs(client, ctx, runner, stt_provider, commit_merge=False)
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # 作り直した merge も、書き込みの前に落ちて回数を使い切る
+    async with ctx.db.write() as conn:
+        rerun = repo.lease_job(conn, "w-dead", ["merge_transcript"], now_ms())
+        assert rerun is not None
+        conn.execute("UPDATE processing_jobs SET attempts = max_attempts, lease_until = 0 WHERE id = ?", (rerun.id,))
+    # Act
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Assert: merge は作り直した行が failed で残るだけで、新しい行を作らない。撮り直しは利用者の再試行を待つ
+    with ctx.db.read() as conn:
+        merges = [(j.id, j.status) for j in repo.list_jobs(conn, "m-1") if j.job_type == "merge_transcript"]
+        pending = repo.has_replacements(conn, "m-1")
+    assert merges == [(rerun.id, "failed")] and pending is True
+    assert (await client.post(f"/v1/jobs/{rerun.id}/retry")).status_code == 200
+    await runner.run_until_idle()
+    with ctx.db.read() as conn:
+        assert repo.has_replacements(conn, "m-1") is False
+
+
+async def test_failed_merge_replaced_for_staged_retry_still_publishes_its_failure(
+        client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner, stt_provider: FakeSTTProvider,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """ハンドラの失敗で merge が failed になり、入れ替え待ちの撮り直しのために後続処理がその行を消して作り直しても、
+    失敗のイベントを流す（§12 rerun_merge_for_staged。消した後は行を引けないので、消す前に控えた行を流す）。"""
+    # Arrange: merge の間に撮り直しを置き、merge のワーカー（Runner）が回数を使い切った最後の試行で失敗する
+    leased = await _stage_retry_while_merge_runs(client, ctx, runner, stt_provider, commit_merge=True)
+    with ctx.db.read() as conn:
+        merge = repo.get_job(conn, leased.id)   # 回数を使い切った max_attempts を持たせる（lease 時点の Job は前の上限のまま）
+    assert merge is not None
+    runner.owner = "w-merge"
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(ctx.events, "publish", lambda _meeting_id, event: published.append(event))
+    # Act
+    await runner._on_failure(merge, JobError("merge crashed"), 0)
+    # Assert: failed の行は消えて作り直した merge が pending で残り、イベントは failed → 作り直した merge の順に流れる
+    with ctx.db.read() as conn:
+        merges = [(j.id, j.status) for j in repo.list_jobs(conn, "m-1") if j.job_type == "merge_transcript"]
+    assert len(merges) == 1 and merges[0][0] != merge.id and merges[0][1] == "pending"
+    jobs = [(e["job"]["id"], e["job"]["status"]) for e in published if e["type"] == "job"]
+    assert jobs == [(merge.id, "failed"), merges[0]]
+    assert any(e["type"] == "meeting_status" for e in published)
+
+
+async def test_vad_from_expired_lease_does_not_advance_chunk(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    """lease を失った旧ワーカーの VAD 結果は書かない。書くと failed の vad ジョブを残したまま Chunk が進む（基本設計 §9.3）。"""
+    # Arrange: vad ジョブを抱えたワーカーが落ち、回数切れで回収される
+    await _seed(client, 1)
+    stale = await _expire_exhausted(ctx, "vad_chunk")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Act: 旧ワーカーの VAD が後から終わる
+    await handlers.handle_vad(ctx, stale)
+    # Assert: Chunk は pending のまま、transcribe ジョブも作らない
+    with ctx.db.read() as conn:
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+        types = [j.job_type for j in repo.list_jobs(conn, "m-1")]
+    assert chunk is not None and chunk.stt_status == "pending"
+    assert "transcribe_chunk" not in types
+
+
+async def test_vad_from_expired_lease_does_not_mark_chunk_missing(client: httpx.AsyncClient, ctx: AppContext) -> None:
+    """lease を失った旧ワーカーが音声を読めなくても、Chunk を missing にしない。例外は投げる（基本設計 §9.3）。"""
+    # Arrange: vad ジョブを抱えたワーカーが落ちて回収された後、その Chunk のファイルが読めなくなる
+    await _seed(client, 1)
+    stale = await _expire_exhausted(ctx, "vad_chunk")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    with ctx.db.read() as conn:
+        before = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    assert before is not None
+    (ctx.settings.data_dir / before.local_path).write_bytes(b"corrupted")
+    # Act / Assert: 失敗は Runner の失敗処理へ渡す（旧ワーカーの報告は finish_job が無視する）
+    with pytest.raises(InvalidAudioError):
+        await handlers.handle_vad(ctx, stale)
+    with ctx.db.read() as conn:
+        after = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    assert after is not None and after.save_status == before.save_status
+
+
+async def test_vad_does_not_mark_chunk_missing_after_repair(client: httpx.AsyncClient, ctx: AppContext,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """VAD が音声を読めなかった後、missing を書く前に再 PUT の修復がファイルを書き戻していれば、missing にせず VAD を続ける。"""
+    # Arrange: VAD が読む時点ではファイルが壊れていて、VAD が書き込みロックを取る直前に修復が書き戻す
+    await _seed(client, 1)
+    async with ctx.db.write() as conn:
+        vad = repo.lease_job(conn, "w-1", ["vad_chunk"], now_ms())
+        assert vad is not None
+        chunk = repo.get_chunk(conn, vad.chunk_id or "")
+    assert chunk is not None
+    path = ctx.settings.data_dir / chunk.local_path
+    original = path.read_bytes()
+    path.write_bytes(b"corrupted")
+    real_write = ctx.db.write
+
+    def write_after_repair():  # type: ignore[no-untyped-def]
+        path.write_bytes(original)     # 修復は書き込みロックの下で書き戻す。VAD のトランザクションより先にコミットした
+        return real_write()
+    monkeypatch.setattr(ctx.db, "write", write_after_repair)
+    # Act
+    await handlers.handle_vad(ctx, vad)
+    # Assert: Chunk は missing にならず、VAD の結果で次へ進む
+    monkeypatch.undo()
+    with ctx.db.read() as conn:
+        after = repo.get_chunk(conn, chunk.id)
+    assert after is not None and after.save_status != "missing"
+    assert after.stt_status != "pending"
+
+
+async def test_merge_from_expired_lease_does_not_write_transcript(client: httpx.AsyncClient, ctx: AppContext,
+                                                                  runner: JobRunner) -> None:
+    """lease を失った旧ワーカーの merge は書かない。書くと failed の merge ジョブを残したまま transcript が進み、要約ジョブまで作る（基本設計 §9.3）。"""
+    # Arrange: merge ジョブを抱えたワーカーが落ち、回数切れで回収される
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "merge_transcript")
+    stale = await _expire_exhausted(ctx, "merge_transcript")
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Act: 旧ワーカーの merge が後から終わる
+    await handlers.handle_merge(ctx, stale)
+    # Assert: transcript の版は進まず、会議は transcribing のまま、要約ジョブも作らない
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        types = [j.job_type for j in repo.list_jobs(conn, "m-1")]
+    assert meeting is not None and (meeting.status, meeting.transcript_version) == ("transcribing", 0)
+    assert "synthesize_minutes" not in types
+
+
+async def test_sweeper_keeps_meeting_completed_by_summary_before_lease_expired(client: httpx.AsyncClient, ctx: AppContext,
+                                                                              runner: JobRunner) -> None:
+    """要約をコミットした後、finish_job の前に lease が切れて回数も使い切っていても、回収せず会議を failed に戻さない（§14）。
+    要約と同じトランザクションでジョブを completed にしている（repo.mark_job_committed）。"""
+    # Arrange: 要約と会議の completed は書けたが、完了報告の前に lease が切れて回数も使い切った
+    await _seed(client, 1)
+    await _run_until_job(ctx, runner, "synthesize_minutes")
+    async with ctx.db.write() as conn:
+        job = repo.lease_job(conn, "w-slow", ["synthesize_minutes"], now_ms())
+        assert job is not None
+    await handlers.handle_summary(ctx, job)
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (job.id,))
+    # Act
+    assert await sweep_once(ctx.db, ctx.events) == 0
+    # Assert: ジョブは completed のままで、書き込み済みの要約と会議の completed も残る
+    with ctx.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        swept = repo.get_job(conn, job.id)
+        n = conn.execute("SELECT COUNT(*) AS n FROM meeting_summary_versions WHERE meeting_id = 'm-1'").fetchone()["n"]
+    assert swept is not None and swept.status == "completed"
+    assert meeting is not None and meeting.status == "completed"
+    assert n == 1
+
+
+async def test_vad_retry_after_committed_result_does_not_requeue_completed_chunk(client: httpx.AsyncClient, ctx: AppContext,
+                                                                                 runner: JobRunner) -> None:
+    """VAD の結果をコミットした後に lease が切れて回数切れで回収され、その vad ジョブを再試行しても、完了済みの Chunk を queued に戻さない（§14）。"""
+    # Arrange: VAD の結果は書けたが完了報告の前に止まり、その間に transcribe が完了した
+    await _seed(client, 1)
+    async with ctx.db.write() as conn:
+        vad = repo.lease_job(conn, "w-slow", ["vad_chunk"], now_ms())
+        assert vad is not None
+    await handlers.handle_vad(ctx, vad)
+    await runner.run_until_idle()
+    async with ctx.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_until = 0, max_attempts = attempts WHERE id = ?", (vad.id,))
+    assert await sweep_once(ctx.db, ctx.events) == 1
+    # Act: 利用者が failed の vad ジョブを再試行する
+    assert (await client.post(f"/v1/jobs/{vad.id}/retry")).status_code == 200
+    await runner.run_until_idle()
+    # Assert: Chunk は completed のまま、会議は要約まで進む
+    with ctx.db.read() as conn:
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+        meeting = repo.get_meeting(conn, "m-1")
+    assert chunk is not None and chunk.stt_status == "completed"
+    assert meeting is not None and meeting.status == "completed"
 ```
 
 ### 23.4.1 既存 DB のアップグレードと fencing token
@@ -6510,7 +8320,7 @@ from minutes_local.jobs.retry import BusinessValidationError, SchemaValidationEr
 from minutes_local.llm.fake_provider import FakeSummaryProvider
 from minutes_local.llm.map_reduce import split_windows, synthesize
 from minutes_local.llm.schema import MeetingSummaryDraft
-from minutes_local.llm.validate import SegmentIndex, parse_draft, validate
+from minutes_local.llm.validate import SegmentIndex, _deadline_supported, parse_draft, validate
 from tests.conftest import valid_summary_response
 
 SEGS = {
@@ -6599,6 +8409,605 @@ def test_validate_rejects_unquoted_and_misplaced_claims() -> None:
     ]
 
 
+def test_deadline_needs_the_same_expression_in_quote() -> None:
+    """quote に期限らしい表現があるだけでは、別の期限を通さない（段 5）。"""
+    # Arrange: QA は「田中さんが来週までに仕様書を更新します」
+    index = SegmentIndex(SEGS)
+    deadlines = ["来週", "来週中", "月末", "11月20日", "再来週", "次回の定例まで"]
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "仕様書を更新", "assignee": "田中", "deadline": deadline, "sourceSegmentIds": [A[:8]], **EV_A}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons]
+    # Act
+    results = {d: reasons_for(d) for d in deadlines}
+    # Assert: 「来週」と、「来週」を言い換えた期限は通る。別の相対表現・日付に換算した期限・quote に無い文言は落ちる
+    assert results == {
+        "来週": [], "来週中": [],
+        "月末": ["DEADLINE_NOT_IN_TRANSCRIPT"], "11月20日": ["DEADLINE_NOT_IN_TRANSCRIPT"],
+        "再来週": ["DEADLINE_NOT_IN_TRANSCRIPT"], "次回の定例まで": ["DEADLINE_NOT_IN_TRANSCRIPT"],
+    }
+
+
+def test_compound_deadline_is_not_matched_by_its_part() -> None:
+    """「来月末」は 1 つの表現。quote の「来月上旬」は「来月」を含んでも「来月末」を裏付けない（段 5）。"""
+    # Arrange
+    sid = "cccccccc-3333-4000-8000-000000000003"
+    quote = "鈴木さんが来月上旬に見積もりを出します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "見積もりを出す", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons]
+    # Act / Assert
+    assert reasons_for("来月上旬") == []
+    assert reasons_for("来月末") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_month_qualifier_after_no_is_one_expression() -> None:
+    """「来月の末」は「来月末」と同じ 1 つの表現。quote の「来月の末」は裏付け、「来月に提出」は裏付けない（段 5）。"""
+    # Arrange
+    sid = "dddddddd-4444-4000-8000-000000000044"
+
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        index = SegmentIndex({sid: quote})
+        item = {"task": "見積もりを出す", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]],
+                "quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert
+    assert reasons_for("来月の末", "鈴木さんが来月の末までに見積もりを出します") == []
+    assert reasons_for("来月末", "鈴木さんが来月の末までに見積もりを出します") == []
+    assert reasons_for("来月の末", "鈴木さんが来月に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("来週の末", "鈴木さんが来週に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("今月の上旬", "鈴木さんが今月上旬に見積もりを出します") == []
+
+
+def test_deadline_is_not_assembled_from_parts_of_other_dates() -> None:
+    """quote の別々の日付の部品（「今月上旬」の「上旬」と「来月下旬」の「来月」）を寄せ集めても「来月上旬」を裏付けない（段 5）。"""
+    # Arrange
+    sid = "dddddddd-4444-4000-8000-000000000004"
+    quote = "鈴木さんが今月上旬に確認し、来月下旬に提出します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "確認して提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: quote にある組だけが通る
+    assert reasons_for("来月下旬") == []
+    assert reasons_for("今月上旬") == []
+    assert reasons_for("来月上旬") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_month_period_and_time_are_one_expression() -> None:
+    """「来月上旬午後5時」は月の時期と時刻で 1 つの表現。quote の別の月の時期に付いた時刻を寄せ集めても裏付けない（段 5）。"""
+    # Arrange
+    sid = "dededede-4545-4000-8000-000000000045"
+
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        index = SegmentIndex({sid: quote})
+        item = {"task": "見積もりを出す", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]],
+                "quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ組（「の」の有無は問わない）なら通る
+    assert reasons_for("来月上旬午後5時", "鈴木さんが来月上旬の午後5時までに見積もりを出します") == []
+    # 別の月の時期に付いた時刻と、時刻の無い「来月上旬」を寄せ集めても通さない
+    assert reasons_for("来月上旬午後5時", "鈴木さんが今月上旬午後5時に確認し、来月上旬に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 月の時期に付いた英語の時刻は、時刻だけの deadline を裏付けない（日付に付いた時刻と同じ。_ATTACHED_TIME_EN）
+    assert reasons_for("5pm", "鈴木さんが来月上旬 5pm に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("来月上旬5pm", "鈴木さんが来月上旬 5pm に見積もりを出します") == []
+
+
+def test_week_end_and_time_are_one_expression() -> None:
+    """「来週末午後5時」は週末と時刻で 1 つの表現。quote の別の週末に付いた時刻を寄せ集めても裏付けない（段 5）。"""
+    # Arrange
+    sid = "dfdfdfdf-4646-4000-8000-000000000046"
+
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        index = SegmentIndex({sid: quote})
+        item = {"task": "見積もりを出す", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]],
+                "quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ組（「の」の有無は問わない）なら通る
+    assert reasons_for("来週末午後5時", "鈴木さんが来週末の午後5時までに見積もりを出します") == []
+    assert reasons_for("週末17時", "鈴木さんが週末17時に見積もりを出します") == []
+    # 時刻の違う週末、別の週末に付いた時刻と時刻の無い「来週末」の寄せ集めは通さない
+    assert reasons_for("来週末午後5時", "鈴木さんが来週末午前9時に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("来週末午後5時", "鈴木さんが今週末午後5時に確認し、来週末に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 時刻の付かない週末は従来どおり（「来週の末」も「来週末」と同じ）
+    assert reasons_for("来週末", "鈴木さんが来週の末に見積もりを出します") == []
+    # 日本語の助詞・語（「中に」）は修飾として扱わない（「来週中に11月20日」は「来週」と「11月20日」の両方で比べる）
+    assert reasons_for("来週中に11月20日", "鈴木さんが来週、11月20日までに見積もりを出します") == []
+
+
+def test_relative_day_and_time_are_one_expression() -> None:
+    """「明日午後5時」は相対の日と時刻で 1 つの表現。quote の別の句の「明日」と「午後5時」を寄せ集めても裏付けない（段 5）。"""
+    # Arrange
+    sid = "dfdfdfdf-4747-4000-8000-000000000047"
+
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        index = SegmentIndex({sid: quote})
+        item = {"task": "見積もりを出す", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]],
+                "quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ組（「の」の有無・英語の時刻を問わない）なら通る
+    assert reasons_for("明日午後5時", "鈴木さんが明日の午後5時までに見積もりを出します") == []
+    assert reasons_for("明後日17時", "鈴木さんが明後日17時に見積もりを出します") == []
+    assert reasons_for("明日5pm", "鈴木さんが明日 5pm に見積もりを出します") == []
+    # 別の句の「明日」と時刻、時刻の違う「明日」、別の相対の日に付いた時刻は通さない
+    assert reasons_for("明日午後5時", "鈴木さんが明日確認し、明後日午後5時に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("明日午後5時", "午後5時に会議があり、鈴木さんが明日見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("明日午後5時", "鈴木さんが明日午前9時に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 「明日」に付いた英語の時刻は、時刻だけの deadline を裏付けない（日付に付いた時刻と同じ）
+    assert reasons_for("5pm", "鈴木さんが明日 5pm に見積もりを出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 時刻の付かない相対の日は従来どおり
+    assert reasons_for("明日", "鈴木さんが明日までに見積もりを出します") == []
+
+
+def test_deadline_year_must_match_the_quote() -> None:
+    """年の付いた日付は年まで 1 つの表現。quote の 2026 年は deadline の 2027 年の同じ月日を裏付けない（段 5）。"""
+    # Arrange
+    sid = "eeeeeeee-5555-4000-8000-000000000005"
+    quote = "鈴木さんが2026年11月20日と2026/12/1と26年3月5日までに提出します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ年なら通り、年が違えば月日が同じでも落ちる。年の無い月日も、どの年かを quote から言えないので通さない
+    assert reasons_for("2026年11月20日") == []
+    assert reasons_for("2027年11月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("2026/12/1") == []
+    assert reasons_for("2026/12/2") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 2 桁の年（「26年」）も年まで比べる。元号の付いた年は元号まで比べる（test_deadline_era_must_match_the_quote）
+    assert reasons_for("26年3月5日") == []
+    assert reasons_for("27年3月5日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_deadline_relative_year_must_match_the_quote() -> None:
+    """相対の年（再来年・来年・今年・去年）の付いた日付は年まで 1 つの表現。quote の「再来年11月20日」は deadline の「来年11月20日」を裏付けない（段 5）。"""
+    # Arrange
+    farther, same = "再来年11月20日までに提出", "来年11月20日までに提出"
+    # Act / Assert: 年が違えば月日が同じでも落ちる。同じ相対の年なら通る（「の」を挟んでもよい）
+    assert not _deadline_supported("来年11月20日", farther)
+    assert _deadline_supported("来年11月20日", same)
+    assert _deadline_supported("来年11月20日", "来年の11月20日までに提出")
+    assert _deadline_supported("再来年11月20日", "再来年11月20日までに提出")
+    assert not _deadline_supported("今年11月20日", "去年11月20日までに提出")
+    assert not _deadline_supported("11月20日", "来年11月20日までに提出")
+
+
+def test_deadline_standalone_relative_year_must_match_the_quote() -> None:
+    """相対の年だけの期限（「来年」「来年末」「来年11月」「来年度」）も 1 つの表現。quote の「再来年」は deadline の「来年」を裏付けない（段 5）。
+
+    期限の表現として切り出さないと _phrase_in の部分一致になり、「来年」が「再来年」の中に当たる。
+    """
+    # Act / Assert: 同じ相対の年なら通る（「の」を挟んでもよい）
+    assert _deadline_supported("来年", "来年までに提出")
+    assert _deadline_supported("再来年", "再来年に提出")
+    assert _deadline_supported("来年末", "来年の末までに提出")
+    assert _deadline_supported("来年11月", "来年の11月に提出")
+    assert _deadline_supported("来年度末", "来年度末までに提出")
+    assert _deadline_supported("来年春", "来年の春に提出")
+    # 年が違えば落ちる（「来年」は「再来年」の中にも現れる）
+    assert not _deadline_supported("来年", "再来年までに提出")
+    assert not _deadline_supported("今年", "去年までに提出")
+    # 後ろの月・時期・年度も年と 1 つの表現。違えば落ち、付いた quote は付いていない deadline を裏付けない
+    assert not _deadline_supported("来年11月", "来年3月に提出")
+    assert not _deadline_supported("来年末", "来年に提出")
+    assert not _deadline_supported("来年度末", "来年度に提出")
+    assert not _deadline_supported("来年春", "来年秋に提出")
+    assert not _deadline_supported("来年度上期", "来年度下期に提出")
+    assert not _deadline_supported("来年", "来年11月20日までに提出")
+    # 後ろの時刻も年と 1 つの表現。同じ年の時刻なら通り、別の年に付いた時刻と寄せ集めて裏付けない
+    assert _deadline_supported("来年度末午後5時", "来年度末の午後5時までに提出")
+    assert not _deadline_supported("来年度末午後5時", "今年度末午後5時に確認し、来年度末に提出")
+    # 相対の年に付いた英語の時刻は、時刻だけの deadline を裏付けない（_ATTACHED_TIME_EN）
+    assert not _deadline_supported("5pm", "来年度末 5pm までに提出")
+    assert _deadline_supported("来年度末5pm", "来年度末 5pm までに提出")
+
+
+def test_deadline_era_must_match_the_quote() -> None:
+    """元号の付いた日付は元号まで 1 つの表現。quote の令和 8 年は deadline の平成 8 年の同じ月日を裏付けない（段 5）。"""
+    # Arrange
+    sid = "ffffffff-6666-4000-8000-000000000006"
+    quote = "鈴木さんが令和8年11月20日と令和元年5月1日までに提出します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ元号・同じ年なら通り、元号が違えば年の数字と月日が同じでも落ちる（元年も同じ）
+    assert reasons_for("令和8年11月20日") == []
+    assert reasons_for("平成8年11月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("令和元年5月1日") == []
+    assert reasons_for("平成元年5月1日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_deadline_time_must_match_the_quote() -> None:
+    """日付と時刻は 1 つの表現。quote の「11月20日午前9時」は deadline の「11月20日午後5時」を裏付けない（段 5）。"""
+    # Arrange
+    sid = "cdcdcdcd-8888-4000-8000-000000000008"
+    quote = "鈴木さんが11月20日午前9時までに提出し、11/21 17:00に共有します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ日付・同じ時刻なら通り（「の」の有無は問わない）、日付が同じでも時刻が違えば落ちる
+    assert reasons_for("11月20日午前9時") == []
+    assert reasons_for("11月20日の午前9時") == []
+    assert reasons_for("11月20日午後5時") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11/21 17:00") == []
+    assert reasons_for("11/21 9:00") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 時刻の付いた quote は、時刻の無い同じ日付の deadline を裏付けない（年の無い月日と同じ扱い）。時刻だけの deadline も同じ
+    assert reasons_for("11月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("午前9時") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_relative_month_and_day_are_matched_as_a_pair() -> None:
+    """相対の月と日（「来月20日」）は 1 つの表現。quote の「来月21日」の「来月」は deadline の「来月20日」を裏付けない（段 5）。"""
+    # Arrange
+    sid = "efefefef-9999-4000-8000-000000000009"
+    quote = "鈴木さんが来月21日に提出します"
+    other_sid = "fefefefe-9999-4000-8000-00000000000a"
+    other_quote = "佐藤さんが来月に共有します"
+    index = SegmentIndex({sid: quote, other_sid: other_quote})
+
+    def reasons_for(deadline: str, segment: str = sid, text: str = quote) -> list[str]:
+        evidence = {"quote": text, "evidenceSpan": {"segmentId": segment[:8], "start": 0, "end": len(text)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [segment[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 日が違えば別の表現（「来月」だけに縮まない）
+    assert not _deadline_supported("来月20日", quote)
+    assert _deadline_supported("来月21日", quote)
+    # 同じ月と日なら通り（「の」の有無は問わない）、日が違えば落ちる。日の付いた quote は日の無い「来月」を裏付けない
+    assert reasons_for("来月21日") == []
+    assert reasons_for("来月の21日") == []
+    assert reasons_for("来月20日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("再来月21日") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("来月") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 日の無い相対の月は、これまでどおり同じ表現の quote で通る
+    assert reasons_for("来月", other_sid, other_quote) == []
+    assert reasons_for("来月20日", other_sid, other_quote) == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_weekday_and_time_are_matched_as_a_pair() -> None:
+    """曜日と時刻（「来週金曜9時」「月曜17時」）は 1 つの表現。quote の別の句の曜日と時刻を寄せ集めて裏付けない（段 5）。"""
+    # Arrange
+    sid = "f0f0f0f0-aaaa-4000-8000-00000000000b"
+    quote = "鈴木さんが来週金曜9時に確認し、月曜日の17時に提出します"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: quote にある曜日と時刻の組は、書き方（「の」・「曜日」と「曜」）が違っても通る
+    assert reasons_for("来週金曜9時") == []
+    assert reasons_for("来週の金曜の9時") == []
+    assert reasons_for("月曜17時") == []
+    assert reasons_for("月曜日17時") == []
+    # 別の句の曜日と時刻は寄せ集めない。時刻の付いた quote は時刻の無い曜日を裏付けない（日付と時刻と同じ扱い）
+    assert reasons_for("来週金曜17時") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("月曜9時") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("来週金曜") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_week_and_weekday_are_matched_as_a_pair() -> None:
+    """週と曜日の組は 1 つの表現。quote の「今週金曜」と別の「来週」を寄せ集めて deadline の「来週金曜」を裏付けない（段 5）。
+
+    英語も同じ。normalize は空白を落とすので、「next week friday」が「friday」だけに縮んで「this week friday」に通ることもない。
+    """
+    # Arrange
+    sid = "abababab-7777-4000-8000-000000000007"
+    quote = "鈴木さんが今週金曜に確認し、来週提出します。佐藤さんはthis week fridayにレビューし、next weekに送ります"
+    index = SegmentIndex({sid: quote})
+    evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+
+    def reasons_for(deadline: str) -> list[str]:
+        item = {"task": "確認して提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: quote にある組は、書き方（「の」・語順）が違っても通る
+    assert reasons_for("今週金曜") == []
+    assert reasons_for("今週の金曜") == []
+    assert reasons_for("this week friday") == []
+    assert reasons_for("Friday this week") == []
+    assert reasons_for("来週") == []
+    assert reasons_for("next week") == []
+    # 別の週の曜日は通さない。組の部品だけ（どの週の金曜かを言えない）も通さない
+    assert reasons_for("来週金曜") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("next week friday") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("金曜") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_english_week_phrases_are_not_matched_as_fragments() -> None:
+    """英語の「next week」「end of」は部品として切り出さない（文字列そのものが quote に現れることを求める）。
+
+    部品にすると「end of month」が「end of the week」の「end of」に、「next weekend」が「next week」に通り、
+    別々の句の部品（「end of the month」と「next week」）を寄せ集めて「end of next week」も通る（段 5）。
+    """
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "cdcdcdcd-8888-4000-8000-000000000008"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": "Suzuki", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ句なら通る
+    assert reasons_for("next week", "Suzuki will submit it next week") == []
+    assert reasons_for("end of month", "Suzuki will submit it by the end of month") == []
+    # 別の句の部品では通さない
+    assert reasons_for("end of month", "Suzuki will submit it by the end of the week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("next weekend", "Suzuki will submit it next week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("end of next week", "Suzuki checks at the end of the month, then submits next week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 時刻と組にならない週の修飾も落とさない（時刻が合っても週が違えば通さない）
+    assert reasons_for("next week 5pm", "Suzuki will submit it next week 5pm") == []
+    assert reasons_for("next week 5pm", "Suzuki will submit it this week 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("next week 5pm", "Suzuki will submit it at 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("5pm next week", "Suzuki will submit it 5pm this week") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 月・年の修飾も同じ（表現として切り出されないので、時刻だけで比べると修飾が落ちる）
+    assert reasons_for("next month 5pm", "Suzuki will submit it next month 5pm") == []
+    assert reasons_for("next month 5pm", "Suzuki will submit it this month 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("this year 5pm", "Suzuki will submit it next year 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 時間帯の修飾（「afternoon」）も表現として切り出さないので、残っていれば deadline 全体を句として求める
+    assert reasons_for("friday afternoon", "Suzuki will submit it friday afternoon") == []
+    assert reasons_for("friday afternoon", "Suzuki will submit it friday morning") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("tomorrow evening", "Suzuki will submit it tomorrow") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 句全体で比べるので、間に語の入る言い方（「next week at 5pm」）は通さない側に倒す（組の形の「at」の省略はここでは効かない）
+    assert reasons_for("next week 5pm", "Suzuki will submit it next week at 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_day_after_tomorrow_is_one_expression() -> None:
+    """「day after tomorrow」は 1 つの表現。quote のその中の「tomorrow」は deadline の「tomorrow」を裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "abababab-7777-4000-8000-000000000007"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": "Suzuki", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert
+    assert reasons_for("tomorrow", "Suzuki will submit the day after tomorrow") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("tomorrow", "Suzuki will submit it tomorrow") == []
+    assert reasons_for("day after tomorrow", "Suzuki will submit the day after tomorrow") == []
+    assert reasons_for("the day after tomorrow", "Suzuki will submit it the day after tomorrow") == []
+
+
+def test_month_after_next_is_not_next_month() -> None:
+    """「再来月末」「再来週末」は 1 つの表現。quote のその中の「来月末」「再来週」は deadline の「来月末」「再来週末」を裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "a1a1a1a1-1010-4000-8000-000000000010"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert
+    assert reasons_for("来月末", "鈴木さんが再来月末までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("再来月末", "鈴木さんが再来月末までに提出します") == []
+    assert reasons_for("来月", "鈴木さんが再来月に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("再来月", "鈴木さんが再来月に提出します") == []
+    assert reasons_for("再来週末", "鈴木さんが再来週に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("再来週末", "鈴木さんが再来週末に提出します") == []
+
+
+def test_two_digit_year_slash_date_is_matched_as_a_full_date() -> None:
+    """2 桁の年の「26/11/20」も年まで 1 つの表現。quote の「26/11/21」は deadline の「26/11/20」を裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "c3c3c3c3-1212-4000-8000-000000000012"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 日が違えば通さない。同じ日付なら通る。年の無い月日は年の付いた quote では裏付けない
+    assert reasons_for("26/11/20", "鈴木さんが26/11/21までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("26/11/20", "鈴木さんが26/11/20までに提出します") == []
+    assert reasons_for("11/20", "鈴木さんが26/11/20までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_slash_date_with_trailing_year_is_matched_as_a_full_date() -> None:
+    """年が後ろの「11/20/2026」も年まで 1 つの表現。「11/20/20」で切れて quote の「11/20/2027」が裏付けることはない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "c3c3c3c3-1212-4000-8000-000000000013"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 年が違えば通さない。同じ日付なら通る。年の無い月日も従来どおり通る
+    assert reasons_for("11/20/2026", "鈴木さんが11/20/2027までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11/20/2026", "鈴木さんが11/20/2026までに提出します") == []
+    assert reasons_for("2026/11/20", "鈴木さんが2027/11/20までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("2026/11/20", "鈴木さんが2026/11/20までに提出します") == []
+    assert reasons_for("11/20", "鈴木さんが11/20までに提出します") == []
+    # 時刻が付いても年で止まる（年と時刻の間の空白は _hint_text が残す）
+    assert reasons_for("11/20/2026 5pm", "鈴木さんが11/20/2027 5pmまでに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11/20/2026 17時", "鈴木さんが11/20/2026 17時までに提出します") == []
+    assert reasons_for("26/11/20 5pm", "鈴木さんが26/11/20 5pmまでに提出します") == []
+    assert reasons_for("26/11/20 17:00", "鈴木さんが26/11/20 17:30までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_slash_date_keeps_the_separator_before_a_time() -> None:
+    """日付と時刻の区切りを落とさない。「2026/12/1 7pm」の日と時刻の数字がつながって 17 日にならず、quote の「2026/12/17」は裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "c3c3c3c3-1212-4000-8000-000000000015"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 別の日（17 日）・同じ日の別の時刻は通さない。同じ日付と時刻なら通る
+    assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/17までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/1 8pmまでに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/1 7pmまでに提出します") == []
+    # 年の無い日付と 24 時間制も同じ（「12/1 17:00」が「12/11」と「7:00」にならない）
+    assert reasons_for("12/1 17:00", "鈴木さんが12/11 7:00までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("12/1 17:00", "鈴木さんが12/1 17:00までに提出します") == []
+    assert reasons_for("1/2 19:00", "鈴木さんが1/21 9:00までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 区切りの書き方（空白・読点・「の」）は問わない
+    assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/1、7pmまでに提出します") == []
+    assert reasons_for("2026/12/1 7pm", "鈴木さんが2026/12/1の7pmまでに提出します") == []
+
+
+def test_date_followed_by_weekday_is_one_hint() -> None:
+    """日付と曜日（「11月20日金曜」）は 1 つの表現。quote の別の句の日付と曜日を寄せ集めても裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "c3c3c3c3-1212-4000-8000-000000000014"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "提出", "assignee": "鈴木", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 同じ日付と曜日なら通る（「の」「曜日」の違いは問わない）。曜日が違う・別の句の寄せ集めは通さない
+    assert reasons_for("11月20日金曜", "鈴木さんが11月20日金曜日までに提出します") == []
+    assert reasons_for("11月20日の金曜", "鈴木さんが11月20日金曜までに提出します") == []
+    assert reasons_for("11月20日金曜", "鈴木さんが11月20日木曜までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11月20日金曜", "鈴木さんが11月20日に確認し、金曜に提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 曜日の付いた quote は曜日の無い deadline を裏付けない（時刻・年の付いた quote と同じ扱い）
+    assert reasons_for("11月20日", "鈴木さんが11月20日金曜までに提出します") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_next_or_this_weekday_keeps_the_week_qualifier() -> None:
+    """「next friday」「this friday」は 1 つの表現。quote の「this friday」は deadline の「next friday」を裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "d4d4d4d4-1313-4000-8000-000000000013"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": "Suzuki", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 週の修飾が違えば通さない。同じなら区切り・大文字小文字が違っても通る
+    assert reasons_for("next friday", "Suzuki will submit it this Friday") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("this friday", "Suzuki will submit it next Friday") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("Next Friday", "Suzuki will submit it next friday.") == []
+    # 修飾の無い曜日も、修飾付きの quote では裏付けない（どの週の金曜かを deadline から言えない）
+    assert reasons_for("friday", "Suzuki will submit it next Friday") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_english_time_must_match_the_quote() -> None:
+    """英語の時刻（「5pm」「9 am」「5:30pm」）も日付・曜日と 1 つの表現。quote の「next Friday 9am」は deadline の「next Friday 5pm」を裏付けない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "e5e5e5e5-1414-4000-8000-000000000014"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": "Suzuki", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 曜日が同じでも時刻が違えば通さない
+    assert reasons_for("next Friday 5pm", "Suzuki will submit next Friday 9am") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("tomorrow 5pm", "Suzuki will submit tomorrow 9am") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 別の句の曜日と時刻を寄せ集めて通さない
+    assert reasons_for("next Friday 5pm", "Suzuki submits next Friday 9am and reviews Monday 5pm") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 日付に付いた英語の時刻も同じ。「5:30」を日本語の時刻として切り出して am / pm を落とさない
+    assert reasons_for("11/20 5pm", "鈴木さんが11/20 9amまでに提出") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("11月20日 5:30pm", "鈴木さんが11月20日5:30amまでに提出") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("5pm", "Suzuki will submit it at 9am") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 日付・曜日に付いた時刻は、時刻だけの deadline を裏付けない（時刻の無い日付と同じ扱い）
+    assert reasons_for("5pm", "鈴木さんが11/20 5pmまでに提出") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("5pm", "鈴木さんが金曜日の 5pm までに提出") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 別の句の時刻だけの表現は、日付に付いた時刻があっても数える
+    assert reasons_for("5pm", "鈴木さんが11/20 9am、確認は5pmまで") == []
+    # 同じなら、空白・大文字小文字・「at」の有無が違っても通る
+    assert reasons_for("next Friday 5pm", "Suzuki will submit it next friday at 5 PM.") == []
+    assert reasons_for("11/20 5pm", "鈴木さんが11/20 5pmまでに提出") == []
+    assert reasons_for("11月20日 5:30pm", "鈴木さんが11月20日5:30pmまでに提出") == []
+    assert reasons_for("5pm", "Suzuki will submit it by 5 pm") == []
+    # 24 時間制の時刻も英語の曜日と 1 つの表現。同じ曜日と時刻なら通り、時刻が違えば通らず、別の句の曜日と時刻を寄せ集めても通らない
+    assert reasons_for("Friday 17:00", "Suzuki will submit it Friday 17:00") == []
+    assert reasons_for("next Friday 17:00", "Suzuki will submit it next friday at 17:00.") == []
+    assert reasons_for("Friday 17:00", "Suzuki will submit it Friday 9:00") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("Friday 17:00", "Suzuki submits Friday 9:00 and reviews Monday 17:00") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+
+
+def test_english_deadline_hints_need_word_boundaries_in_the_quote() -> None:
+    """英語の期限の表現は、quote の中で語として現れるときだけ数える。正規化で空白が落ちて別の語にまたがった並びは数えない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "b2b2b2b2-1111-4000-8000-000000000011"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": "Suzuki", "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 語をまたいだ・語の一部の並びは通さない
+    assert reasons_for("Monday", "Suzuki will ask Simon day by day") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("EOW", "Suzuki heard the cat meow") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("EOD", "Suzuki will bring the deodorant") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("Friday", "Suzuki works on Fridays") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 語として現れれば、区切り・大文字小文字・日本語に挟まれていても通る
+    assert reasons_for("Monday", "Suzuki will submit it on Monday.") == []
+    assert reasons_for("EOD", "Suzuki submits by EOD, then reviews") == []
+    assert reasons_for("friday next week", "Suzuki submits it Friday, next week") == []
+    assert reasons_for("tomorrow", "鈴木さんはtomorrowに提出") == []
+
+
+def test_deadline_without_hints_matches_only_a_whole_phrase() -> None:
+    """期限の表現を含まない deadline は句全体で比べる。「next week」は「next weekend」の先頭に当たっても通さない（段 5）。"""
+    def reasons_for(deadline: str, quote: str) -> list[str]:
+        sid = "efefefef-9999-4000-8000-000000000009"
+        index = SegmentIndex({sid: quote})
+        evidence = {"quote": quote, "evidenceSpan": {"segmentId": sid[:8], "start": 0, "end": len(quote)}}
+        item = {"task": "submit", "assignee": None, "deadline": deadline, "sourceSegmentIds": [sid[:8]], **evidence}
+        _, rejected, _ = validate(_draft(actionItems=[item]), index)
+        return [reason for r in rejected for reason in r.reasons if reason == "DEADLINE_NOT_IN_TRANSCRIPT"]
+    # Act / Assert: 長い句の先頭・途中では通さない
+    assert reasons_for("next week", "Suzuki will submit it next weekend") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    assert reasons_for("end of month", "Suzuki will submit it by the end of monthly review") == ["DEADLINE_NOT_IN_TRANSCRIPT"]
+    # 句読点・文頭・大文字・日本語との境目では通る
+    assert reasons_for("next week", "Suzuki will submit it by next week.") == []
+    assert reasons_for("next week", "Next week, Suzuki will submit it") == []
+    assert reasons_for("next week", "鈴木さんがnext weekにsubmitします") == []
+    # 日本語は語の境目を決められないので、これまでどおり部分文字列で比べる
+    assert reasons_for("次回の定例まで", "鈴木さんが次回の定例までにsubmitします") == []
+
+
+def test_accepted_evidence_span_stores_the_full_segment_id() -> None:
+    """採用した項目の evidenceSpan.segmentId は、sourceSegmentIds と同じ完全 ID で保存する（位置はそのまま。§11.5）。"""
+    # Arrange: LLM は短縮 ID で根拠位置を返す
+    index = SegmentIndex(SEGS)
+    draft = _draft(
+        decisions=[{"text": "予算は据え置き", "sourceSegmentIds": [B[:8]], **EV_B}],
+        actionItems=[{"task": "仕様書を更新", "assignee": "田中", "deadline": "来週", "sourceSegmentIds": [A[:8]], **EV_A}],
+    )
+    # Act
+    accepted, rejected, _ = validate(draft, index)
+    # Assert
+    assert rejected == []
+    assert [(d.sourceSegmentIds, d.evidenceSpan.segmentId, d.evidenceSpan.start, d.evidenceSpan.end)
+            for d in accepted.decisions] == [([B], B, 0, len(QB))]
+    assert [(a.sourceSegmentIds, a.evidenceSpan.segmentId, a.evidenceSpan.start, a.evidenceSpan.end)
+            for a in accepted.actionItems] == [([A], A, 0, len(QA))]
+
+
+def test_claim_contradicting_its_quote_passes_as_known_limitation() -> None:
+    """段 3a (4) は語彙の重なりで、含意は見ない。quote を否定した claim も通る（既知の制限。基本設計 §12.5）。"""
+    # Arrange: QB は「予算は据え置きで決定しました」
+    index = SegmentIndex(SEGS)
+    draft = _draft(decisions=[{"text": "予算は据え置きで決定しなかった", "sourceSegmentIds": [B[:8]], **EV_B}])
+    # Act
+    accepted, rejected, _ = validate(draft, index)
+    # Assert
+    assert [d.text for d in accepted.decisions] == ["予算は据え置きで決定しなかった"] and rejected == []
+
+
 def test_split_windows_respects_line_boundaries() -> None:
     lines = [f"[00:{i:02d}] [mic] [seg:{i:08x}] 発言{i}" for i in range(20)]
     w = split_windows(lines, max_chars=120)
@@ -6639,6 +9048,7 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 
 from minutes_local.api.sse import format_event
 from minutes_local.db import repo
@@ -6647,7 +9057,7 @@ from minutes_local.jobs.events import EventBroker
 from minutes_local.jobs.retry import ProviderUnreachableError
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.llm.fake_provider import FakeSummaryProvider
-from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm, valid_summary_response
+from tests.conftest import create_meeting, finalize, put_chunk, silence_pcm, sine_pcm, valid_summary_response
 
 
 async def test_event_broker_delivers_and_drops_when_full() -> None:
@@ -6720,6 +9130,23 @@ async def test_runner_publishes_job_events(client: httpx.AsyncClient, ctx: AppCo
     await asyncio.wait_for(t, 5)
     types = [e["type"] for e in received]
     assert "job" in types and "transcript_version" in types and types[-1] == "summary_version"
+
+
+@pytest.mark.parametrize("silent", [False, True])
+async def test_created_merge_job_is_published_while_pending(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                                            monkeypatch: pytest.MonkeyPatch, silent: bool) -> None:
+    """transcribe の完了（silent=False）・vad の完了（silent=True）で作った merge は、lease される前（pending）にも流す（§13）。"""
+    # Arrange
+    await create_meeting(client)
+    await put_chunk(client, "m-1", 0, silence_pcm(30) if silent else sine_pcm(30))
+    await finalize(client, "m-1", mic=1)
+    published: list[dict] = []  # type: ignore[type-arg]
+    monkeypatch.setattr(ctx.events, "publish", lambda _meeting_id, event: published.append(event))
+    # Act
+    await runner.run_until_idle()
+    # Assert: 作った時点の pending から流れる（流さないと、lease されるまで UI は待ちの merge を知らない）
+    merges = [e["job"]["status"] for e in published if e.get("type") == "job" and e["job"]["job_type"] == "merge_transcript"]
+    assert merges[0] == "pending" and "completed" in merges
 
 
 async def test_ollama_outage_leaves_transcribed_then_completes(client: httpx.AsyncClient, ctx: AppContext,
@@ -7123,8 +9550,12 @@ STT の再実行・無音 Chunk の手動 STT・設定の変更・失敗の除�
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from minutes_local.db import repo
+from minutes_local.db.connection import now_ms
+from minutes_local.db.models import Job
+from minutes_local.jobs import handlers
 from minutes_local.jobs.context import AppContext
 from minutes_local.jobs.runner import JobRunner
 from minutes_local.vad.fake_provider import FakeVADProvider
@@ -7185,6 +9616,66 @@ async def test_manual_transcribe_of_skipped_chunk_reaches_the_transcript(client:
     assert d["status"] == "transcribed" and d["latestSummaryVersion"] == 1
 
 
+async def test_manual_stt_committed_during_merge_schedules_followup_merge(client: httpx.AsyncClient, ctx: AppContext,
+                                                                         runner: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """merge の書き込みの後・完了の記録の前に、手動 STT の Chunk が初めて完了しても、その merge の後に作り直す merge が入れる（§12）。"""
+    # Arrange: 1 つ目の Chunk の手動 STT で merge を作り直させ、その merge の実行中に 2 つ目の Chunk の手動 STT を完了させる
+    await _all_skipped_meeting(client, ctx, runner)
+    assert (await client.post("/v1/meetings/m-1/chunks/mic/0/transcribe")).status_code == 202
+    real_merge = runner.handlers["merge_transcript"]
+    done_during_merge = False
+
+    async def merge_then_transcribe(c: AppContext, merge_job: Job) -> str | None:
+        nonlocal done_during_merge
+        result = await real_merge(c, merge_job)
+        if not done_during_merge:
+            done_during_merge = True
+            assert (await client.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+            async with c.db.write() as conn:
+                job = repo.lease_job(conn, "w-manual", ["transcribe_chunk"], now_ms())
+                assert job is not None
+            await handlers.handle_transcribe(c, job)
+            async with c.db.write() as conn:
+                assert repo.finish_job(conn, job.id, "w-manual", job.attempts, "completed")
+        return result
+
+    monkeypatch.setitem(runner.handlers, "merge_transcript", merge_then_transcribe)   # HANDLERS は共有なのでテスト後に戻す
+    # Act
+    await runner.run_until_idle()
+    # Assert: 作り直した merge（版 3）に両方の Chunk が入る
+    d = await _detail(client)
+    t = (await client.get("/v1/meetings/m-1/transcript")).json()
+    assert done_during_merge and d["transcriptVersion"] == 3
+    assert {s["chunkSequenceNo"] for s in t["segments"]} == {0, 1}
+
+
+async def test_manual_stt_finishing_after_running_merge_remerges(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """受け付けた時点で実行中だった merge（消せない）が先に終わっても、その Chunk の STT の完了で merge を作り直す（§12）。"""
+    # Arrange: 1 つ目の Chunk の手動 STT で作り直した merge の実行中に、2 つ目の Chunk の手動 STT を受け付ける
+    await _all_skipped_meeting(client, ctx, runner)
+    assert (await client.post("/v1/meetings/m-1/chunks/mic/0/transcribe")).status_code == 202
+    real_merge = runner.handlers["merge_transcript"]
+    requested = False
+
+    async def merge_then_request(c: AppContext, merge_job: Job) -> str | None:
+        nonlocal requested
+        result = await real_merge(c, merge_job)
+        if not requested:
+            requested = True
+            assert (await client.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+        return result
+
+    monkeypatch.setitem(runner.handlers, "merge_transcript", merge_then_request)
+    # Act
+    await runner.run_until_idle()
+    # Assert: 完了済みの merge が残ったままだと、2 つ目の Chunk は版 2 の後の transcript に入らない
+    d = await _detail(client)
+    t = (await client.get("/v1/meetings/m-1/transcript")).json()
+    assert requested and d["transcriptVersion"] == 3
+    assert {s["chunkSequenceNo"] for s in t["segments"]} == {0, 1}
+
+
 async def test_manual_transcribe_is_refused_unless_the_chunk_is_skipped(client: httpx.AsyncClient, ctx: AppContext, runner: JobRunner) -> None:
     await _all_skipped_meeting(client, ctx, runner)
     assert (await client.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
@@ -7233,21 +9724,29 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | faster-whisper 正常処理 | `test_full_pipeline_with_silent_chunk` |
 | GPU OOM retry + ダウングレード | `test_oom_downgrades_model_per_meeting`、`test_two_jobs_failing_with_oom_on_the_same_model_downgrade_once`、`test_downgrade_skips_models_that_are_not_installed`、`test_provider_loads_on_the_requested_device_and_keeps_one_model` |
 | ワーカークラッシュ → Sweeper → 再 lease | `test_sweeper_recovers_expired_lease_and_ignores_stale_owner`、`test_pool_is_rebuilt_after_a_worker_crash`、`test_pool_is_rebuilt_after_a_timeout` |
+| 落ち続けるジョブを永久に実行しない（lease 切れの回数上限） | `test_sweeper_fails_job_whose_lease_keeps_expiring` |
+| 合成の途中で落ちた要約は、控えた版から transcript が進んでいれば回数切れでも failed にせず戻す。版が同じ・控える前に落ちたときは回数を数える（§14・§12.7） | `test_sweep_requeues_expired_summary_only_when_transcript_advanced` |
+| 要約をコミットした後・`finish_job` の前に落ちた試行は、版が進んでいても回数切れでも回収しない（作り直さず、failed にもしない。§14・§12.7 `repo.mark_job_committed`） | `test_committed_summary_is_not_requeued_when_transcript_advanced_before_lease_expired`、`test_sweeper_keeps_meeting_completed_by_summary_before_lease_expired` |
+| merge が書き込みをコミットした後に回数切れで failed になっても、その merge が終わる前に置いた撮り直しは作り直した merge が公開する（同じミリ秒でも）。書き込みの前に落ち続ける merge は際限なく作り直さない（§12 `rerun_merge_for_staged`） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly`、`test_failed_merge_replaced_for_staged_retry_still_publishes_its_failure`（Runner の失敗で消した failed の行も流す） |
+| 常駐ループが 1 周の失敗で終わらない | `test_runner_loop_survives_failed_iteration`、`test_sweeper_loop_survives_failed_iteration` |
 | invalid audio no-retry | `test_failed_chunk_blocks_until_excluded`、`test_retry_decisions` |
 | duplicate job / duplicate segment | `test_lease_is_exclusive`、`test_list_and_finalize`（finalize 冪等） |
 | DLQ = failed + 再試行 | `test_retry_failed_job_via_api`、`test_failed_chunk_blocks_until_excluded` |
 | Structured Output / sourceSegmentIds / assignee 検出 | `test_validate_stage3_to_7`、`test_synthesize_single_window_retries_schema_once` |
+| 期限は quote に同じ期限表現があるときだけ通す（quote の別の相対表現・日付への換算・別の日付の部品の寄せ集め・年や元号の違う同じ月日・別の週の同じ曜日では通さない。基本設計 §12.5 段 5） | `test_deadline_needs_the_same_expression_in_quote`、`test_compound_deadline_is_not_matched_by_its_part`、`test_deadline_is_not_assembled_from_parts_of_other_dates`、`test_deadline_year_must_match_the_quote`、`test_deadline_relative_year_must_match_the_quote`、`test_deadline_standalone_relative_year_must_match_the_quote`、`test_deadline_era_must_match_the_quote`、`test_week_and_weekday_are_matched_as_a_pair`、`test_english_week_phrases_are_not_matched_as_fragments`、`test_slash_date_keeps_the_separator_before_a_time` |
+| 段 3a (4) は語彙の重なりで含意は見ない（quote と矛盾する claim も通る既知の制限） | `test_claim_contradicting_its_quote_passes_as_known_limitation` |
 | AI 再生成 / Manual Notes 保護 | `test_regenerate_creates_new_version_and_keeps_notes` |
 | Ollama 停止中に transcript まで完了 | `test_ollama_outage_leaves_transcribed_then_completes`、`test_summary_runs_once_ollama_is_started_after_the_server`、`test_ollama_without_models_is_model_missing` |
 | ハードウェア区分と実行デバイス（Apple Silicon は CPU の int8） | `test_apple_silicon_runs_whisper_on_cpu_int8`、`test_cuda_keeps_tier_compute_type_and_small_gpu_uses_the_gpu`、`test_cpu_only_and_forced_model_follow_the_backend` |
 | モデル未配置で待機 → 配置後に再開 | `test_transcribe_runs_once_a_model_is_placed_after_the_server`、`test_download_result_is_visible_and_reselects_the_model` |
 | モデル取得の allowlist（外向き通信の唯一の例外） | `test_download_checks_the_redirect_target_before_requesting_it`、`test_download_follows_the_hf_cdn_redirect`、`test_whisper_files_per_model`、`test_download_failure_is_reported_not_lost` |
 | SSE の長時間接続（keepalive） | `test_sse_stream_survives_keepalive` |
-| VAD false negative の手動 STT | `test_manual_transcribe_of_skipped_chunk_reaches_the_transcript`、`test_manual_transcribe_is_refused_unless_the_chunk_is_skipped`、`test_manual_transcribe_is_refused_before_the_transcript_exists` |
+| ハンドラ・完了処理で作った merge を pending のうちに流す | `test_runner_publishes_job_events`、`test_created_merge_job_is_published_while_pending` |
+| VAD false negative の手動 STT（merge の実行中に受け付け・完了しても、作り直した merge が入れる） | `test_manual_transcribe_of_skipped_chunk_reaches_the_transcript`、`test_manual_transcribe_is_refused_unless_the_chunk_is_skipped`、`test_manual_transcribe_is_refused_before_the_transcript_exists`、`test_manual_stt_committed_during_merge_schedules_followup_merge`、`test_manual_stt_finishing_after_running_merge_remerges` |
 | 録音中の操作が保存を止めない | `test_rerun_is_refused_while_recording_and_upload_continues`、`test_rerun_rejects_a_model_that_is_not_installed` |
 | 設定値の検証・存在しない会議 | `test_settings_are_validated_and_model_can_be_reset_to_auto`、`test_exclude_failed_on_unknown_meeting_is_404` |
 | STT 実行中は要約を lease しない | `test_allowed_types_excludes_summary_while_stt_running` |
-| 外部通信ゼロ（モジュール規則） | `test_httpx_only_in_allowed_modules` |
+| 外部通信ゼロ（モジュール規則） | `test_httpx_only_in_allowed_modules`・`test_network_modules_only_in_allowed_modules` |
 | 既存 DB のアップグレード（列補完） | `test_phase1_db_gains_missing_columns_and_keeps_rows`、`test_migrate_is_idempotent` |
 | lease 失効ワーカーの結果を書かせない | `test_expired_worker_cannot_write_segments` |
 | 空の正規化テキストを重複扱いしない | `test_similarity_treats_empty_normalized_text_as_different`、`test_empty_candidates_are_kept_both` |
@@ -7278,7 +9777,7 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | 2 AI failure ≠ Transcript loss | `handlers.handle_summary` は `transcript_segments` に書かない。`runner._on_failure` → `pipeline.on_summary_deferred / on_summary_failed` は `meetings.status` のみ変更 |
 | 3 STT failure ≠ Recording loss | `handle_transcribe` は `read_pcm` のみ。`InvalidAudioError` 時は `save_status='missing'` を記録するだけ |
 | 4 Queue failure ≠ Job metadata loss | `processing_jobs` が唯一の Job Store。`sweeper.sweep_once` で再起動後に回収 |
-| 5 Duplicate delivery ≠ Duplicate transcript | `repo.finish_job` と `repo.insert_segments` の `lease_owner` + `attempts`（fencing token）検証、`INSERT OR IGNORE`、部分一意インデックス |
+| 5 Duplicate delivery ≠ Duplicate transcript | `repo.finish_job` と `repo.insert_segments` の `lease_owner` + `attempts`（fencing token）検証、`INSERT OR IGNORE`、部分一意インデックス。`handle_transcribe` は Chunk の segments を置き換える（再試行で前の attempt の行と混ざらない） |
 | 6 AI regeneration ≠ Manual note overwrite | `routes_meetings.put_notes` のみが `meeting_notes` を書く。`jobs/` に `put_notes` 呼び出しなし |
 | 7 VAD false negative ≠ Original audio loss | `pipeline.on_vad_completed` は `stt_status='skipped'` にするだけ。`transcribe_silent_chunk` で救済 |
 | 8 Browser tab hidden ≠ timer-based recording failure | サーバー側の該当なし。Sweeper / heartbeat のタイマーは処理進捗にのみ影響し、録音には関与しない |
@@ -7316,6 +9815,7 @@ async def test_exclude_failed_on_unknown_meeting_is_404(client: httpx.AsyncClien
 | R4 | SSE の `job` イベントの形 | `JobRunner` は DB 行（snake_case）を流し、`GET /jobs` は camelCase（`job_view`）。ブラウザ側 §3 の `jobFromServerRow` が両方を受ける | 動作はするが契約が 2 つある。`job_view` を共有の場所へ移して SSE もそれを流せば 1 つにできる |
 | R5 | `PUT /notes` の `If-Match` なし | 無条件の上書きとして受ける（本書のクライアントは必ず付ける） | 他のクライアントが付け忘れると楽観ロックが効かない。必須（428）にするかを決める |
 | R6 | `transcribe_chunk` 実行中の排他は片方向 | STT 実行中は要約を lease しないが、要約の実行中に別の会議の STT は始まる（基本設計 §5.2 の規則どおり） | `gpu_small` で要約と STT が重なり OOM になりうる（どちらも retryable） |
+| R7 | サーバーの通常終了（Ctrl-C）が実行中のジョブの lease を返さない | `_cmd_serve` の `finally` は Task を cancel するだけで、ジョブは `processing` のまま残る。次の起動では lease の期限（最長 5 分）が切れるまで再実行されず、切れた時点で 1 回分の試行として数える（§14） | 同じジョブの実行中に 5 回終了すると `failed` になる（利用者の再試行で戻せる）。直すなら、cancel を受けた `_execute` が `attempts` を戻して `pending` にし、`_cmd_serve` が Task の終了を待ってから DB を閉じる |
 
 ---
 

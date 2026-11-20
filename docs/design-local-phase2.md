@@ -458,7 +458,8 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
   last_error    TEXT,
   duration_ms   INTEGER,                                   -- 実測記録（§6）
   created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  updated_at    INTEGER NOT NULL,
+  input_transcript_version INTEGER                         -- 要約の試行が合成に使う transcript の版（§12.7。lease で消す）
 );
 -- v4.0 §47 / §58 の部分一意インデックスは SQLite でもそのまま書ける
 CREATE UNIQUE INDEX IF NOT EXISTS uq_transcribe_job
@@ -505,6 +506,36 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_segments_meeting_time ON transcript_segments(meeting_id, start_ms);
 CREATE INDEX IF NOT EXISTS idx_segments_merged ON transcript_segments(meeting_id, merged_version);
+
+-- 完了済みの Chunk を撮り直した結果の置き場（§9.2 の表「結果の書き込み」）。次の merge_transcript が transcript_version を
+-- 上げるのと同じトランザクションで transcript_segments と入れ替える。0 件の結果も入れ替えるので、Chunk ごとの印と行を分ける
+CREATE TABLE IF NOT EXISTS segment_replacements (
+  chunk_id            TEXT PRIMARY KEY REFERENCES audio_chunks(id) ON DELETE CASCADE,
+  meeting_id          TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  created_at          INTEGER NOT NULL,
+  staged_during_merge TEXT   -- 置いた時点で終わっていなかった merge ジョブの id（無ければ NULL）。その merge が回数切れで failed になったとき作り直すかを決める
+);
+CREATE TABLE IF NOT EXISTS staged_segments (
+  -- 列は transcript_segments と同じ（promote_replacements が同じ列名で写す）。chunk_id だけ segment_replacements(chunk_id) を参照する
+  id              TEXT PRIMARY KEY,
+  meeting_id      TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  chunk_id        TEXT NOT NULL REFERENCES segment_replacements(chunk_id) ON DELETE CASCADE,
+  source          TEXT NOT NULL CHECK (source IN ('mic','system')),
+  segment_index   INTEGER NOT NULL,
+  start_ms        INTEGER NOT NULL,
+  end_ms          INTEGER NOT NULL,
+  text            TEXT NOT NULL,
+  normalized_text TEXT,
+  language        TEXT,
+  confidence      REAL,
+  no_speech_prob  REAL,
+  merged_version  INTEGER,
+  merge_reason    TEXT,
+  speaker_id         TEXT,
+  speaker_confidence REAL,
+  created_at      INTEGER NOT NULL,
+  UNIQUE (chunk_id, segment_index)
+);
 ```
 
 ## 8.7 meeting_summary_versions / meeting_notes
@@ -585,12 +616,15 @@ stateDiagram-v2
     [*] --> pending : finalize / 前段ジョブ完了 / 利用者の再実行
     pending --> leased : JobRunner が UPDATE ... RETURNING で取得（lease_until = now + 5min）
     leased --> processing : ワーカーが実行開始（heartbeat で lease 延長）
-    processing --> completed : 成功
+    processing --> completed : 成功（要約は保存と同じトランザクションで completed にし、lease は Runner が外す。§12.7）
     processing --> retrying : retryable エラー かつ attempts < max_attempts
     processing --> failed : non-retryable エラー または attempts >= max_attempts
     retrying --> pending : next_run_at 到達（backoff）
-    leased --> pending : Sweeper が lease 期限切れを検出
-    processing --> pending : Sweeper が lease 期限切れを検出（ワーカークラッシュ）
+    leased --> pending : Sweeper が lease 期限切れを検出（attempts < max_attempts）
+    processing --> pending : Sweeper が lease 期限切れを検出（ワーカークラッシュ、attempts < max_attempts）
+    processing --> pending : 要約の合成の間に transcript の版が進んだ（要約は保存しない。§12.7）
+    leased --> failed : Sweeper が lease 期限切れを検出（attempts >= max_attempts）
+    processing --> failed : Sweeper が lease 期限切れを検出（attempts >= max_attempts）
     pending --> cancelled : 会議削除 / 利用者キャンセル
     retrying --> cancelled : 同上
     failed --> pending : 利用者が「再試行」（attempts をリセット）
@@ -628,9 +662,9 @@ RETURNING id, meeting_id, chunk_id, job_type, attempts, model_name;
 | 仕組み | 内容 |
 | --- | --- |
 | heartbeat | `processing` 中のワーカーは 60 秒ごとに `UPDATE ... SET lease_until = now + 300000 WHERE id = ? AND lease_owner = ?` を発行する。STT 1 Chunk は通常 5 分未満だが、CPU-only の large モデルなど長時間の場合に備える |
-| Sweeper | 30 秒ごとに `status IN ('leased','processing') AND lease_until < now` を `pending` に戻し、`last_error = 'lease expired'` を記録する。起動時にも 1 回実行する（§5.3） |
+| Sweeper | 30 秒ごとに `status IN ('leased','processing') AND lease_until < now` を `pending` に戻し、`last_error = 'lease expired'` を記録する。起動時にも 1 回実行する（§5.3）。**`attempts >= max_attempts` のものは `pending` に戻さず `failed`（`error_class = INTERNAL`）にし、ハンドラの失敗と同じ後続処理を行う**。lease 切れはワーカーがジョブを抱えたまま落ちたことを意味し、Runner の回数判定を通らない。回数を見ずに戻すと、実行するたびにプロセスを落とすジョブ（メモリ不足で OS に止められる等）が再起動のたびに永久に実行される |
 | 二重実行 | Sweeper で戻された後に旧ワーカーが完了報告を送ってきた場合、`UPDATE ... WHERE id = :id AND lease_owner = :owner AND attempts = :attempts` が 0 行になるため無視される。§9.2 の `RETURNING` が返す `attempts` を fencing token としてワーカーが持ち回り、完了報告と結果の書き込みの両方に付ける |
-| 結果の書き込み | `transcript_segments` への INSERT は完了報告と同じトランザクションで行い、先に `SELECT 1 FROM processing_jobs WHERE id = :id AND lease_owner = :owner AND attempts = :attempts AND status = 'processing'` を検証して 0 行なら INSERT せずに結果を破棄する。lease 失効後の旧ワーカーが `INSERT OR IGNORE` で `UNIQUE (chunk_id, segment_index)` を先に埋め、正規の再試行（`attempts` が進んだ側）の結果が無視される事態を防ぐ。検証を通った同一 attempt の重複報告は `UNIQUE` + `INSERT OR IGNORE` で冪等のまま（Invariant 5） |
+| 結果の書き込み | 結果の書き込みと完了報告は別のトランザクションである。ハンドラは 1 つの書き込みトランザクションで、先に `SELECT 1 FROM processing_jobs WHERE id = :id AND lease_owner = :owner AND attempts = :attempts AND status IN ('leased','processing')` を検証し、0 行なら何も書かずに結果を破棄する（lease した直後の `leased` も、`mark_processing` の後の `processing` も正規の実行中として通す。失効した旧ワーカーは状態ではなく `lease_owner` と `attempts` で弾く。詳細設計 server `repo.lease_is_current`）。通れば、その Chunk の `transcript_segments` を新しい結果で置き換え、Chunk を `completed` にする。Chunk がまだ `completed` でなく、会議に実行中（`leased` / `processing`）の merge も無ければ消してから入れる。既に `completed` なら前の結果が公開中の版に載っていることがあるので消さず、新しい結果を `staged_segments` に置き（Chunk ごとの印は `segment_replacements`）、次の merge が版を上げるのと同じトランザクションで入れ替える（§8.6。merge が失敗しても公開中の版は欠けない）。初めて完了する Chunk（手動 STT の無音 Chunk）でも、実行中の merge があれば同じく `staged_segments` に置く。その merge が版を書いた後に直接 `transcript_segments` へコミットすると版に入らず、merge ジョブも一意制約で作り直せないため、結果が transcript から漏れる。staged に置いた結果は、Runner が merge の完了を記録するときに入れ替え待ち（`segment_replacements` の行）を見て、残っていれば merge を作り直し、その merge が入れ替えて版を上げる（詳細設計 server §14）。完了報告（ジョブの `completed`）はその後に Runner が上記の fencing 付き UPDATE で行う。検証によって、lease 失効後の旧ワーカーが `INSERT OR IGNORE` で `UNIQUE (chunk_id, segment_index)` を先に埋め、正規の再試行（`attempts` が進んだ側）の結果が無視される事態を防ぐ。同一 attempt の重複報告は `UNIQUE` + `INSERT OR IGNORE` で冪等のまま（Invariant 5）。2 つのトランザクションの間で lease が切れると、Sweeper が回数に応じてジョブを `pending` に戻すか `failed` にする（Chunk は `completed` のまま）。どちらでも、やり直した attempt が segments を置き換えるので前の結果と混ざらない。`failed` なら再試行か除外で収束し、除外しても Chunk は `completed` なので gap にならない。前の結果で merge が終わっていた場合は、置き場への書き込みと同じトランザクションで完了済みの merge ジョブを消して作り直し、その merge が入れ替えて transcript の版を上げる（詳細設計 §14） |
 
 ## 9.4 Retry 分類とバックオフ
 
@@ -642,9 +676,9 @@ v4.0 §50〜§51 をローカルの障害種別に読み替える。
 | `MODEL_MISSING` | モデル未配置 | yes（無期限） | `next_run_at = now + 5min`。`attempts` は増やさない。UI に「モデルを配置してください」 |
 | `PROVIDER_UNREACHABLE` | Ollama 未起動 | yes（無期限） | 同上 |
 | `TIMEOUT` | STT / LLM が上限時間を超過 | yes | backoff |
-| `INVALID_AUDIO` | WAV ヘッダ不正、sha256 不一致 | **no** | `audio_chunks.save_status = 'missing'`、UI で該当 Chunk を表示。録音原本はブラウザ IndexedDB から再送可能（Phase 1 §23） |
+| `INVALID_AUDIO` | WAV ヘッダ不正、sha256 不一致 | **no** | `audio_chunks.save_status = 'missing'`、UI で該当 Chunk を表示。VAD は missing を書く前に、同じ書き込みトランザクションで Chunk の行を読み直してファイルを照合し、読めなかった後に再 PUT の修復（§23 の逆同期）が書き戻していれば missing にせず、その音声で続ける（詳細設計 server §12 `handle_vad`）。録音原本はブラウザ IndexedDB から再送可能（Phase 1 §23） |
 | `SCHEMA_VALIDATION` | LLM 出力が JSON schema 不一致 | yes（1 回のみ） | 再生成時は temperature を下げる。2 回目失敗で `failed` |
-| `BUSINESS_VALIDATION` | `sourceSegmentIds` 全滅など | **no** | §12.5。除外後に残る項目が 0 の場合のみ `failed` |
+| `BUSINESS_VALIDATION` | `summary` が空 | **no** | §12.5 段 7。段 3〜6 で全項目が除外されても、`summary` があれば成功扱い |
 | `INTERNAL` | その他例外 | yes | backoff |
 
 バックオフは Phase 1 §9.3 と同じ系列（2s, 5s, 10s, 30s, 60s …）に ±20% ジッター。`max_attempts` 既定 5。上限到達は `failed` とし、v4.0 §52〜§53 の DLQ に相当する扱い（UI に「文字起こしに失敗しました [再試行]」）。DLQ という別キューは作らない。`failed` 行そのものが DLQ である。
@@ -666,7 +700,7 @@ flowchart LR
 | `vad_chunk` 完了 → `transcribe_chunk` | `has_voice=1` なら `pending`、`0` なら `audio_chunks.stt_status='skipped'` にしてジョブを作らない | §32 |
 | `transcribe_chunk` 完了 → `merge_transcript` | `SELECT COUNT(*) FROM audio_chunks WHERE meeting_id=? AND stt_status NOT IN ('completed','skipped')` が 0 | §57〜§60 |
 | `merge_transcript` 完了 → `synthesize_minutes` | 即時。ただし §5.2 の排他規則で lease は STT 完了後 | §61 |
-| いずれかが `failed` | 後続を生成しない。UI で「失敗 Chunk を再試行 / 除外して生成」を選ばせる | §97〜§98 |
+| いずれかが `failed` | 後続を生成しない。`transcribe_chunk` の失敗は UI で「失敗 Chunk を再試行 / 除外して生成」を選ばせる。`vad_chunk` と `merge_transcript` の失敗は再試行のみで、除外の対象ではない（`exclude-failed` が取り消すのは `transcribe_chunk` の `failed` ジョブだけ。詳細設計 §14） | §97〜§98 |
 
 「除外して生成」を選んだ場合、`failed` の `transcribe_chunk` を `cancelled` にし、`audio_chunks.stt_status='failed'` のまま `merge_transcript` を生成する。要約の入力には「この区間は文字起こしに失敗しました」を明示的に挿入する（v4.0 §98：AI に黙って欠落データを渡さない）。
 
@@ -682,14 +716,15 @@ stateDiagram-v2
     transcribing --> transcribed : merge_transcript completed
     transcribed --> summarizing : synthesize_minutes leased
     summarizing --> completed : summary version 保存
-    transcribing --> failed : transcribe failed かつ 利用者が除外を選ばない
+    summarizing --> transcribed : 合成の間に merge が transcript の版を進めた（要約は保存せず、同じジョブで合成し直す。§12.7）
     summarizing --> failed : summary failed（transcript は残る）
-    failed --> transcribing : 再試行
+    failed --> summarizing : 要約の再試行・再生成
+    failed --> transcribing : 利用者が STT 再実行
     completed --> summarizing : 利用者が再生成
     completed --> transcribing : 利用者が STT 再実行（モデル変更時）
 ```
 
-`failed` は「会議データの消失」ではない（v4.0 §105）。`transcribed` まで到達していれば transcript は閲覧・編集できる。
+会議の `failed` は要約の失敗だけで起きる。transcribe・VAD・merge のジョブが失敗しても会議は `transcribing` のまま残り、失敗したジョブの再試行（transcribe は除外も可）を待つ。会議の `failed` は「merge が 1 回は終わった」を意味するためである（詳細設計 §14）。`failed` は「会議データの消失」ではない（v4.0 §105）。`transcribed` まで到達していれば transcript は閲覧・編集できる。
 
 ---
 
@@ -757,9 +792,9 @@ Phase 1 §3.10 で先送りした重複排除アルゴリズムを確定する�
 
 | 項目 | 内容 |
 | --- | --- |
-| 入力 | 会議の全 `transcript_segments`（`merged_version IS NULL` または前回版）。`source` 別に `start_ms` 順 |
+| 入力 | 会議の全 `transcript_segments`（`merged_version IS NULL` または前回版）。`source` 別に `start_ms` 順。読む前に、同じトランザクションで撮り直した Chunk の行を `staged_segments` から入れ替える（§8.6） |
 | 出力 | 各行の `merged_version` と `merge_reason` を更新。`meetings.transcript_version` を +1。除外行は `merged_version = NULL`、`merge_reason = 'dup_of:<id>'` |
-| 冪等性 | 同じ入力集合に対して同じ結果を出す（決定的）。再実行は `transcript_version` を進めるだけで、行を削除しない |
+| 冪等性 | 同じ入力集合に対して同じ結果を出す（決定的）。再実行は `transcript_version` を進めるだけで、行を削除しない（撮り直した Chunk の古い行を入れ替えで消すのを除く） |
 
 ## 11.2 正規化
 
@@ -876,16 +911,29 @@ export interface SummaryTopic {
   readonly sourceSegmentIds: ReadonlyArray<string>;
 }
 
+/** quote が引用元セグメント本文のどこにあるかを示す半開区間 [start, end)（v4.0 §66.1）。 */
+export interface EvidenceSpan {
+  readonly segmentId: string;
+  readonly start: number;
+  readonly end: number;
+}
+
 export interface SummaryActionItem {
   readonly task: string;
   readonly assignee: string | null;
   readonly deadline: string | null;
   readonly sourceSegmentIds: ReadonlyArray<string>;
+  /** 引用元セグメント本文からの逐語引用。サーバー側で位置と逐語一致を検証済み（v4.0 §66.2）。§12.7 の「生成時の引用」に使う */
+  readonly quote: string;
+  /** segmentId は sourceSegmentIds のどれか（保存する形は完全 ID。LLM が返す短縮 ID はサーバーが解決して保存する。詳細設計 server §19 `_resolved_span`） */
+  readonly evidenceSpan: EvidenceSpan;
 }
 
 export interface SummaryDecision {
   readonly text: string;
   readonly sourceSegmentIds: ReadonlyArray<string>;
+  readonly quote: string;
+  readonly evidenceSpan: EvidenceSpan;
 }
 
 /** LLM が生成する形（format に渡す JSON Schema はこの型から生成する） */
@@ -901,7 +949,10 @@ export type RejectionReason =
   | "SEGMENT_ID_EMPTY"          // sourceSegmentIds が空
   | "ASSIGNEE_NOT_IN_TRANSCRIPT" // 担当者名が transcript に出現しない
   | "DEADLINE_NOT_IN_TRANSCRIPT" // 期限表現が transcript に出現しない
-  | "DUPLICATE";
+  | "DUPLICATE"
+  | "QUOTE_NOT_VERBATIM"        // quote が引用元セグメント本文に逐語で存在しない
+  | "EVIDENCE_SPAN_MISMATCH"    // evidenceSpan が quote の位置と一致しない／引用元 ID を指していない
+  | "CLAIM_NOT_SUPPORTED";      // 決定内容・タスクが quote に裏付けられていない
 
 export interface RejectedItem {
   readonly kind: "topic" | "decision" | "actionItem";
@@ -939,10 +990,11 @@ v4.0 §65〜§66 の Schema Validation + Business Validation を次の順で実�
 | 1 | JSON としてパース可能 | `SCHEMA_VALIDATION`。temperature 0 で 1 回再生成。再失敗は `failed` |
 | 2 | JSON Schema 準拠（必須キー・型・配列） | 同上 |
 | 3 | 各項目の `sourceSegmentIds` が非空で、全 ID が `transcript_segments`（`merged_version = 現在版`）に実在 | **該当項目を `rejected` へ移す**（`SEGMENT_ID_NOT_FOUND` / `SEGMENT_ID_EMPTY`）。再生成しない |
-| 4 | `assignee` が非 null なら、その文字列（正規化後）が参照セグメントのテキストに出現 | 該当項目を `rejected`（`ASSIGNEE_NOT_IN_TRANSCRIPT`）。v4.0 §63「AI に話者名を推定させない」の実装 |
-| 5 | `deadline` が非 null なら、日付・曜日・相対表現（「来週」「月末」等）のいずれかが参照セグメントに出現 | 該当項目を `rejected`（`DEADLINE_NOT_IN_TRANSCRIPT`） |
+| 3a | `decisions` / `actionItems` の逐語引用（v4.0 §66.2 段階2。詳細設計 server §11 `_check_evidence`・`_supported_by`）。上から順に見て、最初に落ちた検査の理由を付ける：(1) `evidenceSpan.segmentId` が `sourceSegmentIds`（解決後）のどれかで、`[start, end)` がそのセグメント本文の範囲内 → (2) `quote` が空でなく、そのセグメント本文に逐語で出現 → (3) 本文の `[start, end)` が `quote` と一致 → (4) (1)〜(3) を通ったときだけ、決定内容（`text`）・タスク（`task`）の正規化後の文字バイグラムの 50% 以上が `quote` に出現。(4) が測るのは語彙の重なりで、含意ではない：`quote` を否定・反転した主張（「据え置きで決定しました」に対する「据え置きで決定しなかった」）も文字が重なれば通る。否定・極性の検査は入れず、既知の制限として受け入れる（日本語の否定は語尾・助詞・言い換えで表れ、決定的な規則では誤検出と見逃しが多い。逐語の `quote` と根拠の位置は (1)〜(3) で保証され、UI は採用した項目ごとに根拠リンク（`sourceSegmentIds` から Transcript の該当行へスクロール。§18）を出すので、利用者が元発言と照らして矛盾に気づける） | 該当項目を `rejected`。(1)・(3) は `EVIDENCE_SPAN_MISMATCH`、(2) は `QUOTE_NOT_VERBATIM`、(4) は `CLAIM_NOT_SUPPORTED`。再生成しない |
+| 4 | `assignee` が非 null なら、その文字列（正規化後）が `quote`（正規化後）に出現。参照セグメント全体ではなく引用の中を見る（同じセグメントに出る別人の名前を担当者にさせない）。確かめるのは名前が `quote` にあることで、その人がこの項目のタスクに掛かることではない：1 つの `quote` に複数の人とタスクがある（「田中さんが資料を作り、鈴木さんが会場を予約」）と、別のタスクの人も通る。どの人がどのタスクに掛かるかは係り受けの解析が要り、決定的な規則では誤検出と見逃しが多いので、既知の制限として受け入れる（段 3a (4) の否定と同じ扱い。UI の根拠リンクで利用者が元発言と照らす） | 該当項目を `rejected`（`ASSIGNEE_NOT_IN_TRANSCRIPT`）。v4.0 §63「AI に話者名を推定させない」の実装 |
+| 5 | `deadline` が非 null なら、`deadline` の期限表現（日付・曜日・相対表現。「来週」「月末」等）のすべてが `quote` にも出現する。期限表現を含まない `deadline`（「次回の定例まで」）は、正規化後の文字列がそのまま `quote` に出現する。`quote` に期限表現があるだけでは通さない（`quote` の「来週」は `deadline` の「月末」を裏付けない）。月・週と時期の組（「来月上旬」「今週末」）は 1 つの表現として比べ、`quote` の別の日付の部品を寄せ集めて通さない（「今月上旬に確認し、来月下旬に提出」は「来月上旬」を裏付けない）。週と曜日の組（「来週金曜」「next week friday」）も 1 つの表現として比べ、`quote` の「今週金曜」と別の「来週」を寄せ集めて通さない（「next friday」「this friday」も週の修飾まで 1 つの表現として比べ、`quote` の「this friday」で `deadline` の「next friday」を通さない。「の」の有無と英語の語順「friday next week」は同じ表現とみなす。英語の組は正規化で空白が落ちた形でも切り出す。空白を必須にすると「next week friday」が「friday」だけに縮んで「this week friday」に通る。組でない英語の「next week」「end of」は部品として切り出さず、文字列そのものが `quote` に現れることを求める。部品にすると「end of month」が「end of the week」に、「next weekend」が「next week」に通る。組でない週の修飾と時刻を併せ持つ `deadline`（「next week 5pm」）は、時刻に加えて `deadline` 全体が句として `quote` に現れることを求め、`quote` の「this week 5pm」で通さない（時刻だけで比べると週の修飾が落ちる）。「day after tomorrow」は「明後日」と同じく 1 つの表現として比べ、その中の「tomorrow」で `deadline` の「tomorrow」を通さない。`quote` の英語の期限表現は、正規化前の `quote` で語として現れるもの（前後が英数字でない）だけを数える。正規化で空白が落ちると「Simon day」が「monday」に、「meow」が「eow」に当たる）。「再来月」「再来週」は組（「再来月末」「再来週末」）も単独も 1 つの表現として比べ、その中の「来月末」「再来週」で `deadline` の「来月末」「再来週末」を通さない。年の付いた日付（「2026年11月20日」「26年11月20日」「2026/11/20」「26/11/20」）も年まで 1 つの表現として比べ、年の違う同じ月日を通さない。元号の付いた年（「令和8年」「令和元年」）は元号まで比べ、元号の違う同じ年・月日を通さない。相対の年（「再来年」「来年」「今年」「去年」。「の」の有無は問わない）も月日と 1 つの表現として比べ、`quote` の「再来年11月20日」で `deadline` の「来年11月20日」を通さない。月日の付かない相対の年（「来年」「来年11月」「来年度末」「来年春」）も、後ろの月・年度・時期と 1 つの表現として比べ、`quote` の「再来年」で `deadline` の「来年」を、「来年3月」で「来年11月」を通さない（部分文字列で比べると「来年」が「再来年」の中に当たる）。年の無い月日の `deadline` は、年の付いた `quote` では裏付けない。日付に付いた時刻（「11月20日午後5時」「11/21 17:00」。「の」の有無は問わない）も日付と 1 つの表現として比べ、同じ日付の別の時刻（`quote` の「11月20日午前9時」）を通さない。時刻の無い日付・時刻だけの `deadline` も、時刻の付いた `quote` では裏付けない（年と同じ扱い。英語の時刻も同じで、`quote` の「11/20 5pm」は `deadline` の「5pm」を裏付けない）。日本語の曜日に付いた時刻（「来週金曜9時」「月曜日の17時」。「金曜日」と「金曜」は同じ表現とみなす）も曜日と 1 つの表現として比べ、`quote` の「来週金曜9時、月曜17時」の別の句の曜日と時刻を寄せ集めて `deadline` の「来週金曜17時」を通さない。相対の月と日（「来月20日」「再来月の5日」）も 1 つの表現として比べ、`quote` の「来月21日」の「来月」で `deadline` の「来月20日」を通さない（日の付いた `quote` は日の無い「来月」を裏付けない）。英語の時刻（「5pm」「9 am」「5:30pm」）も、日付・英語の曜日（「next friday 5pm」「tomorrow at 9am」。「at」の有無は問わない）と 1 つの表現として比べ、`quote` の「next Friday 9am」で `deadline` の「next Friday 5pm」を通さない（別の句の曜日と時刻も寄せ集めない）。英語の曜日の後ろの 24 時間制の時刻（「friday 17:00」）も曜日と 1 つの表現とし、`quote` の「friday 9:00 … monday 17:00」の寄せ集めで通さない。12 時間制と 24 時間制（「5pm」と「17:00」）は換算せず別の表現とする。相対表現を日付に換算した `deadline`（`quote` は「来週」、`deadline` は「11月20日」）も通さない：換算の基準（会議の日付・タイムゾーン）を検証は持たず、換算の正しさを確かめられない。期限表現を含まない `deadline` が英数字で始まる・終わるときは、`quote` の中でも英数字に挟まれない句全体として現れることを求める（「next week」は「next weekend」に、「end of month」は「end of monthly」に通らない）。日本語は語の境目を文字から決められないので部分文字列で比べる。確かめるのは期限表現が `quote` にあることで、その期限がこの項目のタスクに掛かることではない：1 つの `quote` に複数のタスクと期限がある（「今月上旬に確認し、来月下旬に提出」）と、別のタスクの期限も通る。段 4 と同じ理由で既知の制限とする。期限表現の前後の向き・範囲の語（「まで」「以降」「から」「以前」「by」「after」）も比べない：`deadline` の「11月20日まで」は `quote` の「11月20日以降」でも通る。向きは期限表現の外の助詞・語で表れ、言い換え（「以後」「より後」）も多く、決定的な規則では誤検出と見逃しが多いので、段 3a (4) の否定・極性と同じく既知の制限とする（UI の根拠リンクで利用者が元発言と照らす）。詳細設計 server §19.4 `_deadline_supported` | 該当項目を `rejected`（`DEADLINE_NOT_IN_TRANSCRIPT`） |
 | 6 | `topics` / `decisions` / `actionItems` 内の正規化テキスト重複 | 後続を `rejected`（`DUPLICATE`） |
-| 7 | `summary` が空でない | `BUSINESS_VALIDATION`（non-retryable）。ただし 3〜6 で全項目が除外されても `summary` があれば成功扱い |
+| 7 | `summary` が空でない | `BUSINESS_VALIDATION`（non-retryable）。ただし 3〜6（3a を含む）で全項目が除外されても `summary` があれば成功扱い |
 
 「再生成ではなく除外」を採る理由は Phase 1 §3.8 の通り（軽量モデルは再生成でも同種の幻覚を再現しやすく、時間もかかる）。除外された項目は UI（§18）で「AI が生成したが根拠を確認できなかった項目」として折りたたみ表示し、利用者が元発言を見て手動で採用できる。採用操作は `meeting_notes` への書き込みであり、`meeting_summary_versions` は変更しない。
 
@@ -963,6 +1015,18 @@ Phase 1 §3.8 で先送りした注記テーブルを、静的な設定ファイ
 ## 12.7 版管理と再生成
 
 v4.0 §67〜§68 を継承する。再生成は新しい `version` 行を追加し、旧版を削除しない。`transcript_version` が進んだ後の再生成は自動では起動せず、UI の「再生成」操作でのみ起動する（利用者が transcript を修正した直後に AI が勝手に上書きする体験を避ける）。
+
+**合成の間に transcript が進んだとき。** 要約の合成中に merge（撮り直しの入れ替え・手動 STT の後）が `transcript_version` を進めたら、その要約は保存せず、会議も `completed` にしない。同じ要約ジョブを `pending` に戻し、新しい版で合成し直す（詳細設計 server §20 `handle_summary`、§8 `repo.requeue_job`）。合成・検証が失敗したときも、版が進んでいれば失敗として記録せずに同じく戻す（試行回数は使わない。版の比較は失敗を記録するのと同じトランザクションで行う）。合成の途中でワーカーが落ちて lease が切れたとき（失敗の報告が無い）も同じで、合成の前にジョブの行へ控えた版（`processing_jobs.input_transcript_version`。lease のたびに消す）を Sweeper が回収と同じトランザクションで今の版と比べ、進んでいれば回数切れでも `failed` にせずに戻す（詳細設計 server §14）。控える前に落ちた試行は比べず、従来どおり回数を数える。要約を保存した試行は、保存と同じトランザクションでジョブを `completed` にするので、その後にワーカーが落ちても Sweeper は回収せず、版が進んでいても作り直さない（上の「進んだ後の再生成」は利用者の操作に限る）。古い版に対する失敗で `failed` にすると、会議も `failed` になり、新しい版の要約は利用者が再試行するまで作られない。版が同じなら従来どおり失敗として扱う。merge は要約ジョブを作ろうとするが、実行中の行が一意制約で先にあるので作れず、そのまま保存すると新しい版の transcript に古い版の要約が組になる。まだ要約を保存していないので、上の「進んだ後の再生成」ではなく元の要求（初回の要約・利用者の再生成）の続きとして扱う。
+
+**transcript が進んだ後の引用。** 要約の `sourceSegmentIds`（と、そのどれかを指す `evidenceSpan.segmentId`）は、生成時の transcript 版（`MeetingSummary.transcriptVersion`）の segment を指す。その後に segments の行を消して作り直す処理がある：撮り直しの入れ替え（詳細設計 §8 `repo.promote_replacements`）、手動 STT（`request_rerun_stt`）、未完了の Chunk の再試行（`handle_transcribe`）。無音区間の STT（`transcribe_silent_chunk`）は行を足すだけで消さない。消えた行を指す引用は次のように扱う（Phase 3 も同じ）。
+
+* 要約は書き換えない・消さない（`result_json` は生成時のまま。上の「旧版を削除しない」と同じ）。サーバーは引用を付け替えない。
+* クライアントは、表示中の transcript が要約と同じ版か新しい版のとき、引用先が transcript にあるかを照合する（詳細設計 client §11 `unresolvedCitations`）。同じ版でも照合するのは、手動 STT（`request_rerun_stt`）が segments の行を先に消し、次の版を確定するのはその後の merge だからである（その間の `GET /transcript` は同じ版のまま行が欠ける）。表示中の transcript が要約より古い（取得待ち）・まだ無いときだけ照合せず、取り直しを待つ。この間は、どの項目にも transcript への根拠リンクを出さない（飛び先が要約の版の行か分からない。詳細設計 client §11 `citationNotice` の `pending`、§15.1 W12）。
+* 見つからない引用は transcript へ飛ばさない。決定事項・アクションは生成時に保存した逐語引用（`quote`）を「生成時の引用」として出し、話題（引用を持たない）は「根拠の行は作り直されました」と出す。あわせて「transcript が更新されました。必要なら再生成してください」と案内する（再生成は上のとおり利用者の操作でのみ）。
+
+**手動 STT の間の transcript（現行の設計と既知の制限）。** 手動 STT（`request_rerun_stt`）は、受け付けたトランザクションで会議の全 Chunk の segments を消し、Chunk を `pending` に戻して vad からやり直す（詳細設計 server §12）。撮り直しの入れ替え（`staged_segments`）とは違い、公開中の行を置き換えの確定まで残さない。そのため、やり直しの結果が merge で次の版になるまで、`GET /transcript` は消した行を欠いて返す。やり直しの STT が失敗した Chunk は `failed` になり、消した行は戻らない（ジョブの再試行 `POST /jobs/{id}/retry` が成功すれば作り直す。`exclude_failed` で除外すれば、その区間を欠いたまま merge する）。録音（WAV）は消さないので、再試行・もう一度の手動 STT で作り直せる。
+
+公開中の行を置き換えの確定まで残し、失敗したやり直しでも残す形は、まだ設計していない。`handle_transcribe` は Chunk が `completed` のときだけ入れ替えの経路（`staged_segments`）を通り、`pending` に戻した Chunk では行を消してから入れる。Phase 3 の `handle_transcribe` は `completed` でない Chunk に行があれば Live の結果として再利用する。行を残すだけでは、Phase 2 では最初の結果で消え、Phase 3 では STT をやり直さない。加えて、VAD が `skipped` にした Chunk の旧行、`exclude_failed` 後の merge が旧行を含めるか、Phase 3 の `meeting_speakers` の扱いを決める必要がある。これらを決めてから設計に反映する（PROGRESS「次の作業」）。
 
 ---
 

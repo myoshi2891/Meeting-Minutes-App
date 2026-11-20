@@ -42,7 +42,7 @@ if [ "$TARGET" = server ] || [ "$TARGET" = all ]; then
   [ -x "$WORK/venv/bin/python" ] || uv venv -q --python 3.12 "$WORK/venv"
   uv pip install -q --python "$WORK/venv/bin/python" \
     "fastapi>=0.115" "uvicorn>=0.30" "httpx>=0.27" "pydantic>=2.7" "psutil>=5.9" \
-    "pytest>=8" "pytest-asyncio>=0.23" "anyio>=4" "cryptography>=42" pyflakes
+    "pytest>=8" "pytest-asyncio>=0.23" "anyio>=4" "cryptography>=42" "soundfile>=0.12" "numpy>=1.26" pyflakes
   rm -rf "$WORK/p2s" "$WORK/p3s"; mkdir -p "$WORK/p2s"
   extract "$ROOT/docs/design-local-phase2-server.md" "$WORK/p2s"; init_packages "$WORK/p2s"
   cp -R "$WORK/p2s" "$WORK/p3s"

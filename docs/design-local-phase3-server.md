@@ -5,7 +5,7 @@
 **対となる文書:** Phase 3 詳細設計書 ── ブラウザ側（`docs/design-local-phase3-client.md`）。
 **配置:** `docs/design-local-phase3-server.md`（2026-11-12 にリポジトリ直下から `docs/` 配下へ移行）。
 **設計方針:** Local-First / Zero External Data Egress / Recording-First / Fault-Tolerant / At-Least-Once / Hardware-Aware Degradation。v4.0 の Recording is Source of Truth と Invariant 1〜10 を継承する。LAN 共有は「利用者自身が管理する LAN 内」に限定し、インターネット公開は対象外。
-**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 128 件と本書の 36 件（計 20 ファイル 164 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-13、§23）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。実モデル（pyannote / faster-whisper の言語判定 / FLAC エンコーダ / 実 TLS 接続）は設計時点では実行していない。
+**検証状態:** 本書の全 `python` コードブロック（37 ファイル。うち 14 は Phase 2 ファイルの全文差し替え、2 は Phase 2 テストの差し替え）は Phase 2 のパッケージに上書き・追加され、Phase 2 の 131 件と本書の 62 件（計 20 ファイル 193 件）が Fake Provider による pytest で全件通過することを確認している（2026-11-13、§23）。`pyproject.toml` も本書で差し替える（§1.1）。再現は `scripts/verify-design-docs.sh server`。**全文差し替えのファイルは「Phase 2 の現行ファイルに Phase 3 の差分を当てたもの」である。** Phase 2 側を直したら同じ変更を本書のブロックにも当てる（当て忘れると、Phase 3 の実装で Phase 2 の修正が巻き戻る）。FLAC は実コーデックで往復と破損入力を確かめた（soundfile 0.14.0 / libsndfile 1.2.2、macOS arm64。検証スクリプトが `soundfile` を入れて §23.6 の `test_flac_codec_roundtrip_is_bit_exact` を走らせる）。pyannote の実 Provider は Pipeline だけを差し替えて、時刻の組み立て・引数・一時ファイルの扱いを確かめている（§23.4）。pyannote 本体・faster-whisper の言語判定・実 TLS 接続は設計時点では実行していない（Step 3-h）。
 
 ---
 
@@ -16,8 +16,50 @@
 | 区分 | ファイル | 内容 |
 | --- | --- | --- |
 | 変更禁止 | `api/routes_jobs.py`、`api/routes_models.py`、`api/sse.py`、`api/common.py`、`db/connection.py`、`db/migrate.py`、`db/repo.py`、`jobs/retry.py`、`jobs/sweeper.py`、`jobs/events.py`、`jobs/context.py` 以外の `jobs/*`、`stt/provider.py`、`stt/fake_provider.py`、`stt/executor.py`、`stt/worker.py`、`stt/faster_whisper_provider.py`、`stt/overlap.py`、`stt/confidence.py`、`vad/*`、`merge/normalize.py`、`merge/dedupe.py`、`llm/*`（`prompts.py` 以外）、`hw/*`、`storage/models_dir.py` | Phase 2 のまま。Phase 1 §12・Phase 2 §14 の API 契約はレスポンス形状を変えない（追加のみ） |
-| 変更（全文再掲） | `config.py`、`db/models.py`、`jobs/context.py`、`jobs/pipeline.py`、`jobs/runner.py`、`jobs/handlers.py`、`merge/merger.py`、`llm/prompts.py`、`storage/files.py`、`api/app.py`、`api/routes_phase1.py`、`api/routes_meetings.py`、`bootstrap.py`、`__main__.py` | §4〜§22 で全文を示す |
+| 変更（全文再掲） | `pyproject.toml`（§1.1）、`config.py`、`db/models.py`、`jobs/context.py`、`jobs/pipeline.py`、`jobs/runner.py`、`jobs/handlers.py`、`merge/merger.py`、`llm/prompts.py`、`storage/files.py`、`api/app.py`、`api/routes_phase1.py`、`api/routes_meetings.py`、`bootstrap.py`、`__main__.py` | §4〜§22 で全文を示す |
 | 新規 | `db/migrations_phase3.py`、`db/repo_phase3.py`、`jobs/live.py`、`jobs/scheduler.py`、`diarization/*`、`merge/echo.py`、`stt/language.py`、`storage/codec.py`、`storage/backup.py`、`storage/rebuild.py`、`auth/users.py`、`auth/tls.py`、`api/routes_phase3.py` | — |
+
+## 1.1 依存の追加 `pyproject.toml`（変更）
+
+Phase 3 の機能はどれも任意の依存（extras）で有効になる。入っていなければその機能だけが無効になり、サーバーは Phase 2 と同じに動く。
+
+```toml
+# pyproject.toml
+[project]
+name = "minutes-local"
+version = "0.3.0"
+description = "議事録アプリ ローカル常駐サーバー（Phase 3）"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "httpx>=0.27",
+  "pydantic>=2.7",
+  "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+stt = ["faster-whisper>=1.0", "onnxruntime>=1.17"]
+cuda = ["faster-whisper>=1.0", "onnxruntime-gpu>=1.17"]
+flac = ["soundfile>=0.12", "numpy>=1.26"]
+lan = ["cryptography>=42"]
+diarization = ["pyannote.audio>=3.1,<4.1"]   # 4.1 以降はテレメトリ（§12 の表「通信」）の止め方を確かめていない
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "anyio>=4", "cryptography>=42", "soundfile>=0.12", "numpy>=1.26"]
+
+[project.scripts]
+minutes-local = "minutes_local.__main__:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+| extras | 入れると有効になるもの | 入っていないとき |
+| --- | --- | --- |
+| `flac` | `compress_chunk`（§16 `FlacCodec`）。`numpy` は `faster-whisper` も使うが、STT を入れない構成でも圧縮できるよう明示する | `ctx.codec is None`。圧縮ジョブを作らない。既に FLAC になった Chunk は読めない（`InvalidWavError`）ので、圧縮を使い始めたら外さない |
+| `lan` | `doctor --init-tls`（§19 `auth/tls.py`） | `--init-tls` が ImportError で終わる。証明書を別の手段で用意すれば `serve --tls` は動く |
+| `diarization` | 話者分離（§12 `PyannoteDiarizationProvider`）。PyTorch を連れてくるので大きい | モデルを配置していても `ModelMissingError` → 話者分離なしで merge へ進む |
+| `dev` | テスト。`cryptography` と `soundfile` は §23.7 の証明書のテストと §23.6 の実コーデックのテストが使う（`soundfile` がなければ後者は skip） | — |
 
 ---
 
@@ -27,7 +69,7 @@
 
 | 候補 | 内容 | 採否 |
 | --- | --- | --- |
-| A. 準リアルタイム | 録音中に PUT された Chunk を finalize を待たず STT し、未マージの生セグメントを Live Transcript ペインに出す。遅延 = 30 秒（Chunk 長）+ STT 時間 | **採用** |
+| A. 準リアルタイム | 録音中に PUT された Chunk を finalize を待たず STT し、未マージの生セグメントを Live Transcript ペインに出す。遅延 = 30 秒（Chunk 長）+ STT 時間（話者分離の実行中は、分離が終わるまで STT を lease しないので、その分も遅れる。§9） | **採用** |
 | B. 真のストリーミング | 数百 ms 単位で音声を送りサーバーで逐次 STT | 不採用。録音中の AudioWorklet と GPU/CPU を奪い合い、`NO_AUDIO_FRAMES` を誘発しうる（Invariant 8 の観点）。ブラウザ側の Zero External Data Egress を保ったまま実装するには WebSocket が必要で CSP が広がる |
 | C. Web Speech API | ブラウザ組み込み | 不採用。実装がクラウド STT に音声を送る場合があり Zero External Data Egress に反する |
 
@@ -51,10 +93,12 @@
 確定事項：
 
 * ジョブ種別 `diarize_meeting`（`priority=150`：全 `transcribe_chunk` 完了後、`merge_transcript`(200) の前）。依存関係は `transcribe 完了 → diarize → merge → summary` に変わる
-* `DiarizationProvider` 抽象 + pyannote 実 Provider（遅延 import、モデルは Phase 2 §7.4 と同じ明示ダウンロード経路）+ Fake
+* `DiarizationProvider` 抽象 + pyannote 実 Provider（遅延 import）+ Fake。モデルは利用者が `{dataDir}/models/diarization/` に配置する。Phase 2 §7.4 のような取得の経路は用意しない（配置の規約と理由は §12）
+* 実 Provider に渡す音声は、source ごとに Chunk を絶対時刻の位置へ置いて連続させる（`assemble_timeline()`）。話者分離に渡すのは STT が完了した Chunk だけなので、無音で STT を省いた Chunk の区間は無音で埋める。単純に連結すると、省いた Chunk 1 つにつき後ろの話者区間が 30 秒ずつ前へずれ、別の人の発言にラベルが付く
+* 話者分離はサーバーのプロセス内（デーモンスレッド。§21 `_start_diarize_thread`）で走らせる。STT のようなプロセスプールには入れない（1 会議 1 回で、ワーカーにモデルを持たせておく利点がない）。その代わり、メモリ不足で OS に止められるとサーバーごと落ちる。この場合も、lease 切れの回数上限（Phase 2 §14）で `failed` になり、話者分離なしで merge へ進む（落ち続けて会議が止まったままにはならない）。同時に走らせる分離は `MAX_CONCURRENT_DIARIZE`（1）本までに絞る（`AppContext.diarize_slots`。§7）。1 本分のピーク（全 Chunk の PCM とモデル。§3 の表）しか見積もっておらず、2 本分が載ることは確かめていないため。上げるのは §24 の実機確認で最大メモリを測ってから。`requeue_running_job` で `pending` に戻した分離の次の試行も、旧い試行のスレッド（スレッドは止められない）が抜けて枠を返すまで分離を始めない。分離を待つハンドラがキャンセルされたとき（サーバーの終了など）も、枠はスレッドが抜けるまで返さない（§21 `handle_diarize` の `_release_when_done`）。分離を待つ間も Runner の heartbeat が lease を延ばすので、生きたまま固まった分離は lease 切れでは見つからない。待つ時間に上限（全 Chunk の長さ × 係数、下限 600 秒。`Thresholds.diarize_timeout_*`）を設け、超えたらスレッドを見放す：ジョブは再試行せず `failed`（`TIMEOUT`）にして話者分離なしで merge へ進み、枠はスレッドが抜けるまで持つ（次の分離は始めない）。見放したスレッドは STT と要約の排他では数えない（`AppContext.diarize_abandoned`。固まったまま STT・要約まで止め続けない。VRAM を抱えていれば STT は OOM の扱いに任せる）。スレッドは結果を返せば捨てられて枠を返し、返さなければプロセスの終了で止まる（分離は既定の executor ではなくデーモンスレッドで走らせる。既定の executor のスレッドはインタープリタの終了時に join され、固まっているとサーバーを止められない）。抜けないまま枠が空かなければ、分離はサーバーを再起動するまで始まらない（ログに出す）。
 * mic と system は**別々に**ダイアライズし、ラベルに source 接頭辞を付けない代わりに `meeting_speakers` で `(label → 名前)` を利用者が割り当てる。mic 側は通常 1 話者（利用者本人）だが、会議室のマイクで複数人が話す場合もあるため固定しない
 * ラベルは `S1..Sn`。名前は AI に推定させない（v4.0 §63、Invariant 9）
-* 分離失敗（モデル未配置・OOM 上限到達）は `merge` を止めない。`speaker_id=NULL` のまま続行し、UI に「話者分離なし」を表示
+* 分離失敗（モデル未配置・OOM 上限到達・プロセスごと落ちる失敗の繰り返し）は `merge` を止めない。`speaker_id=NULL` のまま続行し、UI に「話者分離なし」を表示
 * エコー（system の音声を mic が拾う）は、mic/system 間で時間重なり ≥ 0.5 かつ正規化テキスト類似度 ≥ 0.8 のとき mic 側を `merge_reason='echo_of:<system_id>'` で除外する。話者埋め込みの類似は使わない（Provider 依存を避ける。Phase 2 基本設計 §21 からの変更）
 
 ## 2.3 日英の言語認識
@@ -82,11 +126,15 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 
 * ブラウザ側 WAV 生成は変えない。`compress_chunk` ジョブ（`priority=400`、最低優先）が `completed` から `compress_after_days`（既定 7 日）経過した会議の Chunk を FLAC 化する
 * `AudioCodec` 抽象（`encode` / `decode`）。実 Provider は `soundfile`（libsndfile、extras）。Fake は「マジック + 無圧縮 PCM」の自前コンテナで、検証ロジック（復元一致・不一致時の保持）をテストする
-* 圧縮の原子性：`.flac.part` に書く → 復元して `build_wav(pcm)` の sha256 が `audio_chunks.sha256`（WAV 値、不変）と一致 → `local_path` / `codec='flac'` / `sha256_flac` 更新 → WAV 削除。不一致は新ファイルを消して `INVALID_AUDIO`（non-retryable）。WAV は残る
+* 圧縮の原子性：メモリ上で符号化 → 復元して `build_wav(pcm)` の sha256 が `audio_chunks.sha256`（WAV 値、不変）と一致することを確かめる → `write_atomic` で `.flac` を書く → `local_path` / `codec='flac'` / `sha256_flac` 更新 → WAV 削除。不一致は `.flac` を書かずに `INVALID_AUDIO`（non-retryable）。WAV は残る
+* 圧縮と他の処理の競合：(a) 切り替えの更新は lease の現行の所有者だけが行い、Chunk の `local_path` / `sha256` が読んだ時のままであることも確かめる。STT の再実行（ジョブを行ごと消す）や再 PUT の修復（WAV に書き戻す）が先に起きていたら、WAV のまま残して作った `.flac` を消す。圧縮ファイルは試行ごとに別の一時ファイル（`*.staging`）に書き、lease の確認と同じ書き込みロックの下で最終パスへ置き換える。後始末で消すのはその試行の一時ファイルだけなので、lease を失った旧い試行が、別の試行の確定した圧縮ファイルを上書き・削除することはない。(b) 音声を読む側（VAD・STT・話者分離）は、読み取りに失敗したら Chunk の行を読み直し、パスが変わっていれば新しいパスから読む（`read_chunk_pcm()`。存在確認の後に消えて OSError になった場合も同じ）。読み直さないと、置き換わった直後の読み取りが「ファイルなし」になり、正常な Chunk を `missing` にしてしまう。(c) WAV を消すのは、更新のコミットの後の通常の経路も、コミット後・WAV の削除前に落ちた回のやり直しのジョブも、書き込みロックの下で lease が現行で、Chunk がまだ圧縮済み（通常の経路は切り替えた先のパス、やり直しは読んだときと同じパス）のときだけ（`_unlink_wav_if_still_compressed`）。コミットの後・読んだ後に再 PUT の修復が WAV に書き戻していれば、その WAV が正なので残す
 * `read_pcm` は拡張子で分岐し、FLAC の場合も WAV sha256 で照合する（`sha256` 列の意味を変えない）
-* バックアップ：`VACUUM INTO {dataDir}/backups/minutes-{epoch}.sqlite`。`completed` 遷移ごと + 日次。世代数 `backup_generations`（既定 7）
-* 起動時 `PRAGMA integrity_check`。`ok` 以外なら直近バックアップを `minutes.sqlite` に復元してから開く（復元前の壊れたファイルは `minutes.sqlite.corrupt-{epoch}` に退避）
-* `doctor --rebuild`：`recordings/` を走査し、`meeting.json`（finalize 時に書く。Phase 1 §13 の規約を Phase 3 で実装）と WAV/FLAC ヘッダから `meetings` / `audio_chunks` の欠損行を再構築する。既存行は上書きしない
+* バックアップ：`VACUUM INTO {dataDir}/backups/minutes-{世代番号}-{epoch ms}.sqlite`。**直近のバックアップから 24 時間たっていたら作る**（起動時と 1 時間ごとに判定。基準はファイル名の時刻で、プロセスの起動からの経過ではない）。世代数 `backup_generations`（既定 7）。起動のたびに作ると、短時間に再起動を 7 回くり返しただけで古い世代がすべて押し出される。使うたびにサーバーを起動する使い方でも 1 日 1 世代になる。世代管理・復元元の選択・期日の判定の「新しい順」は名前の時刻ではなく世代番号（既存の最大 + 1、ファイル名に残る）で決める。時刻で並べると、時計が戻った後に作った世代が前の世代より古い扱いになり、時計が追いつくと元の順に戻って、どちらでも新しい世代を消す・古い世代から復元する。最新の世代の時刻が現在より未来なら（作った後に時計が戻った）期日として作る（戻った後に作った世代は番号が最大なので、作った直後に消さず、毎周作り直さない）。`completed` 遷移ごとのバックアップは行わない（DB 全体の複製なので会議 1 件ごとには重く、世代もその分早く回る。判定は 1 時間ごとなので、バックアップの間隔は 24 時間を超えて最長でほぼ 25 時間になり、作成が失敗すれば次の成功までさらに延びる。その間の要約とノートは失われうる。録音と transcript は録音ファイルから作り直せる）
+* バックアップは `.part` に書いてから名前を付け替える。書きかけ・失敗したファイルは正規の名前では残らず、復元元にも世代管理の対象にもならない
+* 起動時 `PRAGMA integrity_check`。`ok` 以外なら、壊れたファイルを `minutes.sqlite.corrupt-{epoch}` に退避し、**検査に通る最も新しいバックアップ**を復元して開く（最新が壊れている・このアプリのスキーマ（`schema_version`）を持たなければ 1 つ古いものへ下がる）。使えるバックアップが 1 つもなければ**空の DB で起動する**（起動を止めない。サーバーが動いていなければブラウザは Chunk を送れない）
+* 復元の直後に、録音ファイルから DB にない会議と Chunk を作り直す（下の rebuild と同じ処理を `build_context` が自動で行う）。バックアップより後に録音した会議は DB にないが、ファイルは残っているためである。作り直した会議は transcript から処理し直す。バックアップより後の要約とノートは失われる。バックアップより後に行った手動の文字起こし（無音と判定した Chunk の手動 STT。`POST .../chunks/{source}/{sequenceNo}/transcribe`）も失われ、その Chunk は `skipped` のまま残る（バックアップの時点で STT の前なら、処理し直しで再び `skipped` になる）。手動の STT はもう一度実行する。起動時に、復元元と作り直した件数を標準エラーに警告として出す（黙って古い状態に戻さない）
+* `doctor --rebuild`：`recordings/` を走査し、`meeting.json`（finalize 時に書く。Phase 1 §13 の規約を Phase 3 で実装）と WAV/FLAC ヘッダから `meetings` / `audio_chunks` の欠損行を再構築する。既存行は上書きしない。**serve が動いているデータディレクトリには実行しない**（ロックが取れなければ終了コード 1。同じ Chunk の行を 2 つのプロセスが作り合う）
+* 再構築した会議の状態：`meeting.json` に有効な終了時刻（`endedAtEpochMs`。SQLite INTEGER に収まる 0 以上の整数）があれば `finalized`（確定済み。serve の起動時にジョブを作る）、作成時の控えのまま（終了時刻なし）なら **`recording`** に戻す。確定前の会議を `finalized` にすると、ブラウザが持っている未送信の Chunk の PUT を 409 で断ってしまう（Recording-First）。`recording` に戻せば、Phase 1 の Recovery が残りを送って確定する。`meeting.json` が読めない（無い・壊れている）会議と、終了時刻が不正な値（範囲外・整数でない。控えが壊れた印）の会議も `recording` にする。確定したかが分からず、`finalized` にすると、まだ送信中のブラウザの Chunk を断る（録音を失う側に倒さない）。ブラウザが確定を終えていた会議は `recording` のまま止まり、文字起こしされない（既知の制限。サーバー側に確定を進める経路は無く、利用者の判断を待つ。PROGRESS「次の作業」）。確定前に取ったバックアップから戻した会議は、行が `recording` などの確定前の状態で残る。確定時の控えがあれば、既存の行も `finalized` に進め、欠けている終了時刻などを控えから補う（ブラウザは確定を終えて再送しないので、そのままでは `resume_finalized` が拾わない）
 * 逆同期：`GET /chunks` は `save_status='missing'` の Chunk を `registered=false` で返す（Phase 1 契約の `registered` フィールドの意味の範囲内）。ブラウザ側が IndexedDB の Blob から再 PUT する（client 文書 §6）
 
 ## 2.5 LAN 共有
@@ -95,7 +143,9 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 
 * 既定は Phase 1〜2 と同じ `127.0.0.1` 単一利用者。`serve --bind 0.0.0.0 --tls` を明示したときだけ LAN モード。`--tls` なしの非 loopback bind は拒否する（トークンが平文で LAN を流れるため）
 * TLS：`doctor --init-tls --host <hostname or IP>` で自己署名証明書（`cryptography`、extras `lan`）。ブラウザは初回に証明書の受け入れが必要（断定しない事項 §3）
-* 認証：`users` テーブル（`id`, `name`, `token_hash`, `created_at`）。`minutes-local user add <name>` がトークンを 1 回だけ表示する。`users` が空なら従来の `token` ファイルで `local` ユーザーとして動作（後方互換）
+* 認証：`users` テーブル（`id`, `name`, `token_hash`, `created_at`）。`minutes-local user add <name>` がトークンを 1 回だけ表示する（同名は拒否）。`user remove <id>` で失効させる（トークンを漏らした・利用者が抜けた。会議と録音は消さない）。`user list` で一覧。`users` が空なら従来の `token` ファイルで `local` ユーザーとして動作（後方互換）。DB をバックアップから復元すると（§2.4）`users` もその時点に戻り、バックアップの後に `user remove` で失効させた利用者のトークンがまた通る。運用者は復元の後に `user list` で確かめ、失効させたままにすべき利用者を `user remove` でもう一度消す（serve は復元の警告でこれを促す）
+* 単一利用者と複数利用者の切り替えは**起動時に決まる**（`AppContext.multi_user`）。最初の利用者を追加した後・最後の利用者を削除した後は、サーバーの再起動で反映する。複数利用者の間の追加・削除は再起動なしで効く（トークンは要求ごとに `users` を引く）。複数利用者に切り替えると `token` ファイルは使えなくなり、それまでに録音した会議（所有者 `local`）は誰からも見えなくなる（利用者を全員削除して単一利用者に戻すと見える）。既存の会議を特定の利用者へ引き継ぐ手段は本書の範囲外（§3）
+* 所有者の居ない会議の復元：rebuild（§2.4）は所有者を `recordings/{userId}/` の階層で決めるので、DB をバックアップなしで作り直して `users` が空になると、複数利用者のときの会議（所有者は各利用者の ID）は残るが、サーバーは単一利用者（`local`）で動き、どのトークンからも見えない（404）。`user add` は新しい ID を振るので、同じ ID の利用者は作り直せない。付け替えの手段も設けない（上の項目と同じ。所有者を変えるコマンドは認可の境界を動かすので、別に設計する）。rebuild は `users` に行の無い所有者 ID（`local` を除く）を `RebuildReport.owners_without_user` に入れ、起動時の復旧の警告と `doctor --rebuild` の出力がその ID・見えないこと・取る手順を表示する（`_warn_unowned`）。手順は、サーバーを止め、まず今の DB を `{dataDir}` の直下で別名へ移して残し（例：`minutes.sqlite.before-restore-<epoch>`。WAL なので `minutes.sqlite-wal`・`minutes.sqlite-shm` があれば、同じ名前の後ろに `-wal`・`-shm` を付けて一緒に移す。コピーではなく移すのは、落ちた serve の WAL が `minutes.sqlite` の隣に残ったままだと、置いたバックアップを開いたときにその WAL が適用されて壊れるため。`backups/` の下に置くと世代管理や復元元の候補に、`tmp/` の下に置くと serve の起動で消され、`recordings/` の下は rebuild が走査する）、`{dataDir}/backups/` のうちその利用者を含むバックアップで DB を置き換え、`doctor --rebuild` でバックアップの後の会議を足すこと。rebuild が戻すのは録音から作れる会議と Chunk だけなので、選んだバックアップの後に作られたノートと要約（とバックアップの後の会議の文字起こしの結果。会議はもう一度文字起こしされる）は置き換えで失われる。置き換える前の状態に戻すときは、サーバーを止め、置き換えに使った `minutes.sqlite` と、あれば `minutes.sqlite-wal`・`minutes.sqlite-shm` を同じく `{dataDir}` の直下で別名へ移してから（例：`minutes.sqlite.replaced-<epoch>`。戻すファイルの隣に置き換え後の WAL が残ると、戻した DB を開いたときに適用されて壊れる）、移しておいた 3 つのファイルを元の名前に戻す（そのときは所有者の居ない会議もまた見えなくなる）。置き換えると、そのバックアップの後に `user remove` した利用者のトークンも戻るので、`user list` で確かめて消し直す。そのバックアップが無ければ会議は API から開けない（音声は `recordings/{userId}/` に残る）。`user remove` した利用者の会議も録音を消さないので同じく報告されるが、これは想定どおりで、戻さない（警告もそう書く）。既知の制限とする
 * 認可：認証ミドルウェアが `/v1/meetings/{id}/...` と `/v1/jobs/{id}/...` の所有者を照合し、他人の会議は `404`（存在を漏らさない）。`GET /v1/meetings` は自分の会議のみ
 * ファイル階層：`recordings/{userId}/{meetingId}/{source}/{seq}.wav`。マイグレーション 012 が既存の `recordings/{meetingId}/` を `recordings/local/{meetingId}/` へ移動し `local_path` を更新する。旧ディレクトリは新しい階層を作る前に `{dataDir}/.migrate-012/` へ退避してから統合する（会議 ID が `local` だと旧ディレクトリと新しい階層の親が重なるため）
 * ジョブの公平性：`lease_job` を「利用者ごとの実行中ジョブ数が少ない利用者を優先」に変更（`ORDER BY running_per_user, priority, created_at`）。GPU は依然 1 台なので、同時実行数の上限は Phase 2 と同じ
@@ -108,13 +158,17 @@ Phase 2 では `settings.language` が `ja` / `en` / `auto` で、`auto` は「�
 
 | 事項 | 断定しない理由 | 担保 |
 | --- | --- | --- |
-| pyannote の話者数推定と精度、必要 VRAM | 会議の話者数・音質・重なり発話で大きく変わる。VRAM は 2〜4 GiB 程度が報告されるが環境依存 | `usage_metrics(diarize_duration_ms, diarize_speakers)` を記録。VRAM 予算は STT と同じ排他規則（Phase 2 §5.2）で `diarize_meeting` を STT 完了後にのみ lease |
+| pyannote の話者数推定と精度、必要 VRAM | 会議の話者数・音質・重なり発話で大きく変わる。VRAM は 2〜4 GiB 程度が報告されるが環境依存 | `usage_metrics(diarize_duration_ms, diarize_speakers)` を記録。STT と分離を合わせた VRAM の最大値は実測していないので、GPU では重ねない：`diarize_meeting` は STT の実行中に lease せず、分離の実行中（行または実行枠）は STT（ライブを含む）を lease しない（`JobRunner.allowed_types`）。引き換えに、ライブ文字起こしと他の会議の STT は分離が終わるまで待つ。合算の最大値を実測し、VRAM の予算に収まると確かめるまで、重ねる設定は設けない |
+| pyannote のモデルの配置と API（版による違い） | 配布形態・`config.yaml` の書式・Pipeline の戻り値は pyannote.audio の版で変わる。本書は pyannote 本体を実行していない | 本書が固定するのは Provider の外側の契約だけ（§12：`config.yaml` の場所、通信させない、連続した WAV を渡す、区間を絶対時刻で返す）。実物の配置手順と戻り値の形は Step 3-h で確かめ、§12 の表を実測で更新する |
+| 話者分離の所要時間とメモリ（CPU） | 会議の長さに比例し、CPU では実時間に近い時間がかかりうる。全 Chunk の PCM をメモリに載せる（60 分で 1 source あたり約 115 MB、WAV 化でその倍） | 実行中は heartbeat が lease を延ばす（Phase 2 §13）。タイムアウトは設けない。1 source のタイムラインが 4 時間（`MAX_TIMELINE_MS`、約 461 MB）を超える会議は、PCM を読む前に `INVALID_AUDIO` で話者分離なしにする（§12 `handle_diarize` が Chunk の行の時刻で確かめ（`check_timeline_span`）、読み込み中の量と `assemble_timeline` の確保前にも確かめる。開始時刻の壊れた Chunk で際限なく読み込み・確保しない）。プロセスごと落ちた場合は lease 切れの回数上限で `failed` → 話者分離なしで続行（§2.2） |
+| 複数利用者への切り替え時の既存会議 | 所有者 `local` の会議をどの利用者に引き継ぐかは運用の判断 | 引き継ぎの手段は設けない。`user add` が切り替えの影響を表示する（§22） |
+| `users` を失った後に復元した会議 | バックアップなしで DB を作り直すと、利用者の ID の階層から復元した会議の所有者が `users` に居ない | 付け替えの手段は設けない。警告で ID と手順（今の DB を `-wal`・`-shm` ごと `{dataDir}` の直下で別名へ移して残す → その利用者を含むバックアップを置く → `doctor --rebuild` → `user list` で消し直し）を示し、選んだバックアップの後のノートと要約は、移したファイルを戻さない限り失われることも示す。`user remove` した利用者の会議も報告され、それは戻さない（§2.5） |
 | Whisper の言語判定精度（短い Chunk・混在） | `detect_language` は先頭 30 秒の特徴量で判定し、確信度が低いことがある | 確信度をセグメントごとに `usage_metrics(language_prob)` に記録。< 0.6 のフォールバック率を監視 |
 | Live STT が録音に影響しない | 同一マシンで STT が走ると CPU/GPU が競合する | ブラウザ側 `NO_AUDIO_FRAMES` 発生時に Live を自動停止（client 文書 §8）。`usage_metrics(live_lag_ms)` を記録 |
 | FLAC ライブラリ（libsndfile）の可用性 | OS ごとに配布形態が異なる | extras 未導入なら `compress_chunk` を生成しない（`ctx.codec is None`） |
-| 自己署名証明書のブラウザ受け入れ | ブラウザ・OS の証明書ストア設定に依存 | `doctor --init-tls` が受け入れ手順を表示。受け入れ前は `/v1/health` に到達できないため `UNREACHABLE` として扱われる |
+| 自己署名証明書のブラウザ受け入れ | ブラウザ・OS の証明書ストア設定に依存 | `doctor --init-tls` が受け入れが必要なことを表示する。受け入れ前は `/v1/health` に到達できないため `UNREACHABLE` として扱われる。`--host` には LAN の端末がアドレスバーに入れる名前か IP を渡す（省略時は `127.0.0.1` だけの証明書になり、LAN からは名前の不一致になる） |
 | LAN 内の遅延・帯域 | Wi-Fi 品質に依存。1 Chunk 約 1 MB / 30 秒なので帯域は小さいが、遅延はある | ブラウザ側の `LocalSaver` タイムアウト（30 秒）で吸収。`BACKEND_UNAVAILABLE` の頻度を監視 |
-| `VACUUM INTO` の所要時間 | DB サイズに比例 | `asyncio.to_thread` で実行し API をブロックしない。所要時間を記録 |
+| `VACUUM INTO` の所要時間 | DB サイズに比例 | `asyncio.to_thread` で実行し API をブロックしない。所要時間を `usage_metrics(backup_duration_ms)` に記録 |
 | `INSERT ... SELECT *` によるテーブル再作成の列順一致 | 手作業のマイグレーションで列順がずれると壊れる | §23.1 のマイグレーションテストで Phase 2 DB からの適用を検証 |
 
 ---
@@ -176,7 +230,8 @@ CREATE TABLE processing_jobs_new (
   last_error    TEXT,
   duration_ms   INTEGER,
   created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  updated_at    INTEGER NOT NULL,
+  input_transcript_version INTEGER  -- 要約の試行が合成に使う transcript の版。handle_summary が控え、lease で消す（sweeper が比べる）
 );
 INSERT INTO processing_jobs_new SELECT * FROM processing_jobs;
 DROP TABLE processing_jobs;
@@ -212,6 +267,9 @@ CREATE INDEX IF NOT EXISTS idx_meetings_user ON meetings(local_user_id, created_
 """
 
 PHASE3_SQL: list[tuple[int, str]] = [(9, M009), (10, M010), (11, M011)]
+# このビルドが知る最新の schema_version（012 はファイル移動を伴うので PHASE3_SQL の外で記録する）。
+# 復元元のバックアップの検証（storage/backup.usable_backup）が、これより新しい版を断る
+LATEST_SCHEMA_VERSION = 12
 
 
 MIGRATE_012_STAGING = ".migrate-012"
@@ -339,6 +397,11 @@ class Thresholds:
     llm_connect_timeout_s: float = 10.0
     llm_read_timeout_s: float = 600.0
     llm_ctx_fill_ratio: float = 0.6
+    # Phase 3：話者分離の待ち時間の上限（handle_diarize）。全 Chunk の長さ × 係数、下限 diarize_timeout_min_s。
+    # 係数は §24 の実機確認で 60 分・2 source の所要時間を測って見直す（それまでは大きめに取り、正常な分離を断たない）
+    diarize_timeout_factor_gpu: float = 1.0
+    diarize_timeout_factor_cpu: float = 5.0
+    diarize_timeout_min_s: float = 600.0
     # Phase 3
     language_min_prob: float = 0.6          # これ未満は会議の主言語にフォールバック
     language_dominant_ratio: float = 0.6    # これ以上なら主言語で要約
@@ -388,6 +451,11 @@ class Settings:
     @property
     def token_path(self) -> Path:
         return self.data_dir / "token"
+
+    @property
+    def tmp_dir(self) -> Path:
+        """処理中だけ使う一時ファイル（話者分離に渡す WAV）。serve が起動時に空にする（§22）。"""
+        return self.data_dir / "tmp"
 
     @property
     def tls_cert_path(self) -> Path:
@@ -620,6 +688,15 @@ def job_owner(conn: sqlite3.Connection, job_id: str) -> str | None:
 
 # ---- 公平 lease（§2.5） ----
 
+def has_ready_job(conn: sqlite3.Connection, job_type: str, now: int) -> bool:
+    """job_type のジョブが lease できる状態で待っているか（pending / retrying で next_run_at が過ぎた。lease_job_fair と同じ条件）。"""
+    row = conn.execute(
+        "SELECT 1 FROM processing_jobs WHERE job_type = ? AND status IN ('pending','retrying') AND next_run_at <= ? LIMIT 1",
+        (job_type, now),
+    ).fetchone()
+    return row is not None
+
+
 def lease_job_fair(conn: sqlite3.Connection, owner: str, allowed_types: list[str], now: int,
                    lease_ms: int = 300_000) -> Job | None:
     """利用者ごとの実行中ジョブ数が少ない利用者を優先する。単一利用者では Phase 2 の lease_job と同じ順序になる。"""
@@ -628,7 +705,8 @@ def lease_job_fair(conn: sqlite3.Connection, owner: str, allowed_types: list[str
     ph = ",".join("?" for _ in allowed_types)
     row = conn.execute(
         f"""UPDATE processing_jobs
-            SET status = 'leased', lease_until = ?, lease_owner = ?, attempts = attempts + 1, updated_at = ?
+            SET status = 'leased', lease_until = ?, lease_owner = ?, attempts = attempts + 1, updated_at = ?,
+                input_transcript_version = NULL
             WHERE id = (
               SELECT j.id FROM processing_jobs j
               JOIN meetings m ON m.id = j.meeting_id
@@ -662,7 +740,14 @@ def upsert_speaker(conn: sqlite3.Connection, meeting_id: str, label: str, name: 
 
 
 def set_segment_speaker(conn: sqlite3.Connection, segment_id: str, label: str | None, confidence: float | None) -> None:
+    """撮り直して入れ替え待ちの segments（Phase 2 staged_segments）にも付ける。入れ替えで話者を失わない。"""
     conn.execute("UPDATE transcript_segments SET speaker_id = ?, speaker_confidence = ? WHERE id = ?", (label, confidence, segment_id))
+    conn.execute("UPDATE staged_segments SET speaker_id = ?, speaker_confidence = ? WHERE id = ?", (label, confidence, segment_id))
+
+
+def staged_segments_of_meeting(conn: sqlite3.Connection, meeting_id: str) -> list[Segment]:
+    rows = conn.execute("SELECT * FROM staged_segments WHERE meeting_id = ? ORDER BY source, start_ms, segment_index", (meeting_id,)).fetchall()
+    return [_row(Segment, r) for r in rows]
 
 
 # ---- 言語 ----
@@ -692,6 +777,21 @@ def primary_language(ratio: dict[str, float]) -> tuple[str | None, float]:
 
 # ---- Live ----
 
+def requeue_running_job(conn: sqlite3.Connection, meeting_id: str, job_type: str) -> bool:
+    """実行中（leased / processing）の会議単位のジョブを pending に戻す。戻したら True。
+
+    lease_owner を消すので、実行中のワーカーは lease_is_current・finish_job・heartbeat_job のどれも通らず、結果を書かない
+    （Phase 2 基本設計 §9.3 の fencing）。attempts は戻さない：次の lease で進み、同じ owner の文字列で lease し直しても
+    旧ワーカーと区別できる。戻した実行も 1 回と数えるので、max_attempts はその分早く尽きる
+    """
+    cur = conn.execute(
+        "UPDATE processing_jobs SET status = 'pending', lease_owner = NULL, lease_until = NULL, next_run_at = 0, updated_at = ? "
+        "WHERE meeting_id = ? AND job_type = ? AND status IN ('leased','processing')",
+        (now_ms(), meeting_id, job_type),
+    )
+    return cur.rowcount > 0
+
+
 def segments_of_chunk(conn: sqlite3.Connection, chunk_id: str) -> list[Segment]:
     rows = conn.execute("SELECT * FROM transcript_segments WHERE chunk_id = ? ORDER BY segment_index", (chunk_id,)).fetchall()
     return [_row(Segment, r) for r in rows]
@@ -711,6 +811,17 @@ def live_segments_since(conn: sqlite3.Connection, meeting_id: str, since_created
         (meeting_id, since_created_at),
     ).fetchall()
     return [_row(Segment, r) for r in rows]
+
+
+def discard_meeting_job(conn: sqlite3.Connection, meeting_id: str, job_type: str) -> bool:
+    """会議単位のジョブの行を状態を問わず消す。消したら True。
+
+    実行中（leased / processing）の行を消すと、そのワーカーは lease_is_current・finish_job・heartbeat_job のどれも通らず、結果を書かない
+    （requeue_running_job と同じ fencing）。pending に戻さないのは、戻すと消したかった条件（分離の作り直し）が済む前に lease されうるため。
+    次の行は呼び出し側の規則（on_diarize_finished など）が作る
+    """
+    cur = conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ? AND job_type = ?", (meeting_id, job_type))
+    return cur.rowcount > 0
 
 
 def oldest_open_job_age_ms(conn: sqlite3.Connection, meeting_id: str, job_type: str, now: int) -> int | None:
@@ -746,6 +857,7 @@ Phase 3 の Provider（話者分離・言語判定・コーデック）と LAN �
 """ジョブハンドラと API が共有する依存。Phase 3 で diarization / language / codec / 利用者モードを追加。"""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 from ..config import Settings
@@ -754,12 +866,18 @@ from ..diarization.provider import DiarizationProvider
 from ..hw.detect import Hardware
 from ..hw.tiers import SttCandidate, Tier
 from ..llm.provider import SummaryProvider
+from ..storage.backup import Recovery
 from ..storage.codec import AudioCodec
 from ..stt.executor import STTExecutor
 from ..stt.language import LanguageDetector
 from ..storage.models_dir import ModelDownloads
 from ..vad.provider import VADProvider
 from .events import EventBroker
+
+# 同時に走らせる話者分離（DiarizationProvider.diarize）の上限。1 回の分離は全 Chunk の PCM（60 分で 1 source あたり約 115 MB、
+# WAV 化でその倍。上限は 1 source 4 時間 = 約 461 MB）とモデルを同じプロセスに載せる（§3 の表）。2 本分が載る余裕は確かめていない
+# （§24 の実機確認で 60 分・2 source の最大メモリを測る）。上げるのは、その実測で 2 本分のピークがメモリに収まると確かめてから
+MAX_CONCURRENT_DIARIZE = 1
 
 
 @dataclass
@@ -790,8 +908,18 @@ class AppContext:
     diarization: DiarizationProvider | None = None
     language: LanguageDetector | None = None
     codec: AudioCodec | None = None
-    multi_user: bool = False       # users テーブルが空でなければ True
+    multi_user: bool = False       # users テーブルが空でなければ True（起動時に決める。切り替えは再起動で反映。§2.5）
     tls_enabled: bool = False
+    recovery: Recovery | None = None   # 起動時に壊れた DB を作り直したときの記録（§2.4）。正常な起動では None
+    # 話者分離の実行枠（handle_diarize）。asyncio.to_thread のスレッドは止められないので、pending に戻した分離
+    # （requeue_running_job）の次の試行は、旧い試行のスレッドが抜けて枠を返すまで待つ
+    diarize_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(MAX_CONCURRENT_DIARIZE))
+    # 実行中の STT（ライブを含む）のハンドラの数（JobRunner._run_handler が数える）。STT の再実行（request_rerun_stt）が
+    # ジョブの行を消しても推論は止まらないので、行が無くても抜けるまで分離を lease しない（JobRunner.allowed_types）
+    stt_in_flight: int = 0
+    # 時間切れで見放した分離のスレッドの数（handle_diarize の _abandon_until_done）。スレッドは止められないので枠（diarize_slots）は
+    # 抜けるまで持ち続ける（次の分離は始めない）が、固まったスレッドが STT と要約まで止めないよう、その排他では走っていない扱いにする
+    diarize_abandoned: int = 0
 
     @property
     def diarization_active(self) -> bool:
@@ -827,7 +955,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from ..db import repo
+from ..db import repo, repo_phase3
 from ..db.models import AudioChunk, Job
 from ..storage.files import sha256_file
 
@@ -859,23 +987,98 @@ def on_finalized(conn: sqlite3.Connection, meeting_id: str, diarize: bool = Fals
     return created
 
 
-def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: bool, model_name: str | None, diarize: bool) -> None:
+def on_vad_completed(conn: sqlite3.Connection, chunk: AudioChunk, has_voice: bool, model_name: str | None, diarize: bool) -> bool:
+    """戻り値は結果を適用したか。適用するのは Chunk が pending のときだけ（再試行で適用済みの Chunk に来る。Phase 2 §12）。"""
+    current = repo.get_chunk(conn, chunk.id)
+    if current is not None and current.stt_status != "pending":
+        ensure_merge_job(conn, chunk.meeting_id, diarize)
+        return False
     if has_voice:
         repo.update_chunk(conn, chunk.id, stt_status="queued")
         repo.insert_job(conn, chunk.meeting_id, "transcribe_chunk", chunk_id=chunk.id, model_name=model_name)
     else:
         repo.update_chunk(conn, chunk.id, stt_status="skipped")
     ensure_merge_job(conn, chunk.meeting_id, diarize)
+    return True
 
 
-def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk, diarize: bool) -> None:
+def on_transcribe_completed(conn: sqlite3.Connection, chunk: AudioChunk, diarize: bool) -> str | None:
+    """戻り値は作ったジョブ（diarize_meeting か merge_transcript）の id（ensure_merge_job）。呼び出し側がコミット後にイベントを流す。"""
+    current = repo.get_chunk(conn, chunk.id)
+    first_completion = current is None or current.stt_status != "completed"
     repo.update_chunk(conn, chunk.id, stt_status="completed")
-    ensure_merge_job(conn, chunk.meeting_id, diarize)
+    if diarize and first_completion:
+        # 話者分離の入力は、分離の開始時に completed だった Chunk（handle_diarize の targets）。後から初めて completed になった
+        # Chunk（無音と判定した Chunk の手動 STT。transcribe_silent_chunk）の音声には話者区間が無い。
+        # 撮り直し（前から completed）は前の segments の話者を引き継ぐので対象にしない（handle_transcribe の carried）
+        # - 実行中（leased / processing）：pending に戻す。実行中のワーカーの結果は lease の検査で捨てられ（finish_job も通らず
+        #   on_diarize_finished は呼ばれない）、次の lease がこの Chunk を含めて分離し直す。行は同じなので一意制約は保つ
+        # - 終端（completed / failed / cancelled）：この Chunk より先に終わった分離。消して、下の ensure_merge_job に作り直させる
+        #   （残すと ensure_merge_job は分離を済んだものとみなして merge へ進む）
+        # - pending / retrying：まだ入力を読んでいないので何もしない
+        repo_phase3.requeue_running_job(conn, chunk.meeting_id, "diarize_meeting")
+        repo.delete_finished_job(conn, chunk.meeting_id, "diarize_meeting")
+        # merge の行は状態を問わず消す。lease 済みの merge が書く前（handle_transcribe は実行中の merge を見て結果を staged に置く）だと、
+        # その merge が作り直す分離より先に staged 行を昇格させ、話者の無い segments を公開する。完了まで行が残ると
+        # on_diarize_finished も一意制約で merge を作れない。消せば実行中のワーカーは lease の検査で書かず、作り直した分離の完了が
+        # merge を作る（on_diarize_finished）。pending に戻すと分離より先に lease されうる（repo_phase3.discard_meeting_job）
+        repo_phase3.discard_meeting_job(conn, chunk.meeting_id, "merge_transcript")
+    return ensure_merge_job(conn, chunk.meeting_id, diarize)
 
 
 def on_transcribe_failed(conn: sqlite3.Connection, chunk: AudioChunk) -> None:
-    """failed は merge をブロックする。利用者が retry か exclude_failed を選ぶまで待つ（v4.0 §97〜§98）。"""
+    """failed は merge をブロックする。利用者が retry か exclude_failed を選ぶまで待つ（v4.0 §97〜§98）。
+
+    completed の Chunk は変えない。ハンドラが結果を書いた後、finish_job の前に lease が切れて Sweeper が回数切れで
+    回収すると、ここに来る。failed にすると書き込み済みの segments が gap になる（Phase 2 §14）。
+    """
+    current = repo.get_chunk(conn, chunk.id)
+    if current is not None and current.stt_status == "completed":
+        return
     repo.update_chunk(conn, chunk.id, stt_status="failed")
+
+
+def on_job_failed(conn: sqlite3.Connection, job: Job) -> str | None:
+    """ジョブが failed で確定した後の後続処理。Runner（ハンドラの失敗）と Sweeper（lease 切れで回数切れ）が同じ規則を使う。
+
+    戻り値は後続処理で作ったジョブの id（diarize_meeting の失敗で作った merge と、入れ替え待ちの撮り直しを公開する merge。
+    作らなければ None）。Runner と Sweeper がコミット後に流す（完了時の後続ジョブと同じ。流さないと lease されるまで pending の行がイベントに出ない）。
+    """
+    if job.job_type == "transcribe_chunk":
+        on_transcribe_failed(conn, job_of_chunk(conn, job))
+    elif job.job_type == "synthesize_minutes":
+        on_summary_failed(conn, job.meeting_id)
+    elif job.job_type == "vad_chunk":
+        # Chunk も会議も変えず、失敗したジョブの再試行を待つ（Phase 2 §12・§14 の表）
+        return None
+    elif job.job_type == "merge_transcript":
+        return rerun_merge_for_staged(conn, job)
+    elif job.job_type == "diarize_meeting":
+        # 話者分離の失敗は transcript を止めない（§2.2）
+        return on_diarize_finished(conn, job.meeting_id)
+    # live_transcribe_chunk / compress_chunk の失敗は後続に影響しない
+    return None
+
+
+def rerun_merge_for_staged(conn: sqlite3.Connection, job: Job) -> str | None:
+    """failed で確定した merge の後に、入れ替え待ちの撮り直しを公開する merge を作る（Phase 2 §12 rerun_merge_for_staged と同じ規則）。
+
+    この merge が終わる前に置いた撮り直し（stage_replacement が控えた merge の id）があるときだけ作る（書き込みの前に落ち続ける merge を際限なく作り直さない）。
+    作るのは merge で、分離はやり直さない（Runner が merge の完了で作り直す merge と同じ。分離は終端なので ensure_merge_job も merge を作る）。
+    分離の有効・無効（Runner の diarization_active）はここでは持たない（Sweeper からも呼ばれる）ので、on_diarize_finished と同じく
+    全 Chunk が終端のときだけ merge を直接作る。分離が終わっていなければ（作り直した分離が待っている・実行中）作らない
+    （その分離の完了が on_diarize_finished で merge を作る。先に merge を作ると話者の無い segments を公開する）。
+    既知の差：Runner の完了処理（ensure_merge_job）は、分離の行が無く分離が有効なら分離から作るが、ここは merge を作る
+    （merge の後に分離を有効にした会議で、撮り直しの公開に分離を挟まない）
+    """
+    if not repo.has_replacements_staged_during(conn, job.meeting_id, job.id):
+        return None
+    repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
+    if not _all_chunks_terminal(conn, job.meeting_id):
+        return None
+    if repo.count_jobs(conn, job.meeting_id, "diarize_meeting", ["pending", "leased", "processing", "retrying"]) > 0:
+        return None
+    return repo.insert_job(conn, job.meeting_id, "merge_transcript")
 
 
 def _all_chunks_terminal(conn: sqlite3.Connection, meeting_id: str) -> bool:
@@ -890,21 +1093,31 @@ def _all_chunks_terminal(conn: sqlite3.Connection, meeting_id: str) -> bool:
     return True
 
 
-def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str, diarize: bool) -> bool:
-    """全 Chunk が終端なら、話者分離が有効なら diarize_meeting、無効なら merge_transcript を生成する。"""
+def ensure_merge_job(conn: sqlite3.Connection, meeting_id: str, diarize: bool) -> str | None:
+    """全 Chunk が終端なら、話者分離が有効なら diarize_meeting、無効なら merge_transcript を生成する。
+
+    戻り値は作ったジョブの id（作らなかった・既存なら None）。呼び出し側がコミット後にイベントを流すのに使う。
+    """
     if not _all_chunks_terminal(conn, meeting_id):
-        return False
+        return None
     if diarize:
         # diarize が既に終端（completed/failed/cancelled）なら merge へ
         if repo.count_jobs(conn, meeting_id, "diarize_meeting", ["completed", "failed", "cancelled"]) > 0:
-            return repo.insert_job(conn, meeting_id, "merge_transcript") is not None
-        return repo.insert_job(conn, meeting_id, "diarize_meeting") is not None
-    return repo.insert_job(conn, meeting_id, "merge_transcript") is not None
+            return repo.insert_job(conn, meeting_id, "merge_transcript")
+        return repo.insert_job(conn, meeting_id, "diarize_meeting")
+    return repo.insert_job(conn, meeting_id, "merge_transcript")
 
 
-def on_diarize_finished(conn: sqlite3.Connection, meeting_id: str) -> None:
-    """成功・失敗いずれでも merge へ進む（分離失敗は transcript を止めない）。"""
-    repo.insert_job(conn, meeting_id, "merge_transcript")
+def on_diarize_finished(conn: sqlite3.Connection, meeting_id: str) -> str | None:
+    """成功・失敗いずれでも merge へ進む（分離失敗は transcript を止めない）。戻り値は作った merge ジョブの id。
+
+    ensure_merge_job と同じく、全 Chunk が終端になるまで merge を作らない。分離の実行中に手動 STT（transcribe_silent_chunk）で
+    queued に戻った Chunk があると、その STT より先に merge が走り、拾い直した segments が話者の無いまま公開される。
+    その Chunk が completed になると on_transcribe_completed がこの行を消し、ensure_merge_job が分離から作り直す
+    """
+    if not _all_chunks_terminal(conn, meeting_id):
+        return None
+    return repo.insert_job(conn, meeting_id, "merge_transcript")
 
 
 def exclude_failed(conn: sqlite3.Connection, meeting_id: str, diarize: bool = False) -> int:
@@ -938,7 +1151,14 @@ def on_summary_deferred(conn: sqlite3.Connection, meeting_id: str) -> None:
 
 
 def on_summary_failed(conn: sqlite3.Connection, meeting_id: str) -> None:
-    """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。"""
+    """transcript は残る（Invariant 2）。meeting は failed だが transcribed 版の閲覧は可能。
+
+    completed の会議は変えない（要約をコミット済み）。handle_summary は要約と同じトランザクションでジョブも completed にする
+    （repo.mark_job_committed）ので、finish_job の前に lease が切れても Sweeper は回収せず、ここには来ない。念のため残す（Phase 2 §14）。
+    """
+    current = repo.get_meeting(conn, meeting_id)
+    if current is not None and current.status == "completed":
+        return
     repo.set_meeting_status(conn, meeting_id, "failed")
 
 
@@ -948,9 +1168,14 @@ def request_regenerate_summary(conn: sqlite3.Connection, meeting_id: str) -> Non
 
 
 def request_rerun_stt(conn: sqlite3.Connection, meeting_id: str, stt_model: str | None) -> int:
-    """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。"""
+    """STT 再実行：segments を消し、chunk を pending に戻し、vad からやり直す（基本設計 §10.5）。
+
+    消した segments を引用している要約は書き換えない（Phase 2 基本設計 §12.7「transcript が進んだ後の引用」）。
+    """
     # ジョブは行ごと消す。実行中のハンドラは lease の検査（行がない）で結果を書けなくなる（§8 lease_is_current）
     conn.execute("DELETE FROM processing_jobs WHERE meeting_id = ?", (meeting_id,))
+    # まだ merge されていない撮り直しの結果も捨てる（Phase 2 §12 request_rerun_stt）
+    conn.execute("DELETE FROM segment_replacements WHERE meeting_id = ?", (meeting_id,))
     for chunk in repo.list_chunks(conn, meeting_id):
         repo.delete_segments_of_chunk(conn, chunk.id)
         repo.update_chunk(conn, chunk.id, stt_status="pending")
@@ -972,7 +1197,7 @@ def job_of_chunk(conn: sqlite3.Connection, job: Job) -> AudioChunk:
 
 # 9. Runner `jobs/runner.py`（変更）
 
-変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` は STT と同じ GPU 排他規則、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す。
+変更点：(1) 公平 lease（`repo_phase3.lease_job_fair`）、(2) `allowed_types` に Phase 3 のジョブ種別、(3) `diarize_meeting` と STT は GPU で重ねない（双方向の排他。分離は STT の実行中に lease せず、STT（ライブを含む）は分離の実行中に lease しない。合算の VRAM を実測していないため。§3）。分離の実行中は、行（`leased` / `processing`）に加えて実行枠（`ctx.diarize_slots`）が埋まっていることでも判定する（pending に戻した分離の旧い試行のスレッドは行に出ない。行がある間も枠が埋まっている間も、次の分離を lease しない。lease した分離が枠を取る前に、別の Runner が次の分離を lease して枠を待たないため）。STT の実行中は、行に加えて実行中のハンドラの数（`ctx.stt_in_flight`。`_run_handler` が数える）でも判定する（STT の再実行 `request_rerun_stt` が行を消しても、旧い試行の推論はハンドラが抜けるまで GPU を使う）、(4) `diarize_meeting` の失敗時に merge へ進む、(5) 完了後フックが `diarize` フラグを渡す、(6) lease できる分離が待っている間は新しい STT（ライブを含む）を lease せず、実行中の STT が抜けたら次の 1 件を分離だけに予約する（`repo_phase3.has_ready_job`。STT は分離より優先度が高く、ライブ STT が絶えず届くと実行中の STT が 0 にならず分離が飢える。予約しないと、優先度の高い `vad_chunk`（50）が絶えず届く間（公平 lease で別の利用者のジョブが先に来る場合も）分離（150）が lease されない。待つ分離が無くなれば優先度の順に戻る。再試行の待ち時間中の分離と、枠が埋まっていて始められない分離は数えない）。分離の待ちの上限は実行中の STT が抜けるまで（STT の時間切れ）と空いた Runner の次の lease、STT の待ちの上限は待っている分離ごとに分離の時間切れ（§21 `_diarize_timeout_s`。時間切れの後は見放したスレッドを STT の排他で数えない）。
 
 ```python
 # minutes_local/jobs/runner.py
@@ -980,6 +1205,7 @@ def job_of_chunk(conn: sqlite3.Connection, job: Job) -> AudioChunk:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -988,8 +1214,10 @@ from ..db import repo, repo_phase3
 from ..db.connection import now_ms
 from ..db.models import Job
 from . import pipeline
-from .context import AppContext
+from .context import MAX_CONCURRENT_DIARIZE, AppContext
 from .retry import JobError, RetryDecision, decide, normalize_exception
+
+log = logging.getLogger(__name__)
 
 Handler = Callable[[AppContext, Job], Awaitable[str | None]]
 """ハンドラは成功時に None（または使用モデル名）を返し、失敗時に JobError を送出する。"""
@@ -997,6 +1225,7 @@ Handler = Callable[[AppContext, Job], Awaitable[str | None]]
 HEARTBEAT_INTERVAL_S = 60.0
 LEASE_MS = 300_000
 GPU_HEAVY = ("transcribe_chunk", "live_transcribe_chunk", "diarize_meeting")
+STT_TYPES = ("transcribe_chunk", "live_transcribe_chunk")
 
 
 class JobRunner:
@@ -1009,14 +1238,46 @@ class JobRunner:
     # ---- 排他規則（基本設計 §5.2） ----
 
     def allowed_types(self) -> list[str]:
-        types = ["vad_chunk", "live_transcribe_chunk", "transcribe_chunk", "merge_transcript", "compress_chunk"]
+        types = ["vad_chunk", "merge_transcript", "compress_chunk"]
         with self.ctx.db.read() as conn:
-            stt_running = sum(repo.count_jobs(conn, None, t, ["leased", "processing"]) for t in ("transcribe_chunk", "live_transcribe_chunk"))
-            diarize_running = repo.count_jobs(conn, None, "diarize_meeting", ["leased", "processing"])
-        # diarize は STT 実行中には lease しない（GPU 排他）。STT は diarize 実行中でも動く（diarize は 1 会議 1 ジョブで短い）
-        if stt_running == 0:
+            stt_rows = sum(repo.count_jobs(conn, None, t, ["leased", "processing"]) for t in STT_TYPES)
+            diarize_rows = repo.count_jobs(conn, None, "diarize_meeting", ["leased", "processing"])
+            # lease できる状態で待っている分離。再試行の待ち時間中（next_run_at が先）は数えない（待つ間に STT を止めない）
+            diarize_ready = repo_phase3.has_ready_job(conn, "diarize_meeting", now_ms())
+        # 行に加えて実行中のハンドラ（ctx.stt_in_flight）も数える。STT の再実行（request_rerun_stt）が行を消した旧い試行は
+        # 行に出ないが、推論が終わってハンドラが抜けるまで GPU を使う。行だけで判定すると、その推論と並んで分離を lease する
+        stt_running = stt_rows + self.ctx.stt_in_flight
+        # 実行枠（ctx.diarize_slots）が埋まっていれば分離が走っている。pending に戻した分離（requeue_running_job）の旧い試行は
+        # 行を見ても分からないが、スレッドが抜けるまで枠を持つ。行だけで判定すると、そのスレッドと並んで次の分離や要約を lease する
+        diarize_slots_full = self.ctx.diarize_slots.locked()
+        diarize_running = diarize_rows > 0 or diarize_slots_full
+        # GPU を使っている分離。時間切れで見放したスレッド（ctx.diarize_abandoned。handle_diarize）だけが枠を埋めているなら数えない。
+        # 枠は抜けるまで返さない（次の分離は始めない）が、固まったスレッドで STT と要約まで止め続けない（止まる上限を時間切れで切る）。
+        # 固まったスレッドが VRAM を抱えていれば STT は OOM になりうる。そのときは STT の OOM の扱い（再試行とモデルの格下げ）に任せる
+        diarize_live = diarize_rows > 0 or (diarize_slots_full and self.ctx.diarize_abandoned < MAX_CONCURRENT_DIARIZE)
+        # lease できる分離が待っていても、枠が埋まっていれば（見放したスレッドを含む）始められない。そのときは STT を止めない
+        diarize_waiting = diarize_ready and not diarize_running
+        # STT と分離は GPU で重ねない（双方向の排他）。STT と分離を合わせた VRAM の最大値は実測しておらず、予算を決められないため。
+        # 分離の実行中（行または枠）は STT（ライブを含む）を lease しない。引き換えに、ライブ文字起こしと他の会議の STT は
+        # 分離が終わるまで待つ（実測して合算の予算を決めれば重ねてよい。§3 の表）。実行中の STT は止めない（lease 済みは走りきる）
+        # 分離が待っていれば、新しい STT も lease しない（次の 1 件を分離に充てる）。STT は優先度が分離より高く、ライブ STT が
+        # 絶えず届くと（複数の Runner なら lease が重なって）実行中の STT が 0 にならず、分離が永久に lease されない。
+        # 実行中の STT は走りきり、抜けたら下の予約で分離を lease する。待つ分離が無くなれば従来の優先度の順に戻る
+        # 予約：STT が抜けていて分離を始められるなら、次の 1 件は分離だけにする。vad_chunk（優先度 50）は分離（150）より先に
+        # lease されるので、録音中の会議の vad_chunk が絶えず届くと（利用者ごとの公平 lease で別の利用者のジョブが先に来る場合も）
+        # 分離が lease されない。分離の待ちの上限は、実行中の STT が抜けるまで（STT の時間切れ）と、空いた Runner の次の lease。
+        # STT の待ちの上限は、待っている分離ごとに分離の時間切れ（handle_diarize の _diarize_timeout_s）。時間切れの後は見放した
+        # スレッドを STT の排他で数えない（diarize_live）ので、分離が固まっても STT は止まり続けない
+        if stt_running == 0 and diarize_waiting:
+            return ["diarize_meeting"]
+        if not diarize_live and not diarize_waiting:
+            types[1:1] = ["live_transcribe_chunk", "transcribe_chunk"]
+        # diarize は STT 実行中には lease しない（GPU 排他）。
+        # 分離の実行中（行または枠）も lease しない（lease しても枠を待つだけで、Runner の 1 枠を何時間も塞ぐ）。
+        # 枠だけで判定すると、lease した分離が枠を取る前（handle_diarize の acquire の前）に別の Runner が次の分離を lease する
+        if stt_running == 0 and not diarize_running:
             types.append("diarize_meeting")
-        if (stt_running == 0 and diarize_running == 0) or self.ctx.models.allow_concurrent_stt_and_llm:
+        if (stt_running == 0 and not diarize_live) or self.ctx.models.allow_concurrent_stt_and_llm:
             types.append("synthesize_minutes")
         return types
 
@@ -1041,7 +1302,14 @@ class JobRunner:
 
     async def run_forever(self, idle_sleep_s: float = 1.0) -> None:
         while not self._stop.is_set():
-            ran = await self.run_once()
+            try:
+                ran = await self.run_once()
+            except Exception:  # noqa: BLE001
+                # ハンドラの例外は _execute が JobError にして記録する。ここへ来るのは lease や結果の記録そのものの失敗
+                # （DB のロック・ディスク満杯）。ループを終わらせると、サーバーは Chunk を受け取り続けるのに以後のジョブが
+                # 1 件も動かない。lease したままのジョブは Sweeper が期限切れで回収する
+                log.exception("job runner iteration failed; retrying")
+                ran = False
             if not ran:
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=idle_sleep_s)
@@ -1071,7 +1339,7 @@ class JobRunner:
         hb = asyncio.create_task(self._heartbeat(job.id))
         started = time.monotonic()
         try:
-            model_used = await handler(self.ctx, job)
+            model_used = await self._run_handler(handler, job)
         except BaseException as exc:  # noqa: BLE001 - JobError に正規化して記録する
             hb.cancel()
             if isinstance(exc, asyncio.CancelledError):
@@ -1080,46 +1348,92 @@ class JobRunner:
             return
         hb.cancel()
         duration = int((time.monotonic() - started) * 1000)
+        removed: Job | None = None   # 下で消した完了済みの行の控え（消した後は読み直せない）
+        followup: str | None = None  # この完了処理で作った・作り直したジョブの id
         async with self.ctx.db.write() as conn:
             ok = repo.finish_job(conn, job.id, self.owner, job.attempts, "completed", duration_ms=duration)
             if ok and model_used is not None:
                 conn.execute("UPDATE processing_jobs SET model_name = ? WHERE id = ?", (model_used, job.id))
             if ok and job.job_type in ("vad_chunk", "transcribe_chunk"):
-                # 自分自身が processing のままではハンドラ内の ensure_merge_job が成立しないため、完了確定後に再判定する
-                pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
+                # 自分自身が processing のままではハンドラ内の ensure_merge_job が成立しないため、完了確定後に再判定する。
+                # 作ったジョブは下で流す（流さないと lease されるまで pending の行がイベントに出ない）
+                followup = pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
+            if ok and job.job_type == "merge_transcript" and repo.has_replacements(conn, job.meeting_id):
+                # merge の書き込みのコミット後・この完了の記録の前（processing の間）にコミットした撮り直しは、この merge では
+                # 入れ替わっていない。handle_transcribe の delete_finished_job は processing の行を消さず、ensure_merge_job も
+                # 一意制約で作れないので、完了を記録した今、作り直す（作らないと撮り直しは次の merge まで公開されない）。
+                # 消す前に完了を記録した行を控える。消した後の _publish_job は行を引けず、完了のイベントが流れない
+                removed = repo.get_job(conn, job.id)
+                repo.delete_finished_job(conn, job.meeting_id, "merge_transcript")
+                followup = pipeline.ensure_merge_job(conn, job.meeting_id, self.ctx.diarization_active)
             if ok and job.job_type == "diarize_meeting":
-                pipeline.on_diarize_finished(conn, job.meeting_id)
-        self._publish_job(job.id)
+                followup = pipeline.on_diarize_finished(conn, job.meeting_id)
+        # どちらもコミットの後に流す（コミット前に流すと、購読側が読み直したときに行がまだない・ロールバックで消える）
+        self._publish_job(job.id, removed=removed)
+        if followup is not None:
+            self._publish_job(followup)
+
+    async def _run_handler(self, handler: Handler, job: Job) -> str | None:
+        """ハンドラを実行する。STT は抜けるまで ctx.stt_in_flight に数える（allowed_types が分離を lease しない）。
+
+        抜けるのは推論が終わったとき（行を消されていれば lease の検査で結果を捨てる）か、タイムアウトでプールを作り直したとき
+        （ワーカーごと止まる。Phase 2 §13 PoolExecutor）。ハンドラがキャンセルで抜けても推論のワーカーは止まらないので、
+        その分は _run_stt が推論の終わりまで数え続ける（_hold_stt_until_done。ここでは推論のタスクが見えない）
+        """
+        if job.job_type not in STT_TYPES:
+            return await handler(self.ctx, job)
+        self.ctx.stt_in_flight += 1
+        try:
+            return await handler(self.ctx, job)
+        finally:
+            self.ctx.stt_in_flight -= 1
 
     async def _on_failure(self, job: Job, err: JobError, duration_ms: int) -> None:
         now = now_ms()
         d = decide(err, job.attempts, job.max_attempts, now)
-        if job.job_type == "diarize_meeting" and not err.counts_attempt:
-            # モデル未配置等の無期限 retry では待たず failed にし、merge へ進める（§2.2）
+        if job.job_type == "diarize_meeting" and (not err.counts_attempt or err.error_class == "TIMEOUT"):
+            # モデル未配置等の無期限 retry では待たず failed にし、merge へ進める（§2.2）。時間切れ（handle_diarize）も再試行しない。
+            # 固まったスレッドが抜けるまで枠が空かず、再試行は lease されないまま待ち続け、その間 merge も要約も進まない
             d = RetryDecision("failed", None, True)
+        followup: str | None = None  # 失敗の後続処理で作ったジョブの id（分離の失敗で作った merge）
+        removed: Job | None = None   # 後続処理が消した failed の行の控え（消した後は読み直せない）
         async with self.ctx.db.write() as conn:
-            ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
-                                 last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
-            if not ok:
-                return  # 旧ワーカーの報告は無視（基本設計 §9.3）
-            if not d.consume_attempt:
-                conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
-            if err.error_class == "OOM" and job.job_type in GPU_HEAVY and job.job_type != "diarize_meeting":
-                self._downgrade_stt(conn, job.meeting_id, job.model_name)
-            if d.next_status == "failed":
-                if job.job_type == "transcribe_chunk":
-                    pipeline.on_transcribe_failed(conn, pipeline.job_of_chunk(conn, job))
+            # 要約の失敗は、合成に使った版（handle_summary が付ける）と今の版を、この記録と同じトランザクションで比べる。
+            # 進んでいれば古い版に対する失敗なので記録せず、同じ行を pending に戻す（requeue_job。試行回数は戻す。§12.7）。
+            # lease を失っていれば requeue_job も finish_job も 0 行で、何も書かない
+            requeued = self._input_advanced(conn, job, err) and repo.requeue_job(conn, job.id, self.owner, job.attempts)
+            if not requeued:
+                ok = repo.finish_job(conn, job.id, self.owner, job.attempts, d.next_status, error_class=err.error_class,
+                                     last_error=err.message[:2000], next_run_at=d.next_run_at, duration_ms=duration_ms)
+                if not ok:
+                    return  # 旧ワーカーの報告は無視（基本設計 §9.3）
+                if not d.consume_attempt:
+                    conn.execute("UPDATE processing_jobs SET attempts = attempts - 1 WHERE id = ?", (job.id,))
+                if err.error_class == "OOM" and job.job_type in GPU_HEAVY and job.job_type != "diarize_meeting":
+                    self._downgrade_stt(conn, job.meeting_id, job.model_name)
+                if d.next_status == "failed":
+                    # merge の失敗では、後続処理が failed の行を消して作り直すことがある（rerun_merge_for_staged）。消す前に控え、
+                    # 消えていれば控えを流す。消した後の _publish_job は行を引けず、失敗のイベントが流れない（完了時と同じ）
+                    failed_row = repo.get_job(conn, job.id)
+                    followup = pipeline.on_job_failed(conn, job)
+                    if repo.get_job(conn, job.id) is None:
+                        removed = failed_row
                 elif job.job_type == "synthesize_minutes":
-                    pipeline.on_summary_failed(conn, job.meeting_id)
-                elif job.job_type == "diarize_meeting":
-                    # 話者分離の失敗は transcript を止めない（§2.2）
-                    pipeline.on_diarize_finished(conn, job.meeting_id)
-                # live_transcribe_chunk / compress_chunk の失敗は後続に影響しない
-            elif job.job_type == "synthesize_minutes":
-                # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
-                pipeline.on_summary_deferred(conn, job.meeting_id)
-            repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
-        self._publish_job(job.id)
+                    # Ollama 未起動等で待機に戻る：transcript は閲覧可能な transcribed に戻す（基本設計 §26.4）
+                    pipeline.on_summary_deferred(conn, job.meeting_id)
+                repo.record_metric(conn, f"job_error_{err.error_class.lower()}", 1, meeting_id=job.meeting_id)
+        # 完了時と同じく、どちらもコミットの後に流す
+        self._publish_job(job.id, removed=removed)
+        if followup is not None:
+            self._publish_job(followup)
+
+    @staticmethod
+    def _input_advanced(conn, job: Job, err: JobError) -> bool:  # type: ignore[no-untyped-def]
+        """ハンドラが失敗に付けた入力の transcript の版（handle_summary）が、今の会議の版と違うか。付いていなければ False。"""
+        if err.input_transcript_version is None:
+            return False
+        current = repo.get_meeting(conn, job.meeting_id)
+        return current is not None and current.transcript_version != err.input_transcript_version
 
     def _downgrade_stt(self, conn, meeting_id: str, ran_with: str | None) -> None:  # type: ignore[no-untyped-def]
         """会議単位でモデルを 1 段落とす（基本設計 §7.3）。ran_with は失敗したジョブが使ったモデル（lease 時点の model_name）。
@@ -1156,9 +1470,10 @@ class JobRunner:
         except asyncio.CancelledError:
             return
 
-    def _publish_job(self, job_id: str) -> None:
+    def _publish_job(self, job_id: str, *, removed: Job | None = None) -> None:
+        """removed はコミット済みのトランザクションで消した行の控え。消した行は読み直せないので控えを流す。"""
         with self.ctx.db.read() as conn:
-            job = repo.get_job(conn, job_id)
+            job = removed if removed is not None else repo.get_job(conn, job_id)
             meeting = repo.get_meeting(conn, job.meeting_id) if job else None
         if job is None:
             return
@@ -1167,7 +1482,7 @@ class JobRunner:
             self.ctx.events.publish(job.meeting_id, {"type": "meeting_status", "status": meeting.status})
 ```
 
-`diarize_meeting` が `MODEL_MISSING` / `PROVIDER_UNREACHABLE` で無期限 retry になる場合、Phase 2 の規則では 5 分ごとに待ち続け、その間 merge も summary も進まない。話者分離はプレビュー性の機能なので、`_on_failure` の冒頭で `RetryDecision("failed")` に置き換え、merge へ進める（§2.2「分離失敗は merge を止めない」の具体化）。
+`diarize_meeting` が `MODEL_MISSING` / `PROVIDER_UNREACHABLE` で無期限 retry になる場合、Phase 2 の規則では 5 分ごとに待ち続け、その間 merge も summary も進まない。話者分離はプレビュー性の機能なので、`_on_failure` の冒頭で `RetryDecision("failed")` に置き換え、merge へ進める（§2.2「分離失敗は merge を止めない」の具体化）。時間切れ（`TIMEOUT`。§21 `handle_diarize` が固まった分離を見放したとき）も同じく再試行せず `failed` にする。見放したスレッドが枠を持ったままなので、再試行は lease されずに待ち続ける。
 
 ---
 
@@ -1231,27 +1546,39 @@ def set_live_enabled(conn: sqlite3.Connection, meeting_id: str, enabled: bool) -
     repo.update_meeting(conn, meeting_id, live_stt_enabled=int(enabled))
 ```
 
-Live で生成されたセグメントは `transcript_segments` に通常どおり挿入され（`merged_version=NULL`）、finalize 後の `transcribe_chunk` が同一 Chunk のセグメント有無を見て STT を省略する（§21 `handle_transcribe`）。Live は Overlap を付けないため、境界品質は確定 STT より僅かに劣る（§2.1）。
+Live で生成されたセグメントは `transcript_segments` に通常どおり挿入され（`merged_version=NULL`）、finalize 後の `transcribe_chunk` が同一 Chunk のセグメント有無を見て STT を省略する（§21 `handle_transcribe`）。Chunk が既に `completed` のとき（確定結果のコミット後に lease 切れで回収されたジョブの再試行）は省略せず、Phase 2 と同じく segments を置き換える（Phase 2 詳細設計 §14）。Live は Overlap を付けないため、境界品質は確定 STT より僅かに劣る（§2.1）。
 
 ---
 
 # 11. 日次スケジューラ `jobs/scheduler.py`
 
-`compress_chunk` の生成とバックアップを日次で行う。Sweeper と同じループ構造。
+`compress_chunk` の生成と、バックアップ・世代管理を行う。起動時と 1 時間ごとに `run_once()` を呼ぶ。
+
+| 処理 | 頻度 | 判定 |
+| --- | --- | --- |
+| `compress_chunk` の生成 | 毎回（冪等。同じ Chunk のジョブは 1 件。`uq_compress_job`） | `completed` から `compress_after_days` 経過した会議の WAV の Chunk。`ctx.codec is None` なら何もしない |
+| バックアップ + 世代管理 | 直近のバックアップから 24 時間以上たっていたとき | `backup_due()`。基準はバックアップのファイル名の時刻（§2.4） |
+
+ループは 1 回の失敗（ディスク満杯、DB のロック）を記録して次の回へ進む（Phase 2 §14 の常駐ループと同じ）。`run_once(ctx, now=...)` の `now` は期日の判定とバックアップのファイル名に使う時刻で、テストが差し替える（実時間を待たない）。
 
 ```python
 # minutes_local/jobs/scheduler.py
-"""日次処理：compress_chunk の生成、バックアップ世代管理。§2.4。"""
+"""定期処理：compress_chunk の生成、バックアップと世代管理。§2.4。"""
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 
 from ..db import repo, repo_phase3
 from ..db.connection import now_ms
 from ..storage import backup
 from .context import AppContext
 
-DAILY_INTERVAL_S = 24 * 3600.0
+log = logging.getLogger(__name__)
+
+CHECK_INTERVAL_S = 3600.0                  # 起動時と 1 時間ごとに、やることがあるかを見る
+BACKUP_INTERVAL_MS = 24 * 3600 * 1000      # 直近のバックアップからこれだけ経っていたら作る
 
 
 async def schedule_compression(ctx: AppContext) -> int:
@@ -1267,18 +1594,44 @@ async def schedule_compression(ctx: AppContext) -> int:
     return created
 
 
-async def daily_once(ctx: AppContext) -> dict[str, int]:
+def backup_due(ctx: AppContext, now: int) -> bool:
+    """直近のバックアップから BACKUP_INTERVAL_MS 経っているか。1 つもなければ True。
+
+    プロセスの起動からの経過ではなく、ファイル名の時刻で決める。使うたびにサーバーを起動しても 1 日 1 世代になり、
+    短時間に再起動を繰り返しても古い世代を押し出さない。直近は世代番号が最大の世代（list_backups の末尾）。
+    その時刻が未来なら（作った後に時計が戻った）作る。作らないまま待ち続けると、戻った後のノートと要約にバックアップがない。
+    作った世代は番号が最大なので、次の周からはそれを直近として 1 日待つ（毎周作っては消すことはない）。
+    """
+    files = backup.list_backups(ctx.settings.backups_dir)
+    latest = backup.backup_time_ms(files[-1]) if files else None
+    return latest is None or latest > now or now - latest >= BACKUP_INTERVAL_MS
+
+
+async def run_once(ctx: AppContext, now: int | None = None) -> dict[str, int]:
+    """1 回分。圧縮ジョブの生成（冪等）と、期日が来ていればバックアップと世代管理。
+
+    now は期日の判定とバックアップのファイル名に使う時刻（テストが差し替える。省略時は現在）。
+    """
+    t = now_ms() if now is None else now
     compressed = await schedule_compression(ctx)
-    path = await asyncio.to_thread(backup.create_backup, ctx.db, ctx.settings.backups_dir)
+    if not backup_due(ctx, t):
+        return {"compress_jobs": compressed, "backup": 0, "pruned": 0}
+    started = time.monotonic()
+    await asyncio.to_thread(backup.create_backup, ctx.db, ctx.settings.backups_dir, t)
     pruned = backup.prune_backups(ctx.settings.backups_dir, ctx.settings.backup_generations)
     async with ctx.db.write() as conn:
         repo.record_metric(conn, "backup_created", 1)
-    return {"compress_jobs": compressed, "backup": 1 if path else 0, "pruned": pruned}
+        repo.record_metric(conn, "backup_duration_ms", int((time.monotonic() - started) * 1000))
+    return {"compress_jobs": compressed, "backup": 1, "pruned": pruned}
 
 
-async def run_forever(ctx: AppContext, stop: asyncio.Event, interval_s: float = DAILY_INTERVAL_S) -> None:
+async def run_forever(ctx: AppContext, stop: asyncio.Event, interval_s: float = CHECK_INTERVAL_S) -> None:
     while not stop.is_set():
-        await daily_once(ctx)
+        try:
+            await run_once(ctx)
+        except Exception:  # noqa: BLE001
+            # ディスク満杯・DB のロックで 1 回失敗しても、ループを終わらせない（終わると再起動までバックアップも圧縮も止まる）
+            log.exception("scheduled maintenance failed; retrying at the next check")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_s)
         except asyncio.TimeoutError:
@@ -1289,6 +1642,23 @@ async def run_forever(ctx: AppContext, stop: asyncio.Event, interval_s: float = 
 
 # 12. 話者分離 `diarization/`
 
+実 Provider（`pyannote_provider.py`）が守る契約を先に示す。pyannote 本体は設計時点で実行していないので、本書が固定するのは Provider の**外側**（何を渡し、何を受け取り、どこに何を置くか）である。内側（配布物の書式・Pipeline の戻り値の形）は版で変わりうるので、Step 3-h で実物に合わせてこの表を更新する（§3）。
+
+| 項目 | 規約 | 確かめ方 |
+| --- | --- | --- |
+| モデルの場所 | `{dataDir}/models/diarization/config.yaml`（Pipeline の設定）。このファイルがあれば `build_context` が実 Provider を作る。設定が参照するモデル（セグメンテーション・話者埋め込み）のファイルも同じディレクトリの下に置き、設定からは**絶対パス**で指す（相対パスの基準は pyannote の版に依存する） | 3-h |
+| 取得 | サーバーは取得しない。利用者が配布元から取得して配置する（設計時点の理解では、配布元が利用条件への同意を求める配布形態で、サーバーが代わりに取得できない） | 3-h |
+| 通信 | import の前に `HF_HUB_OFFLINE=1` と `PYANNOTE_METRICS_ENABLED=false` を設定する。前者で、設定が Hub 上のモデル名を指していても取りに行かず、ロードの失敗として現れる。後者で、4.x が既定で送る利用状況のテレメトリ（OpenTelemetry、送信先 `otel.pyannote.ai`）を止める。どちらも `build_context`（§22）がプロセスの最初に設定する（言語判定が同じプロセスで faster_whisper を先に import するので、分離のロード時では `HF_HUB_OFFLINE` が効かない）。許す版は `>=3.1,<4.1` で、その全リリースの wheel を確かめた（3.1.0〜3.4.0 は送信のコードなし、4.0.0〜4.0.7 は送信の 3 関数がすべてこの変数で止まる）。版の上限を上げるときは同じ確認をやり直す。読み込んだパイプラインが pyannoteAI の製品パイプライン（`pyannote.audio.pipelines.pyannoteai.*`。`sdk` は音声を Web API へ送る）なら `MODEL_MISSING` にする（Zero External Data Egress） | 3-h（ネットワークを切らずにロードと分離を行い、4.0.0 の送信間隔（60 秒）より長く待って外向きの接続がないことを見る。3.x と 4.x の両方） |
+| 入力 | source ごとに `assemble_timeline()` で連続させた 16 kHz・mono・PCM16 の WAV を `{dataDir}/tmp/` に書き、そのパスを渡す。終わったら消す。OS の一時ディレクトリは使わない（録音がデータディレクトリの外に出る） | `test_pyannote_provider_keeps_absolute_time_across_skipped_chunk` |
+| 引数 | 話者数の上限があれば `max_speakers`。`num_speakers`（人数の指定）には渡さない。`handle_diarize` は上限を渡さない（推定に任せる） | 同上 |
+| 戻り値 | `itertracks(yield_label=True)` で `(区間, _, 話者)` を列挙できるもの。区間の `start` / `end` は渡した WAV の先頭からの秒。結果のオブジェクトが `speaker_diarization` 属性を持つ版では、その属性を使う | 3-h |
+| 時刻 | 区間の秒に、その source の先頭 Chunk の絶対開始 ms を足して `SpeakerTurn` にする | `test_speaker_after_silent_chunk_is_not_shifted` |
+| ラベル | `(source, Pipeline の話者)` の出現順に `S1, S2, …`。mic と system で同じ人が話していても別のラベルになる（§2.2） | `test_diarize_assigns_labels_and_names_are_user_assigned` |
+| 実行デバイス | `Hardware.gpu.backend == "cuda"` のときだけ `cuda`。Apple Silicon・GPU なしは `cpu`（STT と同じ。Phase 2 §9） | 3-h |
+| 失敗 | 設定なし・`pyannote.audio` なしは `ModelMissingError`（待たずに話者分離なしで続行。§9）。メモリ不足は `OOMError`。それ以外は Runner が `INTERNAL` として回数つきで再試行する | `test_diarize_model_missing_does_not_wait`、`test_diarize_failure_does_not_block_merge` |
+
+`PyannoteDiarizationProvider(pipeline=...)` で Pipeline を差し替えられる。テストは pyannote を入れずに、Provider の本物のコード（時刻の組み立て・一時ファイル・引数・ラベル付け）を通す。`FakeDiarizationProvider` は Chunk ごとに絶対時刻で区間を作るので、「連結すると時刻がずれる」種類の不具合を検出できない。実 Provider の経路を確かめるテストでは Fake ではなくこの差し替えを使う。
+
 ```python
 # minutes_local/diarization/provider.py
 """話者分離 Provider 抽象。会議単位・source 別に SpeakerTurn 列を返す。"""
@@ -1296,6 +1666,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol
+
+from ..jobs.retry import InvalidAudioError
+
+# 1 source あたりのタイムラインの上限（先頭の Chunk の開始から最後の Chunk の終わりまで）。16 kHz・PCM16 で 1 ms = 32 バイトなので
+# 4 時間で約 461 MB、bytes への変換と WAV 化の一時的な複製を足しても上限が決まる。開始時刻が壊れた Chunk が 1 つあるだけで、
+# 間の無音を埋めるために際限なく確保しないようにする
+MAX_TIMELINE_MS = 4 * 60 * 60 * 1000
 
 
 @dataclass(frozen=True)
@@ -1310,10 +1687,12 @@ class SpeakerTurn:
 @dataclass(frozen=True)
 class DiarizationRequest:
     meeting_id: str
-    # source ごとの (絶対開始 ms, PCM16 16kHz) の列。Chunk 順。
+    # source ごとの (絶対開始 ms, PCM16 16kHz) の列。STT を省いた無音 Chunk・読めなかった Chunk は入らない（間が空く）。
+    # 連続した音声が要る Provider は assemble_timeline() で組み立てる
     pcm_by_source: dict[str, list[tuple[int, bytes]]]
     models_dir: str
-    max_speakers: int | None = None
+    work_dir: str                       # 一時ファイルの置き場所（{dataDir}/tmp）。音声をデータディレクトリの外に書かない
+    max_speakers: int | None = None     # 話者数の上限。None は Provider の推定に任せる
 
 
 @dataclass(frozen=True)
@@ -1325,6 +1704,44 @@ class DiarizationResult:
 
 class DiarizationProvider(Protocol):
     def diarize(self, req: DiarizationRequest) -> DiarizationResult: ...
+
+
+def assemble_timeline(chunks: list[tuple[int, bytes]], max_ms: int = MAX_TIMELINE_MS) -> tuple[int, bytes]:
+    """(先頭の絶対開始 ms, 連続した PCM)。各 Chunk を絶対時刻の位置に置き、渡されなかった区間を無音で埋める。
+
+    単純に連結すると、間の Chunk が 1 つ抜けるたびに後ろの音声が Chunk 長（30 秒）ずつ前へ詰まり、Provider が返す区間が
+    会議の時刻とずれて、別の人の発言に話者ラベルが付く。16 kHz では 1 ms = 16 サンプルなので、位置は誤差なく決まる。
+    長さが max_ms を超えるときは、確保する前に InvalidAudioError（再試行しない）にする。話者分離なしで続行する（§2.2）。
+    """
+    if not chunks:
+        return 0, b""
+    ordered = sorted(chunks, key=lambda c: c[0])
+    base_ms = ordered[0][0]
+    even = [(start_ms, pcm[: len(pcm) - len(pcm) % 2]) for start_ms, pcm in ordered]     # PCM16 の半端な 1 バイトは捨てる
+    total = max((start_ms - base_ms) * 32 + len(pcm) for start_ms, pcm in even)
+    if total > max_ms * 32:
+        raise InvalidAudioError(f"diarization timeline too long: {total // 32} ms > {max_ms} ms")
+    buf = bytearray(total)
+    for start_ms, pcm in even:
+        offset = (start_ms - base_ms) * 32
+        buf[offset:offset + len(pcm)] = pcm
+    return base_ms, bytes(buf)
+
+
+def check_timeline_span(spans: list[tuple[str, int, int]], max_ms: int = MAX_TIMELINE_MS) -> None:
+    """(source, 開始 ms, 終了 ms) の並びから、assemble_timeline が組み立てる長さを PCM を読む前に確かめる。超えれば InvalidAudioError。
+
+    全 Chunk の PCM を読んでから assemble_timeline で弾くと、上限を超える会議でもその前に全部をメモリに載せる。
+    長さは Chunk の行の時刻で決め、ファイルの大きさは使わない（圧縮済みの Chunk はファイルが小さい）。
+    行の時刻より長く復号される Chunk は、handle_diarize のスレッド（_load_and_diarize）の読み込み中の上限と assemble_timeline が弾く。
+    """
+    bounds: dict[str, tuple[int, int]] = {}
+    for source, start_ms, end_ms in spans:
+        lo, hi = bounds.get(source, (start_ms, end_ms))
+        bounds[source] = (min(lo, start_ms), max(hi, end_ms))
+    for source, (lo, hi) in sorted(bounds.items()):
+        if hi - lo > max_ms:
+            raise InvalidAudioError(f"diarization timeline too long: {source} {hi - lo} ms > {max_ms} ms")
 ```
 
 ```python
@@ -1361,19 +1778,26 @@ class FakeDiarizationProvider(DiarizationProvider):
 """pyannote.audio の実 Provider。遅延 import。モデルは {models_dir}/diarization/ に利用者が配置する（Zero External Data Egress）。"""
 from __future__ import annotations
 
+import os
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
-from ..jobs.retry import ModelMissingError, OOMError
+from ..jobs.retry import ModelMissingError, OOMError, is_oom_message
 from ..storage.files import build_wav
-from .provider import DiarizationProvider, DiarizationRequest, DiarizationResult, SpeakerTurn
+from .provider import DiarizationProvider, DiarizationRequest, DiarizationResult, SpeakerTurn, assemble_timeline
 
 
 class PyannoteDiarizationProvider(DiarizationProvider):
-    def __init__(self) -> None:
-        self._pipeline: Any = None
+    def __init__(self, device: str = "cpu", pipeline: Any = None) -> None:
+        """device は "cuda" か "cpu"（bootstrap が Hardware.gpu.backend から決める。Apple Silicon は cpu）。
+
+        pipeline はテスト用の差し替え（`pipeline(wav のパス, **kwargs)` で itertracks() を持つ結果を返すもの）。
+        pyannote 本体なしで、時刻の組み立て・引数・一時ファイルの扱いを確かめられる（§23.4）。
+        """
+        self.device = device
+        self._pipeline: Any = pipeline
 
     def _load(self, models_dir: Path) -> Any:
         if self._pipeline is not None:
@@ -1381,17 +1805,61 @@ class PyannoteDiarizationProvider(DiarizationProvider):
         config = models_dir / "diarization" / "config.yaml"
         if not config.exists():
             raise ModelMissingError("diarization model not installed (models/diarization/config.yaml)")
+        # config.yaml が Hugging Face Hub 上のモデル名を指していても、取りに行かせない（Zero External Data Egress）。
+        # 配置が足りなければ通信せず、ロードの失敗として現れる。huggingface_hub は import 時に読むので、本番は build_context（§22）が
+        # プロセスの最初に設定する。ここでも設定するのは、Provider を単体で使う場合（build_context を通らない）のため
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        # pyannote.audio 4.x は既定で利用状況（モデル・パイプラインの初期化、処理した音声の長さ）を OpenTelemetry で
+        # otel.pyannote.ai へ送る。HF_HUB_OFFLINE では止まらない。許す版（>=3.1,<4.1）の全リリースの wheel で確かめた：
+        # 3.1.0〜3.4.0 には送信のコードが無い。4.0.0〜4.0.7 は送信の 3 関数がどれもこの環境変数を呼ぶたびに見て、"false" なら何も記録しない
+        # （import 時は未設定のときだけ既定値 true を入れる）。記録が無ければ送信処理は何も送らない（opentelemetry-sdk 1.34.0 で実測）。
+        # set_telemetry_metrics(..., save_choice_as_default=True) はパッケージ内の設定を書き換えるので使わない
+        os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
         try:
             from pyannote.audio import Pipeline  # type: ignore[import-not-found]
         except ImportError as e:
             raise ModelMissingError(f"pyannote.audio not installed: {e}") from e
         try:
-            self._pipeline = Pipeline.from_pretrained(str(config))
+            pipeline = Pipeline.from_pretrained(str(config))
+            # config.yaml は利用者が置く。4.x の pipelines.pyannoteai.* を指していると、sdk は実行時に音声を pyannoteAI の Web API へ
+            # アップロードし、local は別パッケージ（pyannoteai）に処理を委ねる（通信しないことを確かめていない）。
+            # どちらも受け付けず、オープンソースのローカルのパイプラインだけを使う（Zero External Data Egress）
+            if type(pipeline).__module__.startswith("pyannote.audio.pipelines.pyannoteai"):
+                raise ModelMissingError("diarization config points to a pyannoteAI hosted pipeline; only local models are allowed")
+            if self.device != "cpu":
+                import torch  # type: ignore[import-not-found]
+                pipeline.to(torch.device(self.device))      # 既定は CPU。移さないと GPU があっても CPU で走る
         except Exception as e:  # noqa: BLE001
-            if "out of memory" in str(e).lower():
+            if is_oom_message(str(e)):
                 raise OOMError(str(e)) from e
             raise
-        return self._pipeline
+        self._pipeline = pipeline
+        return pipeline
+
+    def _run(self, pipeline: Any, pcm: bytes, work_dir: Path, max_speakers: int | None) -> Any:
+        """1 source 分を一時 WAV にして Pipeline に渡し、話者区間（Annotation）を返す。
+
+        一時ファイルはデータディレクトリの中（work_dir）に作る。OS の一時ディレクトリは、他の OS ユーザーから読める設定がありうる。
+        Windows は開いたままのファイルを別のハンドルで開けないので、閉じてから渡し、終わったら自分で消す
+        （強制終了で残った分は serve が起動時に work_dir ごと消す。§22）。
+        """
+        work_dir.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(dir=work_dir, prefix="diarize-", suffix=".wav")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(build_wav(pcm))
+            # max_speakers は上限。num_speakers（人数の指定）に渡すと、その人数ちょうどに分けられてしまう
+            kwargs = {"max_speakers": max_speakers} if max_speakers else {}
+            try:
+                output = pipeline(name, **kwargs)
+            except Exception as e:  # noqa: BLE001
+                if is_oom_message(str(e)):
+                    raise OOMError(str(e)) from e
+                raise
+        finally:
+            Path(name).unlink(missing_ok=True)
+        # pyannote.audio 4 系は結果のオブジェクト（speaker_diarization に Annotation）を返し、3 系は Annotation そのものを返す
+        return getattr(output, "speaker_diarization", output)
 
     def diarize(self, req: DiarizationRequest) -> DiarizationResult:
         pipeline = self._load(Path(req.models_dir))
@@ -1403,18 +1871,9 @@ class PyannoteDiarizationProvider(DiarizationProvider):
         for source, chunks in req.pcm_by_source.items():
             if not chunks:
                 continue
-            base_ms = chunks[0][0]
-            pcm = b"".join(p for _, p in chunks)   # Chunk は連続（欠落は呼び出し側が無音で埋める）
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-                f.write(build_wav(pcm))
-                f.flush()
-                try:
-                    kwargs = {"num_speakers": req.max_speakers} if req.max_speakers else {}
-                    annotation = pipeline(f.name, **kwargs)
-                except Exception as e:  # noqa: BLE001
-                    if "out of memory" in str(e).lower():
-                        raise OOMError(str(e)) from e
-                    raise
+            # Chunk の間（無音で STT を省いた Chunk・欠損）を無音で埋めて、区間の時刻を会議の時刻に合わせる
+            base_ms, pcm = assemble_timeline(chunks)
+            annotation = self._run(pipeline, pcm, Path(req.work_dir), req.max_speakers)
             for turn, _, speaker in annotation.itertracks(yield_label=True):
                 key = (source, str(speaker))
                 if key not in label_map:
@@ -1599,6 +2058,9 @@ def run_merge(conn: sqlite3.Connection, meeting_id: str, th: Thresholds) -> Merg
     if meeting is None:
         raise ValueError(f"meeting not found: {meeting_id}")
     new_version = meeting.transcript_version + 1
+    # 撮り直した Chunk の結果を入れ替える。版を上げるのと同じトランザクションなので、失敗すれば公開中の版が残る（Phase 2 §18）。
+    # 消した行を引用している要約は書き換えない（Phase 2 基本設計 §12.7。クライアントが生成時の引用として出す）
+    repo.promote_replacements(conn, meeting_id)
     all_segments = repo.list_segments(conn, meeting_id)
     for s in all_segments:
         if s.normalized_text is None:
@@ -1750,8 +2212,11 @@ class AudioCodec(Protocol):
     @property
     def extension(self) -> str: ...
     def encode(self, pcm: bytes) -> bytes: ...
-    # 壊れた入力は ValueError で返す（read_pcm が InvalidWavError に包む）
-    def decode(self, data: bytes) -> bytes: ...
+    # 壊れた入力は ValueError で返す（read_pcm が InvalidWavError に包む）。max_samples を渡したら、それを超える分は復号しない
+    # （返すのは最大 max_samples + 1 サンプル。超えたかどうかは read_pcm が長さで判定する。全量を PCM にしてから比べない）
+    def decode(self, data: bytes, max_samples: int | None = None) -> bytes: ...
+    # max_samples サンプルの音声を符号化したファイルの最悪の大きさ。read_pcm はこれを超えて読まない（全量を読み込む前に断る）
+    def max_encoded_bytes(self, max_samples: int) -> int: ...
 
 
 class FakeCodec:
@@ -1766,10 +2231,15 @@ class FakeCodec:
     def encode(self, pcm: bytes) -> bytes:
         return self.MAGIC + struct.pack("<I", len(pcm)) + pcm
 
-    def decode(self, data: bytes) -> bytes:
+    def max_encoded_bytes(self, max_samples: int) -> int:
+        return 8 + max_samples * 2
+
+    def decode(self, data: bytes, max_samples: int | None = None) -> bytes:
         if len(data) < 8 or data[:4] != self.MAGIC:
             raise ValueError("not a fake container")
         n, = struct.unpack_from("<I", data, 4)
+        if max_samples is not None:
+            n = min(n, (max_samples + 1) * 2)
         pcm = data[8:8 + n]
         if self.corrupt and pcm:
             return pcm[:-2] + b"\x00\x00"
@@ -1787,11 +2257,20 @@ class FlacCodec:
         sf.write(buf, np.frombuffer(pcm, dtype=np.int16), 16000, format="FLAC", subtype="PCM_16")
         return buf.getvalue()
 
-    def decode(self, data: bytes) -> bytes:
+    def max_encoded_bytes(self, max_samples: int) -> int:
+        """最悪の符号化の大きさ。圧縮の効かない音声は verbatim になり、PCM（16 bit・モノラルで 2 バイト/サンプル）に、フレームごとの
+        見出し・CRC と subframe の見出し（合わせて 20 バイト以下）が付く。FLAC のブロックは最小 16 サンプルなので 16 サンプルごとに
+        20 バイトを見込む（libsndfile の既定のブロックは 4096 サンプルで、実際の余分ははるかに小さい）。メタデータ（STREAMINFO・
+        padding・コメント・シークテーブル）に 1 MiB を見込む。ファイルのヘッダの長さは使わない（壊れていると信じられない）"""
+        return max_samples * 2 + (max_samples // 16 + 1) * 20 + (1 << 20)
+
+    def decode(self, data: bytes, max_samples: int | None = None) -> bytes:
         import numpy as np  # type: ignore[import-not-found]
         import soundfile as sf  # type: ignore[import-not-found]
+        # 読むフレーム数を上限 + 1 で止める（ヘッダのフレーム数は壊れていると信じられない。-1 は全量）
+        frames = -1 if max_samples is None else max_samples + 1
         try:
-            audio, sr = sf.read(io.BytesIO(data), dtype="int16")
+            audio, sr = sf.read(io.BytesIO(data), frames=frames, dtype="int16")
         except RuntimeError as e:
             # 壊れたファイルの libsndfile の例外（RuntimeError 系）を、AudioCodec.decode の約束どおり ValueError にそろえる。
             # read_pcm はこれを InvalidWavError に変えるので、呼び出し側（修復判定・STT）は 1 種類の例外だけを扱えばよい
@@ -1833,6 +2312,10 @@ WAV_BITS = 16
 
 class InvalidWavError(ValueError):
     pass
+
+
+class PcmTooLongError(ValueError):
+    """read_pcm の max_samples を超える音声。壊れた音声（InvalidWavError）とは分ける（呼び出し側は Chunk を飛ばさずに断る）。"""
 
 
 @dataclass(frozen=True)
@@ -1913,23 +2396,47 @@ def write_atomic(data_dir: Path, relative_path: str, data: bytes) -> Path:
     return final
 
 
-def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = None, codec: AudioCodec | None = None) -> bytes:
-    """WAV または圧縮ファイルを読み、PCM を返す。expected_sha256 は常に WAV 形式での値（§2.4）。"""
+def _read_at_most(path: Path, limit: int, relative_path: str) -> bytes:
+    """path を limit バイトまで読む。超えるファイルは limit + 1 バイトで読むのをやめ、PcmTooLongError で断る（全量を読み込まない）。"""
+    with path.open("rb") as fh:
+        data = fh.read(limit + 1)
+    if len(data) > limit:
+        raise PcmTooLongError(f"file larger than {limit} bytes: {relative_path}")
+    return data
+
+
+def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = None, codec: AudioCodec | None = None,
+             max_samples: int | None = None) -> bytes:
+    """WAV または圧縮ファイルを読み、PCM を返す。expected_sha256 は常に WAV 形式での値（§2.4）。
+
+    max_samples を渡すと、それより長い音声は全量を PCM にする前に PcmTooLongError で断る。読む量そのものを上限で止める
+    （WAV はヘッダ + PCM の大きさ、圧縮ファイルは codec.max_encoded_bytes。超えれば全量を読まずに断る）。圧縮ファイルはさらに、
+    上限 + 1 サンプルで止めた復号の長さで判定する（ヘッダの長さは壊れていると信じられない）
+    """
     path = data_dir / relative_path
     if not path.exists():
         raise InvalidWavError(f"file missing: {relative_path}")
-    data = path.read_bytes()
+    if path.suffix != ".wav" and (codec is None or codec.extension != path.suffix):
+        raise InvalidWavError(f"no codec for {path.suffix}: {relative_path}")
+    if max_samples is None:
+        data = path.read_bytes()
+    else:
+        limit = (codec.max_encoded_bytes(max_samples) if path.suffix != ".wav" and codec is not None
+                 else WAV_HEADER_BYTES + max_samples * 2)
+        data = _read_at_most(path, limit, relative_path)
     if path.suffix == ".wav":
         if expected_sha256 is not None and sha256_hex(data) != expected_sha256:
             raise InvalidWavError(f"sha256 mismatch: {relative_path}")
         parse_wav_header(data)
         return data[WAV_HEADER_BYTES:]
-    if codec is None or codec.extension != path.suffix:
-        raise InvalidWavError(f"no codec for {path.suffix}: {relative_path}")
+    if codec is None:
+        raise InvalidWavError(f"no codec for {path.suffix}: {relative_path}")   # 上で確かめ済み（型を絞る）
     try:
-        pcm = codec.decode(data)
+        pcm = codec.decode(data, max_samples)
     except ValueError as e:
         raise InvalidWavError(f"decode failed: {relative_path}: {e}") from e
+    if max_samples is not None and len(pcm) > max_samples * 2:
+        raise PcmTooLongError(f"longer than {max_samples} samples: {relative_path}")
     if expected_sha256 is not None and sha256_hex(build_wav(pcm)) != expected_sha256:
         raise InvalidWavError(f"sha256 mismatch after decode: {relative_path}")
     return pcm
@@ -1939,43 +2446,120 @@ def read_pcm(data_dir: Path, relative_path: str, expected_sha256: str | None = N
 
 # 17. バックアップと整合性検査 `storage/backup.py`
 
+| 関数 | 役割 | 落とし穴への対処 |
+| --- | --- | --- |
+| `create_backup` | `VACUUM INTO` で `minutes-{世代番号}-{epoch ms}.sqlite` を作る | `.part` に書いてから名前を付け替える。書きかけを正規の名前で残さない。世代番号は既存の最大 + 1（同じミリ秒の 2 回目も前の世代を上書きしない） |
+| `list_backups` | 完成したバックアップを古い順に返す | ファイル名の世代番号で並べる（時刻で並べると時計の巻き戻りと追いつきで順が入れ替わる）。`.part` と規約外の名前は含めない |
+| `prune_backups` | 新しい方から `keep` 世代を残す | 中断で残った `.part` も消す |
+| `restore_latest` | 壊れた DB を退避し、復元元にできる最も新しいバックアップを置く | DB に触る前に復旧中の控え（`minutes.sqlite.recovering`）を置き、`build_context` が `rebuild` を終えてから消す（`finish_recovery`）。途中で止まれば次の起動が控えを見て、DB が無くても初回起動とみなさずにやり直す。コピーは別名に書いてから付け替える。候補ごとに `integrity_check` をかけ、壊れていれば 1 つ古いものへ下がる。空のファイルは検査に通るので、大きさも見る。`integrity_check` は表の無い DB や別のアプリの DB も通すので、`schema_version` が 1 以上・このビルドの最新（`LATEST_SCHEMA_VERSION`）以下であることも確かめ、満たさなければ 1 つ古いものへ下がる（`usable_backup`）。使えるものがなければ DB を置かない（空で起動し、§18 が作り直す）。`users` もバックアップの時点に戻るので、その後に失効させた利用者のトークンがまた通る。運用者は復元の後に、失効させたままにすべき利用者をもう一度消す（§2.5） |
+| `Recovery` | 起動時に DB を作り直した記録（復元元・作り直した件数） | `AppContext.recovery` に載せ、`serve` / `doctor` が警告として出す（§22） |
+
 ```python
 # minutes_local/storage/backup.py
 """VACUUM INTO によるバックアップ、世代管理、起動時の integrity_check と復元。§2.4。"""
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..db.connection import Database
+from ..db.migrations_phase3 import LATEST_SCHEMA_VERSION
+from .rebuild import RebuildReport
 
 PREFIX = "minutes-"
 SUFFIX = ".sqlite"
+PART_SUFFIX = ".part"
 
 
-def create_backup(db: Database, backups_dir: Path) -> Path:
+@dataclass
+class Recovery:
+    """起動時に壊れた DB を作り直した記録（§2.4）。serve と doctor が利用者に知らせる。"""
+    restored_from: Path | None                                       # 復元元。None は使えるバックアップがなく、空の DB から始めた
+    rebuilt: RebuildReport = field(default_factory=RebuildReport)    # 録音ファイルから作り直した件数（build_context が埋める）
+
+
+def create_backup(db: Database, backups_dir: Path, now: int | None = None) -> Path:
+    """`minutes-{世代番号}-{epoch ms}.sqlite` を作る。now は名前に入れる時刻（省略時は現在。定期処理は期日の判定に使った時刻を渡す）。
+
+    世代番号は既存の最大 + 1。並び（世代管理・復元元の選択）は時刻ではなくこの番号で決める。時刻で並べると、時計が戻った後に
+    作った世代が前の世代より古い扱いになり、時計が追いつくと元の順に戻るので、どちらの時点でも新しい世代を消す・古い世代から復元する。
+    書きかけを正規の名前で残さない。`.part` に書き、終わってから名前を付け替える。途中で失敗・強制終了しても、
+    list_backups()（復元元と世代管理の対象）には完成したファイルしか現れない。
+    """
     backups_dir.mkdir(parents=True, exist_ok=True)
-    target = backups_dir / f"{PREFIX}{int(time.time() * 1000)}{SUFFIX}"
-    # VACUUM INTO はトランザクション外で実行する。読み取り接続でよい。
-    with db.read() as conn:
-        conn.execute("VACUUM INTO ?", (str(target),))
+    stamp = int(time.time() * 1000) if now is None else now
+    existing = list_backups(backups_dir)
+    gen = (backup_generation(existing[-1]) or 0) + 1 if existing else 1
+    while any(backups_dir.glob(f"{PREFIX}{gen}-*{SUFFIX}")):
+        gen += 1                                 # 規約外の名前と重なっても前の世代を上書きしない
+    target = backups_dir / f"{PREFIX}{gen}-{stamp}{SUFFIX}"
+    part = target.with_name(target.name + PART_SUFFIX)
+    part.unlink(missing_ok=True)                 # VACUUM INTO は既存のファイルへ書けない
+    try:
+        # VACUUM INTO はトランザクション外で実行する。読み取り接続でよい。
+        with db.read() as conn:
+            conn.execute("VACUUM INTO ?", (str(part),))
+        os.replace(part, target)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
     return target
 
 
+def _name_parts(path: Path) -> tuple[int, int] | None:
+    """(世代番号, epoch ms)。規約外の名前は None。"""
+    if not (path.name.startswith(PREFIX) and path.name.endswith(SUFFIX)):
+        return None
+    gen, sep, stamp = path.name[len(PREFIX):-len(SUFFIX)].partition("-")
+    # ASCII の数字だけを受ける。str.isdigit() は「²」なども真にするが int() は投げ、一覧・定期のバックアップ・復元元の選択が止まる
+    if not (sep and _is_ascii_digits(gen) and _is_ascii_digits(stamp)):
+        return None
+    return int(gen), int(stamp)
+
+
+def _is_ascii_digits(text: str) -> bool:
+    return text.isascii() and text.isdigit()
+
+
+def backup_generation(path: Path) -> int | None:
+    """ファイル名に入っている世代番号。規約外の名前は None。"""
+    parts = _name_parts(path)
+    return parts[0] if parts is not None else None
+
+
+def backup_time_ms(path: Path) -> int | None:
+    """ファイル名に入っている作成時刻（epoch ms）。規約外の名前は None。期日の判定だけに使い、並びには使わない。"""
+    parts = _name_parts(path)
+    return parts[1] if parts is not None else None
+
+
 def list_backups(backups_dir: Path) -> list[Path]:
+    """完成したバックアップを世代番号の順（古い順）に返す。書きかけ（.part）と規約外の名前は含めない。
+
+    世代管理・復元元の選択・期日の判定は、この順で揃える。番号はファイル名に残るので、時計が戻っても追いついても変わらない。
+    """
     if not backups_dir.exists():
         return []
-    return sorted(p for p in backups_dir.glob(f"{PREFIX}*{SUFFIX}") if p.is_file())
+    numbered = [(_name_parts(p), p) for p in backups_dir.glob(f"{PREFIX}*{SUFFIX}") if p.is_file()]
+    return [p for _, p in sorted((parts, p) for parts, p in numbered if parts is not None)]
 
 
 def prune_backups(backups_dir: Path, keep: int) -> int:
+    """新しい方（世代番号の大きい方）から keep 世代を残して消す。前回の中断で残った書きかけ（.part）も消す。
+    戻り値は消した世代数。"""
     files = list_backups(backups_dir)
     removed = 0
     for p in files[:-keep] if keep > 0 else files:
         p.unlink(missing_ok=True)
         removed += 1
+    if backups_dir.exists():
+        for part in backups_dir.glob(f"{PREFIX}*{SUFFIX}{PART_SUFFIX}"):
+            part.unlink(missing_ok=True)
     return removed
 
 
@@ -1993,18 +2577,93 @@ def integrity_ok(db_path: Path) -> bool:
         return False
 
 
-def restore_latest(db_path: Path, backups_dir: Path) -> Path | None:
-    """壊れた DB を退避し、直近バックアップをコピーする。バックアップがなければ None。"""
-    files = list_backups(backups_dir)
-    if not files:
+def backup_schema_version(path: Path) -> int | None:
+    """バックアップの schema_version（適用済みのマイグレーションの最大番号）。表が無い・読めない・整数でなければ None。
+
+    読み取り専用で開く（検査で復元元のファイルを書き換えない・無いファイルを作らない）。
+    """
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.DatabaseError, OSError, ValueError):
+        # 表が無い（sqlite3.OperationalError は DatabaseError）・SQLite のファイルでない・パスを URI にできない
         return None
-    latest = files[-1]
+    version = row[0] if row is not None else None
+    return version if isinstance(version, int) and not isinstance(version, bool) else None
+
+
+def usable_backup(path: Path) -> bool:
+    """復元元にできるか。空でなく、integrity_check に通り、このアプリのスキーマ（schema_version が 1 以上、このビルドの最新以下）を持つ。
+
+    空のファイルは integrity_check には通るが、会議が 1 件も入っていない。integrity_check は SQLite のファイルとしての健全さしか
+    見ないので、表の無い DB や別のアプリの DB も通る。それを復元すると、起動時の migrate が空の DB と同じく表を作り、
+    会議の無い DB で始まる（より古い正しいバックアップがあっても使わない）。古い版は復元の後に migrate・apply_phase3 が上げるので通す。
+    このビルドより新しい版は、このビルドが知らない列・表を持つので断る。
+    """
+    try:
+        if path.stat().st_size == 0 or not integrity_ok(path):
+            return False
+    except OSError:
+        return False
+    version = backup_schema_version(path)
+    return version is not None and 1 <= version <= LATEST_SCHEMA_VERSION
+
+
+def recovery_marker(db_path: Path) -> Path:
+    """復旧の途中を示す控え。restore_latest が DB に触る前に置き、build_context が rebuild を終えてから消す。"""
+    return db_path.with_name(db_path.name + ".recovering")
+
+
+def pending_recovery(db_path: Path) -> Recovery | None:
+    """前回の復旧が終わっていなければ（控えが残っていれば）その記録。控えが読めなくても復旧中として扱う（復元元は不明）。"""
+    marker = recovery_marker(db_path)
+    if not marker.exists():
+        return None
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        # 入れ子の深すぎる JSON は RecursionError（ValueError ではない）。読めない控えとして扱い、起動を止めない
+        data = None
+    source = data.get("restoredFrom") if isinstance(data, dict) else None
+    return Recovery(restored_from=Path(source) if isinstance(source, str) else None)
+
+
+def finish_recovery(db_path: Path) -> None:
+    """rebuild まで終えた。控えを消す（次の起動は通常どおり）。"""
+    recovery_marker(db_path).unlink(missing_ok=True)
+
+
+def restore_latest(db_path: Path, backups_dir: Path) -> Path | None:
+    """壊れた DB を退避し、復元元にできる最も新しいバックアップをコピーする。戻り値は復元元。
+
+    最新のものが壊れていれば 1 つ古いものへ下がる。使えるものが 1 つもなければ None を返し、DB のファイルは置かない
+    （呼び出し側が空の DB として開き、録音ファイルから作り直す。§18）。壊れたファイルはどちらの場合も
+    `minutes.sqlite.corrupt-{epoch}` に残す。
+
+    users テーブルもバックアップの時点に戻る。バックアップの後に `user remove` で失効させた利用者は行ごと戻り、
+    そのトークンがまた通る。運用者は復元の後、失効させたままにすべき利用者を `user remove` でもう一度消す（§2.5・serve の警告）。
+
+    途中で止まっても（退避の後・コピーの途中）次の起動で続きからやり直せるよう、DB に触る前に控え（recovery_marker）を置く。
+    控えがあれば open_database_with_recovery は DB が無くても初回起動とみなさない。コピーは別名に書いてから名前を付け替え、
+    書きかけの DB を正規の名前で残さない。
+    """
+    source = next((p for p in reversed(list_backups(backups_dir)) if usable_backup(p)), None)
+    marker = recovery_marker(db_path)
+    marker_tmp = marker.with_name(marker.name + ".part")
+    marker_tmp.write_text(json.dumps({"restoredFrom": str(source) if source is not None else None}), encoding="utf-8")
+    os.replace(marker_tmp, marker)
     if db_path.exists():
         shutil.move(str(db_path), str(db_path.with_name(f"{db_path.name}.corrupt-{int(time.time())}")))
     for extra in (db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm")):
         extra.unlink(missing_ok=True)
-    shutil.copy2(latest, db_path)
-    return latest
+    if source is not None:
+        part = db_path.with_name(db_path.name + ".restoring")
+        shutil.copy2(source, part)
+        os.replace(part, db_path)
+    return source
 ```
 
 ---
@@ -2013,6 +2672,27 @@ def restore_latest(db_path: Path, backups_dir: Path) -> Path | None:
 
 finalize 時に `meeting.json` を書き出し（§20.2）、`doctor --rebuild` がそれと音声ファイルから欠損行を復元する。終了時刻のキーは Phase 1/2 の確定 API と同じ `endedAtEpochMs` で書く（移行 012 が `recordings/local/` へ移すだけの Phase 1/2 の `meeting.json` と同じキーで読める）。会議の作成時に書く控え（Phase 2 §21.2）には終了時刻がなく、その場合 rebuild は `ended_at` を NULL にする（終了時刻を失わない）。`meeting.json` は手で編集・破損しうる外部入力なので、停止理由（`stopReason`）と検出時刻（`stopDetectedAtEpochMs`）は `Meeting` を組み立てる前に組で検証する（`_stop_metadata()`）。未知の停止理由で `Meeting` の検証が失敗したり、範囲外の時刻で SQLite への挿入が `OverflowError` になったりすると、rebuild 全体が止まって他の会議も復元できなくなるためである。停止理由が `manual` / `mic_ended` のどちらかで、検出時刻が確定 API と同じ範囲（0〜2⁶³−1、SQLite INTEGER の上限）の整数（`bool` を除く）のときだけ両方を残し、どちらかが不正なら両方を `None` にする。
 
+停止理由と終了時刻だけでなく、**控えのすべての項目**を同じ方針で扱う。型や範囲が合わない項目は既定値に置き換え、例外にしない。
+
+| 項目 | 合わないときの値 | 判定 |
+| --- | --- | --- |
+| 最上位 | 控えなし（`{}`）として扱う | JSON として読めない、オブジェクトでない、ファイルが読めない |
+| `title` | `"復元された会議"` | 空でない文字列でない、UTF-8 にできない（JSON の孤立サロゲート。`_restored_title`） |
+| `sessionStartEpochMs` / `nativeSampleRate` / `consentConfirmedAt` | `0` | 0 以上・SQLite INTEGER 内の整数でない（`_int_or`） |
+| `endedAtEpochMs` / `totalAudioFrames` | `NULL` | 同上 |
+| `stopReason` と `stopDetectedAtEpochMs` | 組ごと `NULL` | `_stop_metadata()` |
+| `chunks` | 空（時刻は下の仮定で補う） | 配列でない。要素がオブジェクトでない・`source` が `mic` / `system` でない・`sequenceNo` が整数でない要素は、その要素だけ捨てる |
+| `chunks[].startOffsetMs` | `sequenceNo × 30000` | 整数でない。30 秒の Chunk が隙間なく並んでいたと仮定する（一時停止があった会議では時刻がずれる。控えがあれば起きない） |
+| `chunks[].endOffsetMs` | `start + 実際の長さ` | 整数でない |
+| `chunks[].vadScore` / `hasVoice` | `0.0` / `True` | 0〜1 の数値でない / 真偽値でない。有音かどうか分からなければ有音として扱う（Invariant 7） |
+| `chunks[].sha256` | — | 文字列で、ファイルの値と違えばそのファイルを復元しない（`skipped_files`） |
+
+利用者（`local_user_id`）は控えの `localUserId` ではなく**ディレクトリの階層**（`recordings/{userId}/…`）で決める。ファイルの置き場所と所有者が食い違うと、以後の Chunk が別の階層に書かれる。
+
+復元する会議の状態は `_restored_status()` が決める（§2.4）。確定時の控えには終了時刻が入るので、有効な終了時刻（SQLite INTEGER に収まる 0 以上の整数）があれば `finalized`、作成時の控えのままなら `recording`、控えが読めない・終了時刻が不正な値なら `recording`（確定したかが分からない。確定 API は終了時刻を検証してから控えを書くので、不正な値は控えが壊れた印。§2.4 の既知の制限）。
+
+rebuild を呼ぶのは 2 か所だけである。`doctor --rebuild`（データディレクトリのロックを取ってから。§22）と、`build_context` の起動時の復旧（壊れた DB を復元した直後。§22）。動いているサーバーと並行して呼ばない。
+
 ```python
 # minutes_local/storage/rebuild.py
 """recordings/ の走査による meetings / audio_chunks の再構築。既存行は上書きしない。§2.4。"""
@@ -2020,10 +2700,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeGuard
 
+from ..auth.users import LOCAL_USER_ID
 from ..db import repo
 from ..db.connection import now_ms
 from ..db.models import AudioChunk, Meeting
@@ -2035,9 +2716,15 @@ from .files import meeting_dir as meeting_rel_dir
 @dataclass
 class RebuildReport:
     meetings_created: int = 0
+    meetings_finalized: int = 0     # 既存の確定前の行（確定前のバックアップから戻した）を控えに合わせて finalized にした数
     chunks_created: int = 0
+    chunks_relinked: int = 0        # 既存の行が指すファイルがなく、同じ音声の別のファイル（圧縮後の FLAC など）へ向け直した数
     chunks_marked_missing: int = 0
+    chunks_reverified: int = 0      # 前に missing にした行のファイルが戻り（直り）、行の内容と一致したので verified に戻した数
     skipped_files: list[str] | None = None
+    # 走査した会議の所有者（ディレクトリの利用者 ID）のうち、users に行が無いもの（local を除く）。その会議はどのトークンからも
+    # 見えない（404）。DB を失って users が空になった・その利用者を追加する前のバックアップから戻した場合に起きる。§2.5
+    owners_without_user: list[str] = field(default_factory=list)
 
 
 def write_meeting_json(data_dir: Path, meeting: Meeting, chunks: list[AudioChunk]) -> Path:
@@ -2059,31 +2746,87 @@ def write_meeting_json(data_dir: Path, meeting: Meeting, chunks: list[AudioChunk
     return write_atomic(data_dir, rel, json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8"))
 
 
+# 録音ファイル 1 つの音声の上限（サンプル数）。録音の Chunk は 30 秒（480,000 サンプル。Phase 1 §8）で、その 10 倍を見込む。
+# rebuild は利用者のディスク上のファイルを読む（壊れた・別の版が書いた・手で置いたものでありうる）。超えるファイルは全量を読まずに
+# 飛ばし（skipped_files）、残りの復元を続ける。上限なしに読むと、1 つの巨大なファイルで起動時の復元がメモリを使い切って止まる
+REBUILD_MAX_CHUNK_SAMPLES = 480_000 * 10
+
+
+def _read_chunk_file(path: Path, codec: AudioCodec | None) -> bytes | None:
+    """録音ファイルを上限（REBUILD_MAX_CHUNK_SAMPLES を符号化した最悪の大きさ）まで読む。超える・読めないときは None。
+
+    大きさを stat で確かめてから読むと、その間に置き換わったファイルを全量読む。読む量そのものを上限 + 1 バイトで止める（read_pcm と同じ）
+    """
+    max_samples = REBUILD_MAX_CHUNK_SAMPLES
+    limit = (codec.max_encoded_bytes(max_samples) if codec is not None and codec.extension == path.suffix
+             else WAV_HEADER_BYTES + max_samples * 2)
+    try:
+        with path.open("rb") as fh:
+            data = fh.read(limit + 1)
+    except OSError:
+        return None
+    return data if len(data) <= limit else None
+
+
 def _chunk_from_file(path: Path, codec: AudioCodec | None) -> tuple[int, str, bytes] | None:
-    """(sample_count, wav_sha256, pcm) をファイルから復元。読めなければ None。"""
-    data = path.read_bytes()
+    """(sample_count, wav_sha256, pcm) をファイルから復元。読めない・上限を超えるときは None。"""
+    data = _read_chunk_file(path, codec)
+    if data is None:
+        return None
+    return _chunk_from_bytes(path, data, codec)
+
+
+def _chunk_from_bytes(path: Path, data: bytes, codec: AudioCodec | None) -> tuple[int, str, bytes] | None:
+    """読んだ内容 data（path の拡張子で形式を決める）から (sample_count, wav_sha256, pcm) を復元。形式が合わない・上限を超えるときは None。
+
+    圧縮ファイルの復号は上限 + 1 サンプルで止める（codec.decode の max_samples）。ファイルの大きさが上限に収まっても、
+    符号化の形式によっては復号した PCM がはるかに大きくなりうる
+    """
+    max_samples = REBUILD_MAX_CHUNK_SAMPLES
     if path.suffix == ".wav":
         try:
             h = parse_wav_header(data)
         except ValueError:
             return None
+        if h.sample_count > max_samples:
+            return None
         return h.sample_count, sha256_hex(data), data[WAV_HEADER_BYTES:]
     if codec is not None and codec.extension == path.suffix:
         try:
-            pcm = codec.decode(data)
+            pcm = codec.decode(data, max_samples)
         except ValueError:
+            return None
+        if not pcm or len(pcm) > max_samples * 2:
             return None
         return len(pcm) // 2, sha256_hex(build_wav(pcm)), pcm
     return None
 
 
-def _stop_metadata(meta: dict[str, Any]) -> tuple[str | None, int | None]:
-    """meeting.json の停止理由と検出時刻を組で検証する。片方でも不正なら両方 None（Meeting の検証で rebuild 全体を止めない）。"""
-    reason, detected = meta.get("stopReason"), meta.get("stopDetectedAtEpochMs")
-    # bool は int のサブクラスなので明示的に除く。範囲は確定 API と同じ SQLite INTEGER（範囲外は insert で OverflowError）
-    if reason in ("manual", "mic_ended") and _is_sqlite_epoch_ms(detected):
-        return reason, detected
-    return None, None
+# ---- meeting.json の読み取り ----
+# 控えは利用者のディスク上のファイルで、壊れている・手で書き換えられている・別の版が書いたものでありうる。
+# 項目ごとに型と範囲を確かめ、合わなければ既定値に置き換える。1 つの会議の壊れた控えで rebuild 全体（1 トランザクション）を止めない
+
+# meeting.json の上限（バイト）。書くのは会議 1 件の項目と Chunk の一覧で、最長の会議（4 時間・2 source・30 秒の Chunk で 960 件、
+# 1 件 300 バイト前後）でも 300 KB ほど。超えるものは控えとして読まない（壊れた・手で置いた巨大なファイルで起動時の復旧がメモリを使い切らない）
+MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
+
+
+def _load_snapshot(path: Path) -> dict[str, Any]:
+    """meeting.json を読む。ない・読めない・上限（MAX_SNAPSHOT_BYTES）を超える・最上位がオブジェクトでないときは空（控えなしとして復元する）。
+
+    大きさを stat で確かめてから読むと、その間に置き換わったファイルを全量読む。読む量そのものを上限 + 1 バイトで止める（_read_chunk_file と同じ）
+    """
+    try:
+        with path.open("rb") as f:
+            raw = f.read(MAX_SNAPSHOT_BYTES + 1)
+        if len(raw) > MAX_SNAPSHOT_BYTES:
+            return {}
+        # UnicodeDecodeError は ValueError のサブクラス
+        loaded = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        # 入れ子の深すぎる JSON は ValueError ではなく RecursionError になる。1 つの会議の控えで rebuild・起動時の復旧を止めない
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def _is_sqlite_epoch_ms(value: object) -> TypeGuard[int]:
@@ -2092,45 +2835,199 @@ def _is_sqlite_epoch_ms(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2**63 - 1
 
 
+def _int_or(value: object, default: int) -> int:
+    """0 以上で SQLite INTEGER に収まる整数ならその値、そうでなければ default。"""
+    return value if _is_sqlite_epoch_ms(value) else default
+
+
+def _restored_title(value: object) -> str:
+    """空でなく UTF-8 にできる文字列ならその値、そうでなければ「復元された会議」。
+    JSON の孤立サロゲート（"\\ud800"）は str として読めるが、SQLite への挿入で UnicodeEncodeError になり rebuild 全体が止まる。"""
+    if not isinstance(value, str) or not value:
+        return "復元された会議"
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "復元された会議"
+    return value
+
+
+def _chunk_offsets(mc: dict[str, Any], seq: int, duration: int) -> tuple[int, int] | None:
+    """Chunk の開始・終了時刻を組で検証する。控えの値（終了が不正・欠落なら開始 + 長さで補う）が、両方とも SQLite INTEGER に収まり
+    終了 >= 開始なら採用する。そうでなければ、30 秒の Chunk が隙間なく並んでいたと仮定した値（Phase 1 §14 の Chunk 長）にする。
+    個別の検証だけでは、範囲内の開始 + 長さが上限を超えたり終了が開始より前になったりして、挿入（OverflowError）で rebuild 全体が止まる。
+    既定の値も収まらない（連番が大きすぎる）ときは None（呼び出し側がファイルを飛ばす）。
+    """
+    start, end = mc.get("startOffsetMs"), mc.get("endOffsetMs")
+    if isinstance(start, int) and _is_sqlite_epoch_ms(start):
+        if not (isinstance(end, int) and _is_sqlite_epoch_ms(end)):
+            end = start + duration                       # 終了だけ不正・欠落なら開始 + 長さで補う（従来どおり）
+        if _is_sqlite_epoch_ms(end) and end >= start:
+            return start, end
+    fallback = seq * 30000
+    return (fallback, fallback + duration) if _is_sqlite_epoch_ms(fallback + duration) else None
+
+
+def _stop_metadata(meta: dict[str, Any]) -> tuple[str | None, int | None]:
+    """meeting.json の停止理由と検出時刻を組で検証する。片方でも不正なら両方 None（Meeting の検証で rebuild 全体を止めない）。"""
+    reason, detected = meta.get("stopReason"), meta.get("stopDetectedAtEpochMs")
+    if reason in ("manual", "mic_ended") and _is_sqlite_epoch_ms(detected):
+        return reason, detected
+    return None, None
+
+
+def _restored_status(meta: dict[str, Any]) -> str:
+    """復元する会議の状態。確定時の控えには有効な終了時刻（SQLite INTEGER に収まる 0 以上の整数）が入る。
+
+    終了時刻が不正な値（範囲外・整数でない）の控えは、確定したかが分からないものとして recording にする。確定 API は終了時刻を
+    検証してから控えを書くので、不正な値は控えが壊れた・書き換えられた印で、確定の根拠にしない（finalized にすると録音を失う側に倒れる）。
+
+    控えが作成時のまま（終了時刻なし）なら recording に戻す。ブラウザは未送信の Chunk と確定の要求をまだ持っていて、
+    finalized にすると Chunk の PUT を 409 で断ってしまう（Recording-First）。確定は Phase 1 の Recovery がやり直す。
+    控えそのものが読めない会議も recording にする。確定したかが分からない（_snapshot_finalized と同じく、読めない控えを確定の
+    根拠にしない）。finalized にすると、まだ送信中のブラウザの Chunk を断り、録音を失う。ブラウザが確定を終えていた会議は
+    recording のまま止まり、文字起こしされない（既知の制限。§2.4）。
+    """
+    return "finalized" if _snapshot_finalized(meta) else "recording"
+
+
+PRE_FINALIZE_STATUSES = ("created", "recording", "finalizing")
+
+
+def _snapshot_finalized(meta: dict[str, Any]) -> bool:
+    """控えが確定時のもの（終了時刻が有効な SQLite の epoch 値）か。読めない控え（空）も、終了時刻が不正な控えも確定とみなさない
+    （確定したかが分からない。既存の行を動かす根拠にも、新しい行を finalized にする根拠にもしない）。"""
+    return _is_sqlite_epoch_ms(meta.get("endedAtEpochMs"))
+
+
+def _snapshot_chunks(meta: dict[str, Any]) -> dict[tuple[str, int], dict[str, Any]]:
+    """控えの Chunk 一覧を (source, sequenceNo) で引けるようにする。形の合わない要素は捨てる。"""
+    raw = meta.get("chunks")
+    out: dict[tuple[str, int], dict[str, Any]] = {}
+    for c in raw if isinstance(raw, list) else []:
+        if isinstance(c, dict) and c.get("source") in ("mic", "system") and _is_sqlite_epoch_ms(c.get("sequenceNo")):
+            out[(c["source"], c["sequenceNo"])] = c
+    return out
+
+
+def _vad_score(value: object) -> float:
+    ok = isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+    return float(value) if ok else 0.0      # type: ignore[arg-type]
+
+
+def _codec_of(path: Path) -> str:
+    return "wav" if path.suffix == ".wav" else ("flac" if path.suffix == ".flac" else "fake")
+
+
+def _file_matches_chunk(path: Path, chunk: AudioChunk, codec: AudioCodec | None) -> bool | None:
+    """path が chunk の音声として読めるか。True：読めて内容が行と一致。False：ない・読めない・形式が壊れている・内容が違う。
+    None：この環境では確かめられない（圧縮ファイルで、行に sha256_flac がなく codec も合わない）。健全かもしれないので壊れた扱いにしない。
+    """
+    if path.suffix != ".wav" and chunk.sha256_flac is not None:
+        # 圧縮ファイルは行に控えたファイルの sha256 と比べる（codec がなくても確かめられる）
+        data = _read_chunk_file(path, codec)   # 上限を超える・読めないときは None（壊れた扱い）
+        return data is not None and sha256_hex(data) == chunk.sha256_flac
+    if path.suffix != ".wav" and (codec is None or codec.extension != path.suffix):
+        return None if path.exists() else False
+    restored = _chunk_from_file(path, codec)
+    return restored is not None and restored[1] == chunk.sha256
+
+
+def _relink_chunk(conn: sqlite3.Connection, data_dir: Path, chunk: AudioChunk, f: Path, codec: AudioCodec | None) -> bool:
+    """既存の Chunk の行が指すファイルがない（または壊れている）とき、同じ連番のファイル f が同じ音声なら、行を f へ向け直す。向け直したら True。
+
+    古いバックアップから戻すと、その後に圧縮した Chunk の行は消した WAV を指したまま残る（handle_compress は WAV を消す）。
+    向け直さないと下の走査が missing にし、残っている圧縮ファイルを使わない。f を復元した WAV の sha256 が行と一致したときだけ
+    向け直す（検証していないファイルを指さない）。行そのもの（ID・時刻・STT の状態）は変えない。
+    行が指すファイルが残っていても、壊れていれば（_file_matches_chunk が False）向け直す。健全なとき・確かめられないときは向け直さない。
+    """
+    rel = str(f.relative_to(data_dir))
+    if rel == chunk.local_path or _file_matches_chunk(data_dir / chunk.local_path, chunk, codec) is not False:
+        return False
+    # f は 1 回だけ読み、検証したそのバイト列から大きさと sha256_flac を記録する。読み直すと、その間に置き換わった
+    # 検証していない内容を記録してしまう。読めなければ（権限・取り外し）この Chunk だけ向け直さず、rebuild と起動時の復元を止めない
+    encoded = _read_chunk_file(f, codec)   # 上限を超える・読めないときは None（_chunk_from_file と同じ）
+    if encoded is None:
+        return False
+    restored = _chunk_from_bytes(f, encoded, codec)
+    if restored is None or restored[1] != chunk.sha256:
+        return False
+    repo.update_chunk(conn, chunk.id, local_path=rel, codec=_codec_of(f), size_bytes=len(encoded), save_status="verified",
+                      sha256_flac=None if f.suffix == ".wav" else sha256_hex(encoded))
+    return True
+
+
 def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) -> RebuildReport:
+    """recordings/{userId}/{meetingId}/ を走査し、DB にない会議と Chunk の行を作る。既存の行は上書きしない。
+
+    既存の Chunk の行が指すファイルがない・壊れているときは、同じ連番で内容（WAV の sha256）が一致するファイルへ向け直す（_relink_chunk）。
+    古いバックアップから戻した行が、その後の圧縮で消えた WAV を指しているためである。
+
+    例外は確定の状態だけ。確定前に取ったバックアップから戻すと、会議の行は recording のまま残る。確定時の控えがあれば
+    finalized に進め、欠けている終了時刻・総フレーム数・停止理由を控えから補う。ブラウザは確定を終えて再送しないので、
+    recording のままだと resume_finalized（finalized だけを拾う）がジョブを作らず、文字起こしされないまま止まる。
+
+    Chunk の STT の状態はバックアップの時点のまま動かさない（控えにもファイルにも STT の結果は無い）。バックアップの後に行った
+    手動の STT（無音と判定した Chunk の transcribe_silent_chunk）は失われ、その Chunk は skipped のまま残る
+    （バックアップの時点で STT の前なら、処理し直しで VAD が再び skipped にする）。手動の STT はもう一度実行する。
+
+    呼び出すのは、そのデータディレクトリを使う serve がいないとき（`doctor --rebuild` はロックを取る。§22）か、
+    serve 自身の起動時（DB の復元の直後。§22 build_context）だけ。動いているサーバーと並行すると、同じ Chunk の行を取り合う。
+    """
     report = RebuildReport(skipped_files=[])
     recordings = data_dir / "recordings"
     if not recordings.exists():
         return report
     for meeting_dir in sorted(p for p in recordings.glob("*/*") if p.is_dir()):
+        # 利用者はディレクトリの階層で決める（ファイルの置き場所と local_user_id を食い違わせない）
         user_id, meeting_id = meeting_dir.parent.name, meeting_dir.name
-        meta: dict[str, Any] = {}
-        mj = meeting_dir / "meeting.json"
-        if mj.exists():
-            try:
-                meta = json.loads(mj.read_text(encoding="utf-8"))
-            except ValueError:
-                meta = {}
+        meta = _load_snapshot(meeting_dir / "meeting.json")
         t = now_ms()
-        if repo.get_meeting(conn, meeting_id) is None:
+        existing = repo.get_meeting(conn, meeting_id)
+        if existing is not None and existing.status in PRE_FINALIZE_STATUSES and _snapshot_finalized(meta):
+            ended, frames = meta.get("endedAtEpochMs"), meta.get("totalAudioFrames")
+            fields: dict[str, Any] = {"status": "finalized"}
+            if existing.ended_at is None and _is_sqlite_epoch_ms(ended):
+                fields["ended_at"] = ended
+            if existing.total_audio_frames is None and _is_sqlite_epoch_ms(frames):
+                fields["total_audio_frames"] = frames
             stop_reason, stop_detected_at = _stop_metadata(meta)
-            # 不正な終了時刻（範囲外・整数でない）は None にし、Meeting の検証や insert で rebuild 全体を止めない
-            ended_raw = meta.get("endedAtEpochMs")
-            ended_at = ended_raw if _is_sqlite_epoch_ms(ended_raw) else None
+            if existing.stop_reason is None and stop_reason is not None:
+                fields["stop_reason"], fields["stop_detected_at"] = stop_reason, stop_detected_at
+            repo.update_meeting(conn, meeting_id, **fields)
+            report.meetings_finalized += 1
+        if existing is None:
+            stop_reason, stop_detected_at = _stop_metadata(meta)
+            title, ended, frames = meta.get("title"), meta.get("endedAtEpochMs"), meta.get("totalAudioFrames")
             repo.insert_meeting(conn, Meeting(
-                id=meeting_id, local_user_id=str(meta.get("localUserId", user_id)), title=str(meta.get("title", "復元された会議")),
-                status="finalized", session_start_epoch_ms=int(meta.get("sessionStartEpochMs", 0)),
-                native_sample_rate=int(meta.get("nativeSampleRate", 0)), consent_confirmed_at=int(meta.get("consentConfirmedAt", 0)),
-                # 終了時刻のキーは全フェーズで endedAtEpochMs。会議の作成時に書いた控え（確定前）にはなく、その場合は None
-                ended_at=ended_at, total_audio_frames=meta.get("totalAudioFrames"), created_at=t, updated_at=t,
+                id=meeting_id, local_user_id=user_id, title=_restored_title(title),
+                status=_restored_status(meta),  # type: ignore[arg-type]
+                session_start_epoch_ms=_int_or(meta.get("sessionStartEpochMs"), 0),
+                native_sample_rate=_int_or(meta.get("nativeSampleRate"), 0), consent_confirmed_at=_int_or(meta.get("consentConfirmedAt"), 0),
+                # 終了時刻のキーは全フェーズで endedAtEpochMs。不正な値（範囲外・整数でない）は None にする
+                ended_at=ended if _is_sqlite_epoch_ms(ended) else None,
+                total_audio_frames=frames if _is_sqlite_epoch_ms(frames) else None, created_at=t, updated_at=t,
                 stop_reason=stop_reason, stop_detected_at=stop_detected_at,
             ))
             report.meetings_created += 1
-        meta_chunks = {(c["source"], int(c["sequenceNo"])): c for c in meta.get("chunks", []) if "source" in c and "sequenceNo" in c}
+        meta_chunks = _snapshot_chunks(meta)
         for source in ("mic", "system"):
             sdir = meeting_dir / source
-            if not sdir.exists():
+            if not sdir.is_dir():
                 continue
             for f in sorted(sdir.iterdir()):
-                if f.suffix not in (".wav", ".flac", ".fake") or not f.stem.isdigit():
+                # ASCII の数字だけを連番として受ける。str.isdigit() は「²」なども真にするが int() は投げ、rebuild 全体（起動時の復元）が止まる
+                if f.suffix not in (".wav", ".flac", ".fake") or not (f.stem.isascii() and f.stem.isdigit()):
                     continue
                 seq = int(f.stem)
-                if repo.get_chunk_by_key(conn, meeting_id, source, seq) is not None:
+                if not _is_sqlite_epoch_ms(seq):
+                    # 連番が SQLite INTEGER に収まらない名前。照会・挿入の OverflowError で rebuild 全体を止めない
+                    report.skipped_files.append(str(f.relative_to(data_dir)))
+                    continue
+                known = repo.get_chunk_by_key(conn, meeting_id, source, seq)
+                if known is not None:
+                    if _relink_chunk(conn, data_dir, known, f, codec):
+                        report.chunks_relinked += 1
                     continue
                 restored = _chunk_from_file(f, codec)
                 if restored is None:
@@ -2138,24 +3035,55 @@ def rebuild(conn: sqlite3.Connection, data_dir: Path, codec: AudioCodec | None) 
                     continue
                 sample_count, wav_sha, _ = restored
                 mc = meta_chunks.get((source, seq), {})
-                if "sha256" in mc and mc["sha256"] != wav_sha:
+                if isinstance(mc.get("sha256"), str) and mc["sha256"] != wav_sha:
                     report.skipped_files.append(str(f.relative_to(data_dir)))
                     continue
-                start = int(mc.get("startOffsetMs", seq * 30000))
                 duration = int(sample_count / 16)
+                offsets = _chunk_offsets(mc, seq, duration)
+                if offsets is None:
+                    # 連番が大きすぎて既定の時刻も SQLite INTEGER に収まらない。挿入で rebuild 全体を止めない
+                    report.skipped_files.append(str(f.relative_to(data_dir)))
+                    continue
+                start, end = offsets
+                try:
+                    size_bytes = f.stat().st_size
+                except OSError:
+                    # 読んだ後に消えた・読めなくなった（取り外し・別プロセスの削除）。このファイルだけ飛ばし、rebuild 全体
+                    # （1 トランザクション。起動時の復元）を止めない
+                    report.skipped_files.append(str(f.relative_to(data_dir)))
+                    continue
+                has_voice = mc.get("hasVoice")
                 repo.upsert_chunk(conn, AudioChunk(
                     id=repo.new_id(), meeting_id=meeting_id, source=source, sequence_no=seq,  # type: ignore[arg-type]
-                    start_offset_ms=start, end_offset_ms=int(mc.get("endOffsetMs", start + duration)), duration_ms=duration,
-                    sample_count=sample_count, local_path=str(f.relative_to(data_dir)), size_bytes=f.stat().st_size, sha256=wav_sha,
-                    vad_score=float(mc.get("vadScore", 0.0)), has_voice=bool(mc.get("hasVoice", True)), save_status="verified",
-                    created_at=t, codec="wav" if f.suffix == ".wav" else ("flac" if f.suffix == ".flac" else "fake"),
+                    start_offset_ms=start, end_offset_ms=end, duration_ms=duration,
+                    sample_count=sample_count, local_path=str(f.relative_to(data_dir)), size_bytes=size_bytes, sha256=wav_sha,
+                    # 有音かどうかが分からなければ有音として扱う（無音と決めつけて STT を省かない。Invariant 7）
+                    vad_score=_vad_score(mc.get("vadScore")), has_voice=has_voice if isinstance(has_voice, bool) else True,
+                    save_status="verified", created_at=t,
+                    codec=_codec_of(f),
                 ))
                 report.chunks_created += 1
-        # DB にあるがファイルがない Chunk を missing に
+        # DB にあるがファイルがない Chunk を missing に。verified の Chunk はファイルがあっても読めなければ（壊れている・内容が違う）
+        # missing にする（存在するだけで読める Chunk として扱わない）。確かめられない圧縮ファイル（None）はそのまま。
+        # verified でない行（registered）は存在だけを見る（従来どおり）
+        # missing の行も確かめ直す。ファイルを同じ場所に戻した（直した）とき、_relink_chunk は同じパスを向け直さないので、
+        # ここで見ないと missing のまま残る。内容が行と一致したときだけ verified に戻し、それ以外（ない・違う・確かめられない）は missing のまま
         for c in repo.list_chunks(conn, meeting_id):
-            if not (data_dir / c.local_path).exists() and c.save_status != "missing":
+            path = data_dir / c.local_path
+            if c.save_status == "missing":
+                if _file_matches_chunk(path, c, codec) is True:
+                    repo.update_chunk(conn, c.id, save_status="verified")
+                    report.chunks_reverified += 1
+                continue
+            broken = _file_matches_chunk(path, c, codec) is False if c.save_status == "verified" else not path.exists()
+            if broken:
                 repo.update_chunk(conn, c.id, save_status="missing")
                 report.chunks_marked_missing += 1
+    # 既存の会議も含めて数える（doctor --rebuild をやり直しても、見えないままの会議を報告し続ける）
+    owners = {p.parent.name for p in recordings.glob("*/*") if p.is_dir()} - {LOCAL_USER_ID}
+    report.owners_without_user = sorted(
+        o for o in owners if conn.execute("SELECT 1 FROM users WHERE id = ?", (o,)).fetchone() is None
+    )
     return report
 ```
 
@@ -2962,6 +3890,13 @@ async def transcribe_silent_chunk(meeting_id: str, source: str, sequence_no: int
         # 完了済みの merge ジョブを消す。この Chunk の STT が終わると ensure_merge_job が作り直し、transcript の版が上がる。
         # 要約は自動では作り直さない（会議は transcribed に戻る。利用者が再生成を選ぶ）
         repo.delete_finished_job(conn, meeting_id, "merge_transcript")
+        # 完了済みの話者分離も消す。分離は completed の Chunk だけを入力にしたので、この Chunk の音声の区間には話者区間がない。
+        # 残すと ensure_merge_job が分離を作り直さずに merge へ進み、拾い直した segments は話者の無いまま公開される。
+        # 作り直した分離は、話者の付いた segments を変えず、話者の無い segments だけに付ける（handle_diarize の _align_labels）。
+        # 分離が実行待ち・実行中なら、ここでは消せない（一意制約の行は 1 つ）。この Chunk の STT の完了時に
+        # on_transcribe_completed が、実行中の分離を pending に戻すか、先に終わった分離を消して作り直させる。
+        # 分離が先に終わっても、on_diarize_finished はこの Chunk が終端になるまで merge を作らない
+        repo.delete_finished_job(conn, meeting_id, "diarize_meeting")
         repo.record_metric(conn, "vad_manual_transcribe", 1, meeting_id=meeting_id)
     return {"jobId": job_id}
 
@@ -3105,13 +4040,18 @@ async def me(request: Request) -> Any:
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
+import logging
+import os
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from ..db import repo, repo_phase3
 from ..db.connection import now_ms
 from ..db.models import AudioChunk, Job, Segment, SummaryVersion
-from ..diarization.provider import DiarizationRequest, SpeakerTurn
+from ..diarization.provider import MAX_TIMELINE_MS, DiarizationProvider, DiarizationRequest, DiarizationResult, SpeakerTurn, check_timeline_span
 from ..llm.caveats import caveats_for
 from ..llm.map_reduce import synthesize
 from ..llm.prompts import MIXED_NOTE_EN, MIXED_NOTE_JA, PROMPT_VERSION
@@ -3123,13 +4063,45 @@ from ..stt.confidence import confidence
 from ..stt.language import LanguageGuess, resolve_chunk_language
 from ..stt.overlap import build_input, to_absolute
 from ..stt.provider import STTRequest, STTResult
-from ..storage.files import InvalidWavError, build_wav, read_pcm, sha256_hex, write_atomic
+from ..storage.files import InvalidWavError, PcmTooLongError, build_wav, read_pcm, sha256_hex, write_atomic
 from . import pipeline
 from .context import AppContext
-from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError
+from .retry import InvalidAudioError, JobTimeoutError, ModelMissingError, ProviderUnreachableError, normalize_exception
 from .selection import refresh_llm, refresh_stt
 
+log = logging.getLogger(__name__)
+
 DEFAULT_LLM_CTX_TOKENS = 8192
+
+
+def read_chunk_pcm(ctx: AppContext, chunk: AudioChunk, max_samples: int | None = None) -> bytes:
+    """Chunk の PCM を読む。行を読んでからファイルを開くまでの間に圧縮（§2.4）がファイルを置き換えていたら、行を読み直して読む。
+
+    読み直さないと、置き換わった直後の読み取りが「ファイルなし」で失敗し、呼び出し側が正常な Chunk を missing にする。
+    read_pcm の存在確認の後・読み取りの前に置き換わると OSError（FileNotFoundError）になるので、それも読み直しの対象にする。
+    パスが変わっていなければ本当の欠損・破損なので、元の例外をそのまま返す。
+    max_samples は read_pcm に渡す（超えれば PcmTooLongError。読み直しの対象ではない）。
+    """
+    try:
+        return read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec, max_samples)
+    except (InvalidWavError, OSError):
+        with ctx.db.read() as conn:
+            fresh = repo.get_chunk(conn, chunk.id)
+        if fresh is None or fresh.local_path == chunk.local_path:
+            raise
+        return read_pcm(ctx.settings.data_dir, fresh.local_path, fresh.sha256, ctx.codec, max_samples)
+
+
+def _read_stored_pcm(ctx: AppContext, chunk: AudioChunk) -> bytes | None:
+    """保存済みファイルを読み、WAV の sha256 まで照合する。読めなければ None。
+
+    規則は routes_phase1._stored_chunk_intact と同じ（欠損・sha256 不一致・復号の失敗・OSError は読めない扱い）。
+    jobs から api を import しない（向きが逆になる）ので、同じ規則をここにも置く
+    """
+    try:
+        return read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec)
+    except (InvalidWavError, OSError):
+        return None
 
 
 def _stt_model_for(ctx: AppContext, meeting_id: str, conn) -> str | None:  # type: ignore[no-untyped-def]
@@ -3137,6 +4109,23 @@ def _stt_model_for(ctx: AppContext, meeting_id: str, conn) -> str | None:  # typ
     if m is not None and m.stt_model_used:
         return m.stt_model_used
     return ctx.models.stt.name if ctx.models.stt else None
+
+
+def _publish_created_job(ctx: AppContext, job_id: str) -> None:
+    """ハンドラのトランザクションで作ったジョブを、コミットの後に Runner._publish_job と同じ形で流す（Phase 2 §13）。"""
+    # 書き込みはコミット済み。読み直し・配信の失敗を Runner へ伝えると、終わった試行が失敗として記録され再試行される。
+    # 記録だけして戻る（購読側は再接続時の補完で追いつく。§13）。Exception だけを捕まえ、CancelledError は止めない
+    try:
+        with ctx.db.read() as conn:
+            job = repo.get_job(conn, job_id)
+            meeting = repo.get_meeting(conn, job.meeting_id) if job else None
+        if job is None:
+            return
+        ctx.events.publish(job.meeting_id, {"type": "job", "job": job.model_dump()})
+        if meeting is not None:
+            ctx.events.publish(job.meeting_id, {"type": "meeting_status", "status": meeting.status})
+    except Exception:
+        log.exception("failed to publish created job %s after commit", job_id)
 
 
 # ---- vad ----
@@ -3150,18 +4139,39 @@ async def handle_vad(ctx: AppContext, job: Job) -> str | None:
         # transcribe_chunk 生成へ進む。skipped は audio_chunks.stt_status 専用の値であり、
         # processing_jobs.status には存在しない（Phase 2 基本設計 §13.1）。
         async with ctx.db.write() as conn:
+            # lease が失効していれば書かない（Phase 2 基本設計 §9.3）。検査と書き込みは同じトランザクションで行う
+            if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                return None
             pipeline.on_vad_completed(conn, chunk, chunk.has_voice, _stt_model_for(ctx, job.meeting_id, conn), ctx.diarization_active)
         return None
     try:
-        pcm = read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec)
-    except InvalidWavError as e:
+        pcm = read_chunk_pcm(ctx, chunk)
+    except (InvalidWavError, OSError) as e:
+        # 読めないファイル（権限・取り外し。read_chunk_pcm は読み直しても読めなければ OSError のまま返す）も、壊れた WAV と同じく
+        # 修復を確かめ直し、無事でなければ missing にする。OSError のまま投げると INTERNAL で再試行を回数切れまで繰り返し、Chunk も missing にならない
+        repaired: bytes | None = None
         async with ctx.db.write() as conn:
-            repo.update_chunk(conn, chunk.id, save_status="missing")
-        raise InvalidAudioError(str(e)) from e
+            # 成功時と同じく、失効した旧ワーカーは Chunk を書かない（Phase 2 §12 handle_vad）。例外はそのまま投げる。
+            # 失敗の記録は Runner が行い、旧ワーカーの報告は finish_job の fencing が無視する
+            if repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                # 読めなかった後・このロックを取る前に再 PUT の修復（書き込みロックの下で書き戻す）が入っていれば、ファイルは無事。
+                # 同じトランザクションで行を読み直して照合し（_stored_chunk_intact と同じ規則）、無事なら missing にせず VAD を続ける。
+                # 確かめずに missing にすると、修復した Chunk を欠損と記録し、再試行しない INVALID_AUDIO で VAD が止まる
+                current = repo.get_chunk(conn, chunk.id)
+                repaired = await asyncio.to_thread(_read_stored_pcm, ctx, current) if current is not None else None
+                if repaired is None:
+                    repo.update_chunk(conn, chunk.id, save_status="missing")
+        if repaired is None:
+            raise InvalidAudioError(str(e)) from e
+        pcm = repaired
     result = await asyncio.to_thread(ctx.vad.detect, pcm)
     async with ctx.db.write() as conn:
-        repo.update_chunk(conn, chunk.id, has_voice=result.has_voice, server_vad_score=result.voiced_ratio, vad_source="server_silero")
-        pipeline.on_vad_completed(conn, chunk, result.has_voice, _stt_model_for(ctx, job.meeting_id, conn), ctx.diarization_active)
+        # 失効した旧ワーカーが書くと、failed の vad ジョブを残したまま Chunk が進む（Phase 2 §12 handle_vad）
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return None
+        # 既に適用済み（再試行で queued / completed の Chunk に来た）なら、VAD の値も書き換えない
+        if pipeline.on_vad_completed(conn, chunk, result.has_voice, _stt_model_for(ctx, job.meeting_id, conn), ctx.diarization_active):
+            repo.update_chunk(conn, chunk.id, has_voice=result.has_voice, server_vad_score=result.voiced_ratio, vad_source="server_silero")
     return None
 
 
@@ -3182,8 +4192,8 @@ async def _run_stt(ctx: AppContext, job: Job, chunk: AudioChunk, *, with_overlap
     compute = ctx.models.stt.compute_type if ctx.models.stt else "int8"
     device = ctx.models.stt.device if ctx.models.stt else "cpu"
     try:
-        pcm = read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, ctx.codec)
-        prev_pcm = read_pcm(ctx.settings.data_dir, prev.local_path, prev.sha256, ctx.codec) if prev is not None else None
+        pcm = read_chunk_pcm(ctx, chunk)
+        prev_pcm = read_chunk_pcm(ctx, prev) if prev is not None else None
     except InvalidWavError as e:
         async with ctx.db.write() as conn:
             repo.update_chunk(conn, chunk.id, save_status="missing")
@@ -3203,11 +4213,35 @@ async def _run_stt(ctx: AppContext, job: Job, chunk: AudioChunk, *, with_overlap
     timeout_s = max(30.0, chunk.duration_ms / 1000 * factor)
     req = STTRequest(pcm=stt_input, model_name=model_name, compute_type=compute, device=device, models_dir=str(ctx.settings.models_dir),
                      language=language, beam_size=1 if ctx.models.tier == "cpu_only" else 5)
+    # 推論は別のタスクで待ち、shield で包む。このハンドラがキャンセルされても（サーバーの終了など）推論のワーカーは止まらない
+    # （ProcessPool の実行中のタスクも asyncio.to_thread のスレッドも cancel できない）。_run_handler の数（ctx.stt_in_flight）は
+    # ハンドラが抜けた時点で減るので、キャンセルで抜けるときは、推論が終わるかプールの作り直しでワーカーが止まって
+    # タスクが終わるまで、ここで 1 つ数えておく（_hold_stt_until_done。数えないと、その推論と並んで分離を lease する）
+    work = asyncio.ensure_future(ctx.stt.transcribe(req, timeout_s))
     try:
-        result = await ctx.stt.transcribe(req, timeout_s)
+        result = await asyncio.shield(work)
     except asyncio.TimeoutError as e:
         raise JobTimeoutError(f"stt timeout after {timeout_s:.0f}s") from e
+    except asyncio.CancelledError:
+        if not work.done():
+            _hold_stt_until_done(ctx, work)
+        raise
     return result, prefix_ms, model_name, language, guess
+
+
+def _hold_stt_until_done(ctx: AppContext, work: asyncio.Future[STTResult]) -> None:
+    """キャンセルで抜けたハンドラの推論を、終わるまで ctx.stt_in_flight に数える（allowed_types が分離を lease しない）。
+
+    _run_handler の finally が減らすより前に増やすので、数は 0 に落ちない。プールの作り直し（タイムアウト・異常終了・サーバーの終了）で
+    ワーカーが止まると、推論のタスクは BrokenProcessPool などで終わり、そこで返す（handle_diarize の _release_when_done と同じ）
+    """
+    ctx.stt_in_flight += 1
+
+    def done(task: asyncio.Future[STTResult]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            log.warning("stt finished after its handler was cancelled: %s", task.exception())
+        ctx.stt_in_flight -= 1
+    work.add_done_callback(done)
 
 
 def _segments_from(result: STTResult, chunk: AudioChunk, prefix_ms: int, language: str) -> list[Segment]:
@@ -3227,13 +4261,17 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         chunk = pipeline.job_of_chunk(conn, job)
         existing = repo_phase3.segments_of_chunk(conn, chunk.id)
         meeting = repo.get_meeting(conn, job.meeting_id)
-    if existing:
+    # 再利用するのは Live の結果だけ。Chunk が既に completed なら、既存の segments は前の attempt の確定結果
+    # （コミット後に lease 切れで回収されたジョブの再試行）なので、Phase 2 と同じく撮り直して置き換える（Phase 2 詳細設計 §14）
+    if existing and chunk.stt_status != "completed":
         # Live STT の結果を再利用（§2.1）。完了にするのは lease の現行の所有者だけ（Phase 2 基本設計 §9.3）
         async with ctx.db.write() as conn:
             if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
                 return None
-            pipeline.on_transcribe_completed(conn, chunk, ctx.diarization_active)
+            created = pipeline.on_transcribe_completed(conn, chunk, ctx.diarization_active)
             repo.record_metric(conn, "stt_reused_live", 1, meeting_id=chunk.meeting_id)
+        if created is not None:
+            _publish_created_job(ctx, created)
         return None
     result, prefix_ms, model_name, language, guess = await _run_stt(ctx, job, chunk, with_overlap=True)
     segments = _segments_from(result, chunk, prefix_ms, language)
@@ -3242,7 +4280,38 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         # 書いた件数では判定しない。無音で segments が空だと失効していても 0 件になり、旧ワーカーが Chunk を完了にしてしまう
         if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
             return model_name
-        repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
+        # この Chunk の結果を置き換える。前の結果で merge が終わっていれば作り直して版を上げる（Phase 2 詳細設計 §14・手動 STT と同じ）
+        current = repo.get_chunk(conn, chunk.id)
+        replaced = current is not None and current.stt_status == "completed"
+        # 話者分離が終わっていると、ensure_merge_job は diarize_meeting を作り直さず merge へ進む。
+        # 置き換える前の segments の話者を、同じ source で時間の重なりが最大のものから新しい segments へ移す（§21 の割当と同じ規則）。
+        # 分離を再実行しないのは、ラベル（S1, S2…）が振り直されて利用者が付けた名前と食い違うため。話者の無い segments は移さない
+        # 既知の制限：分離の区間（turns）は保存していないので、引き継げるのは前の話者付き segments の時間範囲だけ。それと時間が
+        # 重ならない新しい segments（前の試行が拾わなかった発話）は話者なしで残る。ここに来るのはコミット後に lease が切れたジョブの
+        # 再試行（同じ音声・同じモデル）だけで、STT の再実行（request_rerun_stt）は segments を消して pending に戻すので通らない
+        previous = repo_phase3.segments_of_chunk(conn, chunk.id) if replaced else []
+        # 実行中の merge があれば、初めての完了（手動 STT）でも staged に置く。その merge の書き込みの後にコミットすると版に入らず、
+        # 一意制約で merge も作れない。Runner が merge の完了で入れ替え待ちを見て作り直す（Phase 2 §12 handle_transcribe）。
+        # 話者分離を作り直すとき（初めての完了）は、on_transcribe_completed が実行中の merge の行を消す（書く前なら書かせない）。
+        # 分離は staged 行にも話者を付け、その完了後の merge が入れ替える
+        merge_running = repo.count_jobs(conn, chunk.meeting_id, "merge_transcript", ["leased", "processing"]) > 0
+        if replaced or merge_running:
+            # 前の結果は公開中の版に載っていることがあるので消さず、次の merge が版を上げるのと同じトランザクションで入れ替える
+            # （Phase 2 §12 handle_transcribe・repo.promote_replacements）。下の話者の付け直しは staged_segments にも届く
+            repo.stage_replacement(conn, chunk.meeting_id, chunk.id)
+            repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts, staged=True)
+        else:
+            repo.delete_segments_of_chunk(conn, chunk.id)
+            repo.insert_segments(conn, segments, job_id=job.id, owner=job.lease_owner or "", attempts=job.attempts)
+        carried = tuple(SpeakerTurn(p.source, p.start_ms, p.end_ms, p.speaker_id,
+                                    p.speaker_confidence if p.speaker_confidence is not None else 0.0)
+                        for p in previous if p.speaker_id is not None)
+        if carried:
+            for sid, label, conf in _assign_speakers(segments, carried):
+                repo_phase3.set_segment_speaker(conn, sid, label, conf)
+        # 初めての完了でも完了済みの merge を消す。手動 STT を受け付けた時点で実行中だった merge が先に終わっていると、
+        # 残した行が一意制約で作り直しを止める（Phase 2 §12 handle_transcribe）
+        repo.delete_finished_job(conn, chunk.meeting_id, "merge_transcript")
         if meeting is not None and meeting.stt_model_used is None:
             repo.update_meeting(conn, chunk.meeting_id, stt_model_used=model_name)
         repo.record_metric(conn, "stt_seconds", chunk.duration_ms / 1000, model_name=model_name, meeting_id=chunk.meeting_id)
@@ -3251,7 +4320,10 @@ async def handle_transcribe(ctx: AppContext, job: Job) -> str | None:
         if guess is not None:
             repo.record_metric(conn, "language_prob", guess.probability, meeting_id=chunk.meeting_id)
         repo_phase3.save_language_ratio(conn, chunk.meeting_id, repo_phase3.language_ratio(conn, chunk.meeting_id))
-        pipeline.on_transcribe_completed(conn, chunk, ctx.diarization_active)
+        created = pipeline.on_transcribe_completed(conn, chunk, ctx.diarization_active)
+    # 作ったジョブはコミットの後に流す（Runner の完了処理の ensure_merge_job は既存で None を返す）
+    if created is not None:
+        _publish_created_job(ctx, created)
     return model_name
 
 
@@ -3294,40 +4366,210 @@ def _assign_speakers(segments: list[Segment], turns: tuple[SpeakerTurn, ...]) ->
     return out
 
 
+def _align_labels(segments: list[Segment], turns: tuple[SpeakerTurn, ...], taken: set[str]) -> tuple[SpeakerTurn, ...]:
+    """作り直した分離のラベルを、前の分離で segments に付いたラベルへ付け替える（利用者が付けた名前と食い違わせない）。
+
+    分離をやり直すとラベル（S1, S2…）は振り直される。同じ source で時間が重なる長さの合計が大きい組から 1 対 1 で対応付ける。
+    対応の無いラベルは taken（segments と meeting_speakers のラベル）と重ならない新しいラベルにする。
+    """
+    overlap: dict[tuple[str, str], int] = {}
+    for s in segments:
+        if s.speaker_id is None:
+            continue
+        for t in turns:
+            ov = min(s.end_ms, t.end_ms) - max(s.start_ms, t.start_ms)
+            if t.source == s.source and ov > 0:
+                overlap[(t.label, s.speaker_id)] = overlap.get((t.label, s.speaker_id), 0) + ov
+    mapping: dict[str, str] = {}
+    used: set[str] = set()
+    for (new, old), _ in sorted(overlap.items(), key=lambda kv: (-kv[1], kv[0])):
+        if new not in mapping and old not in used:
+            mapping[new] = old
+            used.add(old)
+    reserved = set(taken) | used
+    n = 1
+    for new in sorted({t.label for t in turns} - set(mapping)):
+        while f"S{n}" in reserved:
+            n += 1
+        mapping[new] = f"S{n}"
+        reserved.add(mapping[new])
+    return tuple(SpeakerTurn(t.source, t.start_ms, t.end_ms, mapping[t.label], t.confidence) for t in turns)
+
+
+def _release_when_done(slots: asyncio.Semaphore, worker: asyncio.Future[DiarizationResult]) -> None:
+    """分離のスレッドが抜けたら実行枠を返す（handle_diarize がキャンセル・時間切れで先に抜けたとき）。
+
+    返すのは Future の完了の通知（イベントループの上で呼ばれる）。スレッドの関数の finally で返すと、ループの外から Semaphore に
+    触ることになる。結果は捨てる（呼び出し元は抜けている）。例外は取り出して、未取得の警告を出さない
+    """
+    def done(task: asyncio.Future[DiarizationResult]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            log.warning("diarization finished after its handler left: %s", task.exception())
+        slots.release()
+    worker.add_done_callback(done)
+
+
+def _abandon_until_done(ctx: AppContext, worker: asyncio.Future[DiarizationResult]) -> None:
+    """時間切れで見放したスレッドを、抜けるまで ctx.diarize_abandoned に数える（JobRunner.allowed_types が STT と要約の排他で除く）。"""
+    ctx.diarize_abandoned += 1
+
+    def done(_: asyncio.Future[DiarizationResult]) -> None:
+        ctx.diarize_abandoned -= 1
+        log.warning("abandoned diarization thread exited; the diarization slot is free again")
+    worker.add_done_callback(done)
+
+
+def _start_diarize_thread(fn: Callable[[], DiarizationResult]) -> asyncio.Future[DiarizationResult]:
+    """fn をデーモンスレッドで走らせ、結果をイベントループの Future で返す。
+
+    asyncio.to_thread（既定の executor）は使わない。既定の executor のスレッドはインタープリタの終了時に join されるので、
+    固まった分離が残っていると、サーバーを止めてもプロセスが抜けず、再起動で回復できない。デーモンスレッドはプロセスの終了で止まる。
+    結果はループのスレッドで Future に渡す（call_soon_threadsafe）。ループが閉じた後（サーバーの終了）に届いた結果は捨てる
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[DiarizationResult] = loop.create_future()
+
+    def deliver(outcome: Callable[[], None]) -> None:
+        try:
+            loop.call_soon_threadsafe(lambda: None if future.done() else outcome())
+        except RuntimeError:
+            log.info("diarization finished after the event loop closed; the result is discarded")
+
+    def run() -> None:
+        try:
+            result = fn()
+        except Exception as e:  # noqa: BLE001  ハンドラ側（normalize_exception）で分類する
+            error = e   # except を抜けると e は消える。後でループのスレッドが呼ぶ lambda には別の名前で渡す
+            deliver(lambda: future.set_exception(error))
+            return
+        deliver(lambda: future.set_result(result))
+
+    threading.Thread(target=run, name="diarize", daemon=True).start()
+    return future
+
+
+def _diarize_timeout_s(ctx: AppContext, targets: list[AudioChunk]) -> float:
+    """分離を待つ時間の上限（秒）。全 Chunk の長さ × 段（GPU / CPU）の係数、下限 diarize_timeout_min_s。
+
+    分離を待つ間も Runner の heartbeat が lease を延ばすので、生きたまま固まった分離（返らない provider.diarize）は lease 切れでは
+    見つからない。この上限で見つける（STT の stt_timeout_factor と同じ考え方）
+    """
+    th = ctx.settings.thresholds
+    factor = th.diarize_timeout_factor_cpu if ctx.models.tier == "cpu_only" else th.diarize_timeout_factor_gpu
+    audio_s = sum(c.duration_ms for c in targets) / 1000
+    return max(th.diarize_timeout_min_s, audio_s * factor)
+
+
+def _load_and_diarize(ctx: AppContext, provider: DiarizationProvider, meeting_id: str, targets: list[AudioChunk]) -> DiarizationResult:
+    """分離のスレッドの本体。Chunk の PCM を読んで復号し（FLAC を含む）、分離する。
+
+    読み込みと復号もスレッドで行う。イベントループで行うと、1 source あたり最大約 461 MB の読み込みと復号の間、API・SSE・
+    heartbeat が止まる。分離と同じスレッドにまとめるのは、実行枠（diarize_slots）の返却をスレッドの終わりに一本化するため
+    （読み込みだけを別のスレッドにすると、その間にハンドラがキャンセルされたとき、読み込みが続いたまま枠が返る）
+    """
+    pcm_by_source: dict[str, list[tuple[int, bytes]]] = {}
+    loaded: dict[str, int] = {}
+    limit = MAX_TIMELINE_MS * 32   # 1 source あたりの上限（16 kHz・PCM16 で 1 ms = 32 バイト）
+    for c in targets:
+        # 読む前に、この source の残りの量（サンプル数）を上限として渡す。壊れた・差し替えられた圧縮ファイルが行の時刻よりはるかに
+        # 長く復号されても、全量を PCM にする前に断る（Chunk ごとに上限全体を渡すと、1 つで約 461 MB を確保しうる）。
+        # 長さの検査は sha256 の照合より前なので、壊れていて上限も超えるファイルは、飛ばす（InvalidWavError）のではなく分離ごと断る
+        try:
+            pcm = read_chunk_pcm(ctx, c, max_samples=(limit - loaded.get(c.source, 0)) // 2)
+        except PcmTooLongError as e:
+            raise InvalidAudioError(f"diarization input too large: {c.source}") from e
+        except (InvalidWavError, OSError):
+            # 壊れた Chunk も、読めない Chunk（権限・I/O エラー。read_chunk_pcm は読み直しても変わらなければ元の OSError を返す）も飛ばし、
+            # 読める Chunk で分離を続ける。OSError を通すと、1 つの Chunk で会議全体の話者分離が失敗する
+            continue
+        # 読んだ後にも確かめる（二重の守り。読む前の上限と同じ値）
+        loaded[c.source] = loaded.get(c.source, 0) + len(pcm)
+        if loaded[c.source] > limit:
+            raise InvalidAudioError(f"diarization input too large: {c.source} {loaded[c.source]} bytes")
+        pcm_by_source.setdefault(c.source, []).append((c.start_offset_ms, pcm))
+    req = DiarizationRequest(meeting_id=meeting_id, pcm_by_source=pcm_by_source, models_dir=str(ctx.settings.models_dir),
+                             work_dir=str(ctx.settings.tmp_dir))
+    return provider.diarize(req)
+
+
 async def handle_diarize(ctx: AppContext, job: Job) -> str | None:
     if ctx.diarization is None:
         raise ModelMissingError("diarization provider not available")
-    with ctx.db.read() as conn:
-        chunks = repo.list_chunks(conn, job.meeting_id)
-        segments = repo.list_segments(conn, job.meeting_id)
-    pcm_by_source: dict[str, list[tuple[int, bytes]]] = {}
-    for c in chunks:
-        if c.stt_status != "completed":
-            continue
+    # 実行枠（ctx.diarize_slots。上限は MAX_CONCURRENT_DIARIZE）を取ってから Chunk を読む。PCM を読んだ後に待つと、待つ間も
+    # 読んだ分（1 source あたり最大約 461 MB）を抱える。pending に戻された旧い試行（requeue_running_job）は、lease を失っても
+    # asyncio.to_thread のスレッドを止められないので、スレッドが抜けて枠を返すまで次の試行は分離を始めない。
+    # 待つ間も Runner の heartbeat が lease を延ばす（待っている試行は Runner の 1 枠を占める）
+    # 枠は async with で持たない。分離を待つハンドラがキャンセルされる（サーバーの終了など）と、async with はスレッドが走ったまま
+    # 枠を返し、次の試行が並んで分離を始める。スレッドを待つ間に抜けたときは、スレッドが抜けた時点で枠を返す（_release_when_done）
+    provider = ctx.diarization
+    await ctx.diarize_slots.acquire()
+    worker: asyncio.Future[DiarizationResult] | None = None
+    try:
+        with ctx.db.read() as conn:
+            chunks = repo.list_chunks(conn, job.meeting_id)
+        targets = [c for c in chunks if c.stt_status == "completed"]
+        # PCM を読む前に、行の時刻で 1 source のタイムラインの長さを確かめる（assemble_timeline と同じ上限。§9 の表）。
+        # 超えれば InvalidAudioError（再試行しない）で、話者分離なしで merge へ進む（§2.2）
+        check_timeline_span([(c.source, c.start_offset_ms, c.end_offset_ms) for c in targets])
+        # PCM の読み込み・復号（読んだ量の上限の確認を含む）と分離を 1 つのデーモンスレッドで行う（_load_and_diarize）。
+        # スレッドの終わりは Future で受け、shield で包んで待つ。このハンドラがキャンセル・時間切れで抜けても Future は残り、
+        # スレッドの終わりを知らせる（枠はそこで返す。下の finally）
+        worker = _start_diarize_thread(functools.partial(_load_and_diarize, ctx, provider, job.meeting_id, targets))
+        timeout_s = _diarize_timeout_s(ctx, targets)
         try:
-            pcm = read_pcm(ctx.settings.data_dir, c.local_path, c.sha256, ctx.codec)
-        except InvalidWavError:
-            continue
-        pcm_by_source.setdefault(c.source, []).append((c.start_offset_ms, pcm))
-    req = DiarizationRequest(meeting_id=job.meeting_id, pcm_by_source=pcm_by_source, models_dir=str(ctx.settings.models_dir))
-    result = await asyncio.to_thread(ctx.diarization.diarize, req)
-    assignments = _assign_speakers(segments, result.turns)
-    async with ctx.db.write() as conn:
-        for sid, label, conf in assignments:
-            repo_phase3.set_segment_speaker(conn, sid, label, conf)
-        for label in sorted({lb for _, lb, _ in assignments if lb}):
-            conn.execute("INSERT OR IGNORE INTO meeting_speakers (meeting_id, label, name, updated_at) VALUES (?,?,NULL,?)",
-                         (job.meeting_id, label, now_ms()))
-        repo.record_metric(conn, "diarize_duration_ms", result.duration_ms, meeting_id=job.meeting_id)
-        repo.record_metric(conn, "diarize_speakers", result.speaker_count, meeting_id=job.meeting_id)
-    return None
+            result = await asyncio.wait_for(asyncio.shield(worker), timeout_s)
+        except asyncio.TimeoutError as e:
+            # 生きたまま固まった分離。スレッドは止められないので見放す：枠は抜けるまで持ち（finally の _release_when_done。次の分離は
+            # 始めない）、STT と要約の排他では数えない（_abandon_until_done）。ジョブは再試行せず failed にし、話者分離なしで
+            # merge へ進む（Runner._on_failure）。スレッドが後で抜ければ結果は捨て（ハンドラは抜けている）、枠を返す。
+            # 抜けなければ、プロセスの終了（サーバーの再起動）で止まる（デーモンスレッド。_start_diarize_thread）
+            _abandon_until_done(ctx, worker)
+            log.error("diarization of meeting %s did not finish in %.0fs; abandoning its thread (restart the server to free the slot "
+                      "if it never exits)", job.meeting_id, timeout_s)
+            raise JobTimeoutError(f"diarization timeout after {timeout_s:.0f}s") from e
+        async with ctx.db.write() as conn:
+            # lease が失効していれば何も書かない（Phase 2 基本設計 §9.3）。分離は長く走るので、失効した旧ワーカーが
+            # merge の後でラベルを上書きしたり、新しい attempt の結果を古い結果で置き換えたりする
+            if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+                return None
+            # 割り当てる segments は書き込みトランザクションの中で読み直す。分離の実行中に completed の Chunk を撮り直すと
+            # （handle_transcribe）、前の segments にまだ話者が無いので引き継ぎ（carried）は空のまま新しい staged 行が入り、
+            # 開始時に読んだ ID だけに書くと、その行は話者の無いまま次の merge で昇格する。読み直せば staged 行にも付く。
+            # 撮り直して入れ替え待ちの segments にも付ける（失敗した分離の再試行は merge の後に走りうる。入れ替えで話者を失わない）
+            segments = repo.list_segments(conn, job.meeting_id) + repo_phase3.staged_segments_of_meeting(conn, job.meeting_id)
+            turns = result.turns
+            if any(s.speaker_id is not None for s in segments):
+                # 作り直した分離（無音と判定した Chunk を手動 STT した後。transcribe_silent_chunk）。話者の付いた segments は変えず、
+                # 話者の無い segments（拾い直した音声）だけに、前のラベルへ付け替えた区間で付ける。失敗すれば何も変えずに merge へ進む
+                taken = {s.speaker_id for s in segments if s.speaker_id is not None} | {sp.label for sp in repo_phase3.list_speakers(conn, job.meeting_id)}
+                turns = _align_labels(segments, turns, taken)
+                segments = [s for s in segments if s.speaker_id is None]
+            assignments = _assign_speakers(segments, turns)
+            for sid, label, conf in assignments:
+                repo_phase3.set_segment_speaker(conn, sid, label, conf)
+            for label in sorted({lb for _, lb, _ in assignments if lb}):
+                conn.execute("INSERT OR IGNORE INTO meeting_speakers (meeting_id, label, name, updated_at) VALUES (?,?,NULL,?)",
+                             (job.meeting_id, label, now_ms()))
+            repo.record_metric(conn, "diarize_duration_ms", result.duration_ms, meeting_id=job.meeting_id)
+            repo.record_metric(conn, "diarize_speakers", result.speaker_count, meeting_id=job.meeting_id)
+        return None
+    finally:
+        if worker is None or worker.done():
+            ctx.diarize_slots.release()   # スレッドを始める前に抜けた（タイムラインの上限など）か、スレッドが抜けている
+        else:
+            _release_when_done(ctx.diarize_slots, worker)   # スレッドがまだ走っている（キャンセル・時間切れで抜けた）
 
 
 # ---- merge / summary ----
 
 async def handle_merge(ctx: AppContext, job: Job) -> str | None:
     async with ctx.db.write() as conn:
+        # lease が失効していれば何も書かない（Phase 2 §12 handle_merge）
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return None
         report = run_merge(conn, job.meeting_id, ctx.settings.thresholds)
+        # 撮り直しの結果は handle_transcribe の時点では transcript_segments に無い。入れ替えた後の segments で言語比率を取り直す
+        repo_phase3.save_language_ratio(conn, job.meeting_id, repo_phase3.language_ratio(conn, job.meeting_id))
         pipeline.on_merge_completed(conn, job.meeting_id)
         repo.record_metric(conn, "merge_echo", report.echo, meeting_id=job.meeting_id)
     ctx.events.publish(job.meeting_id, {"type": "transcript_version", "transcriptVersion": report.transcript_version})
@@ -3359,16 +4601,32 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
             raise InvalidAudioError("meeting missing")
         lines, gaps = render_lines(conn, job.meeting_id, meeting.transcript_version)
         seg_texts = {ln.segment_id: ln.text for ln in lines}
+    # 合成に使う版をジョブの行へ控える（lease の現行の所有者だけ）。合成の途中でワーカーが落ちて lease が切れたとき、Sweeper が
+    # この版と今の版を比べ、進んでいれば古い版に対する試行として回数に数えずに同じ行を戻す（§14 sweeper.sweep_once。§12.7）。
+    # ハンドラの失敗は JobError.input_transcript_version で同じ比較をする（Runner._on_failure）
+    async with ctx.db.write() as conn:
+        repo.record_input_transcript_version(conn, job.id, job.lease_owner or "", job.attempts, meeting.transcript_version)
     ratio = json.loads(meeting.language_ratio_json) if meeting.language_ratio_json else {}
     language, mixed = _summary_language(ctx, ratio)
     text = format_for_llm(lines, gaps)
     if mixed:
         text = (MIXED_NOTE_EN if language == "en" else MIXED_NOTE_JA) + "\n" + text
     th = ctx.settings.thresholds
-    synth = await synthesize(ctx.llm, llm_model, language, text, DEFAULT_LLM_CTX_TOKENS, th.llm_ctx_fill_ratio)
-
-    index = SegmentIndex(seg_texts)
-    accepted, rejected, unresolved = validate(synth.draft, index)
+    try:
+        synth = await synthesize(ctx.llm, llm_model, language, text, DEFAULT_LLM_CTX_TOKENS, th.llm_ctx_fill_ratio)
+        index = SegmentIndex(seg_texts)
+        accepted, rejected, unresolved = validate(synth.draft, index)
+    except Exception as exc:
+        # 合成・検証の失敗に、合成に使った transcript の版を付けて投げる。Runner の _on_failure が、失敗を記録する書き込み
+        # トランザクションの中で今の版と比べ、進んでいれば failed にせず同じ行を pending に戻す（古い版に対する失敗。failed に
+        # すると会議も failed になり、新しい版の要約ジョブは実行中のこの行が一意制約で先にあるので作られていない）。
+        # 比較をここで別のトランザクションで行うと、比較の後・失敗の記録の前に merge が版を進めたとき failed になる。
+        # CancelledError は捕まえない
+        err = normalize_exception(exc)
+        err.input_transcript_version = meeting.transcript_version
+        if err is exc:
+            raise
+        raise err from exc
     total = len(synth.draft.topics) + len(synth.draft.decisions) + len(synth.draft.actionItems)
     t = now_ms()
     summary = MeetingSummary(
@@ -3379,6 +4637,18 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
     report = SummaryValidationReport(schemaValid=True, schemaRetries=synth.schema_retries, mapWindows=synth.map_windows,
                                      totalItems=total, rejectedItems=len(rejected), unresolvedSegmentIds=unresolved)
     async with ctx.db.write() as conn:
+        # lease が失効していれば要約も会議の completed も書かない（基本設計 §9.3）。Sweeper が回数切れで failed にした後に
+        # 書くと、failed のジョブと completed の会議が組になる。検査と書き込みは同じトランザクションで行う
+        if not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts):
+            return llm_model
+        # 合成の間に merge（撮り直しの入れ替え・手動 STT の後）が transcript の版を進めていれば、古い版の要約を保存せず、
+        # 会議も completed にしない（merge が transcribed にした状態のまま）。merge の on_merge_completed が作ろうとする要約ジョブは、
+        # 実行中のこの行が一意制約（uq_summary_job）で先にあるので作られない。この試行を取り消して同じ行を pending に戻し、
+        # 新しい版で合成し直す（まだ要約を保存していないので、§12.7 の「進んだ後の再生成」ではなく元の要求の続き）
+        current = repo.get_meeting(conn, job.meeting_id)
+        if current is not None and current.transcript_version != meeting.transcript_version:
+            repo.requeue_job(conn, job.id, job.lease_owner or "", job.attempts)
+            return llm_model
         version = repo.next_summary_version(conn, job.meeting_id)
         repo.insert_summary(conn, SummaryVersion(
             id=repo.new_id(), meeting_id=job.meeting_id, version=version, transcript_version=meeting.transcript_version,
@@ -3388,6 +4658,10 @@ async def handle_summary(ctx: AppContext, job: Job) -> str | None:
         repo.update_meeting(conn, job.meeting_id, llm_model_used=llm_model, summary_language=language)
         repo.record_metric(conn, "llm_schema_fail", synth.schema_retries, model_name=llm_model, meeting_id=job.meeting_id)
         pipeline.on_summary_completed(conn, job.meeting_id)
+        # ジョブも同じトランザクションで completed にする（lease は Runner の finish_job が外す）。finish_job の前にワーカーが落ちても、
+        # Sweeper はコミット済みの試行を回収しない。回収すると要約を作り直し（版が進んでいれば §12.7 の自動の再生成になる）、
+        # 回数切れなら failed にする
+        repo.mark_job_committed(conn, job.id, job.lease_owner or "", job.attempts)
     ctx.events.publish(job.meeting_id, {"type": "summary_version", "version": version})
     return llm_model
 
@@ -3402,22 +4676,59 @@ async def handle_compress(ctx: AppContext, job: Job) -> str | None:
     with ctx.db.read() as conn:
         chunk = pipeline.job_of_chunk(conn, job)
     if chunk.codec != "wav":
+        # 切り替えのコミット後・WAV の削除前に落ちた回のやり直し。残っている WAV を消す（圧縮済みが正なので、消してよい）
+        await _unlink_wav_if_still_compressed(ctx, job, chunk.id, chunk.local_path)
         return codec.name
     wav_path = ctx.settings.data_dir / chunk.local_path
     if not wav_path.exists():
         raise InvalidAudioError(f"wav missing: {chunk.local_path}")
-    pcm = read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, None)
+    # 大きさはエンコードの前に測る。後で測ると、その間に lease を引き継いだ試行が確定して WAV を消していると失敗し、一時ファイルが残る
+    wav_size = wav_path.stat().st_size
+    try:
+        pcm = read_pcm(ctx.settings.data_dir, chunk.local_path, chunk.sha256, None)
+    except InvalidWavError as e:
+        raise InvalidAudioError(str(e)) from e          # 壊れた WAV は圧縮しない（再試行しても直らない）
     encoded = await asyncio.to_thread(codec.encode, pcm)
     restored = await asyncio.to_thread(codec.decode, encoded)
     if sha256_hex(build_wav(restored)) != chunk.sha256:
         raise InvalidAudioError("round-trip mismatch; keeping wav")
     new_rel = str(Path(chunk.local_path).with_suffix(codec.extension))
-    write_atomic(ctx.settings.data_dir, new_rel, encoded)
-    async with ctx.db.write() as conn:
-        repo.update_chunk(conn, chunk.id, local_path=new_rel, codec=codec.name, sha256_flac=sha256_hex(encoded), size_bytes=len(encoded))
-        repo.record_metric(conn, "compress_saved_bytes", wav_path.stat().st_size - len(encoded), meeting_id=chunk.meeting_id)
-    wav_path.unlink(missing_ok=True)
+    new_path = ctx.settings.data_dir / new_rel
+    # 試行ごとに別の一時ファイルへ書く（同じディレクトリなので os.replace は原子的）。最終パスへ直接書くと、lease を失った
+    # 旧い試行が、確定した別の試行の圧縮ファイルを上書きしたり、後始末で消したりする。拡張子が .staging なので rebuild は拾わない
+    staging = write_atomic(ctx.settings.data_dir, f"{new_rel}.{repo.new_id()}.staging", encoded)
+    saved_bytes = wav_size - len(encoded)
+    try:
+        async with ctx.db.write() as conn:
+            # 切り替えるのは lease の現行の所有者だけ（Phase 2 基本設計 §9.3）。STT の再実行はジョブを行ごと消し（§8）、
+            # 再 PUT の修復は Chunk を書き戻す。どちらかが先に起きていたら WAV のまま残し、この試行の一時ファイルだけを消す（finally）
+            current = repo.get_chunk(conn, chunk.id)
+            if (not repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts)
+                    or current is None or current.local_path != chunk.local_path or current.sha256 != chunk.sha256):
+                return codec.name
+            # lease の確認と同じ書き込みロックの下で置き換える。確認の後に別の試行が割り込んで先に確定することはない
+            os.replace(staging, new_path)
+            repo.update_chunk(conn, chunk.id, local_path=new_rel, codec=codec.name, sha256_flac=sha256_hex(encoded), size_bytes=len(encoded))
+            repo.record_metric(conn, "compress_saved_bytes", saved_bytes, meeting_id=chunk.meeting_id)
+    finally:
+        staging.unlink(missing_ok=True)   # 置き換えた後は存在しない。消すのはこの試行の一時ファイルだけ
+    # 切り替えのコミットの後に再 PUT の修復が入ると、同じパスへ WAV を書き戻す。確かめずに消すとその WAV を消す
+    await _unlink_wav_if_still_compressed(ctx, job, chunk.id, new_rel)
     return codec.name
+
+
+async def _unlink_wav_if_still_compressed(ctx: AppContext, job: Job, chunk_id: str, compressed_rel: str) -> None:
+    """圧縮済みの Chunk の隣に残る WAV を消す（§2.4 (c)）。
+
+    消すのは書き込みロックの下で、lease が現行で、Chunk がまだ圧縮済みのファイル（compressed_rel）を指しているときだけ。
+    再 PUT の修復は書き込みロックの下で WAV に書き戻して codec を wav に戻すので、確かめた後・消すまでの間に割り込まない。
+    修復が先に入っていれば、その WAV が正なので残す
+    """
+    async with ctx.db.write() as conn:
+        current = repo.get_chunk(conn, chunk_id)
+        if (repo.lease_is_current(conn, job.id, job.lease_owner or "", job.attempts)
+                and current is not None and current.codec != "wav" and current.local_path == compressed_rel):
+            (ctx.settings.data_dir / compressed_rel).with_suffix(".wav").unlink(missing_ok=True)
 
 
 HANDLERS = {
@@ -3442,6 +4753,19 @@ def exclude_failed(conn: sqlite3.Connection, meeting_id: str, diarize: bool = Fa
 ---
 
 # 22. 起動処理 `bootstrap.py`（変更）と CLI `__main__.py`（変更）
+
+Phase 2 §22 からの変更点。
+
+| 場面 | 動作 |
+| --- | --- |
+| `build_context`：DB が壊れている | `open_database_with_recovery` が退避と復元を行い（§17）、マイグレーションの後で `rebuild` が録音ファイルから行を作り直す（§18）。結果は `AppContext.recovery`。正常なら `None` |
+| `serve` | ロック → 一時ディレクトリ（`{dataDir}/tmp`）を空にする → `build_context` → 復旧していれば警告を標準エラーに出す → 以降は Phase 2 と同じ（bind → トークン → sweep → `resume_finalized` → Runner・Sweeper・定期処理のループ）。復旧で `finalized` に戻った会議は `resume_finalized` がジョブを作る |
+| `doctor`（serve が動いていない） | ロックを取り、`build_context(recover=True)`。壊れた DB はここでも復旧する |
+| `doctor`（serve が動いている） | ロックが取れないので `build_context(recover=False)`。使用中の DB を退避・復元しない。DB が開けなければ「サーバーを再起動して復旧する」と出して終了コード 1 |
+| `doctor --rebuild` | ロックが取れなければ何もせず終了コード 1（「サーバーを止めてから」）。取れたら `rebuild` を実行して件数を出す。`users` に行の無い所有者の会議があれば、その ID と手順（置き換える前に今の DB を `-wal`・`-shm` ごと `{dataDir}` の直下で別名へ移す）を警告し、選んだバックアップの後のノートと要約は移したファイルを戻さない限り失われる。戻すときはサーバーを止め、置き換えた DB を `-wal`・`-shm` ごと別名へ移してから戻すことも示す（`_warn_unowned`。§2.5） |
+| `doctor --init-tls [--host …]` | 証明書を作って終了する（DB もロックも触らない）。既存の証明書は上書きする（端末側の受け入れはやり直しになる） |
+| `user add <name>` | 同名は終了コード 1（トレースバックにしない）。最初の 1 人のときは、再起動で複数利用者に切り替わること・`token` ファイルが使えなくなること・既存の会議が見えなくなることを表示する（§2.5） |
+| `user remove <id>` | 利用者を削除する。トークンは次の要求から通らない。会議と録音は消さない。最後の 1 人のときは、再起動で単一利用者に戻ることを表示する。該当なしは終了コード 1 |
 
 ```python
 # minutes_local/bootstrap.py
@@ -3470,6 +4794,7 @@ from .jobs.selection import select_models
 from .llm.provider import SummaryProvider
 from .storage import backup
 from .storage.codec import AudioCodec
+from .storage.rebuild import rebuild
 from .stt.executor import InlineExecutor, PoolExecutor, STTExecutor
 from .stt.language import LanguageDetector
 from .stt.provider import STTProvider
@@ -3515,12 +4840,25 @@ def read_token(path: Path) -> str | None:
     return path.read_text(encoding="ascii").strip() or None
 
 
-def open_database_with_recovery(settings: Settings) -> tuple[Database, Path | None]:
-    """integrity_check に失敗したら直近バックアップから復元して開く（§2.4）。戻り値の 2 番目は復元元。"""
-    restored: Path | None = None
-    if not backup.integrity_ok(settings.db_path):
+def open_database_with_recovery(settings: Settings) -> tuple[Database, backup.Recovery | None]:
+    """integrity_check に失敗したら、壊れた DB を退避し、直近のバックアップ（なければ空の DB）で開く（§2.4）。
+
+    壊れていなければ 2 番目は None。使えるバックアップがなくても起動は止めない。サーバーが動いていなければブラウザは
+    Chunk を送れず、録音ファイルが残っていれば会議は作り直せる（Invariant 10）。作り直しは build_context が行う。
+
+    前回の復旧が途中で止まっていれば（backup.pending_recovery）、DB が無くても初回起動とみなさない。DB が無い・壊れていれば
+    復元からやり直し、復元済みなら作り直し（rebuild）だけをやり直す。控えが無ければ従来どおり（DB が無ければ初回起動）。
+    """
+    pending = backup.pending_recovery(settings.db_path)
+    if pending is not None:
+        if settings.db_path.exists() and backup.integrity_ok(settings.db_path):
+            return Database(settings.db_path), pending
         restored = backup.restore_latest(settings.db_path, settings.backups_dir)
-    return Database(settings.db_path), restored
+        return Database(settings.db_path), backup.Recovery(restored_from=restored)
+    if backup.integrity_ok(settings.db_path):
+        return Database(settings.db_path), None
+    restored = backup.restore_latest(settings.db_path, settings.backups_dir)
+    return Database(settings.db_path), backup.Recovery(restored_from=restored)
 
 
 def _default_codec() -> AudioCodec | None:
@@ -3593,12 +4931,27 @@ def acquire_data_dir_lock(data_dir: Path) -> int | None:
 async def build_context(settings: Settings, *, stt_provider: STTProvider | None = None, vad_provider: VADProvider | None = None,
                         llm_provider: SummaryProvider | None = None, hardware: Hardware | None = None,
                         diarization_provider: DiarizationProvider | None = None, language_detector: LanguageDetector | None = None,
-                        codec: AudioCodec | None = None, tls_enabled: bool = False) -> AppContext:
+                        codec: AudioCodec | None = None, tls_enabled: bool = False, recover: bool = True) -> AppContext:
+    """recover=False は、動いている serve の横で呼ぶ `doctor` 用。壊れた DB の退避・復元をしない（使用中の DB を動かさない）。"""
+    # モデルの取得とテレメトリを止める（Zero External Data Egress。§12 の表「通信」）。どのモデルを読むよりも前に、プロセスの最初で設定する。
+    # huggingface_hub は import 時に HF_HUB_OFFLINE を読む。言語判定（FasterWhisperLanguageDetector）は同じプロセスで faster_whisper を
+    # import し、transcribe は話者分離より先に走るので、PyannoteDiarizationProvider._load での設定だけでは間に合わない。
+    # STT の ProcessPool（spawn）のワーカーも、起動時の環境を受け継ぐ
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["PYANNOTE_METRICS_ENABLED"] = "false"
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     restrict_to_current_user(settings.data_dir)   # 録音・トークン・DB を置く。他の OS ユーザーに読ませない
-    db, _restored = open_database_with_recovery(settings)
+    db, recovery = open_database_with_recovery(settings) if recover else (Database(settings.db_path), None)
     migrate(db)
     apply_phase3(db, settings.data_dir)
+    codec = codec if codec is not None else _default_codec()
+    if recovery is not None:
+        # 復元元のバックアップより後に録音した会議（バックアップがなければ全部）は DB にない。録音ファイルから行を作り直す（§18）。
+        # 確定済みの会議は finalized で戻り、serve の resume_finalized がジョブを作る。要約とノートは作り直せない
+        with db.write_sync() as conn:
+            recovery.rebuilt = rebuild(conn, settings.data_dir, codec)
+        # 作り直しまで終えてから控えを消す。ここまでに止まれば、次の起動がやり直す（rebuild は既存の行を上書きしない）
+        backup.finish_recovery(settings.db_path)
     with db.read() as conn:
         settings = settings.with_overrides(repo.get_settings(conn))
         multi_user = user_count(conn) > 0
@@ -3624,14 +4977,15 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
                 from .vad.silero_provider import SileroVADProvider
                 vad = SileroVADProvider(p, th.vad_threshold, th.vad_min_speech_ms, th.vad_min_voiced_ms)
             except ImportError:
-                # モデルは置いてあるが onnxruntime（extras の vad）が入っていない。起動を止めず、未配置と同じく
+                # モデルは置いてあるが onnxruntime（extras の stt / cuda）が入っていない。起動を止めず、未配置と同じく
                 # ブラウザ側の VAD で進める（doctor の vad 行に NOT INSTALLED と出る）
                 vad = None
 
     diarization = diarization_provider
     if diarization is None and (settings.models_dir / "diarization" / "config.yaml").exists():
         from .diarization.pyannote_provider import PyannoteDiarizationProvider
-        diarization = PyannoteDiarizationProvider()
+        # STT と同じく、GPU で走らせるのは CUDA だけ（Apple Silicon・GPU なしは CPU。Phase 2 §9）
+        diarization = PyannoteDiarizationProvider(device="cuda" if hw.gpu.backend == "cuda" else "cpu")
 
     language = language_detector
     if language is None and models.stt is not None and stt_provider is None:
@@ -3639,24 +4993,69 @@ async def build_context(settings: Settings, *, stt_provider: STTProvider | None 
         language = FasterWhisperLanguageDetector(settings.models_dir, models.stt.name, models.stt.compute_type, models.stt.device)
 
     return AppContext(settings=settings, db=db, hardware=hw, models=models, stt=stt, vad=vad, llm=llm_provider,
-                      diarization=diarization, language=language, codec=codec if codec is not None else _default_codec(),
-                      multi_user=multi_user, tls_enabled=tls_enabled)
+                      diarization=diarization, language=language, codec=codec,
+                      multi_user=multi_user, tls_enabled=tls_enabled, recovery=recovery)
 ```
 
 ```python
 # minutes_local/__main__.py
-"""CLI：serve / token / doctor / user。Phase 3 で --tls / --bind / --rebuild / --init-tls / user add を追加。"""
+"""CLI：serve / token / doctor / user。Phase 3 で --tls / --bind / --rebuild / --init-tls / user add・remove・list を追加。"""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import os
+import shutil
+import sqlite3
 import sys
 
 from .bootstrap import acquire_data_dir_lock, bind_listen_socket, build_context, read_token, rotate_token
-from .config import settings_from_env
+from .config import Settings, settings_from_env
+from .storage.backup import Recovery
 
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def _warn_recovery(recovery: Recovery | None) -> None:
+    """起動時に壊れた DB を作り直したことを知らせる（§2.4）。黙って古い状態に戻さない。"""
+    if recovery is None:
+        return
+    source = recovery.restored_from.name if recovery.restored_from is not None else "none (started from an empty database)"
+    r = recovery.rebuilt
+    print(f"WARNING: the database was corrupt and has been recovered. backup: {source}. "
+          f"rebuilt from recordings: meetings+{r.meetings_created} chunks+{r.chunks_created} skipped={len(r.skipped_files or [])}. "
+          "Summaries and notes saved after the backup are lost; rebuilt meetings are transcribed again. "
+          "Users removed after the backup are restored and their tokens work again; run `minutes-local user list` "
+          "and remove them again with `minutes-local user remove <id>`.", file=sys.stderr)
+    _warn_unowned(r.owners_without_user)
+
+
+def _warn_unowned(owners: list[str]) -> None:
+    """users に行の無い利用者の会議を知らせる（§2.5）。所有者の付け替えはできないので、取れる手段を書く。
+
+    user remove で消した利用者の会議もここに出る（録音は消さない）。その場合は想定どおりで、戻さない。
+    置き換える前に今の DB を -wal・-shm ごと dataDir の直下で別名へ移させる（backups/・tmp/・recordings/ の下は起動処理・rebuild が触る）。
+    コピーではなく移す：落ちた serve の WAL が隣に残ると、置いたバックアップを開いたときに適用されて壊れる。
+    rebuild は録音から会議と Chunk を戻すだけなので、選んだバックアップの後のノートと要約は、移したファイルを戻さない限り失われる。
+    戻すときも、サーバーを止め、置き換えた DB を -wal・-shm ごと別名へ移してから戻させる（置き換え後の WAL が戻した DB に適用されないように）。
+    バックアップで置き換えるとその後に消した利用者のトークンも戻るので、置き換えたら user list で確かめて消し直す
+    """
+    if not owners:
+        return
+    print(f"WARNING: meetings under recordings/<id>/ belong to users that are not registered: {', '.join(owners)}. "
+          "No token can open them (the API answers 404). If these users were removed with `minutes-local user remove`, "
+          "this is expected; do not restore them. Otherwise, if a backup in <dataDir>/backups/ contains these users, stop the server, "
+          "first move (do not copy) the current database aside to a separate name directly under <dataDir> (for example "
+          "minutes.sqlite.before-restore-<epoch>, and move minutes.sqlite-wal and minutes.sqlite-shm along with it as "
+          "...-wal and ...-shm if they exist; a WAL left next to the restored file would be applied to it; "
+          "not under backups/, tmp/ or recordings/), then put the backup in place as minutes.sqlite and run "
+          "`minutes-local doctor --rebuild`; then run `minutes-local user list` and remove again any user that was removed "
+          "after that backup. Notes and summaries created after that backup are lost unless you move the set-aside files back "
+          "(rebuild only recovers meetings and chunks from the recordings). To move them back, stop the server, first move "
+          "the replacement minutes.sqlite and its minutes.sqlite-wal and minutes.sqlite-shm (if they exist) aside to another "
+          "separate name directly under <dataDir> (for example minutes.sqlite.replaced-<epoch>), then rename the set-aside "
+          "files back to minutes.sqlite, minutes.sqlite-wal and minutes.sqlite-shm. Without such a backup the meetings cannot be "
+          "reassigned to another user; the audio files stay under recordings/<id>/.", file=sys.stderr)
 
 
 def _cmd_token(args: argparse.Namespace) -> int:
@@ -3678,12 +5077,32 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"tls          : generated {s.tls_cert_path} for {hosts}")
         print("               ブラウザで初回に証明書の受け入れが必要です（§3）。")
         return 0
-    ctx = asyncio.run(build_context(s))
-    if args.rebuild:
+    # serve が動いていなければロックが取れる。DB を書き換える処理（壊れた DB の復元・rebuild）は、取れたときだけ行う
+    lock = acquire_data_dir_lock(s.data_dir)
+    try:
+        if args.rebuild and lock is None:
+            print(f"ERROR: stop the server before `doctor --rebuild` ({s.data_dir} is in use).", file=sys.stderr)
+            return 1
+        return _doctor_report(s, rebuild_requested=bool(args.rebuild), recover=lock is not None)
+    finally:
+        if lock is not None:
+            os.close(lock)
+
+
+def _doctor_report(s: Settings, *, rebuild_requested: bool, recover: bool) -> int:
+    try:
+        ctx = asyncio.run(build_context(s, recover=recover))
+    except sqlite3.DatabaseError as e:
+        # recover=False（serve が動いている）で DB が壊れていた場合。使用中の DB は動かさない
+        print(f"ERROR: cannot open {s.db_path} ({e}). Restart the server to recover from the latest backup.", file=sys.stderr)
+        return 1
+    _warn_recovery(ctx.recovery)
+    if rebuild_requested:
         from .storage.rebuild import rebuild
         with ctx.db.write_sync() as conn:
             report = rebuild(conn, s.data_dir, ctx.codec)
         print(f"rebuild      : meetings+{report.meetings_created} chunks+{report.chunks_created} missing={report.chunks_marked_missing} skipped={report.skipped_files}")
+        _warn_unowned(report.owners_without_user)
     m, hw = ctx.models, ctx.hardware
     print(f"dataDir      : {s.data_dir}")
     print(f"sqlite       : {ctx.db.path}")
@@ -3702,7 +5121,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_user(args: argparse.Namespace) -> int:
-    from .auth.users import create_user, list_users
+    from .auth.users import create_user, delete_user, list_users, user_count
     from .db.connection import Database
     from .db.migrate import migrate
     from .db.migrations_phase3 import apply_phase3
@@ -3710,16 +5129,38 @@ def _cmd_user(args: argparse.Namespace) -> int:
     db = Database(s.db_path)
     migrate(db)
     apply_phase3(db, s.data_dir)
-    if args.user_cmd == "add":
-        with db.write_sync() as conn:
-            user, token = create_user(conn, args.name)
-        print(f"user {user.name} ({user.id}) created. token (shown once):\n{token}")
-    else:
-        with db.read() as conn:
-            for u in list_users(conn):
-                print(f"{u.id}  {u.name}")
-    db.close()
-    return 0
+    try:
+        if args.user_cmd == "add":
+            try:
+                with db.write_sync() as conn:
+                    user, token = create_user(conn, args.name)
+                    count = user_count(conn)
+            except sqlite3.IntegrityError:
+                print(f"ERROR: user {args.name!r} already exists.", file=sys.stderr)   # users.name は UNIQUE
+                return 1
+            print(f"user {user.name} ({user.id}) created. token (shown once):\n{token}")
+            if count == 1:
+                # 単一利用者と複数利用者の切り替えは起動時に決まる（§2.5）
+                print("note: restart the server to switch to multi-user mode. The token file stops working, and meetings "
+                      "recorded so far (owner `local`) are hidden until every user is removed.")
+        elif args.user_cmd == "remove":
+            with db.write_sync() as conn:
+                removed = delete_user(conn, args.user_id)
+                count = user_count(conn)
+            if not removed:
+                print(f"ERROR: no such user id: {args.user_id}", file=sys.stderr)
+                return 1
+            # 会議と録音は消さない（その利用者の会議は、誰からも見えないまま残る）
+            print(f"user {args.user_id} removed. The token is no longer accepted.")
+            if count == 0:
+                print("note: restart the server to return to single-user mode (token file).")
+        else:
+            with db.read() as conn:
+                for u in list_users(conn):
+                    print(f"{u.id}  {u.name}")
+        return 0
+    finally:
+        db.close()
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -3751,7 +5192,10 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             os.close(lock)
 
     async def run() -> int:
+        # 前回の強制終了で残った一時ファイル（話者分離に渡した WAV）を消す。ロックを持っているので、使用中のものはない
+        shutil.rmtree(s.tmp_dir, ignore_errors=True)
         ctx = await build_context(s, tls_enabled=bool(args.tls))
+        _warn_recovery(ctx.recovery)
         try:
             sock = bind_listen_socket(args.bind, s.port)
         except OSError as e:
@@ -3765,12 +5209,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             print(f"token: {token}")
         app = create_app(ctx, token)
         stop = asyncio.Event()
-        await sweeper.sweep_once(ctx.db)
+        await sweeper.sweep_once(ctx.db, ctx.events)
         # Phase 1 で確定した会議と doctor --rebuild が復元した会議のジョブを作る（Phase 2 §14）。diarize は既定の False
         await sweeper.resume_finalized(ctx.db, s.data_dir)
         runners = [JobRunner(ctx, HANDLERS, i) for i in range(ctx.models.max_concurrent_stt)]
         tasks = [asyncio.create_task(r.run_forever()) for r in runners]
-        tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, stop)))
+        tasks.append(asyncio.create_task(sweeper.run_forever(ctx.db, ctx.events, stop)))
         tasks.append(asyncio.create_task(scheduler.run_forever(ctx, stop)))
         kwargs = {"ssl_certfile": str(s.tls_cert_path), "ssl_keyfile": str(s.tls_key_path)} if args.tls else {}
         config = uvicorn.Config(app, host=args.bind, port=s.port, log_level="info", **kwargs)
@@ -3807,6 +5251,8 @@ def main(argv: list[str] | None = None) -> int:
     user_sub = p_user.add_subparsers(dest="user_cmd", required=True)
     p_add = user_sub.add_parser("add")
     p_add.add_argument("name")
+    p_remove = user_sub.add_parser("remove")
+    p_remove.add_argument("user_id")
     user_sub.add_parser("list")
     p_user.set_defaults(fn=_cmd_user)
     args = parser.parse_args(argv)
@@ -3823,7 +5269,7 @@ if __name__ == "__main__":
 
 ## 23.1 ハーネス（変更）と Phase 2 テストの回帰
 
-Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 128 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
+Phase 2 §23.1 の `tests/conftest.py` を、Phase 3 の Fake（話者分離・言語判定・コーデック）を注入できる `ctx3` / `client3` / `runner3` 付きに差し替える。既定の `ctx` は Phase 2 と同じ構成（Phase 3 の Provider なし）にし、Phase 2 の 131 件がそのまま通ることを回帰条件とする。物理パスを見るテストは `conftest.py` の `recording_dir()`（Phase 3 は利用者階層を挟む）を通すので変更不要。唯一の例外は `test_phase1_contract.py` の「ファイルの物理パス」の期待値で、§2.5 の利用者階層に合わせて更新する（API 契約は不変）。
 
 ```python
 # tests/conftest.py
@@ -4280,23 +5726,37 @@ async def test_live_disabled_on_small_tier_by_default(client: httpx.AsyncClient,
 # tests/test_diarization.py
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import threading
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
 
 import httpx
+import pytest
 
 from minutes_local.config import Thresholds
-from minutes_local.db import repo
+from minutes_local.db import repo, repo_phase3
 from minutes_local.db.connection import now_ms
-from minutes_local.db.models import Segment
+from minutes_local.db.models import Job, Segment
 from minutes_local.diarization.fake_provider import FakeDiarizationProvider
+from minutes_local.diarization.provider import MAX_TIMELINE_MS, DiarizationRequest, DiarizationResult, assemble_timeline
+from minutes_local.diarization.pyannote_provider import PyannoteDiarizationProvider
+from minutes_local.storage.files import parse_wav_header
 from minutes_local.jobs.context import AppContext
+from minutes_local.jobs import handlers as handlers_module
+from minutes_local.jobs.handlers import handle_diarize
+from minutes_local.jobs.pipeline import on_diarize_finished, request_rerun_stt
 from minutes_local.jobs.retry import InvalidAudioError, ModelMissingError
 from minutes_local.jobs.runner import JobRunner
+from minutes_local.jobs.sweeper import sweep_once
 from minutes_local.merge.merger import format_for_llm, render_lines, run_merge
 from minutes_local.merge.normalize import normalize
 from minutes_local.stt.fake_provider import FakeSTTProvider
 from minutes_local.stt.provider import STTRequest, STTSegment
-from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm
+from minutes_local.vad.fake_provider import FakeVADProvider
+from tests.conftest import create_meeting, finalize, put_chunk, silence_pcm, sine_pcm
 
 
 def _text_by_pcm(req: STTRequest) -> list[STTSegment]:
@@ -4343,6 +5803,25 @@ async def test_diarize_assigns_labels_and_names_are_user_assigned(client3: httpx
     assert "[mic] [S1:田中] [seg:" in text and "[system] [S2] [seg:" in text
 
 
+async def test_transcribe_retry_after_diarize_keeps_speakers(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                             diarization_provider: FakeDiarizationProvider, stt_provider: FakeSTTProvider) -> None:
+    # Arrange: 話者分離と merge まで終えた後、completed の Chunk の transcribe ジョブを再試行に戻す（コミット後の lease 切れの回収と同じ）
+    await _two_source_meeting(client3, stt_provider)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        job = next(j for j in repo.list_jobs(conn, "m-1") if j.job_type == "transcribe_chunk")
+        conn.execute("UPDATE processing_jobs SET status = 'pending', attempts = 0, next_run_at = 0 WHERE id = ?", (job.id,))
+    # Act
+    await runner3.run_until_idle()
+    # Assert: 分離は再実行せず、作り直した transcript でも差し替えた segments が元の話者を持つ
+    with ctx3.db.read() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        segs = repo.list_segments(conn, "m-1", merged_version=m.transcript_version)
+    assert m.transcript_version == 2 and len(diarization_provider.calls) == 1
+    assert {s.speaker_id for s in segs if s.source == "mic"} == {"S1"}
+    assert {s.speaker_id for s in segs if s.source == "system"} == {"S2", "S3"}
+
+
 async def test_diarize_failure_does_not_block_merge(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
                                                     diarization_provider: FakeDiarizationProvider) -> None:
     await _two_source_meeting(client3)
@@ -4354,6 +5833,154 @@ async def test_diarize_failure_does_not_block_merge(client3: httpx.AsyncClient, 
         jobs = {j.job_type: j.status for j in repo.list_jobs(conn, "m-1") if j.job_type in ("diarize_meeting", "merge_transcript")}
     assert m.status == "completed" and all(s.speaker_id is None for s in segs)
     assert jobs == {"diarize_meeting": "failed", "merge_transcript": "completed"}
+
+
+async def test_diarize_rejects_too_long_timeline_before_reading_pcm(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                                    diarization_provider: FakeDiarizationProvider,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """1 source のタイムラインが上限を超える会議は、Chunk の PCM を読む前に話者分離なしにする（§9 の表）。"""
+    # Arrange: mic の 2 つ目の Chunk の時刻を上限の先へずらす（開始時刻の壊れた Chunk）
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        conn.execute("UPDATE audio_chunks SET start_offset_ms = start_offset_ms + ?, end_offset_ms = end_offset_ms + ? "
+                     "WHERE meeting_id = 'm-1' AND source = 'mic' AND sequence_no = 1", (MAX_TIMELINE_MS, MAX_TIMELINE_MS))
+    reads_in_diarize: list[str] = []
+    in_diarize = False
+    real_read = handlers_module.read_chunk_pcm
+
+    def spy(c: AppContext, chunk: Any, max_samples: int | None = None) -> bytes:
+        if in_diarize:
+            reads_in_diarize.append(chunk.id)
+        return real_read(c, chunk, max_samples)
+
+    real_diarize = runner3.handlers["diarize_meeting"]
+
+    async def diarize_flagged(c: AppContext, job: Any) -> str | None:
+        nonlocal in_diarize
+        in_diarize = True
+        try:
+            return await real_diarize(c, job)
+        finally:
+            in_diarize = False
+
+    monkeypatch.setattr(handlers_module, "read_chunk_pcm", spy)
+    runner3.handlers["diarize_meeting"] = diarize_flagged
+    # Act
+    await runner3.run_until_idle()
+    # Assert: PCM を 1 件も読まず、Provider も呼ばずに失敗し、merge は進む
+    with ctx3.db.read() as conn:
+        jobs = {j.job_type: j for j in repo.list_jobs(conn, "m-1") if j.job_type in ("diarize_meeting", "merge_transcript")}
+    assert reads_in_diarize == [] and diarization_provider.calls == []
+    assert jobs["diarize_meeting"].status == "failed" and jobs["diarize_meeting"].error_class == "INVALID_AUDIO"
+    assert jobs["merge_transcript"].status == "completed"
+
+
+async def test_diarize_reads_chunk_pcm_off_the_event_loop(client3: httpx.AsyncClient, runner3: JobRunner,
+                                                         diarization_provider: FakeDiarizationProvider,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """話者分離の Chunk の読み込みと復号は、イベントループではなくワーカースレッドで行う（§21 handle_diarize）。"""
+    # Arrange: 分離のハンドラの中の read_chunk_pcm が、イベントループの上で呼ばれたかを記録する
+    await _two_source_meeting(client3)
+    on_loop: list[bool] = []
+    in_diarize = False
+    real_read = handlers_module.read_chunk_pcm
+
+    def spy(c: AppContext, chunk: Any, max_samples: int | None = None) -> bytes:
+        if in_diarize:
+            try:
+                asyncio.get_running_loop()
+                on_loop.append(True)
+            except RuntimeError:
+                on_loop.append(False)
+        return real_read(c, chunk, max_samples)
+
+    real_diarize = runner3.handlers["diarize_meeting"]
+
+    async def diarize_flagged(c: AppContext, job: Any) -> str | None:
+        nonlocal in_diarize
+        in_diarize = True
+        try:
+            return await real_diarize(c, job)
+        finally:
+            in_diarize = False
+
+    monkeypatch.setattr(handlers_module, "read_chunk_pcm", spy)
+    monkeypatch.setitem(runner3.handlers, "diarize_meeting", diarize_flagged)   # HANDLERS は共有なのでテストの後に戻す
+    # Act
+    await runner3.run_until_idle()
+    # Assert: 4 Chunk をすべてイベントループの外で読み、分離も 1 回走った
+    assert on_loop == [False] * 4
+    assert len(diarization_provider.calls) == 1
+
+
+async def test_diarize_reads_each_chunk_within_remaining_timeline_budget(client3: httpx.AsyncClient, runner3: JobRunner,
+                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """分離は Chunk ごとに、その source の残りの上限（サンプル数）を read_chunk_pcm に渡す。上限全体を毎回渡すと、
+    長く復号される Chunk 1 つで上限分の PCM を確保しうる（§11 _load_and_diarize。読んだ後の検査は二重の守りとして残す）。"""
+    # Arrange: 分離の中の読み取りに渡した上限を source ごとに記録する
+    await _two_source_meeting(client3)
+    budgets: dict[str, list[int | None]] = {}
+    in_diarize = False
+    real_read = handlers_module.read_chunk_pcm
+
+    def spy(c: AppContext, chunk: Any, max_samples: int | None = None) -> bytes:
+        if in_diarize:
+            budgets.setdefault(chunk.source, []).append(max_samples)
+        return real_read(c, chunk, max_samples)
+
+    real_diarize = runner3.handlers["diarize_meeting"]
+
+    async def diarize_flagged(c: AppContext, job: Any) -> str | None:
+        nonlocal in_diarize
+        in_diarize = True
+        try:
+            return await real_diarize(c, job)
+        finally:
+            in_diarize = False
+
+    monkeypatch.setattr(handlers_module, "read_chunk_pcm", spy)
+    monkeypatch.setitem(runner3.handlers, "diarize_meeting", diarize_flagged)
+    # Act
+    await runner3.run_until_idle()
+    # Assert: 1 つ目は上限全体、2 つ目は 1 つ目（30 秒 = 480000 サンプル）を引いた残り
+    full = MAX_TIMELINE_MS * 16
+    assert budgets == {"mic": [full, full - 480000], "system": [full, full - 480000]}
+
+
+async def test_diarize_skips_chunk_that_raises_oserror(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                       diarization_provider: FakeDiarizationProvider,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    """分離の中で Chunk の読み取りが OSError（権限・I/O エラー）になっても、その Chunk を飛ばし、読める Chunk で分離を続ける（壊れた Chunk と同じ）。"""
+    # Arrange: 分離の中の読み取りだけ、mic の 1 つ目の Chunk で OSError を投げる
+    await _two_source_meeting(client3)
+    in_diarize = False
+    real_read = handlers_module.read_chunk_pcm
+
+    def failing(c: AppContext, chunk: Any, max_samples: int | None = None) -> bytes:
+        if in_diarize and chunk.source == "mic" and chunk.sequence_no == 0:
+            raise PermissionError("denied")
+        return real_read(c, chunk, max_samples)
+
+    real_diarize = runner3.handlers["diarize_meeting"]
+
+    async def diarize_flagged(c: AppContext, job: Any) -> str | None:
+        nonlocal in_diarize
+        in_diarize = True
+        try:
+            return await real_diarize(c, job)
+        finally:
+            in_diarize = False
+
+    monkeypatch.setattr(handlers_module, "read_chunk_pcm", failing)
+    monkeypatch.setitem(runner3.handlers, "diarize_meeting", diarize_flagged)
+    # Act
+    await runner3.run_until_idle()
+    # Assert: 分離は完了し、読めた Chunk（mic 1 つ・system 2 つ）だけを渡した
+    with ctx3.db.read() as conn:
+        status = next(j.status for j in repo.list_jobs(conn, "m-1") if j.job_type == "diarize_meeting")
+    assert status == "completed"
+    assert len(diarization_provider.calls) == 1
+    assert {s: len(v) for s, v in diarization_provider.calls[0].pcm_by_source.items()} == {"mic": 1, "system": 2}
 
 
 async def test_diarize_model_missing_does_not_wait(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
@@ -4393,6 +6020,733 @@ async def test_echo_from_system_is_dropped_on_mic(ctx3: AppContext) -> None:
         rows = {r["id"]: (r["merged_version"], r["merge_reason"]) for r in conn.execute("SELECT id, merged_version, merge_reason FROM transcript_segments").fetchall()}
     assert report.echo == 1 and report.kept == 2
     assert rows["m1"] == (None, "echo_of:s1") and rows["m2"] == (1, "kept") and rows["s1"] == (1, "kept")
+
+
+# ---- 実 Provider の時刻の組み立て（pyannote 本体なしで確かめる。§12） ----
+
+class _FakeTurn:
+    def __init__(self, start: float, end: float) -> None:
+        self.start, self.end = start, end
+
+
+class _FakeAnnotation:
+    def __init__(self, tracks: list[tuple[float, float, str]]) -> None:
+        self.tracks = tracks
+
+    def itertracks(self, yield_label: bool = False) -> Iterator[tuple[_FakeTurn, None, str]]:
+        for start, end, speaker in self.tracks:
+            yield _FakeTurn(start, end), None, speaker
+
+
+class _FakePipeline:
+    """pyannote の Pipeline の代わり。渡された WAV の場所・長さと引数を記録し、決めた区間（秒）を返す。"""
+
+    def __init__(self, tracks: list[tuple[float, float, str]]) -> None:
+        self.tracks = tracks
+        self.calls: list[tuple[Path, int, dict[str, Any]]] = []
+
+    def __call__(self, path: str, **kwargs: Any) -> _FakeAnnotation:
+        self.calls.append((Path(path), parse_wav_header(Path(path).read_bytes()).sample_count, kwargs))
+        return _FakeAnnotation(self.tracks)
+
+
+def test_assemble_timeline_pads_gaps_with_silence() -> None:
+    """Chunk を絶対時刻の位置に置く。渡されなかった区間（無音で STT を省いた Chunk・欠損）は無音で埋め、後ろの時刻をずらさない。"""
+    # Arrange: 1 秒の Chunk が 2 秒目と 5 秒目にある（順不同で渡す）
+    one = b"\x01\x00" * 16000
+    # Act
+    base_ms, pcm = assemble_timeline([(5000, one), (2000, one)])
+    # Assert: 2〜3 秒が音声、3〜5 秒が無音、5〜6 秒が音声
+    assert base_ms == 2000 and len(pcm) == 4 * 32000
+    assert pcm[:32000] == one and pcm[32000:96000] == b"\x00" * 64000 and pcm[96000:] == one
+    assert assemble_timeline([]) == (0, b"")
+
+
+def test_assemble_timeline_rejects_too_long_timeline_before_allocating() -> None:
+    """開始時刻が離れた Chunk があっても、間を埋めるための確保をせず、再試行しない失敗にする。"""
+    # Arrange: 1 秒の Chunk が 0 秒目と、上限を 1 ms 超える位置にある。上限ちょうどまでは組み立てる
+    one = b"\x01\x00" * 16000
+    # Act / Assert
+    with pytest.raises(InvalidAudioError):
+        assemble_timeline([(0, one), (10_000, one)], max_ms=10_999)
+    base_ms, pcm = assemble_timeline([(0, one), (10_000, one)], max_ms=11_000)
+    assert base_ms == 0 and len(pcm) == 11_000 * 32
+
+
+def test_pyannote_provider_keeps_absolute_time_across_skipped_chunk(tmp_path: Path) -> None:
+    """無音で STT を省いた Chunk があっても、後ろの Chunk の話者区間が会議の時刻からずれない。"""
+    # Arrange: 0〜30 秒と 60〜90 秒の Chunk（30〜60 秒は渡されない）。Pipeline は 60〜90 秒に 2 人目を返す
+    pipeline = _FakePipeline([(0.0, 30.0, "SPEAKER_00"), (60.0, 90.0, "SPEAKER_01")])
+    provider = PyannoteDiarizationProvider(pipeline=pipeline)
+    chunk = sine_pcm(30)
+    req = DiarizationRequest(meeting_id="m", pcm_by_source={"mic": [(0, chunk), (60000, chunk)]}, models_dir=str(tmp_path / "models"),
+                             work_dir=str(tmp_path / "tmp"), max_speakers=4)
+    # Act
+    result = provider.diarize(req)
+    # Assert: Pipeline には 90 秒の連続した音声が渡り、区間は絶対時刻のまま返る
+    path, samples, kwargs = pipeline.calls[0]
+    assert samples == 90 * 16000
+    assert [(t.start_ms, t.end_ms, t.label) for t in result.turns] == [(0, 30000, "S1"), (60000, 90000, "S2")]
+    assert kwargs == {"max_speakers": 4}                                              # 上限であって、人数の指定（num_speakers）ではない
+    assert path.parent == tmp_path / "tmp" and not path.exists()                      # 音声はデータディレクトリの中に置き、終わったら消す
+
+
+async def test_speaker_after_silent_chunk_is_not_shifted(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """無音 Chunk を挟んだ会議でも、後ろの Chunk のセグメントに正しい話者が付く（実 Provider の経路を Pipeline だけ差し替えて通す）。"""
+    # Arrange: 音声・無音・音声の 3 Chunk。0〜30 秒が A、60〜90 秒が B
+    pipeline = _FakePipeline([(0.0, 30.0, "A"), (60.0, 90.0, "B")])
+    ctx3.diarization = PyannoteDiarizationProvider(pipeline=pipeline)
+    await create_meeting(client3)
+    for seq, pcm in enumerate([sine_pcm(30), silence_pcm(30), sine_pcm(30)]):
+        await put_chunk(client3, "m-1", seq, pcm)
+    await finalize(client3, "m-1", mic=3)
+    # Act
+    await runner3.run_until_idle()
+    # Assert
+    with ctx3.db.read() as conn:
+        segs = repo.list_segments(conn, "m-1", merged_version=1)
+    assert {s.speaker_id for s in segs if s.start_ms < 30000} == {"S1"}
+    assert {s.speaker_id for s in segs if s.start_ms >= 60000} == {"S2"}
+    assert pipeline.calls[0][0].parent == ctx3.settings.data_dir / "tmp"
+
+
+async def test_manual_transcribe_of_skipped_chunk_gets_speakers_without_relabeling(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                                   runner3: JobRunner) -> None:
+    """無音と判定した Chunk を手動 STT すると、分離を作り直して拾い直した segments に話者を付ける。前の話者・ラベルの名前は変えない。"""
+    # Arrange: 0〜30 秒が A、60〜90 秒が B。中央の Chunk は小さな声で、サーバー VAD が無音と判定する（false negative）
+    pipeline = _FakePipeline([(0.0, 30.0, "A"), (60.0, 90.0, "B")])
+    ctx3.diarization = PyannoteDiarizationProvider(pipeline=pipeline)
+    ctx3.vad = FakeVADProvider(rms_threshold=0.1)
+    await create_meeting(client3)
+    for seq, pcm in enumerate([sine_pcm(30), sine_pcm(30, amplitude=0.02), sine_pcm(30)]):
+        await put_chunk(client3, "m-1", seq, pcm)
+    await finalize(client3, "m-1", mic=3)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        skipped = repo.get_chunk_by_key(conn, "m-1", "mic", 1)
+        assert skipped is not None and skipped.stt_status == "skipped"
+        repo_phase3.upsert_speaker(conn, "m-1", "S2", "佐藤")
+        before = {(s.start_ms, s.speaker_id) for s in repo.list_segments(conn, "m-1", merged_version=1)}
+    # 作り直した分離はラベルを振り直す：中央（拾い直した声）が 2 番目に現れるので、付け替えなければ S2（佐藤）になる
+    pipeline.tracks = [(0.0, 30.0, "A"), (30.0, 60.0, "C"), (60.0, 90.0, "B")]
+    # Act
+    assert (await client3.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+    await runner3.run_until_idle()
+    # Assert
+    with ctx3.db.read() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        assert m is not None and m.transcript_version == 2
+        segs = repo.list_segments(conn, "m-1", merged_version=2)
+        speakers = {sp.label: sp.name for sp in repo_phase3.list_speakers(conn, "m-1")}
+    # 拾い直した Chunk の segments。隣の Chunk の前置き（重なり）の segment は前の話者のまま
+    recovered = [s for s in segs if s.chunk_id == skipped.id]
+    assert len(pipeline.calls) == 2 and recovered
+    # 拾い直した声（30 秒以降）は前のラベルと重ならない新しいラベル。付け替えなければ S2（佐藤）になる。
+    # 先頭の segment は前置きで 0〜30 秒の A と長く重なるので S1（§21 の割当の規則どおり）
+    assert all(s.speaker_id is not None for s in recovered)
+    assert {s.speaker_id for s in recovered if s.start_ms >= 30000} == {"S3"}
+    assert {(s.start_ms, s.speaker_id) for s in segs if s not in recovered} == before   # 前の segments の話者は変えない
+    assert speakers == {"S1": None, "S2": "佐藤", "S3": None}
+
+
+async def _skipped_chunk_queued_for_manual_stt(client3: httpx.AsyncClient, ctx3: AppContext,
+                                               runner3: JobRunner) -> tuple[_FakePipeline, str]:
+    """中央の Chunk を無音と判定させて merge まで進め、その Chunk を手動 STT に回す（STT はまだ走らせない）。"""
+    pipeline = _FakePipeline([(0.0, 30.0, "A"), (60.0, 90.0, "B")])
+    ctx3.diarization = PyannoteDiarizationProvider(pipeline=pipeline)
+    ctx3.vad = FakeVADProvider(rms_threshold=0.1)
+    await create_meeting(client3)
+    for seq, pcm in enumerate([sine_pcm(30), sine_pcm(30, amplitude=0.02), sine_pcm(30)]):
+        await put_chunk(client3, "m-1", seq, pcm)
+    await finalize(client3, "m-1", mic=3)
+    await runner3.run_until_idle()
+    with ctx3.db.read() as conn:
+        skipped = repo.get_chunk_by_key(conn, "m-1", "mic", 1)
+        assert skipped is not None and skipped.stt_status == "skipped"
+    pipeline.tracks = [(0.0, 30.0, "A"), (30.0, 60.0, "C"), (60.0, 90.0, "B")]
+    assert (await client3.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+    return pipeline, skipped.id
+
+
+async def _diarize_without_the_queued_chunk(ctx3: AppContext) -> Job:
+    """話者分離を別のワーカーで lease し、手動 STT の Chunk が queued のうちに分離を終える（入力に含まれない）。"""
+    async with ctx3.db.write() as conn:
+        assert repo.insert_job(conn, "m-1", "diarize_meeting") is not None
+        old = repo_phase3.lease_job_fair(conn, "w-old", ["diarize_meeting"], now_ms())
+        assert old is not None
+    assert await handle_diarize(ctx3, old) is None
+    return old
+
+
+async def _report_diarize_completed(ctx3: AppContext, job: Job) -> None:
+    """Runner の完了処理と同じ：完了を記録できたときだけ on_diarize_finished を呼ぶ。"""
+    async with ctx3.db.write() as conn:
+        if repo.finish_job(conn, job.id, job.lease_owner or "", job.attempts, "completed"):
+            on_diarize_finished(conn, "m-1")
+
+
+def _assert_recovered_chunk_has_speakers(ctx3: AppContext, chunk_id: str) -> None:
+    with ctx3.db.read() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        assert m is not None and m.transcript_version == 2
+        recovered = [s for s in repo.list_segments(conn, "m-1", merged_version=2) if s.chunk_id == chunk_id]
+    assert recovered and all(s.speaker_id is not None for s in recovered)
+    assert {s.speaker_id for s in recovered if s.start_ms >= 30000} == {"S3"}
+
+
+async def test_manual_stt_finishing_during_diarize_reruns_the_diarize(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                      runner3: JobRunner) -> None:
+    """分離の実行中に手動 STT の Chunk が完了すると、実行中の分離は結果を残さず、その Chunk を含めて分離し直してから merge する。"""
+    # Arrange: 分離が Chunk を読まずに結果を書いた後、完了を報告する前に、手動 STT が完了する
+    pipeline, chunk_id = await _skipped_chunk_queued_for_manual_stt(client3, ctx3, runner3)
+    old = await _diarize_without_the_queued_chunk(ctx3)
+    # Runner は分離の実行中に STT を lease しない（GPU で重ねない。§9 allowed_types）。排他の外で走った STT（後ろ盾の確認）として
+    # 手動 STT を直接 lease して実行する（分離は lease 中なので merge は作れない）
+    assert await runner3.run_once() is False
+    async with ctx3.db.write() as conn:
+        stt = repo_phase3.lease_job_fair(conn, runner3.owner, ["transcribe_chunk"], now_ms())
+        assert stt is not None
+    await runner3._execute(stt)
+    # Act: 旧ワーカーが完了を報告し、残りを流す
+    await _report_diarize_completed(ctx3, old)
+    await runner3.run_until_idle()
+    # Assert: 分離は 3 回（最初・入力の古い分離・作り直し）。拾い直した segments に話者が付く
+    assert len(pipeline.calls) == 3
+    _assert_recovered_chunk_has_speakers(ctx3, chunk_id)
+
+
+async def test_diarize_finishing_before_manual_stt_does_not_merge_early(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                        runner3: JobRunner) -> None:
+    """手動 STT の Chunk より先に分離が終わっても merge を作らず、Chunk の完了後に分離を作り直してから merge する。"""
+    # Arrange
+    pipeline, chunk_id = await _skipped_chunk_queued_for_manual_stt(client3, ctx3, runner3)
+    old = await _diarize_without_the_queued_chunk(ctx3)
+    # Act: 分離が手動 STT より先に完了する
+    await _report_diarize_completed(ctx3, old)
+    with ctx3.db.read() as conn:
+        merge_jobs = [j for j in repo.list_jobs(conn, "m-1") if j.job_type == "merge_transcript"]
+    await runner3.run_until_idle()
+    # Assert: Chunk が queued の間は merge を作らない。作り直した分離が拾い直した segments に話者を付ける
+    assert merge_jobs == []
+    assert len(pipeline.calls) == 3
+    _assert_recovered_chunk_has_speakers(ctx3, chunk_id)
+
+
+async def test_manual_stt_committed_during_merge_rediarizes_then_remerges(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                         runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """merge の書き込みの後・完了の記録の前に手動 STT の Chunk が初めて完了すると、分離を作り直し、その後の merge が話者付きで入れる。"""
+    # Arrange: 2 つ目・3 つ目の Chunk を無音と判定させて merge まで進め、2 つ目を手動 STT に回す
+    pipeline = _FakePipeline([(0.0, 30.0, "A"), (30.0, 60.0, "C"), (60.0, 90.0, "B")])
+    ctx3.diarization = PyannoteDiarizationProvider(pipeline=pipeline)
+    ctx3.vad = FakeVADProvider(rms_threshold=0.1)
+    await create_meeting(client3)
+    for seq, pcm in enumerate([sine_pcm(30), sine_pcm(30, amplitude=0.02), sine_pcm(30, amplitude=0.02)]):
+        await put_chunk(client3, "m-1", seq, pcm)
+    await finalize(client3, "m-1", mic=3)
+    await runner3.run_until_idle()
+    assert (await client3.post("/v1/meetings/m-1/chunks/mic/1/transcribe")).status_code == 202
+    real_merge = runner3.handlers["merge_transcript"]
+    done_during_merge = False
+
+    async def merge_then_transcribe(c: AppContext, merge_job: Job) -> str | None:
+        nonlocal done_during_merge
+        result = await real_merge(c, merge_job)
+        if not done_during_merge:
+            # 2 つ目の Chunk で作り直した merge の実行中に、3 つ目の Chunk の手動 STT を完了させる
+            done_during_merge = True
+            assert (await client3.post("/v1/meetings/m-1/chunks/mic/2/transcribe")).status_code == 202
+            async with c.db.write() as conn:
+                job = repo_phase3.lease_job_fair(conn, "w-manual", ["transcribe_chunk"], now_ms())
+                assert job is not None
+            await handlers_module.handle_transcribe(c, job)
+            async with c.db.write() as conn:
+                assert repo.finish_job(conn, job.id, "w-manual", job.attempts, "completed")
+        return result
+
+    monkeypatch.setitem(runner3.handlers, "merge_transcript", merge_then_transcribe)   # HANDLERS は共有なのでテスト後に戻す
+    # Act
+    await runner3.run_until_idle()
+    # Assert: 版 3 に 3 つ目の Chunk が話者付きで入る
+    with ctx3.db.read() as conn:
+        m = repo.get_meeting(conn, "m-1")
+        last = repo.get_chunk_by_key(conn, "m-1", "mic", 2)
+        assert m is not None and last is not None
+        recovered = [s for s in repo.list_segments(conn, "m-1", merged_version=m.transcript_version) if s.chunk_id == last.id]
+    assert done_during_merge and m.transcript_version == 3
+    assert recovered and all(s.speaker_id is not None for s in recovered)
+
+
+async def test_manual_stt_committed_before_leased_merge_writes_discards_that_merge(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                                    runner3: JobRunner) -> None:
+    """lease 済みの merge が書く前に手動 STT の Chunk が初めて完了すると、その merge は書かず、作り直した分離の後の merge が話者付きで入れる。"""
+    # Arrange: 中央の Chunk を手動 STT に回し、merge を別のワーカーで lease しておく（まだ書いていない）
+    pipeline, chunk_id = await _skipped_chunk_queued_for_manual_stt(client3, ctx3, runner3)
+    async with ctx3.db.write() as conn:
+        assert repo.insert_job(conn, "m-1", "merge_transcript") is not None
+        merge = repo_phase3.lease_job_fair(conn, "w-merge", ["merge_transcript"], now_ms())
+        assert merge is not None
+        stt = repo_phase3.lease_job_fair(conn, runner3.owner, ["transcribe_chunk"], now_ms())
+        assert stt is not None
+    # Act: 手動 STT が先にコミットし、その後に lease 済みの merge が書こうとする
+    await runner3._execute(stt)
+    await handlers_module.handle_merge(ctx3, merge)
+    with ctx3.db.read() as conn:
+        after_stale_merge = repo.get_meeting(conn, "m-1")
+        published = [s for s in repo.list_segments(conn, "m-1", merged_version=2) if s.chunk_id == chunk_id]
+    await runner3.run_until_idle()
+    # Assert: 古い merge は話者の無い segments を公開しない。分離を作り直した後の merge が版 2 に話者付きで入れる
+    assert after_stale_merge is not None and after_stale_merge.transcript_version == 1
+    assert published == []
+    assert len(pipeline.calls) == 2
+    _assert_recovered_chunk_has_speakers(ctx3, chunk_id)
+
+
+class _BlockingDiarization:
+    """最初の呼び出しを gate が開くまで止める話者分離。同時に走っている呼び出しの最大数を記録する。"""
+
+    def __init__(self) -> None:
+        self.entered, self.gate = threading.Event(), threading.Event()
+        self.calls = 0
+        self.running = 0
+        self.max_running = 0
+        self._lock = threading.Lock()
+
+    def diarize(self, req: DiarizationRequest) -> DiarizationResult:
+        with self._lock:
+            self.calls += 1
+            self.running += 1
+            self.max_running = max(self.max_running, self.running)
+            first = self.calls == 1
+        try:
+            if first:
+                self.entered.set()
+                self.gate.wait(5)
+            return DiarizationResult(turns=(), speaker_count=0)
+        finally:
+            with self._lock:
+                self.running -= 1
+
+
+async def test_requeued_diarize_waits_for_the_running_attempt(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """pending に戻した分離（requeue_running_job）の次の試行は、旧い試行のスレッドが抜けるまで分離を始めない（§21 handle_diarize）。"""
+    # Arrange: 旧い試行が分離の実行中に pending へ戻され、次の試行が lease される
+    provider = _BlockingDiarization()
+    ctx3.diarization = provider
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        repo.insert_job(conn, "m-1", "diarize_meeting")
+        old = repo_phase3.lease_job_fair(conn, "w-old", ["diarize_meeting"], now_ms())
+        assert old is not None
+    old_attempt = asyncio.create_task(handle_diarize(ctx3, old))
+    assert await asyncio.to_thread(provider.entered.wait, 5)
+    async with ctx3.db.write() as conn:
+        assert repo_phase3.requeue_running_job(conn, "m-1", "diarize_meeting")
+        fresh = repo_phase3.lease_job_fair(conn, "w-new", ["diarize_meeting"], now_ms())
+        assert fresh is not None
+    # Assert: 行は pending に戻っても、旧い試行のスレッドが枠を持つ間は Runner が分離（と STT と並べない要約）を lease しない
+    types = runner3.allowed_types()
+    assert "diarize_meeting" not in types
+    assert "synthesize_minutes" not in types or ctx3.models.allow_concurrent_stt_and_llm
+    new_attempt = asyncio.create_task(handle_diarize(ctx3, fresh))
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    # Act / Assert: 旧い試行が抜けるまで、次の試行は分離を始めない
+    assert provider.calls == 1
+    provider.gate.set()
+    assert await old_attempt is None
+    assert await new_attempt is None
+    assert provider.calls == 2 and provider.max_running == 1
+    # Act / Assert: 次の試行の行を Runner と同じく完了にすれば（行も枠も空く）、分離をまた lease できる
+    async with ctx3.db.write() as conn:
+        assert repo.finish_job(conn, fresh.id, "w-new", fresh.attempts, "completed")
+    assert "diarize_meeting" in runner3.allowed_types()
+
+
+async def test_cancelled_diarize_keeps_the_slot_until_its_thread_exits(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """分離を待つハンドラがキャンセルされても（サーバーの終了など）、スレッドが抜けるまで実行枠を返さない（§21 handle_diarize）。"""
+    # Arrange: 分離のスレッドが走っている
+    provider = _BlockingDiarization()
+    ctx3.diarization = provider
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        repo.insert_job(conn, "m-1", "diarize_meeting")
+        job = repo_phase3.lease_job_fair(conn, "w-old", ["diarize_meeting"], now_ms())
+        assert job is not None
+    attempt = asyncio.create_task(handle_diarize(ctx3, job))
+    assert await asyncio.to_thread(provider.entered.wait, 5)
+    # Act: 待っているハンドラをキャンセルする
+    attempt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await attempt
+    # Assert: スレッドが走っている間は枠を持ち、Runner は分離を lease しない
+    assert ctx3.diarize_slots.locked()
+    assert "diarize_meeting" not in runner3.allowed_types()
+    # Act: スレッドが抜ける
+    provider.gate.set()
+    for _ in range(500):
+        if not ctx3.diarize_slots.locked():
+            break
+        await asyncio.sleep(0.01)
+    # Assert: 抜けたら枠を返す
+    assert not ctx3.diarize_slots.locked()
+    assert provider.calls == 1 and provider.max_running == 1
+
+
+async def test_stt_is_not_leased_while_diarization_runs(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """分離の実行中（行または実行枠）は STT（ライブを含む）を lease しない（GPU で重ねない。合算の VRAM を実測していない。§3）。"""
+    # Arrange
+    await _two_source_meeting(client3)
+    stt = {"transcribe_chunk", "live_transcribe_chunk"}
+    assert stt <= set(runner3.allowed_types())
+    async with ctx3.db.write() as conn:
+        repo.insert_job(conn, "m-1", "diarize_meeting")
+        job = repo_phase3.lease_job_fair(conn, "w-1", ["diarize_meeting"], now_ms())
+        assert job is not None
+    # Act / Assert: 分離の行が lease されている間は STT を lease しない
+    assert not (stt & set(runner3.allowed_types()))
+    # Act / Assert: 行が無くなっても（pending に戻した旧い試行など）、実行枠が埋まっている間は lease しない
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE id = ?", (job.id,))
+    await ctx3.diarize_slots.acquire()
+    try:
+        assert not (stt & set(runner3.allowed_types()))
+    finally:
+        ctx3.diarize_slots.release()
+    # Act / Assert: 分離が終われば STT をまた lease する
+    assert stt <= set(runner3.allowed_types())
+
+
+async def test_pending_diarize_is_admitted_despite_a_replenished_live_queue(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                            runner3: JobRunner) -> None:
+    """ライブ STT が絶えず届いても、待っている分離を飢えさせない（§9 allowed_types）。分離が lease できる状態で待っていれば
+    新しい STT を lease せず、実行中の STT が抜けたら次の 1 件を分離に充てる。"""
+    # Arrange: 分離が待っている。ライブ STT が 1 件実行中で、次のライブ STT も届いている
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE meeting_id = 'm-1'")
+        chunks = repo.list_chunks(conn, "m-1")
+        diarize_id = repo.insert_job(conn, "m-1", "diarize_meeting")
+        for c in chunks[:2]:
+            repo.insert_job(conn, "m-1", "live_transcribe_chunk", chunk_id=c.id)
+        running = repo_phase3.lease_job_fair(conn, "w-live", ["live_transcribe_chunk"], now_ms())
+        assert running is not None
+    stt = {"transcribe_chunk", "live_transcribe_chunk"}
+    # Act / Assert: STT の実行中は、次の STT も分離も lease しない（実行中の STT が抜けるのを待つ）
+    types = set(runner3.allowed_types())
+    assert not (stt & types) and "diarize_meeting" not in types
+    # Act: 実行中の STT が終わり、その間にもライブ STT が届き続ける
+    async with ctx3.db.write() as conn:
+        assert repo.finish_job(conn, running.id, "w-live", running.attempts, "completed")
+        repo.insert_job(conn, "m-1", "live_transcribe_chunk", chunk_id=chunks[2].id)
+    # allowed_types はコミット済みの状態を読む（run_once と同じく、lease の書き込みの前に決める）
+    types = set(runner3.allowed_types())
+    async with ctx3.db.write() as conn:
+        leased = repo_phase3.lease_job_fair(conn, runner3.owner, list(types), now_ms())
+    # Assert: 届いているライブ STT より先に、分離を lease する
+    assert leased is not None and leased.id == diarize_id
+
+
+async def test_ready_diarize_is_leased_before_a_replenished_vad_queue(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """vad_chunk（優先度 50）が絶えず届いても、始められる分離（150）を飢えさせない（§9 allowed_types の予約）。
+    STT が抜けていて分離が待っていれば、次の 1 件は分離だけにする。"""
+    # Arrange: 分離が待っている。録音中の会議の vad_chunk も届いている（分離より優先度が高い）
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE meeting_id = 'm-1'")
+        chunks = repo.list_chunks(conn, "m-1")
+        diarize_id = repo.insert_job(conn, "m-1", "diarize_meeting")
+        for c in chunks[:2]:
+            repo.insert_job(conn, "m-1", "vad_chunk", chunk_id=c.id)
+    # Act
+    types = runner3.allowed_types()
+    async with ctx3.db.write() as conn:
+        leased = repo_phase3.lease_job_fair(conn, runner3.owner, types, now_ms())
+    # Assert: 届いている vad_chunk より先に分離を lease する
+    assert types == ["diarize_meeting"]
+    assert leased is not None and leased.id == diarize_id
+
+
+async def test_hung_diarize_times_out_and_keeps_the_slot_until_its_thread_exits(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                               runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """生きたまま固まった分離（heartbeat が lease を延ばすので lease 切れでは見つからない）は時間切れで見放す（§21 handle_diarize）。
+    ジョブは再試行せず failed にして話者分離なしで merge・要約へ進む。枠はスレッドが抜けるまで返さず（次の分離は始めない）、
+    見放したスレッドは STT と要約の排他では数えない。スレッドが抜ければ枠を返す。"""
+    # Arrange: 分離が gate まで返らない。時間切れを短くする
+    provider = _BlockingDiarization()
+    ctx3.diarization = provider
+    monkeypatch.setattr(handlers_module, "_diarize_timeout_s", lambda ctx, targets: 0.05)
+    await _two_source_meeting(client3)
+    try:
+        # Act
+        await runner3.run_until_idle()
+        # Assert: 分離は時間切れで failed（再試行しない）、merge と要約は進む
+        with ctx3.db.read() as conn:
+            m = repo.get_meeting(conn, "m-1")
+            jobs = {j.job_type: (j.status, j.error_class) for j in repo.list_jobs(conn, "m-1")
+                    if j.job_type in ("diarize_meeting", "merge_transcript")}
+        assert provider.calls == 1
+        assert jobs == {"diarize_meeting": ("failed", "TIMEOUT"), "merge_transcript": ("completed", None)}
+        assert m is not None and m.status == "completed"
+        # Assert: スレッドが走っている間は枠を持つ。見放したスレッドは STT の排他では数えない
+        assert ctx3.diarize_slots.locked() and ctx3.diarize_abandoned == 1
+        types = set(runner3.allowed_types())
+        assert "diarize_meeting" not in types and {"transcribe_chunk", "live_transcribe_chunk"} <= types
+    finally:
+        provider.gate.set()
+    # Act: スレッドが抜ける
+    for _ in range(500):
+        if not ctx3.diarize_slots.locked():
+            break
+        await asyncio.sleep(0.01)
+    # Assert: 枠を返し、見放した数も戻る
+    assert not ctx3.diarize_slots.locked() and ctx3.diarize_abandoned == 0
+
+
+async def test_stt_keeps_priority_when_no_diarize_is_ready(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """分離が待っていない（無い、または再試行の待ち時間中）なら、従来どおり STT を lease し、優先度の順（ライブ STT が先）に戻る（§9）。"""
+    # Arrange: ライブ STT が届いている。分離は再試行の待ち時間中（next_run_at が先）
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE meeting_id = 'm-1'")
+        chunk = repo.list_chunks(conn, "m-1")[0]
+        live_id = repo.insert_job(conn, "m-1", "live_transcribe_chunk", chunk_id=chunk.id)
+        diarize_id = repo.insert_job(conn, "m-1", "diarize_meeting")
+        conn.execute("UPDATE processing_jobs SET status = 'retrying', next_run_at = ? WHERE id = ?", (now_ms() + 600_000, diarize_id))
+    # Act
+    types = runner3.allowed_types()
+    async with ctx3.db.write() as conn:
+        leased = repo_phase3.lease_job_fair(conn, runner3.owner, types, now_ms())
+    # Assert: STT を lease でき、ライブ STT が先に選ばれる
+    assert {"transcribe_chunk", "live_transcribe_chunk"} <= set(types)
+    assert leased is not None and leased.id == live_id
+
+
+async def test_leased_diarize_blocks_next_diarize_before_taking_the_slot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """lease した分離が実行枠を取る前（handle_diarize の acquire の前）でも、次の分離を lease しない（§9 allowed_types）。
+
+    枠だけで判定すると、別の Runner が次の分離を lease し、枠を待つ間 Runner の 1 枠を塞ぐ
+    """
+    # Arrange: 分離の行が lease されたが、まだ枠を取っていない
+    await _two_source_meeting(client3)
+    async with ctx3.db.write() as conn:
+        repo.insert_job(conn, "m-1", "diarize_meeting")
+        job = repo_phase3.lease_job_fair(conn, "w-1", ["diarize_meeting"], now_ms())
+        assert job is not None
+    assert not ctx3.diarize_slots.locked()
+    # Act
+    types = runner3.allowed_types()
+    # Assert
+    assert "diarize_meeting" not in types
+
+
+async def test_withdrawn_running_stt_blocks_diarize_until_it_ends(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    """STT の再実行（request_rerun_stt）が行を消した実行中の STT も、その試行が抜けるまで分離を lease させない（§9 allowed_types）。
+
+    行を消しても推論は止まらない（ハンドラは推論の後の lease の検査で結果を捨てる）。行だけで判定すると、推論と分離が GPU で重なる
+    """
+    # Arrange: STT のハンドラが推論の途中で止まっている
+    await _two_source_meeting(client3)
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    async def blocking_stt(c: AppContext, job: Job) -> str | None:
+        entered.set()
+        await gate.wait()
+        return None
+
+    monkeypatch.setitem(runner3.handlers, "transcribe_chunk", blocking_stt)   # HANDLERS は共有なのでテストの後に戻す
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE meeting_id = 'm-1'")
+        chunk = repo.list_chunks(conn, "m-1")[0]
+        repo.insert_job(conn, "m-1", "transcribe_chunk", chunk_id=chunk.id)
+        job = repo_phase3.lease_job_fair(conn, runner3.owner, ["transcribe_chunk"], now_ms())
+        assert job is not None
+    running = asyncio.create_task(runner3._execute(job))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert "diarize_meeting" not in runner3.allowed_types()
+        # Act: STT の再実行がジョブの行を消す（実行中の試行は止まらない）
+        async with ctx3.db.write() as conn:
+            request_rerun_stt(conn, "m-1", None)
+        # Assert: 行は無くても、旧い試行が走っている間は分離を lease しない
+        assert "diarize_meeting" not in runner3.allowed_types()
+    finally:
+        # Act: 旧い試行が抜ける（失敗しても止まったタスクを残さない）
+        gate.set()
+        await asyncio.wait_for(running, 5)
+    # Assert: 抜けたら分離を lease できる
+    assert "diarize_meeting" in runner3.allowed_types()
+
+
+class _UncancellableSTT:
+    """推論が gate で止まる STT の実行器。実物（PoolExecutor）と同じく、呼び出し側をキャンセルすると待つのはすぐやめるが、
+    推論そのもの（ワーカーの実行中のタスク）は止まらない。推論を別のタスクにして shield で待つことで模す。"""
+
+    def __init__(self) -> None:
+        self.entered, self.gate = asyncio.Event(), asyncio.Event()
+        self.inference: asyncio.Task[None] | None = None
+
+    async def _infer(self) -> None:
+        self.entered.set()
+        await self.gate.wait()
+        raise RuntimeError("stopped by the test")   # 結果は使わない（ハンドラはキャンセル済み）
+
+    async def transcribe(self, req: Any, timeout_s: float) -> Any:
+        if self.inference is None:
+            self.inference = asyncio.create_task(self._infer())
+        await asyncio.shield(self.inference)
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
+async def test_cancelled_stt_keeps_blocking_diarize_until_inference_ends(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                        runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """STT のハンドラがキャンセルされても（サーバーの終了など）、推論が終わるまで ctx.stt_in_flight に数え、分離を lease させない（§21 _run_stt）。"""
+    # Arrange: STT の推論が走っている。行は STT の再実行で消し、実行中の数だけで判定させる
+    await _two_source_meeting(client3)
+    stt = _UncancellableSTT()
+    monkeypatch.setattr(ctx3, "stt", stt)
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM processing_jobs WHERE meeting_id = 'm-1'")
+        chunk = repo.list_chunks(conn, "m-1")[0]
+        repo.insert_job(conn, "m-1", "transcribe_chunk", chunk_id=chunk.id)
+        job = repo_phase3.lease_job_fair(conn, runner3.owner, ["transcribe_chunk"], now_ms())
+        assert job is not None
+    running = asyncio.create_task(runner3._execute(job))
+    await asyncio.wait_for(stt.entered.wait(), 5)
+    async with ctx3.db.write() as conn:
+        request_rerun_stt(conn, "m-1", None)
+    # Act: ハンドラをキャンセルする
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, 5)
+    # Assert: ハンドラは抜けたが、推論が走っている間は数え続け、分離を lease しない
+    assert stt.inference is not None and not stt.inference.done()
+    assert ctx3.stt_in_flight == 1
+    assert "diarize_meeting" not in runner3.allowed_types()
+    # Act: 推論が終わる
+    stt.gate.set()
+    for _ in range(500):
+        if ctx3.stt_in_flight == 0:
+            break
+        await asyncio.sleep(0.01)
+    # Assert: 終わったら数を返し、分離を lease できる
+    assert ctx3.stt_in_flight == 0
+    assert "diarize_meeting" in runner3.allowed_types()
+
+
+def _record_published(ctx3: AppContext, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """ctx3.events.publish に流れたイベントを記録する（配信もそのまま行う）。"""
+    published: list[dict[str, Any]] = []
+    real_publish = ctx3.events.publish
+
+    def record(meeting_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(meeting_id, event)
+    monkeypatch.setattr(ctx3.events, "publish", record)
+    return published
+
+
+async def _until_diarize_job(ctx3: AppContext, runner3: JobRunner) -> None:
+    while True:
+        with ctx3.db.read() as conn:
+            if any(j.job_type == "diarize_meeting" for j in repo.list_jobs(conn, "m-1")):
+                return
+        assert await runner3.run_once() is True
+
+
+def _merge_job_ids(ctx3: AppContext) -> list[str]:
+    with ctx3.db.read() as conn:
+        return [j.id for j in repo.list_jobs(conn, "m-1") if j.job_type == "merge_transcript"]
+
+
+async def test_failed_diarize_publishes_the_merge_job_it_creates(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """ハンドラの失敗で分離が failed に確定して作った merge ジョブは、コミット後に流す（成功時の後続ジョブと同じ）。"""
+    # Arrange: 分離はモデル未配置で失敗する（待たずに failed）
+    ctx3.diarization = FakeDiarizationProvider(fail_with=ModelMissingError("no diarization model"))
+    await _two_source_meeting(client3)
+    await _until_diarize_job(ctx3, runner3)
+    published = _record_published(ctx3, monkeypatch)
+    # Act
+    assert await runner3.run_once() is True
+    # Assert: 作った merge ジョブが lease される前にイベントに出る
+    merges = _merge_job_ids(ctx3)
+    assert len(merges) == 1
+    assert any(e["type"] == "job" and e["job"]["id"] == merges[0] and e["job"]["status"] == "pending" for e in published)
+
+
+async def test_exhausted_diarize_publishes_the_merge_job_it_creates(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """lease 切れで回数を使い切って分離が failed に確定して作った merge ジョブも、Sweeper がコミット後に流す。"""
+    # Arrange: 分離のジョブが待機になるまで進める
+    await _two_source_meeting(client3)
+    await _until_diarize_job(ctx3, runner3)
+    published = _record_published(ctx3, monkeypatch)
+    # Act: lease しては結果を報告せずに落ちる、を max_attempts 回くり返す
+    for _ in range(5):
+        async with ctx3.db.write() as conn:
+            job = repo_phase3.lease_job_fair(conn, "w-dead", ["diarize_meeting"], now_ms())
+            assert job is not None
+            conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
+        await sweep_once(ctx3.db, ctx3.events)
+    # Assert
+    merges = _merge_job_ids(ctx3)
+    assert len(merges) == 1
+    assert any(e["type"] == "job" and e["job"]["id"] == merges[0] and e["job"]["status"] == "pending" for e in published)
+
+
+async def test_diarize_that_keeps_crashing_does_not_block_merge(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """話者分離がプロセスごと落ち続けても（メモリ不足など）、回数を使い切ったら話者分離なしで merge へ進む。"""
+    # Arrange: 話者分離のジョブが待機になるまで進める
+    await _two_source_meeting(client3)
+    while True:
+        with ctx3.db.read() as conn:
+            if any(j.job_type == "diarize_meeting" for j in repo.list_jobs(conn, "m-1")):
+                break
+        assert await runner3.run_once() is True
+    # Act: lease しては結果を報告せずに落ちる、を max_attempts 回くり返す
+    for _ in range(5):
+        async with ctx3.db.write() as conn:
+            job = repo_phase3.lease_job_fair(conn, "w-dead", ["diarize_meeting"], now_ms())
+            assert job is not None
+            conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (job.id,))
+        await sweep_once(ctx3.db, ctx3.events)
+    await runner3.run_until_idle()
+    # Assert: 会議は完了し、話者ラベルは付かない
+    with ctx3.db.read() as conn:
+        meeting = repo.get_meeting(conn, "m-1")
+        segs = repo.list_segments(conn, "m-1", merged_version=1)
+    assert meeting is not None and meeting.status == "completed"
+    assert segs and all(s.speaker_id is None for s in segs)
+
+
+async def test_expired_diarize_worker_does_not_write_speakers(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                              diarization_provider: FakeDiarizationProvider) -> None:
+    """lease が切れた旧ワーカーは、話者分離を終えても結果を書かない（Phase 2 基本設計 §9.3）。"""
+    # Arrange: 話者分離のジョブを lease し、結果を書く前に lease を失効させて回収する
+    await _two_source_meeting(client3)
+    while True:
+        with ctx3.db.read() as conn:
+            if any(j.job_type == "diarize_meeting" for j in repo.list_jobs(conn, "m-1")):
+                break
+        assert await runner3.run_once() is True
+    async with ctx3.db.write() as conn:
+        old = repo_phase3.lease_job_fair(conn, "w-old", ["diarize_meeting"], now_ms())
+        assert old is not None
+        conn.execute("UPDATE processing_jobs SET lease_until = 0 WHERE id = ?", (old.id,))
+    await sweep_once(ctx3.db, ctx3.events)
+    # Act: 旧ワーカーが分離を終えて書こうとする
+    assert await handle_diarize(ctx3, old) is None
+    # Assert: 分離は走ったが、話者ラベルも話者の一覧も書かれない
+    with ctx3.db.read() as conn:
+        segs = repo.list_segments(conn, "m-1")
+        speakers = conn.execute("SELECT COUNT(*) AS n FROM meeting_speakers WHERE meeting_id = 'm-1'").fetchone()["n"]
+    assert len(diarization_provider.calls) == 1
+    assert segs and all(s.speaker_id is None for s in segs)
+    assert speakers == 0
 ```
 
 ## 23.5 言語認識
@@ -4466,23 +6820,39 @@ async def test_dominant_language_selects_prompt(client3: httpx.AsyncClient, ctx3
 # tests/test_codec_recovery.py
 from __future__ import annotations
 
+import asyncio
+import io
 import json
+import os
+import shutil
+import sqlite3
+import threading
+from contextlib import closing
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 
-from minutes_local.bootstrap import open_database_with_recovery
-from minutes_local.db import repo
+from minutes_local.bootstrap import build_context, open_database_with_recovery
+from minutes_local.config import Settings
+from minutes_local.db import repo, repo_phase3
+from minutes_local.db.migrations_phase3 import LATEST_SCHEMA_VERSION
 from minutes_local.db.models import Meeting
-from minutes_local.db.connection import Database
+from minutes_local.db.connection import Database, now_ms
 from minutes_local.jobs import scheduler
 from minutes_local.jobs.context import AppContext
+from minutes_local.jobs.handlers import handle_compress, read_chunk_pcm
 from minutes_local.jobs.runner import JobRunner
+from minutes_local.jobs.sweeper import resume_finalized
+from minutes_local.llm.fake_provider import FakeSummaryProvider
 from minutes_local.storage import backup
 from minutes_local.storage.codec import FakeCodec
-from minutes_local.storage.files import read_pcm
+from minutes_local.storage.files import PcmTooLongError, build_wav, read_pcm, sha256_hex
+from minutes_local.storage import rebuild as rebuild_module
 from minutes_local.storage.rebuild import RebuildReport, rebuild
-from tests.conftest import create_meeting, finalize, put_chunk, sine_pcm
+from minutes_local.stt.fake_provider import FakeSTTProvider
+from tests.conftest import GPU_HW, create_meeting, finalize, put_chunk, sine_pcm
 
 
 async def _completed_meeting(client3: httpx.AsyncClient, runner3: JobRunner, ctx3: AppContext) -> None:
@@ -4557,11 +6927,29 @@ async def test_backup_prune_and_restore(ctx3: AppContext) -> None:
     ctx3.db.close()
     s.db_path.write_bytes(b"garbage" * 100)                                             # DB 破損を再現
     assert backup.integrity_ok(s.db_path) is False
-    db, restored = open_database_with_recovery(s)
-    assert restored == paths[-1] and backup.integrity_ok(s.db_path)
+    db, recovery = open_database_with_recovery(s)
+    assert recovery is not None and recovery.restored_from == paths[-1] and backup.integrity_ok(s.db_path)
     assert any(p.name.startswith("minutes.sqlite.corrupt-") for p in s.data_dir.iterdir())
     db.close()
     ctx3.db = Database(s.db_path)                                                        # fixture の close 用
+
+
+async def test_backup_order_survives_clock_catching_up(ctx3: AppContext) -> None:
+    """時計が戻った後に作った世代は、時計が追いついた後も前の世代より新しい（並びは名前の時刻ではなく世代番号）。"""
+    # Arrange: 時計が進んでいた間に 1 世代、戻った後に 1 世代作る
+    day = 24 * 3600 * 1000
+    t0 = now_ms()
+    d = ctx3.settings.backups_dir
+    ahead = backup.create_backup(ctx3.db, d, t0 + day)
+    after_rollback = backup.create_backup(ctx3.db, d, t0)
+    # Act: 時計が両方の時刻を過ぎた後の並び・期日の判定・世代管理
+    order = backup.list_backups(d)
+    due = scheduler.backup_due(ctx3, t0 + day + 3600 * 1000)
+    pruned = backup.prune_backups(d, keep=1)
+    # Assert: 戻った後の世代が最新のまま（復元元は末尾から選ぶ）。期日はそれから 25 時間で来て、世代管理でも残る
+    assert order == [ahead, after_rollback]
+    assert due is True
+    assert pruned == 1 and backup.list_backups(d) == [after_rollback]
 
 
 async def test_rebuild_from_recordings(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
@@ -4578,6 +6966,93 @@ async def test_rebuild_from_recordings(client3: httpx.AsyncClient, ctx3: AppCont
     assert report.meetings_created == 1 and report.chunks_created == 2 and report.skipped_files == []
     assert m is not None and m.local_user_id == "local" and m.status == "finalized" and m.title == "t"
     assert after == before
+    assert report.owners_without_user == []          # 単一利用者の local は users に行が無くても見える
+
+
+async def test_rebuild_reports_owners_without_user(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """users に行の無い利用者の階層から復元した会議は、その所有者 ID を報告する（どのトークンからも見えない。§2.4）。"""
+    # Arrange: DB を失って users も空。録音は利用者 u-gone の階層にある
+    await _completed_meeting(client3, runner3, ctx3)
+    async with ctx3.db.write() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+    recordings = ctx3.settings.data_dir / "recordings"
+    (recordings / "u-gone").mkdir()
+    os.replace(recordings / "local" / "m-1", recordings / "u-gone" / "m-1")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert report.meetings_created == 1 and m is not None and m.local_user_id == "u-gone"
+    assert report.owners_without_user == ["u-gone"]
+    # Act / Assert: その利用者を含むバックアップから users が戻れば、もう報告しない
+    with ctx3.db.write_sync() as conn:
+        conn.execute("INSERT INTO users (id, name, token_hash, created_at) VALUES ('u-gone', 'gone', 'h', 0)")
+        again = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+    assert again.owners_without_user == []
+
+
+async def test_rebuild_relinks_chunk_compressed_after_backup(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """古いバックアップから戻した行が圧縮で消えた WAV を指していても、同じ音声の圧縮ファイルへ向け直す。内容の合わないファイルは指さない。"""
+    # Arrange: 圧縮を終えた後、行だけを圧縮前（バックアップの時点）に戻す。2 つ目の Chunk の圧縮ファイルは壊す
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        old_rows = sorted(repo.list_chunks(conn, "m-1"), key=lambda c: c.sequence_no)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        for c in old_rows:
+            repo.update_chunk(conn, c.id, local_path=c.local_path, codec="wav", sha256_flac=None, size_bytes=c.size_bytes)
+    broken = (ctx3.settings.data_dir / old_rows[1].local_path).with_suffix(".fake")
+    broken.write_bytes(b"garbage")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        good = repo.get_chunk(conn, old_rows[0].id)
+        bad = repo.get_chunk(conn, old_rows[1].id)
+    # Assert: 行は作り直さずに向け直し、壊れた方は missing にする
+    assert (report.chunks_created, report.chunks_relinked, report.chunks_marked_missing) == (0, 1, 1)
+    assert good is not None and good.local_path.endswith(".fake") and good.codec == "fake" and good.save_status == "verified"
+    assert len(read_pcm(ctx3.settings.data_dir, good.local_path, good.sha256, FakeCodec())) == 960000
+    assert bad is not None and bad.local_path == old_rows[1].local_path and bad.save_status == "missing"
+
+
+async def test_rebuild_relinks_only_when_existing_recording_is_corrupt(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                       runner3: JobRunner) -> None:
+    """行が指すファイルが残っていても壊れていれば、検証した別のファイルへ向け直す。健全なら向け直さない。代わりがなければ missing。"""
+    # Arrange: 圧縮後に行だけを圧縮前（WAV）に戻す。1 つ目の WAV は壊れたまま残り、2 つ目の WAV は元の内容で残っている
+    data_dir = ctx3.settings.data_dir
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        old_rows = sorted(repo.list_chunks(conn, "m-1"), key=lambda c: c.sequence_no)
+    intact_wav = (data_dir / old_rows[1].local_path).read_bytes()
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        for c in old_rows:
+            repo.update_chunk(conn, c.id, local_path=c.local_path, codec="wav", sha256_flac=None, size_bytes=c.size_bytes)
+    (data_dir / old_rows[0].local_path).write_bytes(b"garbage")
+    (data_dir / old_rows[1].local_path).write_bytes(intact_wav)
+    # Act
+    with ctx3.db.write_sync() as conn:
+        report = rebuild(conn, data_dir, ctx3.codec)
+        first = repo.get_chunk(conn, old_rows[0].id)
+        second = repo.get_chunk(conn, old_rows[1].id)
+    # Assert: 壊れた方だけを圧縮ファイルへ向け直し、健全な WAV を指す方はそのまま
+    assert (report.chunks_relinked, report.chunks_marked_missing) == (1, 0)
+    assert first is not None and first.local_path.endswith(".fake") and first.save_status == "verified"
+    assert second is not None and second.local_path == old_rows[1].local_path and second.save_status == "verified"
+    # Act: 2 つ目の WAV も壊し、代わりの圧縮ファイルを消す
+    (data_dir / old_rows[1].local_path).write_bytes(b"garbage")
+    (data_dir / old_rows[1].local_path).with_suffix(".fake").unlink()
+    with ctx3.db.write_sync() as conn:
+        again = rebuild(conn, data_dir, ctx3.codec)
+        second = repo.get_chunk(conn, old_rows[1].id)
+        first = repo.get_chunk(conn, old_rows[0].id)
+    # Assert: 代わりがなければ missing。向け直した 1 つ目は健全なので、壊れた WAV へ戻さない
+    assert (again.chunks_relinked, again.chunks_marked_missing) == (0, 1)
+    assert second is not None and second.save_status == "missing"
+    assert first is not None and first.local_path.endswith(".fake") and first.save_status == "verified"
 
 
 async def test_rebuild_keeps_end_time_from_phase2_snapshot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
@@ -4636,13 +7111,14 @@ async def test_rebuild_drops_malformed_stop_pair(client3: httpx.AsyncClient, ctx
 
 @pytest.mark.parametrize("ended", [-1, 2**63, True, "1700000000000", 1.5])
 async def test_rebuild_drops_malformed_end_time(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner, ended: object) -> None:
-    """SQLite INTEGER に入らない・整数でない終了時刻は None にし、rebuild 全体を止めない（会議と Chunk は復元する）。"""
+    """SQLite INTEGER に入らない・整数でない終了時刻は None にし、rebuild 全体を止めない（会議と Chunk は復元する）。
+    確定したかが分からないので、会議は recording に戻す（不正な終了時刻を確定の根拠にしない。§20 _restored_status）。"""
     # Arrange / Act
     await _completed_meeting(client3, runner3, ctx3)
     report, m = _rewrite_snapshot_and_rebuild(ctx3, endedAtEpochMs=ended)
     # Assert
     assert report.meetings_created == 1 and report.chunks_created == 2
-    assert m is not None and m.status == "finalized" and m.ended_at is None
+    assert m is not None and m.status == "recording" and m.ended_at is None
 
 
 async def test_missing_chunk_is_reported_for_resync(client3: httpx.AsyncClient, ctx3: AppContext) -> None:
@@ -4659,6 +7135,829 @@ async def test_missing_chunk_is_reported_for_resync(client3: httpx.AsyncClient, 
     r2 = await put_chunk(client3, "m-1", 0, pcm)                                        # 逆同期（同一内容の再 PUT）
     assert r2.status_code == 200 and r2.json()["registered"] is True
     assert (await finalize(client3, "m-1", mic=1)).status_code == 200
+
+
+def test_flac_codec_roundtrip_is_bit_exact() -> None:
+    """実コーデック（libsndfile）。往復で PCM が 1 ビットも変わらず、壊れた入力は ValueError になる（extras 未導入なら skip）。"""
+    pytest.importorskip("soundfile")
+    from minutes_local.storage.codec import FlacCodec
+    # Arrange: 極値（-32768 / 32767）を含む 1 秒
+    codec = FlacCodec()
+    pcm = sine_pcm(1) + (-32768).to_bytes(2, "little", signed=True) + (32767).to_bytes(2, "little", signed=True)
+    # Act
+    encoded = codec.encode(pcm)
+    # Assert
+    assert codec.decode(encoded) == pcm and len(encoded) < len(pcm)
+    for broken in (b"", b"xx", encoded[: len(encoded) // 2]):
+        with pytest.raises(ValueError):
+            codec.decode(broken)
+
+
+@pytest.mark.parametrize("kind", ["wav", "fake", "flac"])
+def test_read_pcm_rejects_audio_longer_than_limit_before_decoding_all(tmp_path: Path, kind: str) -> None:
+    """max_samples を超える音声は、全量を PCM にする前に PcmTooLongError で断る（話者分離のタイムラインの上限。§11 _load_and_diarize）。
+    上限以内なら従来どおり読む。圧縮ファイルの復号は上限 + 1 サンプルで止める（ヘッダの長さを信じない）"""
+    codec: object = None
+    if kind == "flac":
+        pytest.importorskip("soundfile")
+        from minutes_local.storage.codec import FlacCodec
+        codec = FlacCodec()
+    elif kind == "fake":
+        codec = FakeCodec()
+    # Arrange: 1 秒（16000 サンプル）の音声
+    pcm = sine_pcm(1)
+    data = build_wav(pcm) if codec is None else codec.encode(pcm)  # type: ignore[attr-defined]
+    name = "a.wav" if codec is None else f"a{codec.extension}"  # type: ignore[attr-defined]
+    (tmp_path / name).write_bytes(data)
+    # Act / Assert: 上限が長さちょうどなら読める。1 サンプル足りなければ断る
+    assert read_pcm(tmp_path, name, None, codec, max_samples=16000) == pcm  # type: ignore[arg-type]
+    with pytest.raises(PcmTooLongError):
+        read_pcm(tmp_path, name, None, codec, max_samples=15999)  # type: ignore[arg-type]
+    if codec is not None:
+        # 復号そのものも上限 + 1 サンプルで止まる（全量を確保しない）
+        assert len(codec.decode(data, max_samples=100)) == 101 * 2  # type: ignore[attr-defined]
+
+
+def test_read_pcm_bounds_compressed_file_read_before_decoding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """圧縮ファイルは、上限に対する最悪の符号化の大きさ（codec.max_encoded_bytes）を超えて読まず、復号の前に PcmTooLongError で断る。
+    ヘッダの長さ（FakeCodec の n）は見ない。全量を読み込まない（Path.read_bytes を使わない）"""
+    # Arrange: ヘッダは 1 秒と書いてあるが、後ろに大きなごみが続くファイル
+    codec = FakeCodec()
+    name = "a.fake"
+    (tmp_path / name).write_bytes(codec.encode(sine_pcm(1)) + b"\x00" * 1_000_000)
+
+    def no_full_read(self: Path) -> bytes:
+        raise AssertionError("read_pcm must not read the whole file")
+
+    def no_decode(self: FakeCodec, data: bytes, max_samples: int | None = None) -> bytes:
+        raise AssertionError("decode must not run on an oversized file")
+
+    monkeypatch.setattr(Path, "read_bytes", no_full_read)
+    monkeypatch.setattr(FakeCodec, "decode", no_decode)
+    # Act / Assert
+    with pytest.raises(PcmTooLongError):
+        read_pcm(tmp_path, name, None, codec, max_samples=16000)
+
+
+def test_flac_worst_case_bound_admits_incompressible_audio(tmp_path: Path) -> None:
+    """圧縮の効かない音声（白色雑音）の FLAC も、長さちょうどの上限なら読める（通常の符号化の余分を見込んだ上限。§16 max_encoded_bytes）。"""
+    pytest.importorskip("soundfile")
+    from minutes_local.storage.codec import FlacCodec
+    # Arrange
+    codec = FlacCodec()
+    pcm = os.urandom(32000)
+    data = codec.encode(pcm)
+    (tmp_path / "a.flac").write_bytes(data)
+    # Act / Assert: 符号化した大きさは上限の中にあり、読める
+    assert len(data) <= codec.max_encoded_bytes(16000)
+    assert read_pcm(tmp_path, "a.flac", None, codec, max_samples=16000) == pcm
+
+
+# ---- 圧縮と読み取りの競合 ----
+
+async def _compress_job(ctx3: AppContext, seq: int = 0):  # type: ignore[no-untyped-def]
+    with ctx3.db.read() as conn:
+        chunk = repo.get_chunk_by_key(conn, "m-1", "mic", seq)
+        job = next(j for j in repo.list_jobs(conn, "m-1") if j.job_type == "compress_chunk" and j.chunk_id == chunk.id)
+    return chunk, job
+
+
+async def test_reader_follows_chunk_replaced_by_compression(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """読み取りの直前に圧縮でファイルが置き換わっても、行を読み直して新しいパスから読む（Chunk を欠損にしない）。"""
+    # Arrange: 圧縮前に読んだ行（WAV のパス）を持ったまま、圧縮が終わる
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        stale = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    assert not (ctx3.settings.data_dir / stale.local_path).exists()
+    # Act
+    pcm = read_chunk_pcm(ctx3, stale)
+    # Assert
+    assert len(pcm) == 960000
+
+
+async def test_reader_follows_chunk_replaced_between_exists_and_read(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                    runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """read_pcm の存在確認の後に圧縮が WAV を消して OSError になっても、行を読み直して新しいパスから読む。"""
+    # Arrange: 圧縮前の行を持ったまま圧縮を終え、古いパスの読み取りは存在確認を通った後の FileNotFoundError にする
+    from minutes_local.jobs import handlers as handlers_module
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        stale = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    real = handlers_module.read_pcm
+
+    def racing(data_dir: Path, relative_path: str, *args: object, **kwargs: object) -> bytes:
+        if relative_path == stale.local_path:
+            raise FileNotFoundError(relative_path)
+        return real(data_dir, relative_path, *args, **kwargs)  # type: ignore[arg-type]
+    monkeypatch.setattr(handlers_module, "read_pcm", racing)
+    # Act
+    pcm = read_chunk_pcm(ctx3, stale)
+    # Assert
+    assert len(pcm) == 960000
+
+
+@pytest.mark.parametrize("readable_on_recheck", [True, False])
+async def test_vad_rechecks_chunk_when_read_raises_os_error(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                            monkeypatch: pytest.MonkeyPatch, readable_on_recheck: bool) -> None:
+    """VAD の読み取りが OSError（権限・取り外し）でも、読めない WAV と同じく修復を確かめ直す。読めれば VAD を続け、読めなければ
+    missing にして INVALID_AUDIO で止める（OSError のまま投げると missing にならず、再試行を回数切れまで繰り返す）。"""
+    # Arrange: vad ジョブを lease し、その Chunk の 1 回目の読み取りを PermissionError にする
+    from minutes_local.jobs import handlers as handlers_module
+    from minutes_local.jobs.retry import InvalidAudioError
+    await create_meeting(client3)
+    await put_chunk(client3, "m-1", 0, sine_pcm(30))
+    assert (await finalize(client3, "m-1", mic=1)).status_code == 200
+    async with ctx3.db.write() as conn:
+        vad = repo_phase3.lease_job_fair(conn, "w-1", ["vad_chunk"], now_ms())
+        assert vad is not None
+
+    def unreadable(*_args: object, **_kwargs: object) -> bytes:
+        raise PermissionError("denied")
+    monkeypatch.setattr(handlers_module, "read_chunk_pcm", unreadable)
+    if not readable_on_recheck:
+        monkeypatch.setattr(handlers_module, "read_pcm", unreadable)
+    # Act
+    if readable_on_recheck:
+        await handlers_module.handle_vad(ctx3, vad)
+    else:
+        with pytest.raises(InvalidAudioError):
+            await handlers_module.handle_vad(ctx3, vad)
+    # Assert
+    with ctx3.db.read() as conn:
+        chunk = repo.get_chunk(conn, vad.chunk_id or "")
+    assert chunk is not None
+    if readable_on_recheck:
+        assert chunk.save_status != "missing" and chunk.stt_status != "pending"
+    else:
+        assert chunk.save_status == "missing"
+
+
+async def test_compress_does_not_switch_after_job_was_withdrawn(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """STT の再実行がジョブを消した後は、実行中だった圧縮が Chunk を切り替えない（WAV のまま、圧縮ファイルも残さない）。"""
+    # Arrange: 圧縮ジョブを lease した後で、再実行がジョブを行ごと消す
+    await _completed_meeting(client3, runner3, ctx3)
+    await scheduler.schedule_compression(ctx3)
+    async with ctx3.db.write() as conn:
+        job = repo_phase3.lease_job_fair(conn, "w-old", ["compress_chunk"], now_ms())
+        assert job is not None
+        conn.execute("DELETE FROM processing_jobs WHERE id = ?", (job.id,))
+    # Act
+    await handle_compress(ctx3, job)
+    # Assert
+    with ctx3.db.read() as conn:
+        chunk = repo.get_chunk(conn, job.chunk_id)
+    path = ctx3.settings.data_dir / chunk.local_path
+    assert chunk.codec == "wav" and path.exists() and not path.with_suffix(".fake").exists()
+
+
+async def test_compress_stale_attempt_keeps_committed_file(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    """lease を失った旧い試行は、別の試行が確定した圧縮ファイルを上書きも削除もしない（試行ごとの一時ファイルに書く）。"""
+    # Arrange: 旧い試行がエンコード中に lease を失い、その間に新しい試行が同じ Chunk を圧縮して確定する
+    await _completed_meeting(client3, runner3, ctx3)
+    await scheduler.schedule_compression(ctx3)
+    async with ctx3.db.write() as conn:
+        stale = repo_phase3.lease_job_fair(conn, "w-old", ["compress_chunk"], now_ms())
+        assert stale is not None
+    entered, gate = threading.Event(), threading.Event()
+    real_encode = ctx3.codec.encode
+
+    def slow_encode(pcm: bytes) -> bytes:
+        if not entered.is_set():
+            entered.set()
+            gate.wait(5)
+        return real_encode(pcm)
+
+    monkeypatch.setattr(ctx3.codec, "encode", slow_encode)
+    old_attempt = asyncio.create_task(handle_compress(ctx3, stale))
+    assert await asyncio.to_thread(entered.wait, 5)
+    async with ctx3.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_owner = 'w-new', attempts = attempts + 1, status = 'processing' WHERE id = ?",
+                     (stale.id,))
+        fresh = repo.get_job(conn, stale.id)
+    assert fresh is not None
+    await handle_compress(ctx3, fresh)
+    # Act: 旧い試行のエンコードを終わらせる
+    gate.set()
+    await old_attempt
+    # Assert: 確定した圧縮ファイルが残り、一時ファイルも残らない
+    with ctx3.db.read() as conn:
+        chunk = repo.get_chunk(conn, stale.chunk_id)
+    assert chunk is not None and chunk.codec == "fake"
+    final = ctx3.settings.data_dir / chunk.local_path
+    assert final.exists() and read_chunk_pcm(ctx3, chunk)
+    assert not list(final.parent.glob("*.staging"))
+
+
+async def _leased_again(ctx3: AppContext, job_id: str):  # type: ignore[no-untyped-def]
+    """完了済みのジョブを、やり直しの試行が lease し直した状態にする（落ちた試行の後に Sweeper が戻し、別の試行が取った）。"""
+    async with ctx3.db.write() as conn:
+        conn.execute("UPDATE processing_jobs SET lease_owner = 'w-retry', attempts = attempts + 1, status = 'processing' WHERE id = ?",
+                     (job_id,))
+        job = repo.get_job(conn, job_id)
+    assert job is not None
+    return job
+
+
+async def test_compress_retry_removes_wav_left_by_crash(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """切り替えのコミット後・WAV の削除前に落ちた場合、やり直しのジョブが残った WAV を消す。"""
+    # Arrange: 圧縮済みの Chunk の隣に WAV が残っていて、やり直しの試行がジョブを lease している
+    await _completed_meeting(client3, runner3, ctx3)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    chunk, done = await _compress_job(ctx3)
+    job = await _leased_again(ctx3, done.id)
+    leftover = (ctx3.settings.data_dir / chunk.local_path).with_suffix(".wav")
+    leftover.write_bytes(b"left by crash")
+    # Act
+    await handle_compress(ctx3, job)
+    # Assert
+    assert not leftover.exists() and (ctx3.settings.data_dir / chunk.local_path).exists()
+
+
+async def test_compress_retry_keeps_wav_repaired_after_read(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """やり直しの試行が圧縮済みの行を読んだ後に、再 PUT の修復が WAV に書き戻していたら、その WAV を消さない。"""
+    # Arrange: 圧縮した後、やり直しの試行が読む行（圧縮済み）を取っておく。その後に圧縮ファイルが壊れ、再 PUT が WAV に書き戻す
+    await _completed_meeting(client3, runner3, ctx3)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    stale, done = await _compress_job(ctx3)
+    job = await _leased_again(ctx3, done.id)
+    (ctx3.settings.data_dir / stale.local_path).write_bytes(b"xx")
+    r = await put_chunk(client3, "m-1", 0, sine_pcm(30))
+    assert r.status_code == 200
+    monkeypatch.setattr("minutes_local.jobs.pipeline.job_of_chunk", lambda _conn, _job: stale)
+    # Act
+    await handle_compress(ctx3, job)
+    # Assert: 書き戻した WAV が残り、読める
+    with ctx3.db.read() as conn:
+        repaired = repo.get_chunk(conn, stale.id)
+    assert repaired is not None and repaired.codec == "wav"
+    assert len(read_pcm(ctx3.settings.data_dir, repaired.local_path, repaired.sha256)) == 960000
+
+
+async def test_compress_keeps_wav_repaired_after_switch(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    """切り替えのコミットの後・WAV の削除の前に、再 PUT の修復が WAV に書き戻していたら、その WAV を消さない。"""
+    # Arrange: 圧縮ジョブを lease する。一時ファイルの後始末（コミットの後・WAV の削除の前）の直後に修復を差し込む
+    await _completed_meeting(client3, runner3, ctx3)
+    await scheduler.schedule_compression(ctx3)
+    async with ctx3.db.write() as conn:
+        job = repo_phase3.lease_job_fair(conn, "w-1", ["compress_chunk"], now_ms())
+        assert job is not None
+    with ctx3.db.read() as conn:
+        original = repo.get_chunk(conn, job.chunk_id)
+    assert original is not None
+    wav = ctx3.settings.data_dir / original.local_path
+    wav_bytes = wav.read_bytes()
+    real_unlink = Path.unlink
+
+    def unlink_then_repair(self: Path, missing_ok: bool = False) -> None:
+        real_unlink(self, missing_ok=missing_ok)
+        if self.name.endswith(".staging"):
+            # 圧縮ファイルが壊れ、再 PUT が WAV に書き戻した（routes_phase1 の修復と同じ書き込み）
+            wav.write_bytes(wav_bytes)
+            with ctx3.db.write_sync() as conn:
+                repo.update_chunk(conn, original.id, local_path=original.local_path, codec="wav", sha256_flac=None,
+                                  size_bytes=len(wav_bytes))
+    monkeypatch.setattr(Path, "unlink", unlink_then_repair)
+    # Act
+    await handle_compress(ctx3, job)
+    # Assert: 書き戻した WAV が残り、読める
+    with ctx3.db.read() as conn:
+        repaired = repo.get_chunk(conn, original.id)
+    assert repaired is not None and repaired.codec == "wav"
+    assert len(read_pcm(ctx3.settings.data_dir, repaired.local_path, repaired.sha256)) == 960000
+
+
+# ---- バックアップ ----
+
+async def test_backup_failure_leaves_no_partial_file(ctx3: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    """書きかけのバックアップを正規の名前で残さない（残ると復元元に選ばれる）。"""
+    # Arrange: 一時ファイルから正規の名前への付け替えで失敗させる
+    def fail_replace(_src: object, _dst: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    # Act / Assert
+    with pytest.raises(OSError):
+        backup.create_backup(ctx3.db, ctx3.settings.backups_dir)
+    assert list(ctx3.settings.backups_dir.iterdir()) == []
+
+
+async def test_restore_skips_broken_backup(ctx3: AppContext) -> None:
+    """最新のバックアップが壊れていても、検査に通る最も新しいものから復元する。integrity_check に通っても、このアプリの
+    スキーマ（schema_version が 1 以上・このビルドの最新以下）を持たないものは飛ばし、1 つ古いものへ下がる。"""
+    # Arrange
+    s = ctx3.settings
+    good = backup.create_backup(ctx3.db, s.backups_dir)
+    gen, stamp = backup.backup_generation(good), backup.backup_time_ms(good)
+    assert gen is not None and stamp is not None
+    # 規約どおりの名前（minutes-{世代}-{epoch ms}.sqlite）で good より新しい世代にする。規約外だと list_backups が除き、
+    # 壊れた候補を退ける経路を通らない
+    empty = s.backups_dir / f"minutes-{gen + 1}-{stamp}.sqlite"
+    corrupt = s.backups_dir / f"minutes-{gen + 2}-{stamp}.sqlite"
+    empty.write_bytes(b"")                                                               # 空のファイルは integrity_check に通るが中身がない
+    corrupt.write_bytes(b"partial")
+    # integrity_check には通るが、このアプリのスキーマを持たない DB（表が無い・別のアプリ・このビルドより新しい版）
+    foreign = s.backups_dir / f"minutes-{gen + 3}-{stamp}.sqlite"
+    newer = s.backups_dir / f"minutes-{gen + 4}-{stamp}.sqlite"
+    with closing(sqlite3.connect(foreign)) as conn:
+        conn.execute("CREATE TABLE other (x INTEGER)")
+        conn.commit()
+    shutil.copyfile(good, newer)
+    with closing(sqlite3.connect(newer)) as conn:
+        conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (?, 0)", (LATEST_SCHEMA_VERSION + 1,))
+        conn.commit()
+    assert backup.integrity_ok(foreign) and backup.integrity_ok(newer)
+    # 新しい順に newer → foreign → corrupt → empty → good を試す
+    assert backup.list_backups(s.backups_dir) == [good, empty, corrupt, foreign, newer]
+    ctx3.db.close()
+    s.db_path.write_bytes(b"garbage" * 100)
+    # Act
+    db, recovery = open_database_with_recovery(s)
+    # Assert
+    assert recovery is not None and recovery.restored_from == good and backup.integrity_ok(s.db_path)
+    db.close()
+
+
+async def test_backup_names_with_non_ascii_digits_are_ignored(ctx3: AppContext) -> None:
+    """世代・時刻に ASCII 以外の数字（「²」は str.isdigit() が真で int() が投げる）を含む名前は規約外として除き、定期のバックアップを止めない。"""
+    # Arrange
+    s = ctx3.settings
+    good = backup.create_backup(ctx3.db, s.backups_dir)
+    odd_gen = s.backups_dir / "minutes-²-1.sqlite"
+    odd_stamp = s.backups_dir / "minutes-1-1²3.sqlite"
+    odd_gen.write_bytes(b"")
+    odd_stamp.write_bytes(b"")
+    # Act
+    listed = backup.list_backups(s.backups_dir)
+    newer = backup.create_backup(ctx3.db, s.backups_dir)
+    # Assert: 名前の解析は None を返し、一覧にも復元元にも入らない
+    assert backup.backup_generation(odd_gen) is None and backup.backup_time_ms(odd_stamp) is None
+    assert listed == [good]
+    assert backup.list_backups(s.backups_dir) == [good, newer]
+    ctx3.db = Database(s.db_path)                                                        # fixture の close 用
+
+
+@pytest.mark.parametrize("with_backup", [True, False])
+async def test_startup_recovery_rebuilds_meetings_missing_from_database(
+        client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner, settings: Settings,
+        stt_provider: FakeSTTProvider, llm_provider: FakeSummaryProvider, with_backup: bool) -> None:
+    """DB が壊れたら、バックアップ（なければ空の DB）で起動し、録音ファイルから会議を作り直す。起動を止めない。"""
+    # Arrange: バックアップの後で録音した会議がある状態で DB が壊れる
+    backed_up = backup.create_backup(ctx3.db, settings.backups_dir) if with_backup else None
+    await _completed_meeting(client3, runner3, ctx3)
+    ctx3.db.close()
+    settings.db_path.write_bytes(b"garbage" * 100)
+    # Act
+    c = await build_context(settings, stt_provider=stt_provider, llm_provider=llm_provider, hardware=GPU_HW, codec=FakeCodec())
+    # Assert
+    try:
+        assert c.recovery is not None and c.recovery.restored_from == backed_up
+        assert c.recovery.rebuilt.meetings_created == 1 and c.recovery.rebuilt.chunks_created == 2
+        with c.db.read() as conn:
+            m = repo.get_meeting(conn, "m-1")
+        assert m is not None and m.status == "finalized"                                 # serve が resume_finalized でジョブを作り直す
+    finally:
+        c.stt.shutdown()
+        c.db.close()
+    ctx3.db = Database(settings.db_path)                                                 # fixture の close 用
+
+
+async def test_interrupted_restore_resumes_on_next_start(
+        client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner, settings: Settings,
+        stt_provider: FakeSTTProvider, llm_provider: FakeSummaryProvider, monkeypatch: pytest.MonkeyPatch) -> None:
+    """壊れた DB を退避した後、バックアップのコピー中に止まっても、次の起動は空の DB の初回起動とみなさず復旧をやり直す。"""
+    # Arrange: バックアップの後で録音した会議がある状態で DB が壊れ、復元のコピーで落ちる
+    backed_up = backup.create_backup(ctx3.db, settings.backups_dir)
+    await _completed_meeting(client3, runner3, ctx3)
+    ctx3.db.close()
+    settings.db_path.write_bytes(b"garbage" * 100)
+    real_copy = backup.shutil.copy2
+
+    def crash(src: object, dst: object) -> None:
+        raise OSError("killed during copy")
+
+    monkeypatch.setattr(backup.shutil, "copy2", crash)
+    with pytest.raises(OSError):
+        open_database_with_recovery(settings)
+    monkeypatch.setattr(backup.shutil, "copy2", real_copy)
+    assert not settings.db_path.exists() and backup.pending_recovery(settings.db_path) is not None
+    # Act: 次の起動
+    c = await build_context(settings, stt_provider=stt_provider, llm_provider=llm_provider, hardware=GPU_HW, codec=FakeCodec())
+    # Assert: 復元からやり直し、録音ファイルから作り直し、控えを消す
+    try:
+        assert c.recovery is not None and c.recovery.restored_from == backed_up
+        assert c.recovery.rebuilt.meetings_created == 1
+        assert backup.pending_recovery(settings.db_path) is None
+    finally:
+        c.stt.shutdown()
+        c.db.close()
+    # 控えが無ければ、次の起動は通常どおり（復旧なし）
+    again = await build_context(settings, stt_provider=stt_provider, llm_provider=llm_provider, hardware=GPU_HW, codec=FakeCodec())
+    try:
+        assert again.recovery is None
+    finally:
+        again.stt.shutdown()
+        again.db.close()
+    ctx3.db = Database(settings.db_path)                                                 # fixture の close 用
+
+
+async def test_startup_recovery_finalizes_meeting_backed_up_before_finalize(
+        client3: httpx.AsyncClient, ctx3: AppContext, settings: Settings,
+        stt_provider: FakeSTTProvider, llm_provider: FakeSummaryProvider) -> None:
+    """確定前のバックアップから戻した会議（行は recording）も、確定時の控えに合わせて finalized にし、起動時にジョブを作る。"""
+    # Arrange: 録音中にバックアップを取り、その後で確定してから DB が壊れる
+    await create_meeting(client3)
+    for seq in range(2):
+        await put_chunk(client3, "m-1", seq, sine_pcm(30))
+    backed_up = backup.create_backup(ctx3.db, settings.backups_dir)
+    assert (await finalize(client3, "m-1", mic=2)).status_code == 200
+    ctx3.db.close()
+    settings.db_path.write_bytes(b"garbage" * 100)
+    # Act
+    c = await build_context(settings, stt_provider=stt_provider, llm_provider=llm_provider, hardware=GPU_HW, codec=FakeCodec())
+    try:
+        with c.db.read() as conn:
+            restored = repo.get_meeting(conn, "m-1")
+        resumed = await resume_finalized(c.db, settings.data_dir)
+        with c.db.read() as conn:
+            m = repo.get_meeting(conn, "m-1")
+            vad_jobs = [j for j in repo.list_jobs(conn, "m-1") if j.job_type == "vad_chunk"]
+        # Assert: 行はバックアップから戻り（作り直さない）、控えに合わせて finalized になり、serve の起動時の回収でジョブができる
+        assert c.recovery is not None and c.recovery.restored_from == backed_up
+        assert c.recovery.rebuilt.meetings_created == 0 and c.recovery.rebuilt.meetings_finalized == 1
+        assert restored is not None and restored.status == "finalized" and restored.ended_at is not None
+        assert resumed == 1 and m is not None and m.status == "transcribing" and len(vad_jobs) == 2
+    finally:
+        c.stt.shutdown()
+        c.db.close()
+    ctx3.db = Database(settings.db_path)                                                 # fixture の close 用
+
+
+# ---- 日次処理 ----
+
+async def test_scheduler_backs_up_only_when_a_day_has_passed(ctx3: AppContext) -> None:
+    """起動のたびにバックアップを作らない（短時間の再起動の繰り返しで、古い世代が押し出されない）。"""
+    # Arrange
+    day = 24 * 3600 * 1000
+    t0 = now_ms()
+    # Act
+    first = await scheduler.run_once(ctx3, now=t0)
+    second = await scheduler.run_once(ctx3, now=t0 + day - 1)
+    third = await scheduler.run_once(ctx3, now=t0 + day)
+    # Assert
+    assert (first["backup"], second["backup"], third["backup"]) == (1, 0, 1)
+    assert [backup.backup_time_ms(p) for p in backup.list_backups(ctx3.settings.backups_dir)] == [t0, t0 + day]
+
+
+async def test_scheduler_keeps_backup_made_after_clock_rollback(ctx3: AppContext) -> None:
+    """時計が戻っても、戻った後の世代を作った直後に消さず、毎周作り直さない（未来の時刻の世代から先に消す）。"""
+    # Arrange: 時計が進んでいた間に世代数いっぱいまで作った（名前の時刻はどれも戻った後の現在より未来）
+    day = 24 * 3600 * 1000
+    t0 = now_ms()
+    keep = ctx3.settings.backup_generations
+    for i in range(keep):
+        backup.create_backup(ctx3.db, ctx3.settings.backups_dir, t0 + (i + 1) * day)
+    # Act
+    first = await scheduler.run_once(ctx3, now=t0)
+    second = await scheduler.run_once(ctx3, now=t0 + 3600 * 1000)
+    # Assert: 戻った後に 1 世代作って残し、未来の世代を 1 つ消す。次の周は作らない
+    stamps = [backup.backup_time_ms(p) for p in backup.list_backups(ctx3.settings.backups_dir)]
+    assert (first["backup"], first["pruned"], second["backup"]) == (1, 1, 0)
+    assert t0 in stamps and len(stamps) == keep
+    assert t0 + day not in stamps                                                        # 最も古い扱いの未来の世代から消える
+
+
+async def test_scheduler_loop_survives_failed_iteration(ctx3: AppContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    """バックアップの失敗（ディスク満杯など）で日次処理のループが終わらない。"""
+    # Arrange: 1 回目のバックアップだけ失敗させる
+    stop = asyncio.Event()
+    calls = 0
+    real = backup.create_backup
+
+    def flaky(db: Database, backups_dir, now=None):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("disk full")
+        stop.set()
+        return real(db, backups_dir, now)
+
+    monkeypatch.setattr(backup, "create_backup", flaky)
+    # Act
+    await asyncio.wait_for(scheduler.run_forever(ctx3, stop, interval_s=0.01), timeout=5)
+    # Assert: 失敗の後の周回でバックアップができている
+    assert calls == 2 and len(backup.list_backups(ctx3.settings.backups_dir)) == 1
+
+
+# ---- 再構築（壊れた meeting.json・確定前の会議） ----
+
+async def test_rebuild_restores_unfinalized_meeting_as_recording(client3: httpx.AsyncClient, ctx3: AppContext) -> None:
+    """確定前の控えしかない会議は recording で復元する。ブラウザが残りの Chunk を送って確定できる（finalized にすると 409 で受け取れない）。"""
+    # Arrange: 確定していない会議の行が失われる
+    await create_meeting(client3)
+    await put_chunk(client3, "m-1", 0, sine_pcm(30))
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        # Act
+        rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    # Assert: 続きの Chunk と確定を受け付ける
+    assert m is not None and m.status == "recording"
+    assert (await put_chunk(client3, "m-1", 1, sine_pcm(30))).status_code in (200, 201)
+    assert (await finalize(client3, "m-1", mic=2)).status_code == 200
+
+
+@pytest.mark.parametrize("fields", [
+    {"sessionStartEpochMs": "abc"},                                                   # 数値でない
+    {"nativeSampleRate": None},
+    {"totalAudioFrames": 2**70},                                                      # SQLite INTEGER 超過
+    {"title": 123},
+    {"title": "会議\ud800"},                                                           # UTF-8 にできない（孤立サロゲート）
+    {"chunks": [1]},                                                                  # 要素がオブジェクトでない
+    {"chunks": {"source": "mic"}},                                                    # 配列でない
+    {"chunks": [{"source": "mic", "sequenceNo": "x"}]},
+    {"chunks": [{"source": "mic", "sequenceNo": 0, "startOffsetMs": "z", "endOffsetMs": None, "vadScore": "high", "hasVoice": "yes"}]},
+    {"chunks": [{"source": "mic", "sequenceNo": 0, "startOffsetMs": 2**63 - 1}]},                   # 開始 + 長さが SQLite INTEGER 超過
+    {"chunks": [{"source": "mic", "sequenceNo": 0, "startOffsetMs": 5000, "endOffsetMs": 1000}]},  # 終了が開始より前
+])
+async def test_rebuild_tolerates_malformed_snapshot_fields(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                           fields: dict[str, object]) -> None:
+    """meeting.json の項目が壊れていても既定値に置き換え、rebuild 全体を止めない（会議と Chunk は復元する）。"""
+    # Arrange / Act
+    await _completed_meeting(client3, runner3, ctx3)
+    report, m = _rewrite_snapshot_and_rebuild(ctx3, **fields)
+    # Assert
+    assert report.meetings_created == 1 and report.chunks_created == 2 and m is not None
+    with ctx3.db.read() as conn:
+        first = repo.get_chunk_by_key(conn, "m-1", "mic", 0)
+    assert first is not None and (first.start_offset_ms, first.end_offset_ms, first.has_voice) == (0, 30000, True)
+
+
+async def test_rebuild_tolerates_deeply_nested_snapshot(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """入れ子の深すぎる meeting.json（json.loads が RecursionError）でも、控えなしとして復元し、rebuild を止めない。"""
+    # Arrange
+    await _completed_meeting(client3, runner3, ctx3)
+    (ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json").write_text("[" * 100_000, encoding="utf-8")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert m is not None and m.title == "復元された会議"
+
+
+async def test_rebuild_treats_oversized_snapshot_as_unreadable(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """上限を超える meeting.json は全量を読まずに読めない控えとして扱い、控えなしとして復元する（rebuild を止めない）。"""
+    # Arrange: 正しい JSON だが上限を 1 バイト超える（中身が読まれていればタイトルが復元される）
+    await _completed_meeting(client3, runner3, ctx3)
+    head = '{"title": "大きすぎる控え", "pad": "'
+    body = head + "x" * (rebuild_module.MAX_SNAPSHOT_BYTES - len(head.encode("utf-8")) - 2) + '"}'
+    path = ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json"
+    path.write_text(body + " ", encoding="utf-8")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert len(body.encode("utf-8")) == rebuild_module.MAX_SNAPSHOT_BYTES
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert m is not None and m.title == "復元された会議"
+
+
+async def test_rebuild_reads_snapshot_at_the_size_limit(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """上限ちょうどの meeting.json は読む（境界）。"""
+    # Arrange
+    await _completed_meeting(client3, runner3, ctx3)
+    head = '{"title": "上限ちょうど", "pad": "'
+    body = head + "x" * (rebuild_module.MAX_SNAPSHOT_BYTES - len(head.encode("utf-8")) - 2) + '"}'
+    (ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json").write_text(body, encoding="utf-8")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert m is not None and m.title == "上限ちょうど"
+
+
+async def test_rebuild_replaces_title_that_cannot_be_encoded(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """UTF-8 にできないタイトル（JSON の孤立サロゲート）は既定のタイトルに置き換える。正しいタイトルはそのまま残す。"""
+    # Arrange / Act
+    await _completed_meeting(client3, runner3, ctx3)
+    broken_report, broken = _rewrite_snapshot_and_rebuild(ctx3, title="会議\ud800")
+    kept_report, kept = _rewrite_snapshot_and_rebuild(ctx3, title="定例")
+    # Assert
+    assert broken_report.meetings_created == 1 and broken is not None and broken.title == "復元された会議"
+    assert kept_report.meetings_created == 1 and kept is not None and kept.title == "定例"
+
+
+def test_deeply_nested_recovery_marker_counts_as_unreadable(settings: Settings) -> None:
+    """復旧の控えが入れ子の深すぎる JSON でも、読めない控え（復元元は不明の復旧中）として扱い、起動を止めない。"""
+    # Arrange
+    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+    backup.recovery_marker(settings.db_path).write_text("{\"a\":" * 100_000, encoding="utf-8")
+    # Act
+    recovery = backup.pending_recovery(settings.db_path)
+    # Assert
+    assert recovery is not None and recovery.restored_from is None
+
+
+async def test_rebuild_reverifies_missing_chunk_whose_file_was_restored(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                       runner3: JobRunner) -> None:
+    """missing にした行のファイルを同じ場所に戻すと、次の rebuild が内容を確かめて verified に戻す。内容が違えば missing のまま。"""
+    # Arrange: 1 つ目のファイルを壊して rebuild で missing にする
+    data_dir = ctx3.settings.data_dir
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        rows = sorted(repo.list_chunks(conn, "m-1"), key=lambda c: c.sequence_no)
+    path = data_dir / rows[0].local_path
+    intact = path.read_bytes()
+    path.write_bytes(b"garbage")
+    with ctx3.db.write_sync() as conn:
+        assert rebuild(conn, data_dir, ctx3.codec).chunks_marked_missing == 1
+    # Act: 別の内容のままもう一度、元の内容に戻してもう一度
+    with ctx3.db.write_sync() as conn:
+        still_broken = rebuild(conn, data_dir, ctx3.codec)
+        broken_row = repo.get_chunk(conn, rows[0].id)
+    path.write_bytes(intact)
+    with ctx3.db.write_sync() as conn:
+        repaired = rebuild(conn, data_dir, ctx3.codec)
+        row = repo.get_chunk(conn, rows[0].id)
+    # Assert
+    assert still_broken.chunks_reverified == 0 and broken_row is not None and broken_row.save_status == "missing"
+    assert (repaired.chunks_reverified, repaired.chunks_marked_missing) == (1, 0)
+    assert row is not None and row.save_status == "verified" and row.local_path == rows[0].local_path
+
+
+async def test_rebuild_skips_relink_when_alternate_becomes_unreadable(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                       runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """向け直す先のファイルが読めなくても（権限・取り外し）、rebuild を止めずにその Chunk だけ向け直さない。"""
+    # Arrange: 圧縮後に行だけを圧縮前（WAV）に戻す。1 つ目の圧縮ファイルは読み取り（検証と記録に使う 1 回）で失敗させる
+    data_dir = ctx3.settings.data_dir
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        old_rows = sorted(repo.list_chunks(conn, "m-1"), key=lambda c: c.sequence_no)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        for c in old_rows:
+            repo.update_chunk(conn, c.id, local_path=c.local_path, codec="wav", sha256_flac=None, size_bytes=c.size_bytes)
+    flaky = (data_dir / old_rows[0].local_path).with_suffix(".fake")
+    reads = {"n": 0}
+    original = Path.open
+
+    def open_failing(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == flaky:
+            reads["n"] += 1
+            raise PermissionError("unreadable")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_failing)
+    # Act
+    with ctx3.db.write_sync() as conn:
+        report = rebuild(conn, data_dir, ctx3.codec)
+        first = repo.get_chunk(conn, old_rows[0].id)
+        second = repo.get_chunk(conn, old_rows[1].id)
+    # Assert: 読めなかった方は向け直さず（行が指す WAV はないので missing）、もう一方は向け直す
+    assert reads["n"] == 1
+    assert (report.chunks_relinked, report.chunks_marked_missing) == (1, 1)
+    assert first is not None and first.local_path == old_rows[0].local_path and first.save_status == "missing"
+    assert second is not None and second.local_path.endswith(".fake") and second.save_status == "verified"
+
+
+async def test_rebuild_relink_records_the_bytes_it_validated(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                              runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """向け直しは向け直す先を 1 回だけ読み、検証したそのバイト列から大きさと sha256_flac を記録する。
+    読み直すと、その間に置き換わった別の内容を、検証していないまま行に記録してしまう。"""
+    # Arrange: 圧縮後に行だけを圧縮前（WAV）に戻す。1 つ目の圧縮ファイルは、2 回目以降の読み取りで別の内容を返す
+    data_dir = ctx3.settings.data_dir
+    await _completed_meeting(client3, runner3, ctx3)
+    with ctx3.db.read() as conn:
+        old_rows = sorted(repo.list_chunks(conn, "m-1"), key=lambda c: c.sequence_no)
+    await scheduler.schedule_compression(ctx3)
+    await runner3.run_until_idle()
+    async with ctx3.db.write() as conn:
+        for c in old_rows:
+            repo.update_chunk(conn, c.id, local_path=c.local_path, codec="wav", sha256_flac=None, size_bytes=c.size_bytes)
+    changing = (data_dir / old_rows[0].local_path).with_suffix(".fake")
+    validated = changing.read_bytes()
+    reads = {"n": 0}
+    original = Path.open
+
+    def open_changing(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == changing:
+            reads["n"] += 1
+            return io.BytesIO(validated if reads["n"] == 1 else validated + b"\x00\x00")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_changing)
+    # Act
+    with ctx3.db.write_sync() as conn:
+        rebuild(conn, data_dir, ctx3.codec)
+        first = repo.get_chunk(conn, old_rows[0].id)
+    # Assert: 記録した大きさと sha256 は、検証した 1 回目の内容のもの
+    assert first is not None and first.local_path.endswith(".fake")
+    assert first.size_bytes == len(validated) and first.sha256_flac == sha256_hex(validated)
+
+
+async def test_rebuild_skips_recording_that_disappears_after_reading(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                     runner3: JobRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    """録音を読んだ後に消えても（取り外し・別プロセスの削除）、rebuild を止めずにそのファイルだけ飛ばし、残りを復元する。"""
+    # Arrange: 会議の行を消す。1 つ目の録音は、中身を読んだ直後に消えるようにする
+    await _completed_meeting(client3, runner3, ctx3)
+    data_dir = ctx3.settings.data_dir
+    mic = data_dir / "recordings" / "local" / "m-1" / "mic"
+    vanishing = sorted(mic.glob("*.wav"))[0]
+    original = rebuild_module._chunk_from_file
+
+    def read_then_vanish(path: Path, codec: object) -> object:
+        restored = original(path, codec)  # type: ignore[arg-type]
+        if path == vanishing:
+            path.unlink()
+        return restored
+
+    monkeypatch.setattr(rebuild_module, "_chunk_from_file", read_then_vanish)
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, data_dir, ctx3.codec)
+        chunks = repo.list_chunks(conn, "m-1")
+    # Assert: 消えた録音は飛ばした一覧に載り、もう一方は復元する
+    assert report.meetings_created == 1 and report.chunks_created == 1
+    assert report.skipped_files == [str(vanishing.relative_to(data_dir))]
+    assert [c.sequence_no for c in chunks] == [1]
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+async def test_rebuild_skips_recording_larger_than_chunk_limit(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner,
+                                                               monkeypatch: pytest.MonkeyPatch, compressed: bool) -> None:
+    """上限（REBUILD_MAX_CHUNK_SAMPLES）を超える録音は全量を読まずに飛ばし、残りを復元する（壊れた・巨大なファイルで起動時の復元がメモリを使い切らない）。"""
+    # Arrange: 会議の行と控え（meeting.json）を消し、2 つ目の録音だけ上限（30 秒の Chunk がちょうど収まる大きさ）を超える長さにする
+    await _completed_meeting(client3, runner3, ctx3)
+    data_dir = ctx3.settings.data_dir
+    mic = data_dir / "recordings" / "local" / "m-1" / "mic"
+    files = sorted(mic.glob("*.wav"))
+    big = files[1]
+    if compressed:
+        big.unlink()
+        big = big.with_suffix(".fake")
+        big.write_bytes(FakeCodec().encode(sine_pcm(31)))
+    else:
+        big.write_bytes(build_wav(sine_pcm(31)))
+    (mic.parent / "meeting.json").unlink(missing_ok=True)
+    monkeypatch.setattr(rebuild_module, "REBUILD_MAX_CHUNK_SAMPLES", 480000, raising=False)
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, data_dir, ctx3.codec)
+        chunks = repo.list_chunks(conn, "m-1")
+    # Assert: 上限を超えた録音は飛ばした一覧に載り、上限に収まる 30 秒の録音は復元する
+    assert report.skipped_files == [str(big.relative_to(data_dir))]
+    assert [c.sequence_no for c in chunks] == [0]
+
+
+async def test_rebuild_skips_recording_named_with_non_ascii_digits(client3: httpx.AsyncClient, ctx3: AppContext,
+                                                                   runner3: JobRunner) -> None:
+    """連番の名前に ASCII 以外の数字（「²」は str.isdigit() が真で int() が投げる）があっても、そのファイルだけ除いて復元する。"""
+    # Arrange: 会議の行を消し、正しい録音の横に「².wav」を置く
+    await _completed_meeting(client3, runner3, ctx3)
+    mic = ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "mic"
+    (mic / "².wav").write_bytes(sorted(mic.glob("*.wav"))[0].read_bytes())
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        chunks = repo.list_chunks(conn, "m-1")
+    # Assert: 正しい録音は復元し、規約外の名前は Chunk にしない
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert sorted(c.sequence_no for c in chunks) == [0, 1]
+
+
+async def test_rebuild_tolerates_snapshot_that_is_not_an_object(client3: httpx.AsyncClient, ctx3: AppContext, runner3: JobRunner) -> None:
+    """meeting.json の最上位がオブジェクトでなくても、控えなしとして復元する。確定したかが分からないので recording にする
+    （finalized にすると、まだ送信中のブラウザの Chunk の PUT を断る。§2.4）。"""
+    # Arrange
+    await _completed_meeting(client3, runner3, ctx3)
+    (ctx3.settings.data_dir / "recordings" / "local" / "m-1" / "meeting.json").write_text("[1, 2]", encoding="utf-8")
+    # Act
+    with ctx3.db.write_sync() as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'm-1'")
+        report = rebuild(conn, ctx3.settings.data_dir, ctx3.codec)
+        m = repo.get_meeting(conn, "m-1")
+    # Assert
+    assert report.meetings_created == 1 and report.chunks_created == 2
+    assert m is not None and m.title == "復元された会議" and m.status == "recording"
 ```
 
 ## 23.7 LAN 共有
@@ -4667,6 +7966,7 @@ async def test_missing_chunk_is_reported_for_resync(client3: httpx.AsyncClient, 
 # tests/test_users_lan.py
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import httpx
@@ -4739,6 +8039,60 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
     from minutes_local.__main__ import main
     assert main(["serve", "--bind", "0.0.0.0"]) == 2
     assert "requires --tls" in capsys.readouterr().err
+
+
+def test_user_cli_rejects_duplicate_name_and_removes_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                          capsys: pytest.CaptureFixture[str]) -> None:
+    """user add は同名を拒否し（トレースバックにしない）、user remove でトークンを失効できる。"""
+    from minutes_local.__main__ import main
+    # Arrange
+    monkeypatch.setenv("MINUTES_DATA_DIR", str(tmp_path))
+    assert main(["user", "add", "alice"]) == 0
+    # Act / Assert: 同名は 1 で終わる
+    assert main(["user", "add", "alice"]) == 1
+    assert "already exists" in capsys.readouterr().err
+    assert main(["user", "list"]) == 0
+    user_id = capsys.readouterr().out.split()[0]
+    # Act / Assert: 削除は 1 回だけ成功し、一覧から消える
+    assert main(["user", "remove", user_id]) == 0
+    assert main(["user", "remove", user_id]) == 1
+    capsys.readouterr()
+    assert main(["user", "list"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_doctor_rebuild_refuses_while_server_is_running(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    """serve が使っているデータディレクトリには rebuild をかけない（同じ Chunk の行を 2 つのプロセスが作り合う）。"""
+    from minutes_local.__main__ import main
+    from minutes_local.bootstrap import acquire_data_dir_lock
+    # Arrange: 動いている serve の代わりにロックを持つ
+    monkeypatch.setenv("MINUTES_DATA_DIR", str(tmp_path))
+    lock = acquire_data_dir_lock(tmp_path)
+    assert lock is not None
+    try:
+        # Act / Assert
+        assert main(["doctor", "--rebuild"]) == 1
+        assert "stop the server" in capsys.readouterr().err
+    finally:
+        os.close(lock)
+
+
+def test_unowned_warning_asks_to_copy_the_database_first(capsys: pytest.CaptureFixture[str]) -> None:
+    """所有者の居ない会議の警告は、置き換える前に今の DB を WAL ごと別名へ移させ、バックアップの後のノートと要約が失われることを伝える（§2.5）。"""
+    from minutes_local.__main__ import _warn_unowned
+    # Act
+    _warn_unowned(["u-gone"])
+    # Assert
+    err = capsys.readouterr().err
+    assert "u-gone" in err
+    assert "first move (do not copy) the current database aside" in err and "minutes.sqlite-wal" in err
+    assert "Notes and summaries created after that backup are lost unless you move the set-aside files back" in err
+    # 戻すときも、置き換えた DB を WAL ごと先に移させる（置き換え後の WAL が戻した DB に適用されない）
+    assert "To move them back, stop the server, first move the replacement minutes.sqlite and its minutes.sqlite-wal" in err
+    # Act / Assert: 報告する ID が無ければ何も出さない
+    _warn_unowned([])
+    assert capsys.readouterr().err == ""
 ```
 
 ## 23.8 テストと設計判断の対応
@@ -4749,14 +8103,37 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | Live State（RUNNING / DEGRADED / STOPPED） | `test_live_state_degrades_with_lag` |
 | Live の小区分既定オフと警告 | `test_live_disabled_on_small_tier_by_default` |
 | 話者ラベル割当・名前は利用者・LLM 入力の `[S1:名前]` | `test_diarize_assigns_labels_and_names_are_user_assigned` |
-| 分離失敗 / モデル未配置でも merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait` |
+| 話者分離の後に transcribe の再試行で segments を置き換えても話者を引き継ぐ（分離は再実行しない） | `test_transcribe_retry_after_diarize_keeps_speakers` |
+| 無音と判定した Chunk の手動 STT は分離を作り直し、拾い直した segments だけに話者を付ける（前の話者・名前付きのラベルは変えない） | `test_manual_transcribe_of_skipped_chunk_gets_speakers_without_relabeling` |
+| 手動 STT の Chunk が分離の実行中に完了したら、実行中の分離を pending に戻して結果を捨てさせ、その Chunk を含めて分離し直してから merge する（§8 `on_transcribe_completed`・`repo_phase3.requeue_running_job`） | `test_manual_stt_finishing_during_diarize_reruns_the_diarize` |
+| 分離が手動 STT の Chunk より先に終わっても merge を作らず（`on_diarize_finished` は全 Chunk の終端を待つ）、Chunk の完了で分離を作り直す | `test_diarize_finishing_before_manual_stt_does_not_merge_early` |
+| merge の実行中（書き込みの後・完了の記録の前）に手動 STT の Chunk が初めて完了しても、結果を staged に置き、分離を作り直してから作り直した merge が話者付きで入れる（§21 `handle_transcribe`） | `test_manual_stt_committed_during_merge_rediarizes_then_remerges` |
+| lease 済みの merge が書く前に手動 STT の Chunk が初めて完了すると、その merge の行を消して書かせず（話者の無い segments を公開しない）、作り直した分離の完了後の merge が話者付きで入れる（§8 `on_transcribe_completed`・`repo_phase3.discard_meeting_job`） | `test_manual_stt_committed_before_leased_merge_writes_discards_that_merge` |
+| 同時に走らせる話者分離は `MAX_CONCURRENT_DIARIZE` 本まで。pending に戻した分離の次の試行は、旧い試行のスレッドが抜けるまで分離を始めず、その間 Runner は分離と（STT と並べない設定なら）要約を lease しない。lease した分離の行がある間も（枠を取る前でも）次の分離を lease しない。分離を待つハンドラがキャンセルされても、スレッドが抜けるまで枠を返さない（§7 `diarize_slots`・§9 `allowed_types`・§21 `handle_diarize`） | `test_requeued_diarize_waits_for_the_running_attempt`、`test_cancelled_diarize_keeps_the_slot_until_its_thread_exits`、`test_leased_diarize_blocks_next_diarize_before_taking_the_slot` |
+| 分離が failed で確定して作った merge ジョブ（`on_job_failed` の戻り値）は、Runner の失敗時も Sweeper の回数切れも、コミット後に流す（完了時の後続ジョブと同じ。§8 `on_job_failed`・§9 `_on_failure`・Phase 2 §14 `sweep_once`） | `test_failed_diarize_publishes_the_merge_job_it_creates`、`test_exhausted_diarize_publishes_the_merge_job_it_creates` |
+| lease できる分離が待っていれば、ライブ STT が絶えず届いても新しい STT を lease せず、実行中の STT が抜けたら次の 1 件を分離に予約する（vad_chunk が絶えず届いても分離が先）。待つ分離が無い（再試行の待ち時間中を含む）なら従来の優先度の順（§9 `allowed_types`・`repo_phase3.has_ready_job`） | `test_pending_diarize_is_admitted_despite_a_replenished_live_queue`、`test_stt_keeps_priority_when_no_diarize_is_ready`、`test_ready_diarize_is_leased_before_a_replenished_vad_queue` |
+| 固まった分離は時間切れで見放し、ジョブは再試行せず failed にして話者分離なしで merge・要約へ進む。枠はスレッドが抜けるまで返さず、見放したスレッドは STT と要約の排他で数えない（§21 `handle_diarize`・§9 `_on_failure`・`allowed_types`） | `test_hung_diarize_times_out_and_keeps_the_slot_until_its_thread_exits` |
+| 分離の読み込みは、Chunk ごとにその source の残りの上限を渡し、上限を超える音声は全量を PCM にする前に断る（読む量を WAV はヘッダ + PCM、圧縮ファイルは最悪の符号化の大きさ `max_encoded_bytes` で止め、圧縮ファイルはさらに上限 + 1 サンプルで止めた復号で判定。§16 `read_pcm`・§21 `_load_and_diarize`） | `test_read_pcm_rejects_audio_longer_than_limit_before_decoding_all`、`test_read_pcm_bounds_compressed_file_read_before_decoding`、`test_flac_worst_case_bound_admits_incompressible_audio`、`test_diarize_reads_each_chunk_within_remaining_timeline_budget` |
+| merge が書き込みをコミットした後に回数切れで failed になっても、その merge が終わる前に置いた撮り直しは作り直した merge が公開する（同じミリ秒でも）。落ち続ける merge は際限なく作り直さない（§8 `rerun_merge_for_staged`。Phase 2 のテストを Phase 3 の pipeline で実行） | `test_committed_merge_expiring_after_staged_retry_schedules_followup_merge`、`test_merge_failing_without_commit_is_not_recreated_endlessly`（Phase 2 §23） |
+| 分離失敗 / モデル未配置 / プロセスごと落ち続けても merge へ | `test_diarize_failure_does_not_block_merge`、`test_diarize_model_missing_does_not_wait`、`test_diarize_that_keeps_crashing_does_not_block_merge` |
+| 実 Provider：無音 Chunk を挟んでも話者区間の時刻がずれない、上限は `max_speakers`、一時ファイルはデータディレクトリの中 | `test_assemble_timeline_pads_gaps_with_silence`、`test_pyannote_provider_keeps_absolute_time_across_skipped_chunk`、`test_speaker_after_silent_chunk_is_not_shifted` |
 | エコー除去 | `test_echo_from_system_is_dropped_on_mic` |
 | Chunk 単位言語判定・比率・混在時の要約言語 | `test_auto_detects_per_chunk_and_mixed_summary_language`、`test_dominant_language_selects_prompt`、`test_resolve_chunk_language_rules` |
-| 圧縮の往復検証・不一致時の保持 | `test_compress_replaces_wav_after_roundtrip`、`test_compress_keeps_wav_when_roundtrip_mismatches` |
+| 圧縮の往復検証・不一致時の保持 | `test_compress_replaces_wav_after_roundtrip`、`test_compress_keeps_wav_when_roundtrip_mismatches`、`test_flac_codec_roundtrip_is_bit_exact`（実コーデック。`soundfile` がなければ skip） |
+| 圧縮と他の処理の競合（読み取りの読み直し・再実行後は切り替えない・残った WAV の掃除） | `test_reader_follows_chunk_replaced_by_compression`、`test_compress_does_not_switch_after_job_was_withdrawn`、`test_compress_retry_removes_wav_left_by_crash` |
 | バックアップ・整合性・再構築・逆同期 | `test_backup_prune_and_restore`、`test_rebuild_from_recordings`、`test_rebuild_keeps_end_time_from_phase2_snapshot`、`test_missing_chunk_is_reported_for_resync` |
+| バックアップの原子性・壊れたバックアップと、このアプリのスキーマを持たない（`schema_version` が無い・新しすぎる）バックアップを復元元にしない | `test_backup_failure_leaves_no_partial_file`、`test_restore_skips_broken_backup` |
+| バックアップは 24 時間に 1 回・定期処理のループが失敗で終わらない | `test_scheduler_backs_up_only_when_a_day_has_passed`、`test_scheduler_loop_survives_failed_iteration` |
+| 圧縮後の古い行を検証した圧縮ファイルへ向け直す。行が指すファイルが壊れていれば向け直し、健全なら向け直さない。代わりがなければ `missing` | `test_rebuild_relinks_chunk_compressed_after_backup`、`test_rebuild_relinks_only_when_existing_recording_is_corrupt`、`test_rebuild_relink_records_the_bytes_it_validated` |
+| rebuild は、読んだ後に消えた・読めなくなった録音をそのファイルだけ飛ばし、残りを復元する（§18 `rebuild`） | `test_rebuild_skips_recording_that_disappears_after_reading` |
+| rebuild は、上限（`REBUILD_MAX_CHUNK_SAMPLES`）を超える録音を全量を読まずに飛ばし、残りを復元する。読む量を上限 + 1 バイトで止め、圧縮ファイルの復号も上限で止める（§18 `_read_chunk_file`） | `test_rebuild_skips_recording_larger_than_chunk_limit` |
+| VAD の読み取りが OSError（権限・取り外し）でも、壊れた WAV と同じく修復を確かめ直し、読めなければ missing にして INVALID_AUDIO で止める（§21 `handle_vad`） | `test_vad_rechecks_chunk_when_read_raises_os_error` |
+| 起動時の復旧（バックアップあり / なし）で録音ファイルから作り直す。復元の途中で止まっても次の起動がやり直す | `test_startup_recovery_rebuilds_meetings_missing_from_database`、`test_interrupted_restore_resumes_on_next_start` |
+| 壊れた `meeting.json` で rebuild を止めない・確定前の会議と、読めない控えの会議（確定したかが分からない）は `recording` に戻す | `test_rebuild_drops_malformed_stop_pair`、`test_rebuild_drops_malformed_end_time`、`test_rebuild_tolerates_malformed_snapshot_fields`、`test_rebuild_tolerates_snapshot_that_is_not_an_object`、`test_rebuild_restores_unfinalized_meeting_as_recording` |
 | 利用者分離・階層・公平 lease・TLS・LAN bind 拒否 | `test_users_lan.py` |
+| CLI：同名の利用者の拒否と削除、serve の動作中は `doctor --rebuild` を断る | `test_user_cli_rejects_duplicate_name_and_removes_user`、`test_doctor_rebuild_refuses_while_server_is_running` |
 | マイグレーション 009〜012 | `test_apply_phase3_moves_files_and_extends_job_types`、`test_apply_phase3_keeps_other_recordings_when_meeting_id_equals_user_id` |
-| Phase 2 の回帰 | Phase 2 §23 の 128 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
+| Phase 2 の回帰 | Phase 2 §23 の 131 件（`test_phase1_contract.py` は物理パスのみ更新。`test_phase1_server_compat.py` は `recording_dir()` 経由なので無変更） |
 
 ---
 
@@ -4768,36 +8145,37 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | --- | --- |
 | 1 Live STT failure ≠ Recording failure | `live.on_chunk_registered` はジョブを生成するだけで PUT の成否に影響しない（例外は `insert_job` の冪等失敗のみ）。`handle_live_transcribe` は `stt_status` を触らない。Live ジョブの失敗は後続に影響しない（§9 `_on_failure`）。ブラウザ側は `NO_AUDIO_FRAMES` で Live を自動停止（client 文書 §8） |
 | 2 AI failure ≠ Transcript loss | Phase 2 と同じ。要約言語の判定（§21 `_summary_language`）は読み取りのみ |
-| 3 STT failure ≠ Recording loss | `handle_compress` は往復検証に成功したときだけ WAV を消す。`read_pcm` は FLAC でも WAV sha256 で照合。`rebuild` は既存行を上書きしない |
+| 3 STT failure ≠ Recording loss | `handle_compress` は往復検証に成功し、lease が現行で、Chunk が読んだ時のままのときだけ WAV を消す。`read_pcm` は FLAC でも WAV sha256 で照合。読み取りは圧縮による置き換えを読み直して追う（`read_chunk_pcm`。正常な Chunk を `missing` にしない）。`rebuild` は既存行を上書きせず、確定前の会議を `recording` に戻して残りの Chunk を受け取れるようにする |
 | 4 Queue failure ≠ Job metadata loss | 010 のテーブル再作成は `INSERT ... SELECT *` で行を保つ（§23.2）。`processing_jobs` が唯一の Job Store である点は不変 |
-| 5 Duplicate delivery ≠ Duplicate transcript | `uq_live_job` / `uq_diarize_job` / `uq_compress_job`。`handle_live_transcribe` と `handle_transcribe` は既存セグメントがあれば挿入しない |
+| 5 Duplicate delivery ≠ Duplicate transcript | `uq_live_job` / `uq_diarize_job` / `uq_compress_job`。`handle_live_transcribe` と `handle_transcribe` は既存セグメントがあれば挿入しない（`handle_transcribe` は `completed` の Chunk の再試行だけ、segments を置き換える） |
 | 6 AI regeneration ≠ Manual note overwrite | 変更なし |
 | 7 VAD false negative ≠ Original audio loss | Live はブラウザ VAD の `has_voice=false` をスキップするだけで、確定 STT は Phase 2 の経路（サーバー VAD + 手動 STT）で救済できる |
 | 8 Browser tab hidden ≠ timer-based recording failure | サーバー側の日次スケジューラ・Sweeper は録音と無関係 |
 | 9 Speaker source ≠ Speaker identity | ラベル `S1..Sn` は経路でも人物でもない。名前は `PUT /speakers` で利用者のみが付け、プロンプト v2 は名前付きラベル以外を担当者にしない（§15）。`validate` 段 4 は Phase 2 のまま |
-| 10 Queue ≠ Source of Truth | `rebuild` が `recordings/` + `meeting.json` から `meetings` / `audio_chunks` を再構築できる。`backup` は SQLite を再構築可能なメタデータとして扱う |
+| 10 Queue ≠ Source of Truth | `rebuild` が `recordings/` + `meeting.json` から `meetings` / `audio_chunks` を再構築できる。`backup` は SQLite を再構築可能なメタデータとして扱う。DB が壊れてバックアップが 1 つもなくても、空の DB で起動して録音ファイルから作り直す（§22） |
 
 ## 24.2 Definition of Done（Phase 3 サーバー側）
 
 | 項目 | 状況 | 担保箇所 |
 | --- | --- | --- |
-| Live STT が録音中に段階的に出る（遅延 30〜60 秒） | 設計済・テスト済（生成・再利用）・実機（遅延） | §10、§23.3 |
+| Live STT が録音中に段階的に出る（遅延 30〜60 秒。話者分離の実行中は分離が終わるまで遅れる。§9） | 設計済・テスト済（生成・再利用）・実機（遅延） | §10、§23.3 |
 | Live 有効時に `NO_AUDIO_FRAMES` が増えない | 実機 | client 文書 §8、`usage_metrics(live_lag_ms)` |
-| 話者ラベルが付き、名前は利用者が割り当てる | 設計済・テスト済 | §12、§20.4、§23.4 |
+| 話者ラベルが付き、名前は利用者が割り当てる | 設計済・テスト済（Fake と、Pipeline を差し替えた実 Provider）・実機（pyannote 本体。§12 の表の「3-h」の行） | §12、§20.4、§23.4 |
 | 話者分離なしでも transcript / 要約が完了する | テスト済 | §23.4 |
 | 日英混在会議で Chunk ごとに言語が付き、要約言語が規則どおり | 設計済・テスト済・実機（判定精度） | §13、§21、§23.5 |
-| FLAC 化後も STT 再実行・transcript 取得・finalize 再実行が動く | テスト済（Fake コーデック）・実機（libsndfile） | §16、§23.6 |
-| DB 破損から自動復元、`doctor --rebuild` で行を再構築 | テスト済 | §17、§18、§23.6 |
+| FLAC 化後も STT 再実行・transcript 取得・finalize 再実行が動く | テスト済（Fake コーデック。実コーデックは往復と破損入力のみ）・実機（実コーデックでの一連の動作） | §16、§23.6 |
+| DB 破損から自動復元（バックアップなしでも起動）、復元後に録音ファイルから自動で作り直す、`doctor --rebuild` で行を再構築 | テスト済 | §17、§18、§22、§23.6 |
+| バックアップが 1 日 1 世代で、再起動の繰り返しで古い世代を失わない | テスト済 | §11、§23.6 |
 | 欠損 Chunk が `registered=false` で返り、再 PUT で復旧 | テスト済 | §20.2、§23.6 |
 | 利用者ごとの分離、公平 lease、TLS 証明書、LAN bind の TLS 必須 | テスト済（証明書生成）・実機（ブラウザ受け入れ・LAN 遅延） | §19、§20.1、§23.7 |
 | Phase 1 §12・Phase 2 §14 の契約が不変 | テスト済 | §23.1（Phase 2 テストの回帰） |
-| 外部通信ゼロ（`httpx` は 2 モジュールのみ） | テスト済 | Phase 2 `test_imports.py` が Phase 3 でも通る |
+| 外部通信ゼロ（`httpx` は 2 モジュールのみ。ほかの通信手段も許可したモジュールだけ） | テスト済 | Phase 2 `test_imports.py` が Phase 3 でも通る |
 
 ## 24.3 実装順序
 
 | Step | 内容 | 通過すべきテスト |
 | --- | --- | --- |
-| 3-a | §4 マイグレーション、§5〜§6 設定とモデル、§16 ファイル階層 | `test_migration_phase3.py`、Phase 2 の回帰 |
+| 3-a | §1.1 `pyproject.toml`、§4 マイグレーション、§5〜§6 設定とモデル、§16 ファイル階層 | `test_migration_phase3.py`、Phase 2 の回帰 |
 | 3-b | §7〜§9 パイプラインと Runner、§20 API | Phase 2 の回帰、`test_phase1_contract.py` |
 | 3-c | §10 Live + §20.4 | `test_live.py` |
 | 3-d | §12 話者分離 + §14 エコー + §15 プロンプト v2 | `test_diarization.py` |
@@ -4805,6 +8183,24 @@ def test_serve_refuses_lan_bind_without_tls(capsys: pytest.CaptureFixture[str]) 
 | 3-f | §16 コーデック + §11 スケジューラ + §17 バックアップ + §18 再構築 | `test_codec_recovery.py` |
 | 3-g | §19 利用者・TLS + §20.1 所有者照合 + §22 CLI | `test_users_lan.py` |
 | 3-h | 実機：pyannote / faster-whisper `detect_language` / libsndfile / LAN 2 台構成 | §24.2 の実機項目 |
+
+Step の順序で気を付ける点：
+
+* Phase 2 のファイルのうち `jobs/sweeper.py` と `db/repo.py` は Phase 3 で変更しないが、Phase 2 側の `pipeline.on_job_failed()`（Phase 2 §12）は Phase 3 の `jobs/pipeline.py` で `diarize_meeting` の分岐を足した版に置き換わる（§8）。この版は分離の失敗で作った merge ジョブと、入れ替え待ちの撮り直しを公開する merge（`rerun_merge_for_staged`）の id を返し、Phase 2 の Sweeper（`sweep_once`）はその行をトランザクションの中で読んでコミット後に流す（Phase 2 の版が返すのは後者だけ）。3-b で `pipeline.py` を差し替えるときに落とさない
+* 3-d の話者分離のテストは pyannote を入れずに通る（Pipeline の差し替え。§12）。`diarization` extras を入れるのは 3-h
+* 3-f の `test_flac_codec_roundtrip_is_bit_exact` は `soundfile` がなければ skip になる。`dev` extras（§1.1）を入れて、skip ではなく通過になっていることを確かめる
+
+3-h（実機）で確かめる項目と、結果を書き戻す場所：
+
+| 項目 | 手順 | 書き戻す場所 |
+| --- | --- | --- |
+| pyannote のモデルの配置 | 配布元から取得し `{dataDir}/models/diarization/` に置く。`config.yaml` の参照をローカルの絶対パスにする。`doctor` の `diarization` 行が `available` になる | §12 の表「モデルの場所」「取得」 |
+| 通信しないこと | ネットワークをつないだまま話者分離を 1 回実行し、終わってから 60 秒以上待っても外向きの接続が出ないことを確かめる（`HF_HUB_OFFLINE`・`PYANNOTE_METRICS_ENABLED`）。pyannote.audio 3.x と 4.x の両方で行う | §12 の表「通信」 |
+| Pipeline の戻り値 | 入れた版で `itertracks(yield_label=True)` が使えるか、`speaker_diarization` 属性を経由するか | §12 の表「戻り値」、`_run()` の末尾 |
+| 所要時間とメモリ | 60 分・2 source の会議で `diarize_duration_ms` とプロセスの最大メモリを記録する（Apple Silicon は CPU） | §3 の表 |
+| 言語判定 | 日英混在の録音で `language_prob` と判定結果を確かめる | §3 の表 |
+| FLAC の一連の動作 | `compress_after_days=0` にして圧縮 → STT の再実行 → transcript 取得 | §24.2 |
+| LAN | 2 台構成で `doctor --init-tls --host <名前>` → `serve --bind 0.0.0.0 --tls` → 別の端末から証明書を受け入れて録音 | §3 の表、§24.2 |
 
 ---
 
